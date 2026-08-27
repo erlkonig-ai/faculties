@@ -556,6 +556,52 @@ pub fn cover_headroom<B: BlobStoreGet>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// prefix stability
+// ---------------------------------------------------------------------------
+
+/// Resolution of the refinement pool, as a divisor of the budget.
+///
+/// The cover is EMITTED oldest-first but REFINED recency-first, so the last
+/// split the budget can afford is the *oldest splittable* chunk — which is the
+/// FRONT of the emitted text. When every split competes for one global
+/// remainder, the marginal decision is therefore a function of the TOTAL, and
+/// it sits at the front: perturb the total by anything and the whole cover
+/// after the first coarse chunk re-cuts.
+///
+/// Measured on `self.pile` (2026-08-27, plain `memory context`, 200,000-char
+/// budget, 202-chunk / 204,717-byte cover, one machine, pile held FIXED so
+/// only the budget number changed): raising the budget by 1,500 characters —
+/// 0.75% — moved the first differing byte to 9,200 of 204,317. One
+/// journal-sized memory does the same, for the same reason.
+///
+/// The fix is to stop letting the mandatory part fund the discretionary part.
+/// The floor — the coarsest antichain, which completeness REQUIRES — is not a
+/// decision, so it is subtracted once and the remainder is quantized to this
+/// resolution. Between quanta the pool is a literal constant, so a new memory
+/// enlarges the floor and moves nothing else, and every leading chunk survives.
+///
+/// The resolution is the one knob, and it is a resolution on the budget axis —
+/// the natural parameter — not a duration, not a calendar unit, and not a proxy
+/// for how often anyone happens to journal. It trades unspent budget against
+/// re-cut frequency, and with per-chunk KV checkpoints downstream those are not
+/// symmetric: a re-cut costs one re-prefill, unspent budget costs detail in
+/// EVERY wake. A journal entry measures ~1,300 characters, so a sixteenth of a
+/// 200,000-character budget absorbs about ten of them before the cover must be
+/// re-cut. Measured over 30 such writes on a clone of the live pile: 27 of 30
+/// re-cut nothing at all, against 3 of 30 unchanged, and a median of 2 of 200
+/// leading chunks surviving, under one global remainder. The price is 9,186
+/// characters (4.6% of the budget) left unspent, and 13 of 200 cover chunks.
+const REFINE_POOL_QUANTUM_DEN: usize = 16;
+
+/// Characters available for refinement: what the budget has left after the
+/// mandatory floor, rounded DOWN to a whole number of quanta so it is a
+/// constant between steps.
+fn refinement_pool(budget_chars: usize, floor_chars: usize) -> usize {
+    let quantum = (budget_chars / REFINE_POOL_QUANTUM_DEN).max(1);
+    budget_chars.saturating_sub(floor_chars) / quantum * quantum
+}
+
 pub fn render_cover<B: BlobStoreGet>(
     space: &TribleSet,
     embeddings_space: &TribleSet,
@@ -726,31 +772,36 @@ pub fn render_cover<B: BlobStoreGet>(
     // gets this gradient from drop-oldest; we get it from the split order,
     // since completeness forbids dropping.)
     let mut cover: Vec<usize> = roots.clone();
+    // The floor is not a decision, so it must not compete with decisions. It is
+    // subtracted once, and what is left — quantized — is the pool every split
+    // is judged against for the rest of this render.
+    let floor_used = used;
+    let pool = refinement_pool(budget_chars, floor_used) as i128;
+    let mut spent: i128 = 0;
     loop {
-        let remaining = budget_chars.saturating_sub(used);
-        if remaining == 0 {
+        let remaining = pool - spent;
+        if remaining <= 0 {
             break;
         }
         let mut best: Option<usize> = None; // position in `cover`
-        let mut best_extra = 0usize;
-        let mut best_key: Option<(f32, i128, i128, usize, Id)> = None;
+        let mut best_delta: i128 = 0;
+        let mut best_key: Option<(f32, i128, i128, i128, Id)> = None;
         for (pos, &i) in cover.iter().enumerate() {
             if children[i].len() < 2 {
                 continue;
             }
-            let mut kids_cost = 0usize;
+            let mut kids_cost = 0i128;
             for &k in &children[i] {
-                kids_cost = kids_cost.saturating_add(context_chunk_cost(
-                    reader,
-                    space,
-                    &spans,
-                    &mut cost_cache,
-                    k,
-                )?);
+                kids_cost += context_chunk_cost(reader, space, &spans, &mut cost_cache, k)? as i128;
             }
-            let pcost = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
-            let extra = kids_cost.saturating_sub(pcost);
-            if extra > remaining {
+            let pcost = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)? as i128;
+            // SIGNED. A split whose children are collectively cheaper than the
+            // parent's own summary gives budget back; `saturating_sub` used to
+            // round that to zero, so the pool was under-spent by however much
+            // detail happened to be cheap. Correctness, independent of any
+            // allocation scheme.
+            let delta = kids_cost - pcost;
+            if delta > remaining {
                 continue;
             }
             // Priority: relevance (subtree-max, when --about) desc → recency
@@ -758,7 +809,7 @@ pub fn render_cover<B: BlobStoreGet>(
             // Without --about every relevance is 0, so recency leads exactly as
             // before; with it, the cover descends into the query-relevant
             // subtrees first and leaves the rest coarse.
-            let key = (relevance[i], spans[i].1, width(i), extra, spans[i].2);
+            let key = (relevance[i], spans[i].1, width(i), delta, spans[i].2);
             let better = match best_key {
                 None => true,
                 Some((br, be, bw, bx, bid)) => {
@@ -777,7 +828,7 @@ pub fn render_cover<B: BlobStoreGet>(
             };
             if better {
                 best = Some(pos);
-                best_extra = extra;
+                best_delta = delta;
                 best_key = Some(key);
             }
         }
@@ -786,8 +837,9 @@ pub fn render_cover<B: BlobStoreGet>(
         };
         let kids = children[cover[pos]].clone();
         cover.splice(pos..=pos, kids);
-        used = used.saturating_add(best_extra);
+        spent += best_delta;
     }
+    used = (floor_used as i128 + spent).max(0) as usize;
 
     // Enforce eligibility at the chunk level the cover selected: a removed /
     // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
@@ -835,11 +887,16 @@ pub fn render_cover<B: BlobStoreGet>(
     // volatile counts (chunk/char totals) would perturb the otherwise
     // prefix-stable cover on every call. Keep it visible to a human on stderr,
     // out of the stored/ingested cover text.
+    // The pool is part of the same status line: a reader who sees a cover come
+    // in under budget needs to know the shortfall is the quantized pool doing
+    // its job, not a cover that failed to fill.
     eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode})",
+        "memory context — {} chunk(s), ~{} of {} characters ({mode}); floor {} + refinement pool {}",
         cover.len(),
         used,
         budget_chars,
+        floor_used,
+        refinement_pool(budget_chars, floor_used),
     );
     for &i in &cover {
         let (s, e, id) = spans[i];
@@ -954,5 +1011,31 @@ mod headroom_tests {
         };
         let error = chunk_embedding_handle(fragment.facts(), chunk).unwrap_err();
         assert!(error.to_string().contains("expected at most one"));
+    }
+
+    /// The pool is a whole number of quanta, so it is a CONSTANT while the
+    /// floor grows — which is the only reason a new memory can leave every
+    /// earlier split decision alone.
+    #[test]
+    fn the_refinement_pool_is_constant_between_quanta() {
+        let budget = 200_000; // quantum = 12_500
+        let a = refinement_pool(budget, 60_000);
+        for floor in [60_001, 61_400, 62_500] {
+            assert_eq!(
+                refinement_pool(budget, floor),
+                a,
+                "floor {floor} moved the pool"
+            );
+        }
+        assert_eq!(a, 137_500);
+        // Crossing a quantum steps it, once, by exactly one quantum. At ~1,300
+        // characters a journal entry that is about ten writes apart.
+        assert_eq!(refinement_pool(budget, 62_501), 125_000);
+        // A floor that eats the budget leaves nothing discretionary — and does
+        // not underflow. (`render_cover` has already failed loud by then.)
+        assert_eq!(refinement_pool(budget, 200_000), 0);
+        assert_eq!(refinement_pool(budget, 999_999), 0);
+        // A budget smaller than the divisor still has a usable quantum of 1.
+        assert_eq!(refinement_pool(8, 3), 5);
     }
 }

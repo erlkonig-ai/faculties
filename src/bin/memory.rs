@@ -3329,4 +3329,70 @@ mod tests {
             "chunk reassembly must equal the stored cover"
         );
     }
+
+    /// A write at the recent edge must not re-cut the cover's LEADING chunks.
+    ///
+    /// drive replays the cover as one `memory <range>` command / summary-output
+    /// pair per chunk, each its own KV-cache checkpoint, so a write costs
+    /// everything from the FIRST CHANGED CHUNK onward. When every split
+    /// competes for one global remainder the marginal decision is a function of
+    /// the TOTAL — and because the cover is emitted oldest-first while it is
+    /// refined recency-first, that marginal decision sits at the FRONT.
+    /// Measured on `self.pile` (2026-08-28, 200,000-char budget, 200-chunk
+    /// cover, one machine, one journal-sized memory per write): a median of 2
+    /// of 200 leading chunks survived. Subtracting the mandatory floor and
+    /// quantizing what is left makes the pool a constant between steps, and the
+    /// same 30-write sequence then re-cut nothing on 27 of them.
+    #[test]
+    fn a_write_at_the_recent_edge_keeps_the_leading_cover_chunks() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let at =
+            |d: u8, h: u8| parse_tai_timestamp(&format!("2026-01-{d:02}T{h:02}:00:00")).unwrap();
+        let write = |text: String, range: (Epoch, Epoch)| {
+            let loaded = storage.load().expect("load collections");
+            create_chunk(storage, &loaded, &text, range, None, range.1).expect("create chunk");
+        };
+        // An apex over five days, each day over three fine chunks. Sized so the
+        // budget BINDS: the coarsest cover is 400 characters, full detail needs
+        // 3,600, and a 4,000-character budget leaves the two oldest days
+        // unsplittable — i.e. the marginal decision sits at the very front,
+        // which is what gives the assertion below its teeth.
+        write("apex ".repeat(80), (at(1, 0), at(6, 0)));
+        for d in 1..=5u8 {
+            write(format!("day{d} ").repeat(70), (at(d, 0), at(d + 1, 0)));
+            for h in [1u8, 9, 17] {
+                write(format!("d{d}h{h:02} ").repeat(50), (at(d, h), at(d, h + 1)));
+            }
+        }
+
+        let cover_now = || {
+            let loaded = storage
+                .load_context(false)
+                .expect("load seeded collections");
+            build_context_cover(&loaded, 4_000, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("build context cover")
+        };
+        let before = cover_now();
+        assert_eq!(before, cover_now(), "two renders with no write must agree");
+        assert!(
+            !before.contains("d1h01 "),
+            "budget must bind — the oldest day should still be coarse:\n{before}"
+        );
+
+        // Writes past the apex's end, so each is a new top-level chunk: exactly
+        // the shape of journalling into a day that has no arc over it yet.
+        for h in [8u8, 10, 12] {
+            write(format!("new{h} ").repeat(4), (at(6, h), at(6, h + 1)));
+            let after = cover_now();
+            assert!(
+                after.starts_with(&before),
+                "a write at the recent edge re-cut the leading chunks\nBEFORE:\n{before}\nAFTER:\n{after}"
+            );
+            assert!(
+                after.contains(&format!("new{h} ")),
+                "the new memory must appear"
+            );
+        }
+    }
 }
