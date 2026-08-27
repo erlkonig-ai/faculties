@@ -27,6 +27,18 @@ use triblespace::prelude::*;
 struct Bucket {
     revisions_scanned: usize,
     revision_refs: usize,
+    /// Of the resolvable references, the ones naming a revision that is still
+    /// its entry's current head — following the link lands on live text.
+    head_refs: usize,
+    /// Of the resolvable references, the ones naming a SUPERSEDED revision.
+    /// The target is real, so nothing reports breakage; the text it carries is
+    /// simply out of date. This is the silent class, and the reason `wiki
+    /// show` resolves to the frontier by default.
+    stale_refs: usize,
+    stale_targets: BTreeSet<Id>,
+    stale_sources: BTreeSet<Id>,
+    /// Of the stale ones, how many a reader would actually click.
+    stale_in_links: usize,
     /// References naming no revision in the store: retired anchors, and ids
     /// that never resolved.
     unresolvable_refs: usize,
@@ -48,6 +60,20 @@ impl Bucket {
             self.revisions_scanned
         );
         println!("  references naming a revision:   {}", self.revision_refs);
+        println!("    naming a CURRENT head:        {}", self.head_refs);
+        println!(
+            "    naming a SUPERSEDED revision: {} across {} revision(s), naming {} distinct id(s)",
+            self.stale_refs,
+            self.stale_sources.len(),
+            self.stale_targets.len()
+        );
+        println!("      in link syntax:             {}", self.stale_in_links);
+        if self.revision_refs > 0 {
+            println!(
+                "      share of resolvable refs:   {:.1}%",
+                100.0 * self.stale_refs as f64 / self.revision_refs as f64
+            );
+        }
         println!(
             "  references naming nothing:      {} across {} revision(s), naming {} distinct id(s)",
             self.unresolvable_refs,
@@ -109,6 +135,9 @@ fn main() -> Result<()> {
         regex::Regex::new(r"\[[^\]]+\]\(wiki:(?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+\)").unwrap();
     let mut frontier_bucket = Bucket::default();
     let mut superseded_bucket = Bucket::default();
+    // (source head, superseded target) for the LIVE wiki only: the citations a
+    // reader following today's text would land on.
+    let mut stale_pairs: Vec<(Id, Id)> = Vec::new();
 
     for record in &records {
         let is_frontier = frontier.contains(&record.id);
@@ -141,16 +170,29 @@ fn main() -> Result<()> {
                     bucket.truncated_refs += 1;
                     continue;
                 };
+                let in_link = link_spans
+                    .iter()
+                    .any(|(start, end)| whole.start() >= *start && whole.end() <= *end);
                 if known_revisions.contains(&id) {
                     bucket.revision_refs += 1;
+                    if frontier.contains(&id) {
+                        bucket.head_refs += 1;
+                    } else {
+                        bucket.stale_refs += 1;
+                        bucket.stale_targets.insert(id);
+                        bucket.stale_sources.insert(record.id);
+                        if in_link {
+                            bucket.stale_in_links += 1;
+                        }
+                        if is_frontier {
+                            stale_pairs.push((record.id, id));
+                        }
+                    }
                     continue;
                 }
                 bucket.unresolvable_refs += 1;
                 bucket.unresolvable_revisions.insert(record.id);
                 bucket.unresolvable_targets.insert(id);
-                let in_link = link_spans
-                    .iter()
-                    .any(|(start, end)| whole.start() >= *start && whole.end() <= *end);
                 if fenced {
                     bucket.unresolvable_fenced += 1;
                 } else if in_link {
@@ -159,6 +201,41 @@ fn main() -> Result<()> {
                     bucket.unresolvable_bare += 1;
                 }
             }
+        }
+    }
+    // A stale citation only MISLEADS if the frontier says something different.
+    // Resolving each live-wiki stale target forward and diffing the text is
+    // what separates "names an older id" from "shows the reader older text".
+    let mut differing_refs = 0usize;
+    let mut identical_refs = 0usize;
+    let mut fork_refs = 0usize;
+    let mut affected_entries: BTreeSet<Id> = BTreeSet::new();
+    let mut misleading_sources: BTreeSet<Id> = BTreeSet::new();
+    let mut resolved: std::collections::BTreeMap<Id, bool> = std::collections::BTreeMap::new();
+    for (source, target) in &stale_pairs {
+        let entry = model
+            .entry_containing(*target)
+            .expect("every revision belongs to one entry");
+        affected_entries.insert(*entry.roots.first().expect("entry has a root"));
+        if entry.frontier.len() > 1 {
+            fork_refs += 1;
+            continue;
+        }
+        let differs = match resolved.get(target) {
+            Some(known) => *known,
+            None => {
+                let old = wiki_model::read_text(&reader, model.revision(*target).unwrap().content)?;
+                let new = wiki_model::read_text(&reader, entry.frontier[0].content)?;
+                let differs = old != new;
+                resolved.insert(*target, differs);
+                differs
+            }
+        };
+        if differs {
+            differing_refs += 1;
+            misleading_sources.insert(*source);
+        } else {
+            identical_refs += 1;
         }
     }
     let _ = handle.close();
@@ -175,6 +252,14 @@ fn main() -> Result<()> {
     );
     frontier_bucket.report("FRONTIER revisions (the live wiki)");
     superseded_bucket.report("SUPERSEDED revisions (immutable history)");
+    println!("FOLLOWING the live wiki's stale citations forward:");
+    println!(
+        "  target text differs from the frontier: {differing_refs} ref(s), in {} source revision(s), touching {} entry(-ies)",
+        misleading_sources.len(),
+        affected_entries.len()
+    );
+    println!("  target text identical to the frontier: {identical_refs} ref(s)");
+    println!("  target's entry is forked:              {fork_refs} ref(s)");
     if frontier_bucket.unresolvable_refs == 0 {
         println!("FRONTIER CLEAN: every reference in the live wiki names a revision");
     } else {

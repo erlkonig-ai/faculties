@@ -69,16 +69,36 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Show a revision, legacy fragment, or entry frontier.
+    /// Show what an id's entry says NOW, following the revision forward.
+    ///
+    /// A citation names a revision — immutable, pinned to the text its author
+    /// read — and `wiki lint` deliberately never rewrites one forward, so a
+    /// corpus that links liberally accumulates pinned ids the frontier has
+    /// since moved past. Following the entry is therefore the reading a reader
+    /// almost always wants, and it was behind an opt-in flag until 2026-08-27.
+    /// Per citation carried by one production pile's live frontier
+    /// (3264 entries, `cargo run --example reference_census`): 11823 of 14555
+    /// (81.2%) named a superseded revision, and 99.6% of those carry text
+    /// DIFFERING from what their entry says today. Freezing by default made
+    /// that a silent wrong answer that looks exactly like a right one.
+    ///
+    /// `--exact` opts back into the frozen revision, for inspecting history.
+    /// A forked entry prints every head rather than choosing one.
     Show {
         id: String,
-        /// Follow an exact revision to its entry's current frontier.
+        /// Show the named revision itself, not its entry's current frontier.
         #[arg(long)]
-        latest: bool,
+        exact: bool,
     },
     /// Print content without a metadata header. Fails on a fork.
+    ///
+    /// Follows the entry forward exactly as `show` does, so the two never
+    /// disagree about what one id says; `--exact` pins the named revision.
     Export {
         id: String,
+        /// Print the named revision itself, not its entry's current frontier.
+        #[arg(long)]
+        exact: bool,
     },
     /// Compare two deterministically ordered revisions in an entry.
     Diff {
@@ -108,7 +128,7 @@ enum Command {
     ///
     /// With an id, incoming links are revision-scoped: a citation records what
     /// its author read, so a superseded revision that cited this page is still
-    /// listed. `wiki show --latest <revision>` says whether it survived.
+    /// listed. `wiki show <revision>` says whether the citation survived.
     Links {
         id: Option<String>,
         /// Rows to print per class, and unreferenced entries to name.
@@ -307,13 +327,20 @@ fn resolve_prefix(model: &RevisionReadModel, raw: &str) -> Result<Id> {
     }
 }
 
+/// Resolve a selector to the revisions a command should act on.
+///
+/// `follow_frontier` is the read-side policy: true asks the ENTRY what it says
+/// now — which may be several heads on a fork — and false pins the one named
+/// revision. Mutations resolve exact here and then join the whole frontier
+/// through [`mutation_entry`], so a write already follows the entry no matter
+/// which member id it is handed.
 fn selector_revisions<'a>(
     model: &'a RevisionReadModel,
     selector: Id,
-    follow_latest: bool,
+    follow_frontier: bool,
 ) -> Result<Vec<&'a RevisionRecord>> {
     let ids: Vec<Id> = if let Some(revision) = model.revision(selector) {
-        if follow_latest {
+        if follow_frontier {
             model
                 .entry_containing(revision.id)
                 .expect("every revision belongs to one entry")
@@ -743,13 +770,25 @@ fn print_revision(
     Ok(())
 }
 
-fn cmd_show(storage: WikiStorage<'_>, id: String, latest: bool) -> Result<()> {
+fn cmd_show(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
     let view = storage.view()?;
     let catalog = wiki_model::load_catalog(&view.facts)?;
     let selector = resolve_prefix(&catalog.revisions, &id)?;
-    let revisions = selector_revisions(&catalog.revisions, selector, latest)?;
+    let revisions = selector_revisions(&catalog.revisions, selector, !exact)?;
+    // A forked entry has no single current text, so print EVERY head under a
+    // banner naming them. Silently picking one would be the same class of
+    // wrong answer this command's default exists to remove — indistinguishable
+    // from a correct one, and only discovered later by an edit that disagrees.
     if revisions.len() > 1 {
-        println!("fork: {} current revisions", revisions.len());
+        println!(
+            "fork: {} current revisions ({}); all shown, --exact pins one",
+            revisions.len(),
+            revisions
+                .iter()
+                .map(|revision| format!("{:x}", revision.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     for (index, revision) in revisions.iter().enumerate() {
         if index > 0 {
@@ -760,13 +799,20 @@ fn cmd_show(storage: WikiStorage<'_>, id: String, latest: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_export(storage: WikiStorage<'_>, id: String) -> Result<()> {
+fn cmd_export(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
     let view = storage.view()?;
     let catalog = wiki_model::load_catalog(&view.facts)?;
     let selector = resolve_prefix(&catalog.revisions, &id)?;
-    let revisions = selector_revisions(&catalog.revisions, selector, false)?;
+    let revisions = selector_revisions(&catalog.revisions, selector, !exact)?;
     let [revision] = revisions.as_slice() else {
-        bail!("selector resolves to a fork; choose an exact revision")
+        bail!(
+            "selector resolves to a fork ({}); choose one with --exact",
+            revisions
+                .iter()
+                .map(|revision| format!("{:x}", revision.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     print!("{}", revision_content(&view.reader, revision)?);
     Ok(())
@@ -1163,8 +1209,8 @@ fn short(value: &str, chars: usize) -> String {
 /// REVISION-scoped by design. An entry-scoped answer asserts a citation that
 /// may no longer exist: if A1 cited this page and A2 dropped the citation,
 /// naming "A" claims A currently cites it, which A's text denies. Naming A1 is
-/// exactly true — A1 did — and `wiki show --latest <A1>` shows whether A's
-/// current text still does.
+/// exactly true — A1 did — and `wiki show <A1>`, which follows the entry
+/// forward, shows whether A's current text still does.
 fn incoming_revisions(
     reader: &PileReader,
     revisions: &RevisionReadModel,
@@ -1931,6 +1977,172 @@ mod tests {
         assert_eq!(entry.frontier[0].supersedes, BTreeSet::from([left, right]));
     }
 
+    /// Publish `root`, then supersede it, and hand back both ids.
+    fn superseded_pair(storage: WikiStorage<'_>) -> (Id, Id) {
+        let before = storage.view().unwrap();
+        let mut genesis = Fragment::empty();
+        let root = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "page".to_owned(),
+            "first draft".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&before, genesis).unwrap();
+
+        cmd_edit(
+            storage,
+            format!("{root:x}"),
+            Some("second draft".to_owned()),
+            None,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+
+        let after = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&after.facts).unwrap();
+        let entry = catalog.revisions.entry_containing(root).unwrap();
+        assert_eq!(entry.frontier.len(), 1);
+        (root, entry.frontier[0].id)
+    }
+
+    /// The default reading follows the entry: naming a superseded id returns
+    /// what that page says NOW, not the text it said when it was cited.
+    #[test]
+    fn show_follows_a_superseded_id_to_the_frontier_by_default() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let (root, head) = superseded_pair(storage);
+        assert_ne!(root, head, "the fixture must actually supersede something");
+
+        let view = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
+        let shown = selector_revisions(&catalog.revisions, root, true).unwrap();
+        assert_eq!(
+            shown.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![head],
+            "a superseded selector must resolve forward to the head"
+        );
+        assert_eq!(
+            revision_content(&view.reader, shown[0]).unwrap(),
+            "second draft"
+        );
+        cmd_show(storage, format!("{root:x}"), false).unwrap();
+    }
+
+    /// `--exact` is the whole escape hatch: it must return the frozen text,
+    /// or history becomes unreadable.
+    #[test]
+    fn exact_pins_the_named_revision() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let (root, head) = superseded_pair(storage);
+
+        let view = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
+        let pinned = selector_revisions(&catalog.revisions, root, false).unwrap();
+        assert_eq!(pinned.iter().map(|r| r.id).collect::<Vec<_>>(), vec![root]);
+        assert_eq!(
+            revision_content(&view.reader, pinned[0]).unwrap(),
+            "first draft"
+        );
+        cmd_show(storage, format!("{root:x}"), true).unwrap();
+        // The head still reads as itself under either policy.
+        assert_eq!(
+            selector_revisions(&catalog.revisions, head, true)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![head]
+        );
+    }
+
+    /// Following the entry must not soften the one honest failure: an id that
+    /// names nothing still fails, with the same message it always had.
+    #[test]
+    fn an_id_that_names_nothing_still_fails_loudly() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let (_root, _head) = superseded_pair(storage);
+        let view = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
+
+        let absent = "f40312df406d1bf1bb5c94ec954e490b";
+        let error = resolve_prefix(&catalog.revisions, absent)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no Wiki id matches"), "got: {error}");
+        assert!(cmd_show(storage, absent.to_owned(), false).is_err());
+        assert!(cmd_show(storage, absent.to_owned(), true).is_err());
+    }
+
+    /// A forked entry has no single current text. `show` prints EVERY head —
+    /// picking one silently is precisely the failure the new default removes —
+    /// while `export`, which must emit one document, refuses and names them.
+    #[test]
+    fn a_forked_frontier_shows_every_head_and_export_refuses() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let before = storage.view().unwrap();
+        let mut genesis = Fragment::empty();
+        let root = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "root".to_owned(),
+            "body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&before, genesis).unwrap();
+
+        let current = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&current.facts).unwrap();
+        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let mut forks = Fragment::empty();
+        let left = stage_revision(
+            storage,
+            &mut forks,
+            Some(entry),
+            "left".to_owned(),
+            "left".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let right = stage_revision(
+            storage,
+            &mut forks,
+            Some(entry),
+            "right".to_owned(),
+            "right".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(&current, forks).unwrap();
+
+        let view = storage.view().unwrap();
+        let catalog = wiki_model::load_catalog(&view.facts).unwrap();
+        let heads: BTreeSet<Id> = selector_revisions(&catalog.revisions, root, true)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(heads, BTreeSet::from([left, right]));
+        cmd_show(storage, format!("{root:x}"), false).unwrap();
+
+        let error = cmd_export(storage, format!("{root:x}"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fork"), "got: {error}");
+        assert!(error.contains(&format!("{left:x}")), "got: {error}");
+        // Naming one head exactly is how a caller resolves the ambiguity.
+        cmd_export(storage, format!("{left:x}"), true).unwrap();
+    }
+
     #[test]
     fn unanchored_native_revision_is_a_cli_selector() {
         let fixture = Fixture::new();
@@ -2377,8 +2589,8 @@ fn main() -> Result<()> {
             tag,
             force,
         } => cmd_edit(storage, id, content, title, tag, force),
-        Command::Show { id, latest } => cmd_show(storage, id, latest),
-        Command::Export { id } => cmd_export(storage, id),
+        Command::Show { id, exact } => cmd_show(storage, id, exact),
+        Command::Export { id, exact } => cmd_export(storage, id, exact),
         Command::Diff { id, from, to } => cmd_diff(storage, id, from, to),
         Command::Archive { id } => mutate_tags(storage, id, "archived", true),
         Command::Restore { id } => mutate_tags(storage, id, "archived", false),

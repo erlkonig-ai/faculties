@@ -1113,7 +1113,7 @@ impl OtherKind {
 pub enum LinkClass {
     /// Resolves to an entry that is still on the live frontier. A citation of
     /// a SUPERSEDED revision lands here too: it names exactly what its author
-    /// read, and `wiki show --latest` follows it forward.
+    /// read, and `wiki show` follows it forward by default.
     Live(usize),
     /// One id names several disconnected entries. Evidence, never breakage.
     Ambiguous(Vec<usize>),

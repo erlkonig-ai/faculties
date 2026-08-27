@@ -32,8 +32,10 @@ or `files:<hash>` in prose does NOT link; the wiki warns you if you
 write one. The label also reads far better than a raw id.
 
 The graphical viewer follows `wiki:entry:<root>` automatically. At the CLI,
-use `wiki show <root> --latest` to navigate the living entry; plain
-`wiki show <root>` deliberately shows the immutable anchor revision itself.
+`wiki show <id>` follows the entry too — it answers what that page says NOW,
+whichever of its revisions you name — and prints every head if the entry is
+forked. Use `wiki show --exact <id>` when you specifically want the frozen
+revision, which is a history question, not a reading one.
 
 == Tagging
 
