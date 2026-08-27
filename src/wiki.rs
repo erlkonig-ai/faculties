@@ -20,8 +20,9 @@ use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
 use crate::schemas::wiki::{
-    attrs, authorship_fragment, revision_fragment, revision_fragment_from_handles, TextHandle,
-    DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION, KIND_VERSION_ID, TAG_SPECS,
+    attrs, authorship_fragment, extract_link_targets, revision_fragment,
+    revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
+    KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -105,11 +106,10 @@ impl RevisionReadModel {
         self.entries
             .iter()
             .filter(|entry| {
-                !entry.frontier.iter().all(|revision| {
-                    revision
-                        .tags
-                        .contains(&crate::schemas::wiki::TAG_ARCHIVED_ID)
-                })
+                !entry
+                    .frontier
+                    .iter()
+                    .all(|revision| revision.tags.contains(&TAG_ARCHIVED_ID))
             })
             .cloned()
             .collect()
@@ -909,6 +909,150 @@ pub fn cover_fragments(
         .into_iter()
         .map(|(title, content, _)| (title, content))
         .collect())
+}
+
+// ── the frontier link model ────────────────────────────────────────────────
+//
+// Reproduced from admitted content: [`extract_link_targets`] is the one
+// extractor, and a target id names the ENTRY that contains the revision it
+// points at. Forks stay forks — an entry with two current states is evidence,
+// not a row to settle by clock or iteration order — so every read below is
+// per-state and the entry keeps all of them.
+//
+// Lifted out of the `gauge` binary on 2026-08-27 so the link audit in the
+// `wiki` CLI and gauge's metrics share one model instead of growing a second
+// extractor that drifts from the first.
+
+/// Display name for a tag id, falling back to the built-in vocabulary and
+/// then to hex, so an unnamed tag still prints something addressable.
+pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
+    match catalog.tag_names.get(&id) {
+        Some(handle) => read_text(reader, *handle),
+        None => Ok(TAG_SPECS
+            .iter()
+            .find_map(|(known, label)| (*known == id).then_some((*label).to_owned()))
+            .unwrap_or_else(|| format!("{id:x}"))),
+    }
+}
+
+/// One current state of an entry, with its content-derived link targets.
+#[derive(Clone, Debug)]
+pub struct FrontierState {
+    pub revision: Id,
+    pub title: String,
+    pub tags: BTreeSet<String>,
+    pub links: Vec<Id>,
+}
+
+/// One logical entry: a stable label, every current state, and whether any of
+/// those states is still un-archived.
+#[derive(Clone, Debug)]
+pub struct FrontierEntry {
+    pub label: Id,
+    pub states: Vec<FrontierState>,
+    pub active: bool,
+}
+
+impl FrontierEntry {
+    /// The agreed title, or every forked title, on one line.
+    pub fn title(&self) -> String {
+        let titles: BTreeSet<&str> = self
+            .states
+            .iter()
+            .map(|state| state.title.as_str())
+            .collect();
+        if titles.len() == 1 {
+            titles.first().expect("one title").to_string()
+        } else {
+            format!(
+                "FORK: {}",
+                titles.into_iter().collect::<Vec<_>>().join(" | ")
+            )
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkResolution {
+    Missing,
+    Unique(usize),
+    Ambiguous(Vec<usize>),
+}
+
+/// Every entry's current states, plus the revision-id → entry index that makes
+/// a link target resolvable.
+#[derive(Clone, Debug)]
+pub struct FrontierModel {
+    pub entries: Vec<FrontierEntry>,
+    selectors: BTreeMap<Id, BTreeSet<usize>>,
+}
+
+impl FrontierModel {
+    pub fn load(catalog: &WikiCatalog, reader: &PileReader) -> Result<Self> {
+        let records = catalog.revisions.all_entries();
+        let mut entries = Vec::with_capacity(records.len());
+        let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
+
+        for (index, entry) in records.iter().enumerate() {
+            let label = *entry.roots.first().expect("admitted Wiki entry has a root");
+            let mut states = Vec::with_capacity(entry.frontier.len());
+            for revision in &entry.frontier {
+                let title = read_text(reader, revision.title)?;
+                let content = read_text(reader, revision.content)?;
+                let tags = revision
+                    .tags
+                    .iter()
+                    .map(|tag| tag_display_name(catalog, reader, *tag))
+                    .collect::<Result<BTreeSet<_>>>()?;
+                let links = extract_link_targets(&content)
+                    .into_iter()
+                    .filter_map(|raw| Id::from_hex(&raw))
+                    .collect();
+                states.push(FrontierState {
+                    revision: revision.id,
+                    title,
+                    tags,
+                    links,
+                });
+            }
+            for revision in &entry.members {
+                selectors.entry(*revision).or_default().insert(index);
+            }
+            let active = entry
+                .frontier
+                .iter()
+                .any(|revision| !revision.tags.contains(&TAG_ARCHIVED_ID));
+            entries.push(FrontierEntry {
+                label,
+                states,
+                active,
+            });
+        }
+
+        Ok(Self { entries, selectors })
+    }
+
+    pub fn resolve(&self, target: Id) -> LinkResolution {
+        match self.selectors.get(&target) {
+            None => LinkResolution::Missing,
+            Some(entries) if entries.len() == 1 => {
+                LinkResolution::Unique(*entries.first().expect("one entry"))
+            }
+            Some(entries) => LinkResolution::Ambiguous(entries.iter().copied().collect()),
+        }
+    }
+
+    pub fn state_count(&self) -> usize {
+        self.active_entries().map(|entry| entry.states.len()).sum()
+    }
+
+    pub fn active_entries(&self) -> impl Iterator<Item = &FrontierEntry> {
+        self.entries.iter().filter(|entry| entry.active)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active_entries().count()
+    }
 }
 
 pub fn materialize_collection(

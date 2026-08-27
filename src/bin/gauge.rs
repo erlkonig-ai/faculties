@@ -12,10 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::legacy_hint::open_scope;
-use faculties::schemas::wiki::extract_link_targets;
 use faculties::storage::{load_signer, open_pile_strict};
-use faculties::wiki::{self as wiki_model, WikiCatalog};
-use triblespace::core::repo::pile::PileReader;
+use faculties::wiki::{self as wiki_model, FrontierEntry, FrontierModel, LinkResolution};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -59,125 +57,7 @@ enum Command {
     },
 }
 
-#[derive(Clone, Debug)]
-struct State {
-    revision: Id,
-    title: String,
-    tags: BTreeSet<String>,
-    links: Vec<Id>,
-}
-
-#[derive(Clone, Debug)]
-struct Entry {
-    label: Id,
-    states: Vec<State>,
-    active: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LinkResolution {
-    Missing,
-    Unique(usize),
-    Ambiguous(Vec<usize>),
-}
-
-#[derive(Debug)]
-struct GaugeModel {
-    entries: Vec<Entry>,
-    selectors: BTreeMap<Id, BTreeSet<usize>>,
-}
-
-impl GaugeModel {
-    fn load(catalog: &WikiCatalog, reader: &PileReader) -> Result<Self> {
-        let records = catalog.revisions.all_entries();
-        let mut entries = Vec::with_capacity(records.len());
-        let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
-
-        for (index, entry) in records.iter().enumerate() {
-            let label = *entry.roots.first().expect("admitted Wiki entry has a root");
-            let mut states = Vec::with_capacity(entry.frontier.len());
-            for revision in &entry.frontier {
-                let title = wiki_model::read_text(reader, revision.title)?;
-                let content = wiki_model::read_text(reader, revision.content)?;
-                let tags = revision
-                    .tags
-                    .iter()
-                    .map(|tag| tag_name(catalog, reader, *tag))
-                    .collect::<Result<BTreeSet<_>>>()?;
-                let links = extract_link_targets(&content)
-                    .into_iter()
-                    .filter_map(|raw| Id::from_hex(&raw))
-                    .collect();
-                states.push(State {
-                    revision: revision.id,
-                    title,
-                    tags,
-                    links,
-                });
-            }
-            for revision in &entry.members {
-                selectors.entry(*revision).or_default().insert(index);
-            }
-            let active = entry.frontier.iter().any(|revision| {
-                !revision
-                    .tags
-                    .contains(&faculties::schemas::wiki::TAG_ARCHIVED_ID)
-            });
-            entries.push(Entry {
-                label,
-                states,
-                active,
-            });
-        }
-
-        Ok(Self { entries, selectors })
-    }
-
-    fn resolve(&self, target: Id) -> LinkResolution {
-        match self.selectors.get(&target) {
-            None => LinkResolution::Missing,
-            Some(entries) if entries.len() == 1 => {
-                LinkResolution::Unique(*entries.first().expect("one entry"))
-            }
-            Some(entries) => LinkResolution::Ambiguous(entries.iter().copied().collect()),
-        }
-    }
-
-    fn state_count(&self) -> usize {
-        self.active_entries().map(|entry| entry.states.len()).sum()
-    }
-
-    fn active_entries(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.iter().filter(|entry| entry.active)
-    }
-
-    fn active_count(&self) -> usize {
-        self.active_entries().count()
-    }
-}
-
-fn tag_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
-    match catalog.tag_names.get(&id) {
-        Some(handle) => wiki_model::read_text(reader, *handle),
-        None => Ok(format!("{id:x}")),
-    }
-}
-
-fn entry_title(entry: &Entry) -> String {
-    let titles: BTreeSet<&str> = entry
-        .states
-        .iter()
-        .map(|state| state.title.as_str())
-        .collect();
-    if titles.len() == 1 {
-        titles.first().expect("one title").to_string()
-    } else {
-        format!(
-            "FORK: {}",
-            titles.into_iter().collect::<Vec<_>>().join(" | ")
-        )
-    }
-}
+type GaugeModel = FrontierModel;
 
 fn short(value: &str, chars: usize) -> String {
     value.chars().take(chars).collect()
@@ -324,7 +204,7 @@ fn cmd_hubs(model: &GaugeModel, top: usize) {
     {
         println!(
             "{count:>4} <- {} [wiki:{:x}]",
-            short(&entry_title(&model.entries[index]), 65),
+            short(&model.entries[index].title(), 65),
             model.entries[index].label
         );
     }
@@ -368,7 +248,7 @@ fn cmd_risk(model: &GaugeModel) {
                         risks.insert(format!(
                             "wiki:{:x} {}",
                             model.entries[target].label,
-                            short(&entry_title(&model.entries[target]), 45)
+                            short(&model.entries[target].title(), 45)
                         ));
                     }
                     LinkResolution::Ambiguous(candidates)
@@ -390,11 +270,7 @@ fn cmd_risk(model: &GaugeModel) {
             }
         }
         if !risks.is_empty() {
-            println!(
-                "{} [wiki:{:x}]",
-                short(&entry_title(entry), 65),
-                entry.label
-            );
+            println!("{} [wiki:{:x}]", short(&entry.title(), 65), entry.label);
             for risk in risks {
                 println!("  cites -> {risk}");
             }
@@ -403,11 +279,11 @@ fn cmd_risk(model: &GaugeModel) {
 }
 
 fn cmd_orphans(model: &GaugeModel, top: usize, ids: bool) {
-    let mut rows: Vec<&Entry> = model
+    let mut rows: Vec<&FrontierEntry> = model
         .active_entries()
         .filter(|entry| entry.states.iter().all(|state| state.links.is_empty()))
         .collect();
-    rows.sort_by_key(|entry| (entry_title(entry).to_lowercase(), entry.label));
+    rows.sort_by_key(|entry| (entry.title().to_lowercase(), entry.label));
     if ids {
         for entry in rows.into_iter().take(top) {
             println!("{:x}", entry.label);
@@ -428,7 +304,7 @@ fn cmd_orphans(model: &GaugeModel, top: usize, ids: bool) {
         };
         println!(
             "{} [wiki:{:x}]{fork}",
-            short(&entry_title(entry), 65),
+            short(&entry.title(), 65),
             entry.label
         );
     }

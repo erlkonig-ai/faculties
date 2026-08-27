@@ -347,13 +347,7 @@ fn read_string(reader: &PileReader, handle: schema::TextHandle) -> Result<String
 }
 
 fn tag_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
-    match catalog.tag_names.get(&id) {
-        Some(handle) => read_string(reader, *handle),
-        None => Ok(schema::TAG_SPECS
-            .iter()
-            .find_map(|(known, label)| (*known == id).then_some((*label).to_owned()))
-            .unwrap_or_else(|| format!("{id:x}"))),
-    }
+    wiki_model::tag_display_name(catalog, reader, id)
 }
 
 fn format_tags(catalog: &WikiCatalog, reader: &PileReader, tags: &BTreeSet<Id>) -> Result<String> {
