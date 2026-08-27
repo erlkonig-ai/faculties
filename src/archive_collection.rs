@@ -25,7 +25,9 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace::core::repo::{
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture,
+};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -215,20 +217,19 @@ impl ArchiveImportWriter {
 
         // Embedded payloads can dominate an import's resident memory. Prove
         // their content identities before touching the pile, then append them
-        // immediately as content-addressed dependencies. They remain
-        // semantically unreachable until the one signed COMMIT written by
-        // `finish`; abandoning this writer therefore leaves only GC-able
-        // blobs, never a partially visible Archive import.
+        // immediately as content-addressed dependencies. Each streamed batch
+        // is captured and offered after every put succeeds; this keeps payload
+        // bytes out of the long-lived Fragment without letting direct puts
+        // escape the publication protocol. They remain semantically
+        // unreachable until the one signed COMMIT written by `finish` because
+        // OFFER grants neither authority nor retention.
         let embedded = validated_embedded_blobs(blobs)?;
         let pile = self
             .collection
             .as_mut()
             .expect("Archive writer remains open while staging")
             .storage_mut();
-        for blob in embedded {
-            pile.put::<UnknownBlob, _>(blob)
-                .context("stage Archive embedded blob")?;
-        }
+        stage_embedded_blobs(pile, embedded)?;
 
         // Only the lightweight logical delta remains resident between source
         // fragments. Data and metadata archives are constructed once at the
@@ -283,6 +284,27 @@ impl ArchiveImportWriter {
             ))),
         }
     }
+}
+
+/// Write one validated streaming payload batch behind an OFFER gate.
+///
+/// The capture is deliberately scoped to one source fragment. A failed put or
+/// offer abandons only this batch; replaying the fragment repeats the same
+/// content-addressed puts and canonical grow-only offer set. The later signed
+/// collection commit owns its own capture for descriptor, data, and metadata.
+fn stage_embedded_blobs<S>(store: &mut S, embedded: Vec<Blob<UnknownBlob>>) -> Result<()>
+where
+    S: BlobStorePut + ArtifactOfferStore,
+{
+    let mut capture = OfferCapture::new(store);
+    for blob in embedded {
+        capture
+            .put::<UnknownBlob, _>(blob)
+            .context("stage Archive embedded blob")?;
+    }
+    capture
+        .offer_pending()
+        .context("offer staged Archive embedded blobs")
 }
 
 /// Recompute and verify every identity carried by a Fragment blob store.
@@ -1371,7 +1393,12 @@ fn optional_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>>
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::error::Error;
+    use std::fmt;
+
     use triblespace::core::collection::records::CollectionHandle;
+    use triblespace::core::repo::{ArtifactHandle, ArtifactOfferSnapshot};
 
     /// Historical namespace of the open-admission Archive fixture.
     fn test_namespace(
@@ -1527,8 +1554,10 @@ mod tests {
         );
 
         // The payload is already durable enough to satisfy a fresh reader,
-        // but no signed collection root makes its facts visible yet.
+        // and its local willingness-to-serve marker is durable, but no signed
+        // collection root makes its facts visible yet.
         let mut physical = open_pile_strict(&pile).unwrap();
+        assert!(physical.offers_snapshot().unwrap().contains(embedded));
         let reader = physical.reader().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
@@ -1577,6 +1606,10 @@ mod tests {
         assert!(snapshot.catalog().is_empty());
         drop(snapshot);
         let mut physical = open_pile_strict(&pile).unwrap();
+        assert!(
+            physical.offers_snapshot().unwrap().contains(embedded),
+            "an orphan OFFER is lawful: it grants neither authority nor retention"
+        );
         let reader = physical.reader().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
@@ -1620,6 +1653,103 @@ mod tests {
         assert!(writer.delta.blobs().is_empty());
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
         assert_eq!(writer.finish(Ok(())).unwrap().1, None);
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum StageEvent {
+        Put(ArtifactHandle),
+        Offer(Vec<ArtifactHandle>),
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct StageOfferError;
+
+    impl fmt::Display for StageOfferError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("injected offer failure")
+        }
+    }
+
+    impl Error for StageOfferError {}
+
+    #[derive(Default)]
+    struct StageProbe {
+        events: Vec<StageEvent>,
+        fail_next_offer: bool,
+    }
+
+    impl BlobStorePut for StageProbe {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, item: T) -> std::result::Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: triblespace::core::blob::BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: triblespace::core::inline::InlineEncoding,
+        {
+            let handle = item.to_blob().get_handle();
+            self.events.push(StageEvent::Put(handle.transmute()));
+            Ok(handle)
+        }
+    }
+
+    impl ArtifactOfferStore for StageProbe {
+        type OfferError = StageOfferError;
+
+        fn offer_all<I>(&mut self, handles: I) -> std::result::Result<(), Self::OfferError>
+        where
+            I: IntoIterator<Item = ArtifactHandle>,
+        {
+            let handles: Vec<_> = handles.into_iter().collect();
+            self.events.push(StageEvent::Offer(handles));
+            if self.fail_next_offer {
+                self.fail_next_offer = false;
+                return Err(StageOfferError);
+            }
+            Ok(())
+        }
+
+        fn offers_snapshot(
+            &mut self,
+        ) -> std::result::Result<ArtifactOfferSnapshot, Self::OfferError> {
+            Ok(ArtifactOfferSnapshot::default())
+        }
+    }
+
+    #[test]
+    fn streamed_blob_batch_offers_canonically_and_replays_after_failure() {
+        let first = Blob::<UnknownBlob>::new(Bytes::from_source(b"first".to_vec()));
+        let second = Blob::<UnknownBlob>::new(Bytes::from_source(b"second".to_vec()));
+        let first_handle: ArtifactHandle = first.get_handle();
+        let second_handle: ArtifactHandle = second.get_handle();
+        let mut offered = vec![first_handle, second_handle];
+        offered.sort_unstable();
+
+        let mut probe = StageProbe {
+            fail_next_offer: true,
+            ..StageProbe::default()
+        };
+        let error = stage_embedded_blobs(&mut probe, vec![second.clone(), first.clone()])
+            .expect_err("the first canonical OFFER batch is injected to fail");
+        assert!(format!("{error:#}").contains("injected offer failure"));
+        assert_eq!(
+            probe.events,
+            vec![
+                StageEvent::Put(second_handle),
+                StageEvent::Put(first_handle),
+                StageEvent::Offer(offered.clone()),
+            ]
+        );
+
+        stage_embedded_blobs(&mut probe, vec![second, first]).unwrap();
+        assert_eq!(
+            &probe.events[3..],
+            &[
+                StageEvent::Put(second_handle),
+                StageEvent::Put(first_handle),
+                StageEvent::Offer(offered),
+            ]
+        );
     }
 
     #[test]

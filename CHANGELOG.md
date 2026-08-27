@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Streamed Archive payloads now enter the artifact-serving protocol.** The
+  Archive importer still validates and writes each source fragment's embedded
+  blobs immediately, so large imports do not retain their bytes until the final
+  collection commit. Those direct writes now pass through one operation-scoped
+  `OfferCapture` and publish a canonical OFFER batch only after every put in the
+  batch succeeds. OFFER grants neither authority nor retention, so an import
+  rejected by later catalog validation remains semantically invisible and its
+  orphan payloads remain collectible.
+
 - **`duplex` stops owning the microphone, so it and `hear` can finally run at
   the same time.** A capture device can be held by exactly one process, and
   `duplex` opened CPAL itself while `hear` owned nothing and inherited Soma's
