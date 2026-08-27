@@ -47,7 +47,9 @@
 //! instead: the loop waits until the playback device has drained the model's
 //! lead below `--lead` frames before producing the next one. Both are the
 //! same discipline — take the period from the hardware that will actually
-//! move the samples, never from a `sleep` (see [`Mouth::pace`]).
+//! move the samples, never from a `sleep` (see [`Mouth::pace`]). The model's
+//! user-audio embeddings are omitted in this mode; as a user input, learned
+//! silence is still real and remains reserved for gating a live microphone.
 //!
 //! ## The two operations an agent gets
 //!
@@ -468,11 +470,11 @@ struct RunArgs {
     /// New frames emitted per decode call.
     #[arg(long, default_value_t = DEFAULT_DECODE_HOP)]
     decode_hop: usize,
-    /// Do not open the capture device; feed digital silence instead. This is
-    /// the GENERATION-ONLY channel — the model speaks and is not listened to
-    /// — and it is also what to use on a handsfree endpoint whose microphone
-    /// is already held open by something else. With no microphone the
-    /// SPEAKER becomes the frame clock (see `--lead`).
+    /// Do not subscribe to the capture stream and omit the model's user-audio
+    /// embeddings. This is the GENERATION-ONLY channel — the model speaks and
+    /// is not listened to — and it is also what to use on a handsfree endpoint
+    /// whose microphone is already held open by something else. With no
+    /// microphone the SPEAKER becomes the frame clock (see `--lead`).
     #[arg(long)]
     no_input: bool,
     /// Generation-only clock: frames of audio the model may run ahead of the
@@ -1654,6 +1656,30 @@ enum Floor {
     Converse,
 }
 
+/// Which PersonaPlex token-step contract one frame uses. Keeping this choice
+/// explicit prevents generation-only mode from quietly falling back to a
+/// learned silence frame, while preserving both ordinary duplex paths.
+#[cfg(feature = "duplex")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersonaPlexStepApi {
+    Duplex,
+    DuplexArbitrated,
+    OutputOnly,
+    OutputOnlyArbitrated,
+}
+
+#[cfg(feature = "duplex")]
+impl PersonaPlexStepApi {
+    fn select(output_only: bool, arbitrated: bool) -> Self {
+        match (output_only, arbitrated) {
+            (false, false) => Self::Duplex,
+            (false, true) => Self::DuplexArbitrated,
+            (true, false) => Self::OutputOnly,
+            (true, true) => Self::OutputOnlyArbitrated,
+        }
+    }
+}
+
 #[cfg(feature = "duplex")]
 fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     use mary::models::personaplex::config as model_cfg;
@@ -1963,18 +1989,18 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         }
 
         let step_start = Instant::now();
-        let heard: [i64; 8] = match samples {
+        let heard: Option<[i64; 8]> = match samples {
             // While the model speaks, an endpoint without echo cancellation
             // would hear itself; gate in software, never by touching the
             // device.
-            Some(_) if args.gate && speaking_hangover > 0 => SILENCE,
+            Some(_) if args.gate && speaking_hangover > 0 => Some(SILENCE),
             Some(frame) => {
                 let codes = pipeline
                     .encoder
                     .encode_stream_frame(&mut encoder_state, &frame);
-                std::array::from_fn(|q| codes[q] as i64)
+                Some(std::array::from_fn(|q| codes[q] as i64))
             }
-            None => SILENCE,
+            None => None,
         };
 
         // The three states of the mouth.
@@ -2008,6 +2034,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         // differently. Forcing a token supplies WHAT is said and WHEN; under
         // `--cadence model` we supply only the what, and the model keeps the
         // when — its own pauses, their lengths, its own `<epad>` placement.
+        let step_api = PersonaPlexStepApi::select(args.no_input, free_timing);
         let trace = if free_timing {
             let queue = &mut queued;
             let waited = &mut wait_frames;
@@ -2060,9 +2087,25 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
                     sampled
                 }
             };
-            pipeline.step_arbitrated(Some(&heard), forced_audio, &mut decide)
+            match (step_api, heard.as_ref()) {
+                (PersonaPlexStepApi::DuplexArbitrated, Some(heard)) => {
+                    pipeline.step_arbitrated(Some(heard), forced_audio, &mut decide)
+                }
+                (PersonaPlexStepApi::OutputOnlyArbitrated, None) => {
+                    pipeline.step_output_only_arbitrated(forced_audio, &mut decide)
+                }
+                _ => unreachable!("PersonaPlex input protocol changed within one frame"),
+            }
         } else {
-            pipeline.step(Some(&heard), forced_audio, forced_text)
+            match (step_api, heard.as_ref()) {
+                (PersonaPlexStepApi::Duplex, Some(heard)) => {
+                    pipeline.step(Some(heard), forced_audio, forced_text)
+                }
+                (PersonaPlexStepApi::OutputOnly, None) => {
+                    pipeline.step_output_only(forced_audio, forced_text)
+                }
+                _ => unreachable!("PersonaPlex input protocol changed within one frame"),
+            }
         };
         // What actually went to the depformer this frame, whichever path chose
         // it. Under arbitration this is the substituted token, not the sample.
@@ -2448,6 +2491,21 @@ mod tests {
         assert_eq!(FRAME_SAMPLES, soma_client::FRAME_SAMPLES);
         assert_eq!(SAMPLE_RATE, soma_client::SAMPLE_RATE);
         assert_eq!(FRAME_SAMPLES as u32 * 1_000 / SAMPLE_RATE, 80);
+    }
+
+    /// User-audio presence and text arbitration are independent protocol
+    /// axes. In particular, generation-only mode must select Mary's explicit
+    /// output-only API under both scheduled and model-timed speech; a learned
+    /// silence frame is an ordinary duplex input, not an output-only stand-in.
+    #[cfg(feature = "duplex")]
+    #[test]
+    fn personaplex_step_api_keeps_output_only_separate_from_duplex() {
+        use PersonaPlexStepApi::*;
+
+        assert_eq!(PersonaPlexStepApi::select(false, false), Duplex);
+        assert_eq!(PersonaPlexStepApi::select(false, true), DuplexArbitrated);
+        assert_eq!(PersonaPlexStepApi::select(true, false), OutputOnly);
+        assert_eq!(PersonaPlexStepApi::select(true, true), OutputOnlyArbitrated);
     }
 
     /// A loop slower than the world skips FORWARD rather than falling behind,
