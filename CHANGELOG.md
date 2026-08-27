@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`wiki show` follows the entry forward by DEFAULT; `--exact` pins the named
+  revision, and `--latest` is gone.** The default was inverted: naming a
+  revision returned that revision's frozen text, and following the entry to its
+  current frontier was the opt-in `--latest`. That is the wrong side of a
+  default, because the failure it produces is silent, looks identical to
+  success, and lands on the common case. It cost a real session on 2026-08-27:
+  a plain `wiki show <id>` returned a superseded revision with no warning of any
+  kind, its See Also carried a link the frontier had already repaired, and the
+  reader — having no way to see the text was stale — invented an explanation for
+  the broken link and rewrote a page around it. The mistake surfaced only
+  because `wiki edit` reported a different parent revision than the one it was
+  handed.
+
+  It was also an inconsistency inside one faculty. A WRITE already follows the
+  entry: `wiki edit <any member id>` joins the whole current frontier
+  regardless of which revision id it is given (`edit_joins_the_complete_current_
+  frontier`). Only the READ froze. Meanwhile `wiki lint` deliberately never
+  rewrites a citation forward — a citation is pinned to the text its author read
+  — so the corpus is designed to accumulate ids the frontier has moved past, and
+  the reader is the only thing that can follow them. That mechanism was behind a
+  flag nobody typed.
+
+  Measured before changing anything, over the live wiki in `self.pile` (3264
+  frontier revisions, one per entry, no forks): of 14555 well-formed
+  `wiki:<32-hex>` citations carried by the frontier's own text, 11823 (81.2%)
+  named a SUPERSEDED revision and only 2732 named a current head. Those stale
+  citations are spread across 2274 of the 3264 live fragments (69.7%), name 2177
+  distinct ids, and 10637 of them sit in clickable link syntax. Following each
+  one forward, 11773 of the 11823 (99.6%) land on text that DIFFERS from what
+  the cited id returns — so the old default answered with materially different
+  content four times in five. Zero frontier citations name nothing at all, so
+  this is not link rot in the usual sense: every target exists, which is exactly
+  why nothing ever reported it. Reproduce with
+  `PILE=… cargo run --release --example reference_census`, which now splits its
+  "names a revision" bucket into current-head and superseded.
+
+  `wiki export` follows the entry too, for the same reason and so the two reads
+  of one id can never disagree; it takes `--exact` as well. Export's documented
+  "fails on a fork" branch was unreachable while it resolved exactly, and is now
+  live: it names the competing heads instead of guessing. `show` on a forked
+  entry prints EVERY head under a banner naming them, because silently picking
+  one would recreate the same class of wrong answer this change removes.
+
+  `--latest` is removed outright rather than kept as a no-op: the only callers
+  were two documentation lines, and clap's "unexpected argument" is a loud
+  failure, which is the one thing the old behaviour was not.
+
 - **`wiki links` audits the whole frontier, and says what kind of dangling a
   dangling link is.** The previous check treated every unresolved target as a
   BROKEN_LINK, which is wrong in both directions on a wiki whose convention is
@@ -20,7 +67,7 @@ All notable changes to this project will be documented in this file.
     the wiki's own convention says marks work worth doing rather than a defect.
 
   A citation of a SUPERSEDED revision is none of these: it names exactly what
-  its author read, and `wiki show --latest` follows it forward. A fork is
+  its author read, and `wiki show` follows it forward. A fork is
   likewise evidence, never a row to settle.
 
   Measured on the live corpus, this is not a cosmetic distinction: the old flat
