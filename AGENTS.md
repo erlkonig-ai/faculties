@@ -47,6 +47,11 @@ cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
 ```
 
+Atomic activation affects only processes launched afterward. Restart all
+long-lived Faculties writers after installing a cohort, especially armed
+`orient wait` watchers; use `lsof -a -d txt -p <pid>` to verify the executable
+generation actually mapped by a surviving process.
+
 The `migrations` binary lives in the `faculties-migrations` member crate, so
 whole-suite builds need `--workspace` (`cargo build --release --workspace
 --bins`). Without it the cohort silently ships without the only command that can

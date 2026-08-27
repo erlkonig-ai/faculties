@@ -508,6 +508,12 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
             path.unlink()
     fsync_directory(command_dir)
     print(f"activated Faculties release {generation} ({len(links)} binaries)")
+    print(
+        "warning: already-running Faculties processes still execute their previous "
+        "release; restart long-lived writers such as `orient wait` and verify the "
+        "mapped executable with `lsof -a -d txt -p <pid>`",
+        file=sys.stderr,
+    )
     return manifest
 
 

@@ -48,6 +48,20 @@ Existing commands not managed by this installer are never overwritten. Old
 generations remain immutable under `~/.local/lib/faculties/releases/`; rollback
 is the same verified atomic activation command with an older generation.
 
+Activation changes the `current` symlink for **new** processes. A process that
+was already running keeps its old executable mapped, even when its command path
+now resolves through the new generation. Restart every long-lived Faculties
+writer after an activation, especially each `orient wait` watcher. Check the
+binary a process is actually executing rather than the current symlink:
+
+```sh
+lsof -a -d txt -p <pid>
+```
+
+This distinction is load-bearing for append-only piles: an apparently healthy
+watcher from an older cohort can keep publishing records under superseded
+semantics indefinitely.
+
 Exercise the full install/switch path in an isolated temporary prefix:
 
 ```sh

@@ -111,6 +111,8 @@ class ReleaseCohortTest(unittest.TestCase):
         self.assertFalse(os.path.lexists(current))
         activated = self.activate("first")
         self.assertEqual(activated.returncode, 0, activated.stderr)
+        self.assertIn("already-running Faculties processes", activated.stderr)
+        self.assertIn("lsof -a -d txt -p <pid>", activated.stderr)
         self.assertEqual(os.readlink(current), "releases/first")
         self.assertEqual(
             os.readlink(self.prefix / "bin" / "orient"),
