@@ -27,8 +27,19 @@
 //! capture device has produced the next full frame, so the conversation runs
 //! at the pace of the physical device and never invents a second timer.
 //!
-//!   mic samples → streaming codec encode → LM step → agent codes → speaker
-//!                                        ↘ stream-0 text → transcript
+//! That is now true ONE LAYER REMOVED, and it is stronger for it. The device
+//! belongs to Soma; this loop subscribes. Its ear thread blocks in
+//! `soma_client::SomaCapture::next_frame` until the body has produced the next
+//! exact frame, and the generation loop blocks on the ear until it hands one
+//! over. Soma's frame delivery IS the hardware signal — the same discipline
+//! `hear` has always run on ("reading the next record is the conversation
+//! clock"). There is no sleep, no timer and no polling interval anywhere on
+//! the path. The device-owning version of this loop actually polled its own
+//! capture ring every 4 ms; blocking on the body removed that too.
+//!
+//!   Soma /audio/capture ──80 ms frames──▶ streaming codec encode → LM step
+//!   (one process owns the mic)                    ↘ agent codes → speaker
+//!                                                 ↘ stream-0 text → transcript
 //!
 //! Codec decode and playback run on their own thread, off the frame clock.
 //!
@@ -104,20 +115,39 @@
 //! boundary artifacts against CPU load. The context default is DEEP for a
 //! reason measured here — see [`DEFAULT_DECODE_CONTEXT`].
 //!
-//! ## Bluetooth handsfree channels, and why the stream is never closed
+//! ## Soma owns the microphone; this binary owns nothing
 //!
-//! On a handsfree (HFP) endpoint — a car kit, a headset — the duplex channel
-//! exists only while something holds the microphone open. Close the input
-//! stream to "take a turn" and the endpoint renegotiates: audio drops
-//! mid-sentence and the far end hears nothing. The capture stream here is
-//! opened once and NEVER closed for the life of the session; the floor is held
-//! in software, never by touching the device.
+//! A capture device can be held by exactly one process. While this binary held
+//! it, `hear` and `duplex` could not run at the same time — a live transcript
+//! and a spoken channel were mutually exclusive by physics, not by policy. Now
+//! Soma is the single owner and fans one microphone out to every consumer, so
+//! both run off the SAME frames: audio embeddings for the thinking model and a
+//! spoken channel, at once, instead of choosing.
+//!
+//! NEVER CLOSE THE MICROPHONE STREAM. On a handsfree (HFP) endpoint — a car
+//! kit, a headset — the duplex channel exists only while something holds the
+//! microphone open; close it to "take a turn" and the endpoint renegotiates,
+//! audio drops mid-sentence, and the far end hears nothing. Soma holds it for
+//! the life of the BODY, so it now outlives this session too: starting and
+//! stopping `duplex` is not a device event at all. The floor is held in
+//! software, never by touching a device.
 //!
 //! DEVICES ARE ADDRESSED BY NAME, NEVER BY INDEX AND NEVER VIA THE SYSTEM
 //! DEFAULT. Connecting a Bluetooth endpoint renumbers the platform's device
 //! list, so an index-addressed or default-addressed stream can land on a dead
-//! virtual channel with nothing in the logs to say so. Opening the named
-//! device IS the verification. `duplex devices` prints the exact names.
+//! virtual channel at -91 dB with nothing in the logs to say so. This binary
+//! keeps that rule BY SUBTRACTION: it names no capture device at all and
+//! inherits Soma's one named choice (`soma --mic-live --mic-device <name>`).
+//! `duplex ear` checks what actually arrives; `duplex devices` still prints
+//! the PLAYBACK names, which this binary does still open by name.
+//!
+//! The speaker is a different case and is deliberately still ours: it is
+//! multi-client on this hardware, so it never forced the exclusion the
+//! microphone did, and repointing an audio SINK through another owner would
+//! move the say-privacy invariant (`voice`'s `route_say`: there is no path
+//! from a private utterance to a room speaker) across a process boundary
+//! before that owner enforces it. That is a change to make deliberately, at
+//! the new owner, first.
 //!
 //! ## What is in the transcript, and what cannot be
 //!
@@ -136,10 +166,20 @@
 //! ## Ceremony
 //!
 //! ```text
-//! duplex devices
+//! # one process owns the microphone, by name, for the life of the body:
+//! soma --mic-live --mic-device 'MacBook Pro Microphone' --port 8000
+//!
+//! duplex devices                       # playback names
+//! duplex ear --soma http://localhost:8000   # the capture seam, no model
 //! duplex run --weights <weights.pile> --voice-prompt <voice.pt> \
-//!            --input '<exact input device name>' \
-//!            --output '<exact output device name>'
+//!            --soma http://localhost:8000 \
+//!            --output '<exact output device name>' \
+//!            --pause-file /tmp/ears.pause
+//!
+//! # …and AT THE SAME TIME, off the same frames:
+//! hear listen --soma http://localhost:8000 --pile gemma_e4b.pile \
+//!             --pause-file /tmp/ears.pause
+//!
 //! # from anywhere, while it runs:
 //! duplex read
 //! duplex say 'the line to say'
@@ -156,7 +196,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -164,9 +204,18 @@ use clap::{Parser, Subcommand};
 use faculties::clock;
 
 /// Samples in one model frame at 24 kHz (80 ms).
-const FRAME_SAMPLES: usize = 1920;
-/// The model's canonical sample rate.
-const SAMPLE_RATE: u32 = 24_000;
+///
+/// Taken FROM Soma's wire format rather than agreed with it: the model's frame
+/// and the body's frame are the same frame, and two constants that merely
+/// happen to match are a drift waiting to happen.
+const FRAME_SAMPLES: usize = soma_client::FRAME_SAMPLES;
+/// The model's canonical sample rate — likewise the body's.
+const SAMPLE_RATE: u32 = soma_client::SAMPLE_RATE;
+const _: () = assert!(FRAME_SAMPLES * 1_000 == 80 * SAMPLE_RATE as usize);
+
+/// Where the body is, unless told otherwise. The same default the rest of the
+/// suite uses (`voice`, `body`, `hear`).
+const DEFAULT_SOMA: &str = "http://localhost:8000";
 /// How far the capture ring may run ahead before the loop discards the
 /// backlog. The model's step count IS its clock, so a loop that falls behind
 /// the world cannot catch up by stepping faster — it can only skip forward.
@@ -221,10 +270,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the audio devices both directions can be addressed by, with the
+    /// List the PLAYBACK devices this channel can be addressed by, with the
     /// native configuration each offers. These exact names are what
-    /// `run --input` / `run --output` expect.
+    /// `run --output` expects. There is no input list: the microphone is
+    /// Soma's, chosen once by name there (`soma --mic-device`) and inherited
+    /// by every consumer.
     Devices,
+    /// Read the body's frames through the SAME ear `run` uses, without the
+    /// model. The capture seam's gate: run it beside `hear listen` against one
+    /// Soma and watch both read the same clock.
+    Ear {
+        /// Base URL of the Soma that owns the microphone.
+        #[arg(long, env = "SOMA_URL", default_value = DEFAULT_SOMA)]
+        soma: String,
+        /// Stop after this many frames (0 = until the stream ends).
+        #[arg(long, default_value_t = 125)]
+        frames: usize,
+    },
     /// Run the channel until interrupted.
     Run(Box<RunArgs>),
     /// Show everything said since the cursor and TAKE THE FLOOR: the model
@@ -268,10 +330,11 @@ struct RunArgs {
     /// Packaged voice prompt the session speaks with.
     #[arg(long, env = "PERSONAPLEX_VOICE_PROMPT")]
     voice_prompt: PathBuf,
-    /// EXACT name of the capture device. Held open for the whole session.
-    /// Not needed with `--no-input`.
-    #[arg(long, default_value = "")]
-    input: String,
+    /// Base URL of the Soma that owns the microphone. This process opens no
+    /// capture device: it subscribes, so `hear` can be reading the same frames
+    /// at the same time. Not needed with `--no-input`.
+    #[arg(long, env = "SOMA_URL", default_value = DEFAULT_SOMA)]
+    soma: String,
     /// EXACT name of the playback device.
     #[arg(long)]
     output: String,
@@ -407,6 +470,21 @@ struct RunArgs {
     /// audio in front of the device at all times.
     #[arg(long)]
     lead: Option<usize>,
+    /// Half-duplex pause file, held for exactly as long as this channel is
+    /// AUDIBLE IN THE ROOM.
+    ///
+    /// Needed only because the microphone is now SHARED: another consumer of
+    /// the same Soma frames (`hear listen --pause-file <the same path>`) would
+    /// otherwise transcribe our own voice back to us. Inside this binary
+    /// turn-taking needs no file at all — `--gate` feeds the model digital
+    /// silence while it speaks, in process, on the frame clock.
+    ///
+    /// The window is held past the last generated frame by whatever audio is
+    /// still in flight to the speaker, because the mouth is audible LATER than
+    /// the model is generating. It is a SOFTWARE hold: nothing here or in
+    /// `hear` closes a device.
+    #[arg(long, env = "VOICE_PAUSE_FILE")]
+    pause_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -420,6 +498,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Devices) => cmd_devices(),
+        Some(Command::Ear { soma, frames }) => cmd_ear(&soma, frames),
         Some(Command::Read {
             peek,
             all,
@@ -727,19 +806,12 @@ fn cmd_status(session: &Path) -> Result<()> {
 fn cmd_devices() -> Result<()> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
     let host = rodio::cpal::default_host();
-    println!("capture devices (--input):");
-    for device in host.input_devices().context("enumerate capture devices")? {
-        let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
-        match device.default_input_config() {
-            Ok(config) => println!(
-                "  {name}\n      {} ch, {} Hz, {:?}",
-                config.channels(),
-                config.sample_rate(),
-                config.sample_format()
-            ),
-            Err(error) => println!("  {name}\n      no usable input configuration: {error}"),
-        }
-    }
+    // No capture list. A capture device can be held by exactly one process,
+    // and that process is Soma: it picks the microphone by name
+    // (`soma --mic-live --mic-device <name>`) and fans it out, which is why
+    // `hear` and `duplex` can run at once. Naming a second one here would be
+    // offering the thing that made them exclusive.
+    println!("capture: Soma's, named once there and inherited (`duplex ear` to check it)");
     println!("playback devices (--output):");
     for device in host
         .output_devices()
@@ -764,185 +836,160 @@ fn cmd_devices() -> Result<()> {
     bail!("audio device support is not compiled into this build (enable the `audio` feature)")
 }
 
-// ── capture: one stream, opened by name, never closed ──────────────────────
+// ── the ear: Soma's frames, and this loop owns no device ───────────────────
 
-#[derive(Default)]
-struct CaptureRing {
-    samples: VecDeque<f32>,
-    /// Frames discarded because the loop could not keep the device's pace.
-    skipped: usize,
-}
-
-/// Owns the live capture stream. Dropping it closes the device, which is why
-/// it is held for the whole session.
-struct Capture {
-    ring: Arc<Mutex<CaptureRing>>,
+/// The far end's voice, as Soma delivers it.
+///
+/// **THIS BINARY OPENS NO DEVICE.** A capture device can be held by exactly
+/// one process, so exactly one process picks it BY NAME and holds it: Soma.
+/// Everything else subscribes. That is not tidiness — while this loop opened
+/// the microphone itself, `hear` and `duplex` could not run at the same time,
+/// and a live transcript and a spoken channel were mutually exclusive by
+/// physics. Now they are two consumers of one body.
+///
+/// DEVICES ARE ADDRESSED BY NAME, NEVER BY INDEX AND NEVER VIA THE SYSTEM
+/// DEFAULT — a Bluetooth connect silently renumbers CoreAudio and an
+/// index-addressed stream lands on a dead virtual channel at -91 dB with
+/// nothing in the logs. This binary keeps that rule BY SUBTRACTION: it names
+/// no device at all and inherits Soma's one named choice.
+///
+/// NEVER CLOSE THE MICROPHONE STREAM. Dropping this ear detaches a consumer;
+/// it does not close anything. On a handsfree (HFP) endpoint the duplex
+/// channel exists only while something holds the microphone open, and Soma is
+/// what holds it — for the life of the body, not the life of this process.
+///
+/// THE READ IS THE CLOCK. The reader thread blocks in `SomaCapture::next_frame`
+/// until the physical device has produced the next exact 80 ms frame, and the
+/// generation loop blocks on the condvar until the reader hands one over. There
+/// is no sleep, no timer and no polling interval on the path — the period is
+/// the hardware's, one layer removed. (The device-owning version of this ear
+/// polled its ring every 4 ms; blocking on the body is strictly better.)
+struct Ear {
+    ring: Arc<(Mutex<EarRing>, Condvar)>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    device_rate: u32,
-    channels: u16,
+    soma: String,
 }
 
-impl Capture {
-    /// Pull exactly one frame, blocking on the device clock.
-    fn next_frame(&self) -> Option<[f32; FRAME_SAMPLES]> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            {
-                let mut ring = self.ring.lock().expect("capture ring");
-                // Stay current: a backlog means the loop is slower than the
-                // world, and the model cannot step faster to catch up.
-                let backlog = ring.samples.len() / FRAME_SAMPLES;
-                if backlog > MAX_BACKLOG_FRAMES {
-                    let drop_frames = backlog - 2;
-                    ring.samples.drain(..drop_frames * FRAME_SAMPLES);
-                    ring.skipped += drop_frames;
-                }
-                if ring.samples.len() >= FRAME_SAMPLES {
-                    let mut frame = [0.0f32; FRAME_SAMPLES];
-                    for slot in frame.iter_mut() {
-                        *slot = ring.samples.pop_front().expect("length checked");
+#[derive(Default)]
+struct EarRing {
+    frames: VecDeque<[f32; FRAME_SAMPLES]>,
+    /// Frames discarded because this loop could not keep the body's pace. The
+    /// model's step count IS its clock, so a loop that falls behind the world
+    /// cannot catch up by stepping faster — it can only skip forward.
+    skipped: usize,
+    /// Where this ear joined the body's clock, and where it has got to. Soma
+    /// fans one microphone out, so these are the BODY's coordinates, shared
+    /// with every other consumer of the same frames — which is what lets two
+    /// of them say they heard the same instant.
+    first_frame: Option<u64>,
+    last_frame: u64,
+    /// Why the stream ended, if it has. Never a silent stop: missing speech
+    /// must not read as silence.
+    ended: Option<String>,
+}
+
+impl Ear {
+    /// Subscribe to the body's microphone. Opening is done here, on the
+    /// caller's thread, so a body that is not running says so immediately
+    /// rather than one frame into the session.
+    fn open(soma: &str) -> Result<Self> {
+        let mut capture = soma_client::SomaCapture::open(soma)
+            .with_context(|| format!("subscribe to Soma's microphone at {soma}"))?;
+        let ring: Arc<(Mutex<EarRing>, Condvar)> =
+            Arc::new((Mutex::new(EarRing::default()), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let ring = Arc::clone(&ring);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("duplex-ear".into())
+                .spawn(move || {
+                    let (lock, ready) = &*ring;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Blocks on the body, which blocks on the device.
+                        match capture.next_frame() {
+                            Ok(frame) => {
+                                let mut ring = lock.lock().expect("ear ring");
+                                ring.first_frame.get_or_insert(frame.frame_index);
+                                ring.last_frame = frame.frame_index;
+                                ring.frames.push_back(frame.samples);
+                                drop(ring);
+                                ready.notify_all();
+                            }
+                            Err(error) => {
+                                let mut ring = lock.lock().expect("ear ring");
+                                ring.ended = Some(format!("{error:#}"));
+                                drop(ring);
+                                ready.notify_all();
+                                return;
+                            }
+                        }
                     }
-                    return Some(frame);
-                }
+                    let mut ring = lock.lock().expect("ear ring");
+                    ring.ended.get_or_insert_with(|| "ear closed".into());
+                    drop(ring);
+                    ready.notify_all();
+                })
+                .context("spawn ear thread")?
+        };
+        Ok(Self {
+            ring,
+            stop,
+            thread: Some(thread),
+            soma: soma.to_string(),
+        })
+    }
+
+    /// Pull exactly one frame, blocking on the body's clock.
+    fn next_frame(&self) -> Option<[f32; FRAME_SAMPLES]> {
+        let (lock, ready) = &*self.ring;
+        let mut ring = lock.lock().expect("ear ring");
+        loop {
+            // Stay current: a backlog means this loop is slower than the
+            // world, and the model cannot step faster to catch up.
+            let backlog = ring.frames.len();
+            if backlog > MAX_BACKLOG_FRAMES {
+                let drop_frames = backlog - 2;
+                ring.frames.drain(..drop_frames);
+                ring.skipped += drop_frames;
             }
-            if self.stop.load(Ordering::Relaxed) || Instant::now() > deadline {
+            if let Some(frame) = ring.frames.pop_front() {
+                return Some(frame);
+            }
+            // Buffered frames are handed over before the ending, so a stream
+            // that died never swallows audio it already delivered.
+            if ring.ended.is_some() {
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(4));
+            ring = ready.wait(ring).expect("ear ring");
         }
     }
 
     fn skipped(&self) -> usize {
-        self.ring.lock().expect("capture ring").skipped
+        self.ring.0.lock().expect("ear ring").skipped
+    }
+
+    /// This ear's place on the body's clock: where it joined and where it is.
+    fn clock(&self) -> (u64, u64) {
+        let ring = self.ring.0.lock().expect("ear ring");
+        (ring.first_frame.unwrap_or(0), ring.last_frame)
+    }
+
+    fn ended(&self) -> Option<String> {
+        self.ring.0.lock().expect("ear ring").ended.clone()
     }
 }
 
-impl Drop for Capture {
+impl Drop for Ear {
+    /// Detaches this consumer. It does NOT close the microphone — that is
+    /// Soma's, held for the life of the body.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
-}
-
-#[cfg(feature = "audio")]
-fn open_capture(name: &str) -> Result<Capture> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-    let host = rodio::cpal::default_host();
-    let device = host
-        .input_devices()
-        .context("enumerate capture devices")?
-        .find(|candidate| candidate.name().map(|n| n == name).unwrap_or(false))
-        .with_context(|| format!("capture device '{name}' not found (disconnected?)"))?;
-    let config = device
-        .default_input_config()
-        .with_context(|| format!("capture device '{name}' offers no input configuration"))?;
-    let device_rate = config.sample_rate();
-    let channels = config.channels();
-    let sample_format = config.sample_format();
-    let stream_config: rodio::cpal::StreamConfig = config.into();
-
-    let ring: Arc<Mutex<CaptureRing>> = Arc::new(Mutex::new(CaptureRing::default()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
-
-    // Streams are !Send, so the stream is built and parked on its own thread
-    // and stays there until the session ends.
-    let thread = {
-        let ring = Arc::clone(&ring);
-        let stop = Arc::clone(&stop);
-        std::thread::Builder::new()
-            .name("duplex-capture".into())
-            .spawn(move || {
-                let build = || -> Result<rodio::cpal::Stream> {
-                    let mut resampler = Resampler::new(device_rate, SAMPLE_RATE);
-                    let sink = Arc::clone(&ring);
-                    let error_sink = |error| eprintln!("duplex: capture stream error: {error}");
-                    let stream = match sample_format {
-                        rodio::cpal::SampleFormat::F32 => device.build_input_stream(
-                            &stream_config,
-                            move |data: &[f32], _: &rodio::cpal::InputCallbackInfo| {
-                                let mono = downmix(data, channels);
-                                let mut out = Vec::with_capacity(mono.len());
-                                resampler.push(&mono, &mut out);
-                                if let Ok(mut ring) = sink.lock() {
-                                    ring.samples.extend(out);
-                                }
-                            },
-                            error_sink,
-                            None,
-                        ),
-                        rodio::cpal::SampleFormat::I16 => device.build_input_stream(
-                            &stream_config,
-                            move |data: &[i16], _: &rodio::cpal::InputCallbackInfo| {
-                                let scaled: Vec<f32> =
-                                    data.iter().map(|v| *v as f32 / 32_768.0).collect();
-                                let mono = downmix(&scaled, channels);
-                                let mut out = Vec::with_capacity(mono.len());
-                                resampler.push(&mono, &mut out);
-                                if let Ok(mut ring) = sink.lock() {
-                                    ring.samples.extend(out);
-                                }
-                            },
-                            error_sink,
-                            None,
-                        ),
-                        other => bail!("capture sample format {other:?} is not supported"),
-                    };
-                    stream.context("build capture stream")
-                };
-                match build() {
-                    Ok(stream) => {
-                        if let Err(error) = stream.play() {
-                            let _ = ready_tx.send(Err(format!("start capture stream: {error}")));
-                            return;
-                        }
-                        let _ = ready_tx.send(Ok(()));
-                        // Hold the stream — and therefore the channel — open.
-                        while !stop.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        drop(stream);
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(format!("{error:#}")));
-                    }
-                }
-            })
-            .context("spawn capture thread")?
-    };
-
-    match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => bail!("capture device '{name}': {message}"),
-        Err(error) => bail!("capture device '{name}' did not start: {error}"),
-    }
-    Ok(Capture {
-        ring,
-        stop,
-        thread: Some(thread),
-        device_rate,
-        channels,
-    })
-}
-
-#[cfg(not(feature = "audio"))]
-fn open_capture(_name: &str) -> Result<Capture> {
-    bail!("audio device support is not compiled into this build (enable the `audio` feature)")
-}
-
-fn downmix(interleaved: &[f32], channels: u16) -> Vec<f32> {
-    if channels <= 1 {
-        return interleaved.to_vec();
-    }
-    let channels = channels as usize;
-    interleaved
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
 }
 
 fn rms(samples: &[f32]) -> f32 {
@@ -952,56 +999,56 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
-/// Linear rate conversion with a persistent fractional cursor, so successive
-/// buffers join without a discontinuity. Handsfree capture is narrowband
-/// already; the band this loses is not in the signal.
-struct Resampler {
-    ratio: f64,
-    position: f64,
-    last: f32,
-    primed: bool,
-}
-
-impl Resampler {
-    fn new(from: u32, to: u32) -> Self {
-        Self {
-            ratio: from as f64 / to as f64,
-            position: 0.0,
-            last: 0.0,
-            primed: false,
+/// The capture seam's gate, without the model: read the body's frames through
+/// the SAME ear `run` uses and report what arrives.
+///
+/// This is what makes the simultaneity claim checkable without paying for
+/// weights — run it beside `hear listen` against one Soma and both will report
+/// frames off the same clock. It is also how to tell "the body is not
+/// producing audio" apart from "the model is not answering".
+fn cmd_ear(soma: &str, frames: usize) -> Result<()> {
+    let ear = Ear::open(soma)?;
+    println!(
+        "duplex: ear open on {} — {} Hz, {} sample frames, this process owns no device",
+        ear.soma,
+        soma_client::SAMPLE_RATE,
+        soma_client::FRAME_SAMPLES
+    );
+    let start = Instant::now();
+    let mut read = 0usize;
+    let mut peak = 0f32;
+    let mut total = 0f64;
+    while frames == 0 || read < frames {
+        let Some(frame) = ear.next_frame() else {
+            break;
+        };
+        let level = rms(&frame);
+        peak = peak.max(level);
+        total += level as f64;
+        read += 1;
+        if read % 12 == 0 {
+            let (first, last) = ear.clock();
+            println!(
+                "  [ear] body frame {last} (joined at {first}) | {read} read | \
+                 {} skipped | rms {level:.4}",
+                ear.skipped()
+            );
         }
     }
-
-    fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        if input.is_empty() {
-            return;
-        }
-        if (self.ratio - 1.0).abs() < f64::EPSILON {
-            out.extend_from_slice(input);
-            return;
-        }
-        if !self.primed {
-            self.last = input[0];
-            self.primed = true;
-        }
-        // `position` is in input samples with `last` sitting at index -1, so
-        // it carries across buffer boundaries.
-        while self.position < input.len() as f64 {
-            let floor = self.position.floor();
-            let fraction = (self.position - floor) as f32;
-            let index = floor as isize;
-            let a = if index < 0 {
-                self.last
-            } else {
-                input[index as usize]
-            };
-            let b = input.get((index + 1).max(0) as usize).copied().unwrap_or(a);
-            out.push(a + (b - a) * fraction);
-            self.position += self.ratio;
-        }
-        self.position -= input.len() as f64;
-        self.last = *input.last().expect("non-empty");
+    let wall = start.elapsed().as_secs_f64();
+    let (first, last) = ear.clock();
+    println!(
+        "duplex: {read} frames in {wall:.1}s — {:.2}x realtime | body frames {first}..{last} | \
+         {} skipped | ear rms mean {:.4} peak {:.4}",
+        (read as f64 * 0.08) / wall.max(1e-9),
+        ear.skipped(),
+        total / read.max(1) as f64,
+        peak
+    );
+    if let Some(reason) = ear.ended() {
+        println!("duplex: the body's stream ended — {reason}");
     }
+    Ok(())
 }
 
 // ── playback: decode away from the frame clock, sink opened by name ────────
@@ -1049,6 +1096,44 @@ const PREBUFFER_FRAMES: usize = 5;
 /// next frame anyway. A device that stops consuming is a fault to surface, not
 /// a reason to wedge the loop forever.
 const PACE_DEADLINE: Duration = Duration::from_millis(500);
+
+/// HOW LONG OUR VOICE IS IN THE ROOM, which is not how long the model is
+/// generating.
+///
+/// The mouth is audible LATER than the model is generating: between the two sit
+/// the codec decoder and the speaker's own queue. So a window that closed when
+/// generation stopped would un-deafen the other consumers of the same
+/// microphone while our last words were still coming out of the speaker, and
+/// `hear` would transcribe our own voice back to us.
+///
+/// The tail is not guessed: it is whatever the mouth still has IN FLIGHT at the
+/// moment generation stops, counted down one frame per frame, because the
+/// speaker consumes one frame per frame. Erring long is the safe direction —
+/// the cost is a little extra deafness, the cost of erring short is the loop
+/// hearing itself.
+///
+/// This gates SOFTWARE only. Nothing here touches a device, and the consumer on
+/// the other side of the pause file keeps reading frames throughout and simply
+/// discards them: the hold stops the model, never the person.
+#[derive(Default)]
+struct AudibleWindow {
+    tail: usize,
+}
+
+impl AudibleWindow {
+    /// `speaking` is the model's own speech signal for this frame; `in_flight`
+    /// is what the mouth has handed the speaker but the speaker has not played.
+    /// Returns whether our voice is in the room right now.
+    fn observe(&mut self, speaking: bool, in_flight: usize) -> bool {
+        if speaking {
+            self.tail = in_flight + PREBUFFER_FRAMES;
+            return true;
+        }
+        let sounding = self.tail > 0;
+        self.tail = self.tail.saturating_sub(1);
+        sounding
+    }
+}
 
 /// How a line of text is laid out across frames on the inner-monologue
 /// stream. The control for the rank measurement below — see
@@ -1657,25 +1742,29 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let lead_target = args.lead.unwrap_or(2 * args.decode_hop).max(1) as u64;
     let mut stalled = 0usize;
 
-    // The capture stream is opened last and held for the whole session. On a
-    // handsfree endpoint this open IS the channel.
-    let capture = if args.no_input {
+    // The ear is subscribed last, and this process opens no device: Soma holds
+    // the microphone for the life of the BODY, so on a handsfree endpoint the
+    // channel is Soma's open, not ours, and it outlives this session.
+    let ear = if args.no_input {
         println!(
-            "duplex: generation only — no capture device, the speaker is the clock \
+            "duplex: generation only — no ear, the speaker is the clock \
              (lead {lead_target} frames = {} ms)",
             lead_target * 80
         );
         None
-    } else if args.input.is_empty() {
-        bail!("--input names the capture device; pass one, or --no-input to generate only")
     } else {
-        println!("duplex: opening '{}' …", args.input);
-        let capture = open_capture(&args.input)?;
         println!(
-            "duplex: capture open — {} ch at {} Hz, held for the session",
-            capture.channels, capture.device_rate
+            "duplex: subscribing to the body's microphone at {} …",
+            args.soma
         );
-        Some(capture)
+        let ear = Ear::open(&args.soma)?;
+        let (joined, _) = ear.clock();
+        println!(
+            "duplex: ear open — {} Hz, {} sample frames, joined the body clock at frame {joined}; \
+             this process owns no device, so `hear` can read the same frames",
+            SAMPLE_RATE, FRAME_SAMPLES
+        );
+        Some(ear)
     };
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1692,6 +1781,24 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
     let mut spoken_was_injected = false;
     let mut pad_run = 0usize;
     let mut speaking_hangover = 0usize;
+
+    // The SHARED-MICROPHONE guard. Inside this binary turn-taking needs no
+    // file — `--gate` feeds the model silence while it speaks, in process, on
+    // the frame clock. The file exists for the OTHER consumers of the same
+    // Soma frames: while it is there, `hear` keeps reading and discards, so it
+    // does not transcribe our own voice back to us. A stale one would deafen
+    // them permanently, so never trust the last run to have exited cleanly.
+    if let Some(path) = args.pause_file.as_deref() {
+        if faculties::turntaking::clear_stale(path) {
+            println!("duplex: cleared a stale pause file at {}", path.display());
+        }
+        println!(
+            "duplex: holding {} while audible, so a `hear` on the same body stays deaf to us",
+            path.display()
+        );
+    }
+    let mut audible: Option<faculties::turntaking::PauseGuard> = None;
+    let mut audible_window = AudibleWindow::default();
 
     let mut seq = 0u64;
     let mut held = false;
@@ -1779,12 +1886,17 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             }
         }
 
-        // THE MICROPHONE IS THE CLOCK.
-        let samples = match capture.as_ref() {
-            Some(capture) => match capture.next_frame() {
+        // THE MICROPHONE IS THE CLOCK — one layer removed, and still no timer:
+        // the ear blocks until the body hands over the frame the device just
+        // produced.
+        let samples = match ear.as_ref() {
+            Some(ear) => match ear.next_frame() {
                 Some(frame) => Some(frame),
                 None => {
-                    eprintln!("duplex: capture stopped producing frames");
+                    match ear.ended() {
+                        Some(reason) => eprintln!("duplex: the body's stream ended — {reason}"),
+                        None => eprintln!("duplex: the body stopped producing frames"),
+                    }
                     break;
                 }
             },
@@ -2031,6 +2143,19 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             }
         }
 
+        // Hold the pause file across the whole time our voice is IN THE ROOM,
+        // which is the generation window plus whatever the decoder and the
+        // speaker still have queued. Software only: nothing here touches a
+        // device, and `hear` keeps reading throughout.
+        if let Some(path) = args.pause_file.as_deref() {
+            let sounding = audible_window.observe(speaking_hangover > 0, mouth.lead() as usize);
+            if sounding && audible.is_none() {
+                audible = Some(faculties::turntaking::PauseGuard::hold(path));
+            } else if !sounding {
+                audible = None;
+            }
+        }
+
         // An utterance ends where the text stream goes quiet — but NOT while
         // a line is still being said. A quiet stretch is only an ending when
         // there is nothing left to say; until the queue is drained it is a
@@ -2070,7 +2195,7 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
 
         frame_index += 1;
         if frame_index % 125 == 0 {
-            let skipped = capture.as_ref().map(Capture::skipped).unwrap_or(0);
+            let skipped = ear.as_ref().map(Ear::skipped).unwrap_or(0);
             println!(
                 "  [clock] {:.1}s | step mean {:.1} ms max {:.1} ms | {} over budget | \
                  {} in skipped | {} out dropped | {} underruns | lead {} | \
@@ -2208,7 +2333,9 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             );
         }
     }
-    drop(capture);
+    // Give the other consumers their ears back before anything slow.
+    drop(audible);
+    drop(ear);
     mouth.finish()?;
     ledger.finish();
     Ok(())
@@ -2288,31 +2415,86 @@ fn wav_header(data_bytes: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The frame shape is not this binary's to choose: it is Soma's wire
+    /// format, and a divergence would be two agreeing constants drifting
+    /// apart. (Also enforced at compile time by the `const _` above.)
     #[test]
-    fn downmix_averages_channels() {
-        assert_eq!(downmix(&[1.0, 0.0, 0.5, 0.5], 2), vec![0.5, 0.5]);
-        assert_eq!(downmix(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+    fn the_frame_is_somas_frame() {
+        assert_eq!(FRAME_SAMPLES, soma_client::FRAME_SAMPLES);
+        assert_eq!(SAMPLE_RATE, soma_client::SAMPLE_RATE);
+        assert_eq!(FRAME_SAMPLES as u32 * 1_000 / SAMPLE_RATE, 80);
     }
 
+    /// A loop slower than the world skips FORWARD rather than falling behind,
+    /// and says how much it skipped. The model's step count is its clock, so
+    /// it cannot catch up by stepping faster.
     #[test]
-    fn resampling_holds_rate_across_buffer_boundaries() {
-        // 48 kHz in, 24 kHz out: the output stays half the input however the
-        // input is chopped up.
-        let mut resampler = Resampler::new(48_000, 24_000);
-        let mut out = Vec::new();
-        for _ in 0..10 {
-            let block: Vec<f32> = (0..960).map(|n| n as f32).collect();
-            resampler.push(&block, &mut out);
+    fn a_slow_loop_skips_forward_and_counts_it() {
+        let ear = Ear {
+            ring: Arc::new((Mutex::new(EarRing::default()), Condvar::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            soma: "test".into(),
+        };
+        {
+            let mut ring = ear.ring.0.lock().unwrap();
+            for value in 0..(MAX_BACKLOG_FRAMES + 5) {
+                ring.frames.push_back([value as f32; FRAME_SAMPLES]);
+            }
         }
-        assert_eq!(out.len(), 4_800);
+        let frame = ear.next_frame().expect("a frame");
+        // Everything but the last two frames is dropped, and the frame handed
+        // over is the current one, not the stale head.
+        assert_eq!(frame[0], (MAX_BACKLOG_FRAMES + 3) as f32);
+        assert_eq!(ear.skipped(), MAX_BACKLOG_FRAMES + 3);
     }
 
+    /// The shared-microphone guard's one rule: the window must not close while
+    /// our voice is still coming out of the speaker. It opens on the first
+    /// speaking frame, stays open for the whole generation window, and then
+    /// outlasts it by exactly what the mouth still had in flight — never less.
     #[test]
-    fn matching_rates_pass_samples_through_untouched() {
-        let mut resampler = Resampler::new(24_000, 24_000);
-        let mut out = Vec::new();
-        resampler.push(&[0.25, -0.5, 1.0], &mut out);
-        assert_eq!(out, vec![0.25, -0.5, 1.0]);
+    fn the_audible_window_outlasts_generation_by_what_is_still_in_flight() {
+        let mut window = AudibleWindow::default();
+        assert!(!window.observe(false, 0), "silence is not audible");
+        // Speaking, with 6 frames sitting in front of the speaker.
+        for _ in 0..5 {
+            assert!(window.observe(true, 6));
+        }
+        // Generation stops. The tail is what was queued plus the prebuffer,
+        // counted down one frame per frame.
+        let tail = 6 + PREBUFFER_FRAMES;
+        for frame in 0..tail {
+            assert!(
+                window.observe(false, 0),
+                "frame {frame} of the tail is still in the room"
+            );
+        }
+        assert!(
+            !window.observe(false, 0),
+            "and then, and only then, silence"
+        );
+    }
+
+    /// A stream that ended hands over what it already delivered before it
+    /// reports the ending: missing speech must never read as silence, and
+    /// delivered speech must never be swallowed by the ending.
+    #[test]
+    fn buffered_frames_survive_the_end_of_the_stream() {
+        let ear = Ear {
+            ring: Arc::new((Mutex::new(EarRing::default()), Condvar::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            soma: "test".into(),
+        };
+        {
+            let mut ring = ear.ring.0.lock().unwrap();
+            ring.frames.push_back([0.5; FRAME_SAMPLES]);
+            ring.ended = Some("the body stopped".into());
+        }
+        assert_eq!(ear.next_frame().expect("the buffered frame")[0], 0.5);
+        assert!(ear.next_frame().is_none());
+        assert_eq!(ear.ended().as_deref(), Some("the body stopped"));
     }
 
     #[test]

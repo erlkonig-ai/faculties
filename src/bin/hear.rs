@@ -47,6 +47,14 @@
 //!
 //! # Soma owns the microphone; this bin owns nothing
 //!
+//! **AND THE CONSUMERS ARE NOT EXCLUSIVE.** Soma fans one microphone out, so
+//! this bin and `duplex` run at the SAME TIME off the same frames — a live
+//! embedding stream for the thinking model and a spoken channel, both, instead
+//! of choosing. A consumer that joins second joins the body's clock already in
+//! progress and is told where; frames carry the BODY's coordinates, so two
+//! consumers can say they heard the same instant. A consumer that cannot keep
+//! up has its own stream ended loudly and disturbs nobody else.
+//!
 //! **DEVICES ARE ADDRESSED BY NAME, NEVER BY INDEX AND NEVER VIA THE SYSTEM
 //! DEFAULT.** A Bluetooth connect silently renumbers CoreAudio and an
 //! index-addressed stream lands on a dead virtual channel at -91 dB with
@@ -59,8 +67,9 @@
 //! **NEVER CLOSE THE MICROPHONE STREAM.** Closing a Bluetooth mic flips the
 //! endpoint between its handsfree and high-quality profiles and chops speech
 //! mid-sentence. Turn-taking is gated in SOFTWARE ONLY: while the pause file
-//! exists (`--pause-file`, the same path the speaking `voice` process holds)
-//! this loop keeps pulling frames and DISCARDS them. The hold stops the model,
+//! exists (`--pause-file`, the same path the speaking `voice` process holds —
+//! or `duplex run --pause-file`, which holds it for as long as its voice is
+//! audible in the room) this loop keeps pulling frames and DISCARDS them. The hold stops the model,
 //! never the person — a human can talk over a hold, and the stream is still
 //! there when it lifts. See `faculties::turntaking`.
 //!
@@ -151,9 +160,16 @@ struct Shared {
     /// Native model-collection pile holding the Gemma-4 hearing stack.
     #[arg(long, env = "GEMMA_PILE")]
     pile: Option<PathBuf>,
-    /// HF model id for the small side files (config.json / tokenizer.json).
-    /// Weights never come from here.
-    #[arg(long, default_value = "google/gemma-4-e4b-it")]
+    /// HF model id for the small side files (config.json / tokenizer.json),
+    /// AND the source name the weights are selected by inside the pile. Weights
+    /// themselves never come from HF.
+    ///
+    /// The capitalisation is load-bearing and was wrong here until it was run
+    /// against a real pile: the filesystem lookup is case-insensitive on macOS
+    /// so `config.json` resolved either way, but the pile's root selection is
+    /// not, and `gemma-4-e4b-it` matched no model root at all. `mary`'s own
+    /// `gemma_hear` spells it this way.
+    #[arg(long, default_value = "google/gemma-4-E4B-it")]
     model: String,
     /// Utterance jsonl to append to.
     #[arg(long, default_value = "/tmp/hear.jsonl")]

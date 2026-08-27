@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`duplex` stops owning the microphone, so it and `hear` can finally run at
+  the same time.** A capture device can be held by exactly one process, and
+  `duplex` opened CPAL itself while `hear` owned nothing and inherited Soma's
+  one named device -- so the two could not run together at all. That was not an
+  inconvenience but a structural impossibility, and it is why splitting hearing
+  from speaking kept failing. Soma is now the single owner and fans one
+  microphone out; `duplex` subscribes through `soma-client` like every other
+  consumer. A live embedding stream for the thinking model AND a spoken channel,
+  off the SAME frames, instead of choosing.
+
+  The clock discipline is unchanged and slightly stronger: the ear thread blocks
+  in `SomaCapture::next_frame` until the body has produced the next exact 80 ms
+  frame and the generation loop blocks on the ear, so the period still comes
+  from the hardware that will actually move the samples -- one layer removed,
+  with no sleep, timer or polling interval anywhere on the path. The
+  device-owning version polled its own capture ring every 4 ms; that is gone
+  too. A loop slower than the world still skips FORWARD and counts it, because
+  the model's step count is its clock and it cannot catch up by stepping faster.
+
+  `--input <exact capture device name>` is REPLACED by `--soma <url>`, and
+  `duplex devices` no longer lists capture devices: naming a second one would be
+  offering back the thing that made the two faculties exclusive. The microphone
+  is named once, in Soma. New `duplex ear` reads the body's frames through the
+  same ear `run` uses, with no model at all -- the capture seam's gate, and the
+  way to tell "the body is not producing audio" from "the model is not
+  answering". New `duplex run --pause-file` holds the half-duplex pause file for
+  exactly as long as this channel is AUDIBLE IN THE ROOM (the generation window
+  plus whatever is still in flight to the speaker, which is later than the model
+  is generating), so a `hear` reading the same body does not transcribe our own
+  voice back to us. Inside `duplex` turn-taking still needs no file: `--gate`
+  feeds the model digital silence while it speaks, in process, on the frame
+  clock.
+
+  REMOVES: `duplex`'s own device-rate resampler and channel downmix, which
+  existed only because it opened an arbitrary capture device; Soma delivers
+  canonical 24 kHz mono. The PLAYBACK device is deliberately still opened here
+  by name -- it is multi-client on this hardware, so it never forced the
+  exclusion the microphone did, and repointing an audio sink through another
+  owner would move the say-privacy invariant across a process boundary before
+  that owner enforces it.
+
+- **`hear`'s default `--model` could not select a model root.** It spelled the
+  source `google/gemma-4-e4b-it`; the pile's root selection is case-sensitive
+  and wants `google/gemma-4-E4B-it` (which is what `mary`'s own `gemma_hear`
+  passes). The HF side files resolved either way because the macOS filesystem
+  lookup is case-insensitive, so nothing showed until it was run against a real
+  pile -- `hear listen` and `hear once` failed with "no model root matches" for
+  every user who did not pass `--model` themselves.
+
 - **The ears become a faculty, and they hand over embeddings.** `hear` replaces
   `converse`: it reads Soma's framed 80 ms capture stream through
   `soma-client`, segments utterances with an energy VAD, and hands over AUDIO

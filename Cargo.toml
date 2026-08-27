@@ -146,9 +146,11 @@ hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
 # The `duplex` faculty: a continuously running spoken channel on mary's
 # streaming full-duplex speech model. `mary/personaplex` brings the LM layers
 # (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
-# stack and the streaming codec. `audio` supplies the named-device capture and
-# playback plumbing. Off by default: the model runtime is heavy and only this
-# one binary needs it. NOT YET REALTIME on the measured hardware — see the
+# stack and the streaming codec. `audio` supplies the named-device PLAYBACK
+# plumbing only — the microphone is Soma's, reached through `soma-client`
+# (unconditional and tiny), which is what lets `hear` and `duplex` run at the
+# same time off one device. Off by default: the model runtime is heavy and only
+# this one binary needs it. NOT YET REALTIME on the measured hardware — see the
 # frame-budget section of the binary's module docs before relying on it.
 duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 [dependencies]
@@ -191,7 +193,7 @@ rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
-soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear (Soma's framed 80 ms capture contract; anyhow + the reqwest already here)
+soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex (Soma's framed 80 ms capture contract; anyhow + the reqwest already here). Unconditional: the capture seam is not a feature, it is how the body is reached.
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
