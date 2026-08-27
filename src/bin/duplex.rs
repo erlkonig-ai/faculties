@@ -1,13 +1,24 @@
 //! duplex — a continuously running spoken channel driven by ONE streaming
 //! speech model, with a transcript an agent reads from and injects into.
 //!
-//! The half-duplex bridge (`converse`) chains three models and three
-//! processes: a transcriber, a text model, a synthesizer. Every joint between
-//! them is a place the conversation breaks, and each adds latency, so the
-//! human waits seconds for a reply. This binary replaces the chain with a
-//! single streaming speech-to-speech model (mary's PersonaPlex port) on its
-//! own 80 ms frame clock: audio codes in, audio codes out, with the model's
-//! inner-monologue text falling out of the same step as exhaust.
+//! The half-duplex bridge (`converse`, removed 2026-08-27) chained three
+//! models and three processes: a transcriber, a text model, a synthesizer.
+//! Every joint between them is a place the conversation breaks, and each adds
+//! latency, so the human waits seconds for a reply. This binary replaces the
+//! chain with a single streaming speech-to-speech model (mary's PersonaPlex
+//! port) on its own 80 ms frame clock: audio codes in, audio codes out, with
+//! the model's inner-monologue text falling out of the same step as exhaust.
+//!
+//! It is also the only path that can speak WHILE the driver is still
+//! generating, and the reason is the `model` cadence below: the model samples
+//! stream 0 itself and we substitute our words onto the frames it chose to
+//! speak, so the pauses and their lengths are its own. A one-shot synthesizer
+//! (`voice`, Qwen3-TTS) takes a whole string per call, so speaking while
+//! generating there means chaining independent syntheses back to back, each
+//! re-conditioned on the reference clip, with inserted pauses rather than
+//! generated ones. The two are not duplicates: `voice` is the one-shot
+//! utterance with the two-channel privacy contract, this is the continuous
+//! conversational channel.
 //!
 //! ## The clock
 //!

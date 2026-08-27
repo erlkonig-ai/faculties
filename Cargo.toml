@@ -109,7 +109,7 @@ required-features = ["widgets"]
 # workflows, and the GORBIE viewer is part of the normal office surface.
 # A stock workspace cohort build (`cargo build --release --workspace --bins`)
 # must ship both.
-default = ["local-embed", "widgets", "audio"]
+default = ["local-embed", "widgets", "audio", "hear"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [
     "dep:GORBIE",
@@ -135,6 +135,14 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
 voice = ["dep:mary", "mary/speak", "audio"]
+# The `hear` faculty: Soma's framed microphone -> energy VAD -> Gemma-4 audio
+# tower + multimodal embedder, handing over EMBEDDINGS (not text). `mary/gemma`
+# brings the parity-gated audio path; `tokenizers` is the decoder's BPE, needed
+# to build the `Hearing` handle even when only `embed` is called. DEFAULT: it
+# replaces `converse` as the shipping ear surface, and `local-embed` (also
+# default) already pays for `mary/gemma`, so the marginal cost is the
+# tokenizer. Capture itself is `soma-client`, which is unconditional and tiny.
+hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
 # The `duplex` faculty: a continuously running spoken channel on mary's
 # streaming full-duplex speech model. `mary/personaplex` brings the LM layers
 # (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
@@ -183,6 +191,8 @@ rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
+soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear (Soma's framed 80 ms capture contract; anyhow + the reqwest already here)
+tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
 serde_json = "1"            # discord, teams, triage, web

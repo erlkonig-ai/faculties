@@ -39,6 +39,18 @@
 //! daemon media API is upload+play; daemon-side streaming is a noted
 //! follow-up).
 //!
+//! HALF-DUPLEX (`--pause-file`, on both channels): the mouth creates the pause
+//! file before any sound and removes it when the utterance ends, so a listener
+//! started with the SAME path (`hear listen --pause-file`) discards audio for
+//! exactly the window in which we might be audible. The listener NEVER CLOSES
+//! ITS MICROPHONE to do this -- closing a Bluetooth mic flips the endpoint
+//! between its handsfree and high-quality profiles and chops speech
+//! mid-sentence, so turn-taking is gated in SOFTWARE only: the hold stops the
+//! model, never the person. The hold is a guard whose `Drop` is the release,
+//! because a crash mid-utterance must not deafen the ears forever. Protocol and
+//! filters live in `faculties::turntaking` (extracted from the `converse`
+//! bridge, which this pair replaces).
+//!
 //! Device targeting: the native sink opens the routed output device BY NAME
 //! via cpal (CoreAudio), never touching the system default output — the
 //! SwitchAudioSource machinery and its whole fragility class (default-switch
@@ -136,6 +148,13 @@ enum Command {
         /// synthesizing or playing — for checking the policy on a busy GPU.
         #[arg(long)]
         dry_run: bool,
+        /// Half-duplex pause file: created before any sound and removed when
+        /// the utterance ends, so a listener started with the SAME path drops
+        /// audio while we speak. See `faculties::turntaking`. The listener
+        /// never closes its microphone — the hold stops the model, never the
+        /// person.
+        #[arg(long, env = "VOICE_PAUSE_FILE")]
+        pause_file: Option<PathBuf>,
     },
     /// Speak ALOUD on the PUBLIC channel — Reachy speaker → room → laptop.
     /// Broadcasting is the point; falls back to any audible device. Recorded on
@@ -146,6 +165,11 @@ enum Command {
         /// Resolve routing and report the target WITHOUT synthesizing/playing.
         #[arg(long)]
         dry_run: bool,
+        /// Half-duplex pause file — see `voice say --pause-file`. A shout is
+        /// exactly the case that needs it: the room speaker is in the room
+        /// with the microphone.
+        #[arg(long, env = "VOICE_PAUSE_FILE")]
+        pause_file: Option<PathBuf>,
     },
     /// Show the routing policy for both channels, the connected audio devices,
     /// and what each channel WOULD select right now (a pure dry-run). Read-only.
@@ -1029,6 +1053,7 @@ fn cmd_speak(
     channel: &str,
     text: &str,
     dry_run: bool,
+    pause_file: Option<&Path>,
 ) -> Result<()> {
     let devices = detect_output_devices()?;
     let prefs = load_route(&session.facts, channel)?;
@@ -1052,6 +1077,19 @@ fn cmd_speak(
         println!("{text}");
         return log_utterance(session, channel, text, None, "voice spoke");
     }
+
+    // HALF-DUPLEX: hold the pause file across synthesis AND playback, so the
+    // ears are deaf for the whole window in which we might be audible. The
+    // guard's `Drop` is the release, which is why it is a guard: an error or a
+    // panic mid-utterance must never leave a listener permanently deafened.
+    // The listener does not stop capturing while this is held — it discards
+    // frames. Closing a Bluetooth mic flips the endpoint between its handsfree
+    // and high-quality profiles and chops speech mid-sentence, so turn-taking
+    // is software-only: the hold stops the model, never the person.
+    let _pause = pause_file.map(|path| {
+        println!("  [half-duplex] holding {}", path.display());
+        faculties::turntaking::PauseGuard::hold(path)
+    });
 
     // ONE generation path (streaming synthesis), sink chosen by the route —
     // see the synthesis section. `out` receives the complete utterance; the
@@ -1219,10 +1257,34 @@ fn main() -> Result<()> {
             Cli::command().print_help().ok();
             println!();
         }
-        Some(Command::Say { text, dry_run }) => storage
-            .with_session(|session| cmd_speak(session, &daemon, CHANNEL_SAY, &text, dry_run))?,
-        Some(Command::Shout { text, dry_run }) => storage
-            .with_session(|session| cmd_speak(session, &daemon, CHANNEL_SHOUT, &text, dry_run))?,
+        Some(Command::Say {
+            text,
+            dry_run,
+            pause_file,
+        }) => storage.with_session(|session| {
+            cmd_speak(
+                session,
+                &daemon,
+                CHANNEL_SAY,
+                &text,
+                dry_run,
+                pause_file.as_deref(),
+            )
+        })?,
+        Some(Command::Shout {
+            text,
+            dry_run,
+            pause_file,
+        }) => storage.with_session(|session| {
+            cmd_speak(
+                session,
+                &daemon,
+                CHANNEL_SHOUT,
+                &text,
+                dry_run,
+                pause_file.as_deref(),
+            )
+        })?,
         Some(Command::Route) => storage.with_session(|session| cmd_route(session, &daemon))?,
         Some(Command::RouteSet { channel, devices }) => {
             storage.with_session(|session| cmd_route_set(session, &channel, &devices))?

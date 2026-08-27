@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **The ears become a faculty, and they hand over embeddings.** `hear` replaces
+  `converse`: it reads Soma's framed 80 ms capture stream through
+  `soma-client`, segments utterances with an energy VAD, and hands over AUDIO
+  EMBEDDINGS -- the rows Gemma-4's audio tower and multimodal embedder produce,
+  in the decoder's own width, which is exactly what the model's own
+  `understand` writes over its audio-soft-token positions before prefill. A
+  transcript throws away tone, hesitation and mood at the greedy argmax, and
+  that argmax is the last place anyone can still get them back; stopping one
+  step earlier costs the consumer nothing, because splicing embeddings is the
+  operation the model already performs. `--transcribe` still decodes text, as a
+  debugging convenience rather than the handover. Soma opens the microphone by
+  name in exactly one process and every consumer inherits that choice, so `hear`
+  opens no device at all and reading the next record is the conversation clock.
+  `hear once --wav` runs recorded clips through the same segmenter and the same
+  embed path, which is how everything below the capture seam is tested without
+  hardware.
+
+- **`converse` is removed; its three guards are library code.** The bridge
+  chained three models across three processes by tailing a jsonl file, and the
+  chain is what `duplex` and `hear` replace. What it alone carried now lives in
+  `faculties::turntaking`, with tests: the PAUSE-FILE protocol (a guard whose
+  `Drop` is the release, so a crash mid-utterance cannot deafen the ears
+  forever), the BARGE-IN overlap heuristic (an utterance stamped inside our own
+  speech window is presumed self-echo even when the pause file missed it --
+  the two guards fail differently, so keeping both is coverage, not
+  redundancy), and the NO-SPEECH / PROMPT-PARROT filter (on empty or
+  AEC-suppressed audio a decoder parrots its own prompt back as the transcript,
+  and without the check a silent room makes the bot recite its instructions
+  aloud). REMOVED WITH IT: the `--brain playground|echo` one-shot turn and the
+  jsonl-tailing loop that joined an ear process to a mouth process. Nothing
+  else used either.
+
+- **`voice say|shout --pause-file`.** The mouth now holds the half-duplex pause
+  file itself for its whole audible window, which is the half of the protocol
+  `converse` used to supply. The listener never closes its microphone to
+  observe it: closing a Bluetooth mic flips the endpoint between its handsfree
+  and high-quality profiles and chops speech mid-sentence, so the hold is
+  software-only and stops the model, never the person. The say-privacy
+  invariant is untouched and still lives in code -- there is no path from
+  `voice say` to a room speaker.
+
 - **Migration generations now have stable semantic names and fitting execution
   boundaries.** The original
   pre-collection transition is `migrations legacy-branches plan|activate`;
