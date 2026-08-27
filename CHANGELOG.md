@@ -45,6 +45,19 @@ All notable changes to this project will be documented in this file.
   owner would move the say-privacy invariant across a process boundary before
   that owner enforces it.
 
+- **`duplex run --spm` and a body frame in the clock line.** The weight pile's
+  two halves have drifted apart -- the codec loader wants a `mary-model-bundles`
+  collection, the pile-side SPM loader still wants the `mary-model-graph` the
+  bundle migration replaced -- so no pile satisfies both and `duplex run` could
+  not load at all. `--spm <path>` overrides the tokenizer from a file, the same
+  flag `mary`'s own PersonaPlex bins take; whatever it loads is still checked
+  against the model's `TEXT_CARD`, so a wrong tokenizer stays a loud failure.
+  The periodic clock line now reports the BODY's frame index, which is the one a
+  `hear` on the same microphone is counting too, so two logs can be laid side by
+  side and read as one instant. The startup line no longer claims a join point
+  it does not have yet: it printed "joined the body clock at frame 0" before any
+  frame had arrived, which is exactly the thing a shared microphone makes untrue.
+
 - **`hear`'s default `--model` could not select a model root.** It spelled the
   source `google/gemma-4-e4b-it`; the pile's root selection is case-sensitive
   and wants `google/gemma-4-E4B-it` (which is what `mary`'s own `gemma_hear`

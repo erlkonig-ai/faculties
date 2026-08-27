@@ -330,6 +330,17 @@ struct RunArgs {
     /// Packaged voice prompt the session speaks with.
     #[arg(long, env = "PERSONAPLEX_VOICE_PROMPT")]
     voice_prompt: PathBuf,
+    /// Text tokenizer file, overriding the copy inside `--weights`.
+    ///
+    /// Needed because the two halves of the weight pile drifted apart: the
+    /// codec loader wants a `mary-model-bundles` collection and the pile-side
+    /// SPM loader still wants the `mary-model-graph` the bundle migration
+    /// replaced, so no pile on this machine satisfies both. Whatever is loaded
+    /// is checked against the model's own `TEXT_CARD` below, so a wrong
+    /// tokenizer is a loud failure rather than gibberish. `mary`'s own
+    /// PersonaPlex bins take the same flag.
+    #[arg(long, env = "PERSONAPLEX_SPM")]
+    spm: Option<PathBuf>,
     /// Base URL of the Soma that owns the microphone. This process opens no
     /// capture device: it subscribes, so `hear` can be reading the same frames
     /// at the same time. Not needed with `--no-input`.
@@ -971,9 +982,12 @@ impl Ear {
     }
 
     /// This ear's place on the body's clock: where it joined and where it is.
-    fn clock(&self) -> (u64, u64) {
+    /// The join point is `None` until the first frame actually arrives —
+    /// reporting a zero there would claim the body's clock had just started,
+    /// which is exactly the thing a shared microphone makes untrue.
+    fn clock(&self) -> (Option<u64>, u64) {
         let ring = self.ring.0.lock().expect("ear ring");
-        (ring.first_frame.unwrap_or(0), ring.last_frame)
+        (ring.first_frame, ring.last_frame)
     }
 
     fn ended(&self) -> Option<String> {
@@ -1029,8 +1043,9 @@ fn cmd_ear(soma: &str, frames: usize) -> Result<()> {
         if read % 12 == 0 {
             let (first, last) = ear.clock();
             println!(
-                "  [ear] body frame {last} (joined at {first}) | {read} read | \
+                "  [ear] body frame {last} (joined at {}) | {read} read | \
                  {} skipped | rms {level:.4}",
+                first.unwrap_or(0),
                 ear.skipped()
             );
         }
@@ -1038,9 +1053,10 @@ fn cmd_ear(soma: &str, frames: usize) -> Result<()> {
     let wall = start.elapsed().as_secs_f64();
     let (first, last) = ear.clock();
     println!(
-        "duplex: {read} frames in {wall:.1}s — {:.2}x realtime | body frames {first}..{last} | \
+        "duplex: {read} frames in {wall:.1}s — {:.2}x realtime | body frames {}..{last} | \
          {} skipped | ear rms mean {:.4} peak {:.4}",
         (read as f64 * 0.08) / wall.max(1e-9),
+        first.unwrap_or(0),
         ear.skipped(),
         total / read.max(1) as f64,
         peak
@@ -1706,8 +1722,11 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             args.seed,
         );
     }
-    let spm = mary::persist::load_spm_tokenizer_from_pile(&args.weights)
-        .context("load the text tokenizer from the weight pile")?;
+    let spm = match args.spm.as_deref() {
+        Some(path) => mary::models::personaplex::spm::SpmTokenizer::load(path),
+        None => mary::persist::load_spm_tokenizer_from_pile(&args.weights)
+            .context("load the text tokenizer from the weight pile (or pass --spm)")?,
+    };
     if spm.vocab_size() != model_cfg::TEXT_CARD {
         bail!(
             "tokenizer vocabulary {} does not match the model's {} — wrong tokenizer",
@@ -1758,10 +1777,9 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
             args.soma
         );
         let ear = Ear::open(&args.soma)?;
-        let (joined, _) = ear.clock();
         println!(
-            "duplex: ear open — {} Hz, {} sample frames, joined the body clock at frame {joined}; \
-             this process owns no device, so `hear` can read the same frames",
+            "duplex: ear open — {} Hz, {} sample frames; this process owns no device, so \
+             `hear` can read the same frames",
             SAMPLE_RATE, FRAME_SAMPLES
         );
         Some(ear)
@@ -2196,9 +2214,16 @@ fn cmd_run(session: &Path, args: RunArgs) -> Result<()> {
         frame_index += 1;
         if frame_index % 125 == 0 {
             let skipped = ear.as_ref().map(Ear::skipped).unwrap_or(0);
+            // The BODY's frame, not ours: a `hear` on the same microphone is
+            // counting the same one, so the two logs can be laid side by side
+            // and read as one instant.
+            let body = ear
+                .as_ref()
+                .map(|ear| ear.clock().1.to_string())
+                .unwrap_or_else(|| "-".into());
             println!(
-                "  [clock] {:.1}s | step mean {:.1} ms max {:.1} ms | {} over budget | \
-                 {} in skipped | {} out dropped | {} underruns | lead {} | \
+                "  [clock] {:.1}s | body frame {body} | step mean {:.1} ms max {:.1} ms | \
+                 {} over budget | {} in skipped | {} out dropped | {} underruns | lead {} | \
                  ear rms mean {:.4} peak {:.4}",
                 session_start.elapsed().as_secs_f64(),
                 step_total / frame_index as f64,
