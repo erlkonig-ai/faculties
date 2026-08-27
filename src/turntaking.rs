@@ -68,7 +68,8 @@ impl PauseGuard {
     /// to create is reported and NOT fatal: half-duplex degrades to "the ears
     /// may hear us", never to "we refuse to speak".
     pub fn hold(path: &Path) -> Self {
-        let created = std::fs::write(path, format!("speaking, pid {}\n", std::process::id())).is_ok();
+        let created =
+            std::fs::write(path, format!("speaking, pid {}\n", std::process::id())).is_ok();
         if !created {
             eprintln!(
                 "warning: could not create pause file {} — the ears may hear this utterance",
@@ -269,11 +270,7 @@ mod tests {
         );
         // ...and the padded/embedded form.
         assert_eq!(
-            drop_reason(
-                &utt(&format!("  {PROMPT}  "), 2.0, 0),
-                &f,
-                None
-            ),
+            drop_reason(&utt(&format!("  {PROMPT}  "), 2.0, 0), &f, None),
             Some("prompt-parrot (no speech)")
         );
         assert_eq!(
@@ -281,7 +278,10 @@ mod tests {
             Some("prompt-parrot (no speech)")
         );
         // Real speech survives.
-        assert_eq!(drop_reason(&utt("what is the weather", 2.0, 0), &f, None), None);
+        assert_eq!(
+            drop_reason(&utt("what is the weather", 2.0, 0), &f, None),
+            None
+        );
     }
 
     #[test]
@@ -302,14 +302,23 @@ mod tests {
             dur_s: 2.0,
         };
         // The equality form still fires.
-        assert_eq!(drop_reason(&echoed, &f, None), Some("prompt-parrot (no speech)"));
+        assert_eq!(
+            drop_reason(&echoed, &f, None),
+            Some("prompt-parrot (no speech)")
+        );
     }
 
     #[test]
     fn vad_blips_and_empty_transcripts_are_dropped() {
         let f = SpeechFilter::default();
-        assert_eq!(drop_reason(&utt("", 2.0, 0), &f, None), Some("too-short-text"));
-        assert_eq!(drop_reason(&utt("a", 2.0, 0), &f, None), Some("too-short-text"));
+        assert_eq!(
+            drop_reason(&utt("", 2.0, 0), &f, None),
+            Some("too-short-text")
+        );
+        assert_eq!(
+            drop_reason(&utt("a", 2.0, 0), &f, None),
+            Some("too-short-text")
+        );
         // The 0.46 s blip that was actually observed.
         assert_eq!(
             drop_reason(&utt("hm", 0.46, 0), &f, None),
