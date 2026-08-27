@@ -148,7 +148,7 @@ telling the tool what to show you next, and the history falls out naturally.
 | Faculty | Purpose |
 |---|---|
 | `compass` | Goal/status/priority board plus referenceable ledger notes |
-| `wiki` | Personal wiki with typst fragments, links, and full-text search |
+| `wiki` | Personal wiki with typst fragments, links, full-text search, and a classified frontier link audit (`wiki links`) |
 | `files` | File organizer backed by blob storage and tags |
 | `orient` | Situation awareness and directed message/goal/note notifications |
 | `atlas` | Cross-collection map of the pile's contents |

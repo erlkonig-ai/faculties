@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **`wiki links` audits the whole frontier, and says what kind of dangling a
+  dangling link is.** The previous check treated every unresolved target as a
+  BROKEN_LINK, which is wrong in both directions on a wiki whose convention is
+  to link liberally. Three outcomes are now separated, because they mean
+  different things and only one of them is breakage:
+
+  * a target that is a real revision inside an entry whose every current state
+    is ARCHIVED -- the live frontier dropped it under the citation, and this is
+    the class that means something broke;
+  * a LEGACY FRAGMENT ANCHOR, which stopped being a selector on 2026-08-18 but
+    whose facts are still in the append-only store, so the reference is
+    reachable through the compatibility path -- a migration signal, not damage;
+  * a target no fragment ever had at any revision -- a forward reference, which
+    the wiki's own convention says marks work worth doing rather than a defect.
+
+  A citation of a SUPERSEDED revision is none of these: it names exactly what
+  its author read, and `wiki show --latest` follows it forward. A fork is
+  likewise evidence, never a row to settle.
+
+  Measured on the live corpus, this is not a cosmetic distinction: the old flat
+  check reported "Checked 3264 entries, 0 issues / All clear!" while two
+  frontier citations pointed into an archived entry the whole time. A revision
+  id inside an archived entry is still a KNOWN id, so a membership test could
+  never see it. The new report finds both, from 10253 frontier citations across
+  3252 live entries.
+
+  The report is diagnostic and never gates: `--strict` is the opt-in exit code,
+  and it fires only on the archived-target class. The same walk yields the
+  incoming direction for free, so unreferenced live entries are listed too, and
+  the number of indexed legacy anchors is printed beside the class counts so a
+  zero there reads as "none is cited" rather than "the index is empty".
+  `wiki check` shares the classifier; `wiki links <id>` is unchanged.
+
+- **`gauge`'s frontier model now lives in `faculties::wiki`.** `gauge` is
+  wiki-only -- every faculty import in it is wiki or generic infrastructure,
+  and it has no pile branch of its own -- so the entry/frontier/selector model
+  it had grown belongs in the library where the wiki CLI can reach it, rather
+  than becoming a second link extractor that drifts from the first. Both
+  binaries now share one `wiki::tag_display_name`, which is also a small fix:
+  gauge prints a built-in tag's name instead of its id.
+
 - **Streamed Archive payloads now enter the artifact-serving protocol.** The
   Archive importer still validates and writes each source fragment's embedded
   blobs immediately, so large imports do not retain their bytes until the final

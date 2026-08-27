@@ -979,16 +979,19 @@ pub enum LinkResolution {
     Ambiguous(Vec<usize>),
 }
 
-/// Every entry's current states, plus the revision-id → entry index that makes
-/// a link target resolvable.
+/// Every entry's current states, plus the indexes that make a link target
+/// resolvable: revision ids directly, legacy fragment anchors through the
+/// compatibility path, and the non-revision entities a target might name.
 #[derive(Clone, Debug)]
 pub struct FrontierModel {
     pub entries: Vec<FrontierEntry>,
     selectors: BTreeMap<Id, BTreeSet<usize>>,
+    anchors: BTreeMap<Id, BTreeSet<usize>>,
+    kinds: BTreeMap<Id, OtherKind>,
 }
 
 impl FrontierModel {
-    pub fn load(catalog: &WikiCatalog, reader: &PileReader) -> Result<Self> {
+    pub fn load(catalog: &WikiCatalog, reader: &PileReader, facts: &TribleSet) -> Result<Self> {
         let records = catalog.revisions.all_entries();
         let mut entries = Vec::with_capacity(records.len());
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
@@ -1029,7 +1032,29 @@ impl FrontierModel {
             });
         }
 
-        Ok(Self { entries, selectors })
+        let anchors = Self::index_anchors(facts, &selectors);
+        let mut kinds = BTreeMap::new();
+        for (id, _) in TAG_SPECS {
+            kinds.insert(id, OtherKind::Tag);
+        }
+        for id in catalog.tag_names.keys() {
+            kinds.insert(*id, OtherKind::Tag);
+        }
+        for id in catalog.author_keys.keys() {
+            kinds.insert(*id, OtherKind::Author);
+        }
+        for record in catalog.revisions.revision_records() {
+            for authorship in &record.authorships {
+                kinds.insert(authorship.id, OtherKind::Authorship);
+            }
+        }
+
+        Ok(Self {
+            entries,
+            selectors,
+            anchors,
+            kinds,
+        })
     }
 
     pub fn resolve(&self, target: Id) -> LinkResolution {
@@ -1052,6 +1077,201 @@ impl FrontierModel {
 
     pub fn active_count(&self) -> usize {
         self.active_entries().count()
+    }
+}
+
+// ── what a dangling link actually means ────────────────────────────────────
+//
+// A wiki whose convention is to LINK LIBERALLY cannot treat every unresolved
+// target as a defect: a link to a page nobody has written yet marks work, not
+// breakage. Three outcomes are genuinely different and a report that merges
+// them is worse than no report at all.
+
+/// A non-revision Wiki entity a link target happens to name.
+///
+/// Not breakage in itself — it says the reference points at the wrong KIND of
+/// thing, which is a different mistake from pointing at nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OtherKind {
+    Tag,
+    Author,
+    Authorship,
+}
+
+impl OtherKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::Author => "author",
+            Self::Authorship => "authorship",
+        }
+    }
+}
+
+/// What a link target names, once the whole revision DAG is consulted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkClass {
+    /// Resolves to an entry that is still on the live frontier. A citation of
+    /// a SUPERSEDED revision lands here too: it names exactly what its author
+    /// read, and `wiki show --latest` follows it forward.
+    Live(usize),
+    /// One id names several disconnected entries. Evidence, never breakage.
+    Ambiguous(Vec<usize>),
+    /// The target is a real revision, but every current state of its entry is
+    /// archived — the live frontier no longer carries it. THIS is the class
+    /// that means a reference went stale under someone.
+    Retired(usize),
+    /// Not a revision, but a legacy fragment anchor whose retained facts still
+    /// name an entry. Reachable through the compatibility path only: the
+    /// anchor stopped being a selector on 2026-08-18. A migration signal.
+    Legacy { entries: Vec<usize>, retired: bool },
+    /// No fragment at any revision, ever. A forward reference — the convention
+    /// is to link liberally, so this is a TODO list, not a defect list.
+    Unwritten(Option<OtherKind>),
+}
+
+impl LinkClass {
+    /// True only for the one class that means something actually broke.
+    pub const fn is_breakage(&self) -> bool {
+        matches!(self, Self::Retired(_))
+    }
+}
+
+/// One citation, kept with the revision that made it.
+#[derive(Clone, Debug)]
+pub struct LinkReference {
+    pub source: Id,
+    pub source_entry: usize,
+    pub source_title: String,
+    pub target: Id,
+    pub class: LinkClass,
+}
+
+/// The whole frontier's outgoing citations, classified, plus the incoming
+/// count each entry earned from that same walk.
+#[derive(Clone, Debug, Default)]
+pub struct LinkAudit {
+    pub states: usize,
+    pub total: usize,
+    pub live: usize,
+    pub ambiguous: Vec<LinkReference>,
+    pub retired: Vec<LinkReference>,
+    pub legacy: Vec<LinkReference>,
+    pub unwritten: Vec<LinkReference>,
+    /// Incoming resolved citations per entry index, self-citations excluded.
+    pub incoming: Vec<usize>,
+}
+
+impl LinkAudit {
+    pub fn breakage(&self) -> usize {
+        self.retired.len()
+    }
+}
+
+impl FrontierModel {
+    /// Every legacy fragment anchor that still names an entry.
+    ///
+    /// The anchor is no longer a SELECTOR, but its facts were never removed —
+    /// the store is append-only — so a reference written before the cutover can
+    /// still be told apart from one that never had a target.
+    fn index_anchors(
+        facts: &TribleSet,
+        selectors: &BTreeMap<Id, BTreeSet<usize>>,
+    ) -> BTreeMap<Id, BTreeSet<usize>> {
+        let mut anchors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
+        for (anchor, revision) in find!(
+            (anchor: Id, revision: Id),
+            pattern!(facts, [{ ?revision @ attrs::fragment: ?anchor }])
+        ) {
+            if let Some(entries) = selectors.get(&revision) {
+                anchors
+                    .entry(anchor)
+                    .or_default()
+                    .extend(entries.iter().copied());
+            }
+        }
+        anchors
+    }
+
+    /// Classify one link target against the complete revision DAG.
+    pub fn classify(&self, target: Id) -> LinkClass {
+        match self.resolve(target) {
+            LinkResolution::Unique(index) => {
+                if self.entries[index].active {
+                    LinkClass::Live(index)
+                } else {
+                    LinkClass::Retired(index)
+                }
+            }
+            LinkResolution::Ambiguous(candidates) => LinkClass::Ambiguous(candidates),
+            LinkResolution::Missing => match self.anchors.get(&target) {
+                Some(entries) => LinkClass::Legacy {
+                    entries: entries.iter().copied().collect(),
+                    retired: !entries.iter().any(|index| self.entries[*index].active),
+                },
+                None => LinkClass::Unwritten(self.kinds.get(&target).copied()),
+            },
+        }
+    }
+
+    /// Walk every current state of every live entry once, classifying its
+    /// outgoing citations and counting the incoming ones on the way.
+    pub fn audit(&self) -> LinkAudit {
+        let mut audit = LinkAudit {
+            incoming: vec![0; self.entries.len()],
+            ..LinkAudit::default()
+        };
+        for (index, entry) in self.entries.iter().enumerate().filter(|(_, e)| e.active) {
+            for state in &entry.states {
+                audit.states += 1;
+                for &target in &state.links {
+                    audit.total += 1;
+                    let class = self.classify(target);
+                    let reference = LinkReference {
+                        source: state.revision,
+                        source_entry: index,
+                        source_title: state.title.clone(),
+                        target,
+                        class: class.clone(),
+                    };
+                    match class {
+                        // A page citing itself does not make it referenced.
+                        LinkClass::Live(target_entry) => {
+                            audit.live += 1;
+                            if target_entry != index {
+                                audit.incoming[target_entry] += 1;
+                            }
+                        }
+                        LinkClass::Ambiguous(_) => audit.ambiguous.push(reference),
+                        LinkClass::Retired(_) => audit.retired.push(reference),
+                        LinkClass::Legacy { .. } => audit.legacy.push(reference),
+                        LinkClass::Unwritten(_) => audit.unwritten.push(reference),
+                    }
+                }
+            }
+        }
+        audit
+    }
+
+    /// How many legacy fragment anchors the compatibility path can still name.
+    ///
+    /// Reported alongside the audit so a ZERO in the legacy class is readable:
+    /// "no anchor is cited from the frontier" and "the anchor index is empty"
+    /// are different findings, and a report that cannot tell them apart is a
+    /// check that passes for the wrong reason.
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// Live entries nothing else at the frontier cites, cheapest form: the
+    /// incoming counts the audit already produced.
+    pub fn unreferenced(&self, audit: &LinkAudit) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| entry.active && audit.incoming[*index] == 0)
+            .map(|(index, _)| index)
+            .collect()
     }
 }
 
@@ -1480,5 +1700,209 @@ mod tests {
         let error = load_catalog(&facts).unwrap_err().to_string();
         assert!(error.contains(&format!("Wiki revision {redundant:x}")));
         assert!(error.contains("has redundant predecessors"));
+    }
+
+    /// THE NEGATIVE CONTROL. A checker that reports zero problems on a real
+    /// corpus proves nothing unless a known-broken reference makes it fire and
+    /// a known-good one does not, so this fixture contains one of each and
+    /// pins every class between them.
+    ///
+    /// Built as one pile because the classifier reads content out of blobs:
+    /// links are reproduced from admitted text, never asserted as facts.
+    #[test]
+    fn the_audit_separates_breakage_from_a_forward_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[21; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (archived_tag, archived, _) = tag_record("archived").unwrap();
+
+        // A page that is still on the frontier: linking to it is FINE.
+        let (live_fragment, live) = revision_record(draft(author, "live page", [])).unwrap();
+        // A page whose only current state is archived: linking to it is the
+        // one thing here that is actually broken.
+        let mut retired_draft = draft(author, "retired page", []);
+        retired_draft.tags.insert(archived);
+        let (retired_fragment, retired) = revision_record(retired_draft).unwrap();
+        // A legacy anchor: not a selector since 2026-08-18, but its facts are
+        // still here, so a reference to it is reachable through the old path.
+        let anchor = genid().id;
+        let legacy_version = genid().id;
+        let mut legacy_fragment = Fragment::empty();
+        let legacy_title: TextHandle = legacy_fragment.put("legacy page".to_owned());
+        let legacy_content: TextHandle = legacy_fragment.put("legacy body".to_owned());
+        legacy_fragment += entity! { ExclusiveId::force_ref(&legacy_version) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::fragment: anchor,
+            attrs::title: legacy_title,
+            attrs::content: legacy_content,
+            metadata::created_at: at(1.0),
+        };
+        // An id nobody ever minted a fragment for.
+        let unwritten = Id::from_hex("11111111111111111111111111111111").unwrap();
+
+        let citing = format!(
+            "ok #link(\"wiki:{live:x}\")[live]\n\
+             broken #link(\"wiki:{retired:x}\")[retired]\n\
+             legacy #link(\"wiki:{anchor:x}\")[anchor]\n\
+             todo #link(\"wiki:{unwritten:x}\")[unwritten]\n\
+             wrong kind #link(\"wiki:{archived:x}\")[a tag]\n"
+        );
+        let (citer_fragment, citer) = revision_record(RevisionDraft {
+            title: "citing page".to_owned(),
+            content: citing,
+            tags: BTreeSet::new(),
+            predecessors: BTreeSet::new(),
+            author,
+            authored_at: at(2.0),
+        })
+        .unwrap();
+
+        let mut fragment = author_fragment + archived_tag;
+        fragment += live_fragment;
+        fragment += retired_fragment;
+        fragment += legacy_fragment;
+        fragment += citer_fragment;
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .commit(fragment)
+            .unwrap();
+        let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
+        let catalog = validate_catalog(&reader, &facts).unwrap();
+        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+
+        let index_of = |target: Id| match model.resolve(target) {
+            LinkResolution::Unique(index) => index,
+            other => panic!("expected one entry for {target:x}, got {other:?}"),
+        };
+        // The good reference does not fire, and the broken one does.
+        assert_eq!(model.classify(live), LinkClass::Live(index_of(live)));
+        assert!(!model.classify(live).is_breakage());
+        assert_eq!(
+            model.classify(retired),
+            LinkClass::Retired(index_of(retired))
+        );
+        assert!(model.classify(retired).is_breakage());
+        // Never written is a TODO, not a defect.
+        assert_eq!(model.classify(unwritten), LinkClass::Unwritten(None));
+        assert!(!model.classify(unwritten).is_breakage());
+        // Naming a tag is a different mistake from naming nothing.
+        assert_eq!(
+            model.classify(archived),
+            LinkClass::Unwritten(Some(OtherKind::Tag))
+        );
+        // The anchor is reachable only through the compatibility path.
+        assert_eq!(
+            model.classify(anchor),
+            LinkClass::Legacy {
+                entries: vec![index_of(legacy_version)],
+                retired: false,
+            }
+        );
+
+        let audit = model.audit();
+        assert_eq!(audit.live, 1);
+        assert_eq!(audit.retired.len(), 1);
+        assert_eq!(audit.retired[0].source, citer);
+        assert_eq!(audit.retired[0].target, retired);
+        assert_eq!(audit.legacy.len(), 1);
+        assert_eq!(audit.unwritten.len(), 2);
+        assert!(audit.ambiguous.is_empty(), "one target, one entry, no fork");
+        // The archived page is not a SOURCE either: only the live frontier is
+        // walked, so retiring a page does not resurrect its own citations.
+        assert_eq!(audit.states, 3, "live, legacy and citing pages only");
+
+        // The orphan direction falls out of the same walk: the citer is cited
+        // by nobody, and the live page it cites is not an orphan.
+        let unreferenced: BTreeSet<Id> = model
+            .unreferenced(&audit)
+            .into_iter()
+            .map(|index| model.entries[index].label)
+            .collect();
+        assert!(unreferenced.contains(&citer));
+        assert!(!unreferenced.contains(&live));
+        pile.close().unwrap();
+    }
+
+    /// A page citing ITSELF is not a page anyone linked to.
+    #[test]
+    fn a_self_citation_does_not_make_an_entry_referenced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("self.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[22; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+        let (successor_fragment, _) = revision_record(RevisionDraft {
+            title: "root".to_owned(),
+            content: format!("see #link(\"wiki:{root:x}\")[my own first draft]\n"),
+            tags: BTreeSet::new(),
+            predecessors: BTreeSet::from([root]),
+            author,
+            authored_at: at(2.0),
+        })
+        .unwrap();
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .commit(author_fragment + root_fragment + successor_fragment)
+            .unwrap();
+        let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
+        let catalog = validate_catalog(&reader, &facts).unwrap();
+        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+        let audit = model.audit();
+        assert_eq!(audit.live, 1, "the citation resolves");
+        assert_eq!(audit.incoming, vec![0], "but not as an incoming reference");
+        assert_eq!(model.unreferenced(&audit).len(), 1);
+        pile.close().unwrap();
+    }
+
+    /// The audit is READ-ONLY, and this compares the pile's bytes to prove it.
+    ///
+    /// The real corpus is written by other windows while a report runs, so its
+    /// size moving proves nothing either way; a pile nobody else holds is the
+    /// only place the claim can actually be tested. Byte equality rather than a
+    /// digest: it is a small file and an exact comparison cannot be fooled.
+    #[test]
+    fn the_audit_leaves_the_pile_byte_identical() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[23; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+        let (citer_fragment, _) = revision_record(RevisionDraft {
+            title: "citer".to_owned(),
+            content: format!("#link(\"wiki:{root:x}\")[root]\n"),
+            tags: BTreeSet::new(),
+            predecessors: BTreeSet::new(),
+            author,
+            authored_at: at(2.0),
+        })
+        .unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .commit(author_fragment + root_fragment + citer_fragment)
+            .unwrap();
+        pile.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Exactly what `wiki links` and `wiki check` do, and nothing else.
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
+        let catalog = validate_catalog(&reader, &facts).unwrap();
+        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+        let audit = model.audit();
+        let _ = model.unreferenced(&audit);
+        pile.close().unwrap();
+
+        assert_eq!(audit.live, 1, "the fixture must actually have been read");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "auditing links must not append a single byte"
+        );
     }
 }

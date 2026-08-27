@@ -328,7 +328,7 @@ fn with_model<T>(
         let reader = pile.reader().context("open Wiki attachment reader")?;
         let catalog =
             wiki_model::validate_catalog(&reader, &facts).context("validate Wiki collection")?;
-        let model = GaugeModel::load(&catalog, &reader)?;
+        let model = GaugeModel::load(&catalog, &reader, &facts)?;
         operation(&model)
     })();
     let close = pile.close().map_err(anyhow::Error::from);

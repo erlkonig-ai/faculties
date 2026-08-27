@@ -13,7 +13,8 @@ use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use faculties::schemas::wiki::{self as schema, extract_link_targets};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{
-    self as wiki_model, EntryRecord, RevisionDraft, RevisionReadModel, RevisionRecord, WikiCatalog,
+    self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
+    RevisionReadModel, RevisionRecord, WikiCatalog,
 };
 #[cfg(test)]
 use hifitime::Epoch;
@@ -98,13 +99,25 @@ enum Command {
         #[arg(long)]
         to: usize,
     },
-    /// Show outgoing links from the current text, and every revision citing it.
+    /// Audit every frontier link, or show one entry's links when given an id.
     ///
-    /// Incoming links are revision-scoped: a citation records what its author
-    /// read, so a superseded revision that cited this page is still listed.
-    /// `wiki show --latest <revision>` says whether the citation survived.
+    /// With no id this classifies the whole live frontier's citations: a
+    /// target that never existed is a forward reference, one whose entry is
+    /// archived is real breakage, and a legacy fragment anchor is a migration
+    /// signal. Diagnostic by default; `--strict` is the opt-in exit code.
+    ///
+    /// With an id, incoming links are revision-scoped: a citation records what
+    /// its author read, so a superseded revision that cited this page is still
+    /// listed. `wiki show --latest <revision>` says whether it survived.
     Links {
-        id: String,
+        id: Option<String>,
+        /// Rows to print per class, and unreferenced entries to name.
+        #[arg(long, default_value = "15")]
+        top: usize,
+        /// Exit non-zero when a link points into an archived entry. OPT-IN:
+        /// nothing else here ever fails, forward references least of all.
+        #[arg(long)]
+        strict: bool,
     },
     List {
         #[arg(long)]
@@ -939,9 +952,12 @@ fn backlink_summaries(
     Ok(summaries)
 }
 
-fn cmd_links(storage: WikiStorage<'_>, id: String) -> Result<()> {
+fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: bool) -> Result<()> {
     let view = storage.view()?;
     let catalog = wiki_model::load_catalog(&view.facts)?;
+    let Some(id) = id else {
+        return cmd_link_audit(&view, &catalog, top, strict);
+    };
     let entry = mutation_entry(&catalog.revisions, &id)?;
     println!("outgoing:");
     for target in derived_links(&view.reader, entry)? {
@@ -952,6 +968,131 @@ fn cmd_links(storage: WikiStorage<'_>, id: String) -> Result<()> {
         println!("  {source:x}");
     }
     Ok(())
+}
+
+fn describe_target(model: &FrontierModel, reference: &LinkReference) -> String {
+    let entry = |index: usize| {
+        let entry = &model.entries[index];
+        format!("{} [wiki:{:x}]", short(&entry.title(), 55), entry.label)
+    };
+    match &reference.class {
+        LinkClass::Live(index) | LinkClass::Retired(index) => entry(*index),
+        LinkClass::Ambiguous(candidates) => candidates
+            .iter()
+            .map(|index| entry(*index))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        LinkClass::Legacy { entries, retired } => format!(
+            "{}{}",
+            entries
+                .iter()
+                .map(|index| entry(*index))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            if *retired { " (archived)" } else { "" }
+        ),
+        LinkClass::Unwritten(Some(kind)) => format!("names a {}, not a page", kind.label()),
+        LinkClass::Unwritten(None) => "nothing, at any revision".to_owned(),
+    }
+}
+
+fn print_class(model: &FrontierModel, heading: &str, rows: &[LinkReference], top: usize) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n--- {heading} ({}) ---", rows.len());
+    for reference in rows.iter().take(top) {
+        println!(
+            "{} [wiki:{:x}]",
+            short(&reference.source_title, 60),
+            reference.source
+        );
+        println!(
+            "  -> wiki:{:x}  {}",
+            reference.target,
+            describe_target(model, reference)
+        );
+    }
+    if rows.len() > top {
+        println!("  … {} more", rows.len() - top);
+    }
+}
+
+/// Classify every citation the live frontier makes.
+///
+/// Diagnostic by design: this reports, it does not gate. The one class that
+/// means something broke is a citation into an entry whose every current state
+/// is archived; an unwritten target is the wiki's link-liberally convention
+/// working as intended, and a legacy anchor is a migration signal.
+fn cmd_link_audit(
+    view: &CollectionView,
+    catalog: &WikiCatalog,
+    top: usize,
+    strict: bool,
+) -> Result<()> {
+    let model = FrontierModel::load(catalog, &view.reader, &view.facts)?;
+    let audit = model.audit();
+    let unreferenced = model.unreferenced(&audit);
+
+    println!("=== WIKI: Frontier Link Audit ===\n");
+    println!(
+        "Live entries:          {} ({} current states)",
+        model.active_count(),
+        audit.states
+    );
+    println!("Outgoing citations:    {}", audit.total);
+    println!("  resolve live:        {}", audit.live);
+    println!(
+        "  ambiguous selector:  {}  (a fork is evidence, not breakage)",
+        audit.ambiguous.len()
+    );
+    println!(
+        "  archived target:     {}  <- BROKEN: the frontier dropped it",
+        audit.retired.len()
+    );
+    println!(
+        "  legacy anchor only:  {}  <- migration signal, still reachable",
+        audit.legacy.len()
+    );
+    println!(
+        "  never written:       {}  <- forward references, a TODO list",
+        audit.unwritten.len()
+    );
+    println!(
+        "Legacy anchors indexed: {}  (a zero above means none is CITED, not\n\
+         \x20                        that none exists)",
+        model.anchor_count()
+    );
+
+    print_class(&model, "ARCHIVED TARGETS", &audit.retired, top);
+    print_class(&model, "LEGACY ANCHORS", &audit.legacy, top);
+    print_class(&model, "NEVER WRITTEN", &audit.unwritten, top);
+    print_class(&model, "AMBIGUOUS SELECTORS", &audit.ambiguous, top);
+
+    println!(
+        "\n--- UNREFERENCED LIVE ENTRIES ({} of {}) ---",
+        unreferenced.len(),
+        model.active_count()
+    );
+    for index in unreferenced.iter().take(top) {
+        let entry = &model.entries[*index];
+        println!("{} [wiki:{:x}]", short(&entry.title(), 60), entry.label);
+    }
+    if unreferenced.len() > top {
+        println!("  … {} more", unreferenced.len() - top);
+    }
+
+    if strict && audit.breakage() > 0 {
+        bail!(
+            "{} frontier citation(s) point into an archived entry",
+            audit.breakage()
+        );
+    }
+    Ok(())
+}
+
+fn short(value: &str, chars: usize) -> String {
+    value.chars().take(chars).collect()
 }
 
 /// Every revision whose own text cites `entry`, superseded revisions included.
@@ -1257,19 +1398,52 @@ fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool)
     Ok(())
 }
 
+/// Report what is actually wrong, which is narrower than what is dangling.
+///
+/// Until 2026-08-27 every unresolved target counted as a BROKEN_LINK, which
+/// made a corpus that links liberally -- a link to a page nobody has written
+/// yet marks work worth doing -- report thousands of defects it does not have.
+/// Only a citation into an entry whose every current state is archived is
+/// breakage; a legacy anchor and an unwritten target are reported separately
+/// and counted as neither. `wiki links` is the full classified report.
 fn cmd_check(storage: WikiStorage<'_>, compile: bool) -> Result<()> {
     let view = storage.view()?;
     let catalog = wiki_model::validate_catalog(&view.reader, &view.facts)?;
-    let known = known_link_ids(&catalog.revisions);
+    let model = FrontierModel::load(&catalog, &view.reader, &view.facts)?;
     let mut issues = 0usize;
+    let mut legacy = 0usize;
+    let mut unwritten = 0usize;
+    let mut archived = 0usize;
     for entry in catalog.revisions.all_entries() {
+        // An archived page citing an archived page is not actionable, and
+        // scoping links to the LIVE frontier is what keeps this command and
+        // `wiki links` from reporting two different numbers for one corpus.
+        // Typst still compiles every entry: bad markup is bad archived too.
+        let live = entry
+            .frontier
+            .iter()
+            .any(|head| !head.tags.contains(&schema::TAG_ARCHIVED_ID));
+        if !live {
+            archived += 1;
+        }
         for head in &entry.frontier {
             let content = revision_content(&view.reader, head)?;
-            for raw in extract_link_targets(&content) {
+            for raw in extract_link_targets(&content).into_iter().filter(|_| live) {
                 let id = Id::from_hex(&raw).expect("extractor returns full ids");
-                if !known.contains(&id) {
-                    eprintln!("BROKEN_LINK  {:x}  wiki:{raw}", head.id);
-                    issues += 1;
+                match model.classify(id) {
+                    LinkClass::Live(_) | LinkClass::Ambiguous(_) => {}
+                    LinkClass::Retired(target) => {
+                        eprintln!(
+                            "BROKEN_LINK  {:x}  wiki:{raw}  -> archived entry wiki:{:x}",
+                            head.id, model.entries[target].label
+                        );
+                        issues += 1;
+                    }
+                    LinkClass::Legacy { .. } => {
+                        eprintln!("LEGACY_LINK  {:x}  wiki:{raw}", head.id);
+                        legacy += 1;
+                    }
+                    LinkClass::Unwritten(_) => unwritten += 1,
                 }
             }
             if compile {
@@ -1280,9 +1454,11 @@ fn cmd_check(storage: WikiStorage<'_>, compile: bool) -> Result<()> {
             }
         }
     }
+    let entries = catalog.revisions.all_entries().len();
     println!(
-        "Checked {} entries, {issues} issues",
-        catalog.revisions.all_entries().len()
+        "Checked {} live entries ({archived} archived, links not scanned), \
+         {issues} issues ({legacy} legacy anchor, {unwritten} unwritten target)",
+        entries - archived
     );
     if issues == 0 {
         println!("All clear!");
@@ -2095,7 +2271,7 @@ fn main() -> Result<()> {
         Command::Archive { id } => mutate_tags(storage, id, "archived", true),
         Command::Restore { id } => mutate_tags(storage, id, "archived", false),
         Command::Revert { id, to } => cmd_revert(storage, id, to),
-        Command::Links { id } => cmd_links(storage, id),
+        Command::Links { id, top, strict } => cmd_links(storage, id, top, strict),
         Command::List {
             tag,
             with_backlink_tag,
