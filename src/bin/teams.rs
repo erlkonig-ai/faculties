@@ -3966,7 +3966,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_auth_secret_reference_is_rejected_before_append() {
+    fn unknown_auth_secret_reference_is_rejected_before_collection_commit() {
         let fixture = Fixture::new();
         let source_identity = source_fragment("tenant.example");
         let source = source_identity.root().unwrap();
@@ -3982,13 +3982,18 @@ mod tests {
         .unwrap();
         let mut fragment = source_identity;
         fragment += profile;
-        let before = fs::read(&fixture.pile).unwrap();
         let error = fixture
             .storage()
             .publish(fragment, "dangling auth ref")
             .unwrap_err();
         assert!(error.to_string().contains("unknown delegated token bundle"));
-        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+
+        // Registering a collection may append its descriptor closure, but a
+        // rejected publication must not make any collection commit visible.
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let records =
+            triblespace::core::collection::discover_collection_records(&mut pile).unwrap();
+        assert!(records.commits().is_empty());
     }
 
     #[test]
