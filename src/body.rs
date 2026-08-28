@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
@@ -99,15 +100,14 @@ impl BodySnapshot {
 /// intrinsic event id, matching the historical JIT reader exactly. Capture
 /// rows form an independent `KIND_CAPTURE` register in the same target bytes;
 /// [`latest_intent`] scopes the read with `winner(KIND_INTENT)`.
-pub fn intent_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+pub fn intent_register_collection(authority: VerifyingKey) -> LwwRegisterCollection {
     LwwRegisterCollection::new(
         crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        namespace,
-        None,
+        authority,
         metadata::tag.id(),
         metadata::created_at.id(),
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        None,
+        authority,
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
     )
 }
@@ -523,16 +523,14 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
-    let snapshot = {
-        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-        collection
-            .snapshot()
-            .map_err(|error| anyhow!("snapshot Body collection: {error}"))?
-    };
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let snapshot = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("snapshot Body collection: {error}"))?;
     let (facts, ticket, reader) = snapshot.into_parts();
     let catalog = validate_catalog(&reader, &facts).context("validate Body collection")?;
     let intents = intent_register_collection(signer.verifying_key())
-        .ensure_exact(pile, &ticket)
+        .ensure_exact(pile, ticket.commits())
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,

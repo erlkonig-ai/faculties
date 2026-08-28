@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::Fragment;
@@ -634,26 +634,26 @@ mod tests {
         let first = imported.report.clone();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let ticket_before = crate::collection_names::open(
+        let collection = crate::collection_names::open(
             &mut pile,
             crate::schemas::wiki::DEFAULT_SCOPE_ID,
-            signer,
+            signer.verifying_key(),
         )
-        .ticket()
         .unwrap();
+        let ticket_before = pile.ticket(collection, &[]).unwrap();
         pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
         let bytes_after = std::fs::metadata(&imported.pile).unwrap().len();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let ticket_after = crate::collection_names::open(
+        let collection = crate::collection_names::open(
             &mut pile,
             crate::schemas::wiki::DEFAULT_SCOPE_ID,
-            signer,
+            signer.verifying_key(),
         )
-        .ticket()
         .unwrap();
+        let ticket_after = pile.ticket(collection, &[]).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());

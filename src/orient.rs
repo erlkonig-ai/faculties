@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
@@ -63,15 +64,14 @@ impl OrientSnapshot {
 }
 
 /// Exact maintained LWW projection for each persona's checkpoint stream.
-pub fn checkpoint_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+pub fn checkpoint_register_collection(authority: VerifyingKey) -> LwwRegisterCollection {
     LwwRegisterCollection::new(
         crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        namespace,
-        None,
+        authority,
         checkpoint::persona.id(),
         metadata::created_at.id(),
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        None,
+        authority,
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
     )
 }
@@ -515,16 +515,14 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<OrientSnapshot> {
-    let snapshot = {
-        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-        collection
-            .snapshot()
-            .map_err(|error| anyhow!("snapshot Orient collection: {error}"))?
-    };
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let snapshot = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("snapshot Orient collection: {error}"))?;
     let (facts, ticket, reader) = snapshot.into_parts();
     load_checkpoint_events(&reader, &facts).context("validate Orient checkpoint collection")?;
     let checkpoints = checkpoint_register_collection(signer.verifying_key())
-        .ensure_exact(pile, &ticket)
+        .ensure_exact(pile, ticket.commits())
         .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
     Ok(OrientSnapshot {
         facts,

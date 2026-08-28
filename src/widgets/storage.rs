@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::observed_union::ObservedIndex;
-use triblespace::core::collection::{CollectionCommit, CollectionHandle};
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt, CollectionTicket};
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::trible::TribleSet;
@@ -652,34 +652,23 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = (|| {
-        let mut by_scope =
-            BTreeMap::<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>::new();
+        let mut by_scope = BTreeMap::<Id, (CollectionHandle, TribleSet, CollectionTicket)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
         for (scope, label) in materialization_scopes(sources) {
-            let (collection_id, facts, commits) = {
-                let mut collection = open_scope(&mut pile, scope, signer.clone());
-                // Written out rather than reached for: core deliberately offers
-                // no helper for hashing a descriptor it did not store. This one
-                // is a display key for the loaded view, never published under.
-                let collection_id =
-                    triblespace::core::blob::IntoBlob::<
-                        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
-                    >::to_blob(collection.descriptor().facts().clone())
-                    .get_handle();
-                let snapshot = collection
-                    .snapshot()
-                    .map_err(|error| format!("materialize {label} collection: {error}"))?;
-                let (facts, commits, _reader) = snapshot.into_parts();
-                (collection_id, facts, commits)
-            };
-            by_scope.insert(scope, (collection_id, facts, commits));
+            let collection = open_scope(&mut pile, scope, &signer)
+                .map_err(|error| format!("register {label} collection: {error:#}"))?;
+            let snapshot = pile
+                .snapshot(collection, &[])
+                .map_err(|error| format!("materialize {label} collection: {error}"))?;
+            let (facts, ticket, _reader) = snapshot.into_parts();
+            by_scope.insert(scope, (collection, facts, ticket));
         }
 
-        if let Some((_, _, commits)) = by_scope.get(&COMPASS_SCOPE_ID) {
+        if let Some((_, _, ticket)) = by_scope.get(&COMPASS_SCOPE_ID) {
             let index = crate::compass::status_register_collection(signer.verifying_key())
-                .ensure_exact(&mut pile, commits)
+                .ensure_exact(&mut pile, ticket.commits())
                 .map_err(|error| format!("maintain Compass status register: {error}"))?;
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
@@ -690,9 +679,9 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             );
         }
 
-        if let Some((_, _, commits)) = by_scope.get(&WIKI_SCOPE_ID) {
+        if let Some((_, _, ticket)) = by_scope.get(&WIKI_SCOPE_ID) {
             let index = crate::wiki::observed_collection(signer.verifying_key())
-                .ensure_exact(&mut pile, commits)
+                .ensure_exact(&mut pile, ticket.commits())
                 .map_err(|error| format!("maintain Wiki supersession index: {error}"))?;
             observed_by_scope
                 .entry(WIKI_SCOPE_ID)
@@ -758,7 +747,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 
 fn validate_catalog(
     reader: &PileReader,
-    by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>,
+    by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet, CollectionTicket)>,
     observed_by_scope: &BTreeMap<Id, BTreeMap<Id, ObservedIndex>>,
     sources: &BTreeSet<SourceKey>,
     secrets: Option<&SecretsSnapshot<PileReader>>,
@@ -966,9 +955,10 @@ mod tests {
 
         let signer = load_signer(path, None).unwrap();
         let mut pile = open_pile_strict(path).unwrap();
-        crate::collection_names::open(&mut pile, STATUS_SCOPE_ID, signer)
-            .commit(fragment)
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, STATUS_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(collection, &signer, fragment).unwrap();
         pile.close().unwrap();
     }
 
@@ -1131,9 +1121,10 @@ mod tests {
             author_fragment + root_fragment + successor_fragment,
         )
         .unwrap();
-        let ticket_before = crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.clone())
-            .ticket()
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let ticket_before = pile.ticket(collection, &[]).unwrap();
         pile.close().unwrap();
 
         let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
@@ -1149,9 +1140,10 @@ mod tests {
         assert_eq!(indexed.revisions.all_entries()[0].frontier[0].id, successor);
 
         let mut pile = open_pile_strict(&path).unwrap();
-        let ticket_after = crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer)
-            .ticket()
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let ticket_after = pile.ticket(collection, &[]).unwrap();
         pile.close().unwrap();
         assert_eq!(ticket_after, ticket_before);
     }

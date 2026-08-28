@@ -13,7 +13,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -63,15 +63,14 @@ impl CompassSnapshot {
 }
 
 /// The exact maintained LWW projection used for current Compass status.
-pub fn status_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+pub fn status_register_collection(authority: VerifyingKey) -> LwwRegisterCollection {
     LwwRegisterCollection::new(
         crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        namespace,
-        None,
+        authority,
         board::status_of.id(),
         metadata::created_at.id(),
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        None,
+        authority,
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
     )
 }
@@ -1026,12 +1025,11 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
-        .materialize()
-        .map_err(|error| anyhow!("materialize Compass collection: {error}"))?;
-    let reader = pile
-        .reader()
-        .map_err(|error| anyhow!("open Compass attachment reader: {error}"))?;
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let (facts, _, reader) = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("materialize Compass collection: {error}"))?
+        .into_parts();
     validate_known_payloads(&reader, &facts)?;
     Ok((facts, reader))
 }
@@ -1042,16 +1040,14 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
-    let snapshot = {
-        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-        collection
-            .snapshot()
-            .map_err(|error| anyhow!("snapshot Compass collection: {error}"))?
-    };
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let snapshot = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("snapshot Compass collection: {error}"))?;
     let (facts, ticket, reader) = snapshot.into_parts();
     validate_known_payloads(&reader, &facts)?;
     let status = status_register_collection(signer.verifying_key())
-        .ensure_exact(pile, &ticket)
+        .ensure_exact(pile, ticket.commits())
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     Ok(CompassSnapshot {
         facts,
@@ -1071,8 +1067,8 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    open_scope(pile, DEFAULT_SCOPE_ID, signer.clone())
-        .commit(fragment)
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Compass collection fragment: {error}"))
 }
 

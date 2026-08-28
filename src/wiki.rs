@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
 use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetCollection};
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -217,14 +217,13 @@ impl WikiSnapshot {
 }
 
 /// Exact maintained dominated-set projection used for Wiki frontiers.
-pub fn observed_collection(namespace: VerifyingKey) -> ObservedSetCollection {
+pub fn observed_collection(authority: VerifyingKey) -> ObservedSetCollection {
     ObservedSetCollection::new(
         crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        namespace,
-        None,
+        authority,
         metadata::supersedes.id(),
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        None,
+        authority,
         crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
     )
 }
@@ -1282,12 +1281,11 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone())
-        .materialize()
-        .map_err(|error| anyhow!("materialize Wiki collection: {error}"))?;
-    let reader = pile
-        .reader()
-        .map_err(|error| anyhow!("open Wiki attachment reader: {error}"))?;
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let (facts, _, reader) = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("materialize Wiki collection: {error}"))?
+        .into_parts();
     validate_catalog(&reader, &facts)?;
     Ok((facts, reader))
 }
@@ -1296,23 +1294,21 @@ pub fn materialize_collection(
 /// supersession index.
 ///
 /// The source facts, commit ticket, and attachment reader come from one
-/// [`Collection::snapshot`](triblespace::core::collection::Collection::snapshot)
-/// observation. Index maintenance happens only afterward and is attached to
+/// [`CollectionStoreExt::snapshot`] observation. Index maintenance happens
+/// only afterward and is attached to
 /// that exact ticket, so it cannot change which authoritative commits this
 /// read admits even if newer commits arrive concurrently.
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
-    let snapshot = {
-        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-        collection
-            .snapshot()
-            .map_err(|error| anyhow!("snapshot Wiki collection: {error}"))?
-    };
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let snapshot = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("snapshot Wiki collection: {error}"))?;
     let (facts, ticket, reader) = snapshot.into_parts();
     let observed = observed_collection(signer.verifying_key())
-        .ensure_exact(pile, &ticket)
+        .ensure_exact(pile, ticket.commits())
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let catalog = validate_catalog_with_order(&reader, &facts, &observed)?;
     Ok(WikiSnapshot {
@@ -1331,8 +1327,8 @@ pub fn commit_collection(
     // The signature is curation of this fragment into the collection. Author
     // attribution lives inside the revision artifact and is intentionally not
     // inferred from, or forced equal to, this signer.
-    open_scope(pile, DEFAULT_SCOPE_ID, signer.clone())
-        .commit(fragment)
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
 }
 
@@ -1515,13 +1511,10 @@ mod tests {
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
-        let ticket_before = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .ticket()
-            .unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let ticket_before = pile.ticket(collection, &[]).unwrap();
         let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
-        let ticket_after_index = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .ticket()
-            .unwrap();
+        let ticket_after_index = pile.ticket(collection, &[]).unwrap();
         assert_eq!(ticket_after_index, ticket_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 
@@ -1553,9 +1546,10 @@ mod tests {
         fragment += untagged_fragment;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(fragment)
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let catalog = validate_catalog(&reader, &facts).unwrap();
         assert_eq!(
@@ -1920,9 +1914,10 @@ mod tests {
         fragment += citer_fragment;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(fragment)
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let catalog = validate_catalog(&reader, &facts).unwrap();
         let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
@@ -2000,9 +1995,15 @@ mod tests {
         .unwrap();
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(author_fragment + root_fragment + successor_fragment)
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(
+            collection,
+            &signer,
+            author_fragment + root_fragment + successor_fragment,
+        )
+        .unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let catalog = validate_catalog(&reader, &facts).unwrap();
         let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
@@ -2037,9 +2038,15 @@ mod tests {
         })
         .unwrap();
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(author_fragment + root_fragment + citer_fragment)
-            .unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(
+            collection,
+            &signer,
+            author_fragment + root_fragment + citer_fragment,
+        )
+        .unwrap();
         pile.close().unwrap();
         let before = std::fs::read(&path).unwrap();
 
