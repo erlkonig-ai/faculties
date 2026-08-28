@@ -11,8 +11,8 @@ use faculties::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjec
 use faculties::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSummary};
 use faculties::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
 use faculties::archive_collection::{
-    self as archive_collection, ArchiveImportWriter, ArchivePart, ArchivePayload,
-    ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
+    self as archive_collection, ArchiveBlock, ArchiveImportWriter, ArchivePart, ArchivePayload,
+    ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot, ArchiveTimelineBlock,
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
@@ -31,7 +31,6 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::trible::{Fragment, TribleSet};
-use triblespace::macros::{find, pattern};
 
 #[derive(Parser)]
 #[command(
@@ -679,57 +678,11 @@ fn run_show(storage: ArchiveStorage<'_>, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct LoadedBlock {
-    semantic: ArchiveProjection,
-    receipts: Vec<ArchiveProjection>,
-}
-
-fn load_block(archive: &ArchiveSnapshot, block: Id) -> Result<LoadedBlock> {
-    let receipt_ids = archive.projections_for_block(block);
-    if receipt_ids.is_empty() {
-        bail!("canonical Archive block {block:X} has no source projection");
-    }
-    let mut receipts = receipt_ids
-        .into_iter()
-        .map(|id| archive.projection(id))
-        .collect::<Result<Vec<_>>>()?;
-    receipts.sort_unstable_by_key(|projection| projection.id);
-    if receipts.iter().any(|projection| projection.block != block) {
-        bail!("Archive source projection lookup crossed block identities");
-    }
-    Ok(LoadedBlock {
-        semantic: receipts[0].clone(),
-        receipts,
-    })
-}
-
-fn earliest_receipt_source_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
-    let mut earliest = None;
-    for receipt in &block.receipts {
-        let Some(timestamp) = receipt.source_timestamp else {
-            continue;
-        };
-        let key = interval_key(timestamp)?;
-        if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
-            earliest = Some((key, timestamp));
-        }
-    }
-    Ok(earliest.map(|(_, timestamp)| timestamp))
-}
-
-fn semantic_block_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
-    match block.semantic.block_timestamp {
-        Some(timestamp) => Ok(Some(timestamp)),
-        None => earliest_receipt_source_timestamp(block),
-    }
-}
-
 fn load_thread(
     archive: &ArchiveSnapshot,
     projection_prefix: &str,
     limit: usize,
-) -> Result<Vec<LoadedBlock>> {
+) -> Result<Vec<ArchiveBlock>> {
     if limit == 0 {
         bail!("thread limit must be at least 1");
     }
@@ -746,7 +699,7 @@ fn load_thread(
                 "thread ancestry exceeds {limit} canonical blocks; increase --limit so no fork is hidden"
             );
         }
-        let loaded = load_block(archive, block)?;
+        let loaded = archive.block(block)?;
         pending.extend(loaded.semantic.block_previous.iter().copied());
         nodes.insert(block, loaded);
     }
@@ -786,7 +739,7 @@ fn load_thread(
 
 fn render_block(
     archive: &ArchiveSnapshot,
-    block: &LoadedBlock,
+    block: &ArchiveBlock,
     include_all_parts: bool,
 ) -> Result<String> {
     let mut out = String::new();
@@ -794,7 +747,7 @@ fn render_block(
     writeln!(
         out,
         "timestamp: {}",
-        format_interval(semantic_block_timestamp(block)?)?
+        format_interval(block.timeline_timestamp()?)?
     )?;
     for predecessor in &block.semantic.block_previous {
         writeln!(out, "previous: {predecessor:X}")?;
@@ -831,13 +784,13 @@ fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<(
     let text = faculties::text_arg(text, "search text")?;
     let search = ArchiveSearchSnapshot::ensure_local(storage.pile, storage.key)?;
     for hit in search.search(&text, limit)? {
-        let block = load_block(search.archive(), hit.block)?;
+        let block = search.archive().block(hit.block)?;
         println!(
             "{:.4} {} {} receipt(s) {} {}",
             hit.score,
             short_id(hit.block),
             hit.projections.len(),
-            format_interval(semantic_block_timestamp(&block)?)?,
+            format_interval(block.timeline_timestamp()?)?,
             projection_snippet(&block.semantic),
         );
     }
@@ -957,76 +910,10 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
 
 const REPLAY_STREAM: &str = "archive-replay";
 
-#[derive(Clone)]
-struct TimelineBlock {
-    key: i128,
-    block: LoadedBlock,
-}
-
-fn is_dialogue(block: &LoadedBlock) -> bool {
-    block
-        .semantic
-        .parts
-        .iter()
-        .any(|part| part.modality == archive_schema::content_fact::modality::TEXT)
-}
-
-fn timeline_after(
-    archive: &ArchiveSnapshot,
-    position: i128,
-    with_tools: bool,
-) -> Result<Vec<TimelineBlock>> {
-    let catalog = archive.catalog();
-    let blocks: BTreeSet<Id> = find!(
-        block: Id,
-        pattern!(catalog, [{ _?projection @ archive_schema::source_projection::projects_to: ?block }])
-    )
-    .collect();
-    let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
-        (block: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(catalog, [{ ?block @ archive_schema::block::timestamp: ?timestamp }])
-    )
-    .collect();
-    let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
-    for (block, timestamp) in find!(
-        (block: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(catalog, [
-            { _?projection @ archive_schema::source_projection::projects_to: ?block },
-            { _?projection @ archive_schema::source_projection::source_timestamp: ?timestamp },
-        ])
-    ) {
-        let key = interval_key(timestamp)?;
-        let entry = earliest_receipt_timestamps
-            .entry(block)
-            .or_insert((key, timestamp));
-        if key < entry.0 {
-            *entry = (key, timestamp);
-        }
-    }
-    let mut timeline = Vec::new();
-    for block_id in blocks {
-        let timestamp = canonical_timestamps.get(&block_id).copied().or_else(|| {
-            earliest_receipt_timestamps
-                .get(&block_id)
-                .map(|(_, timestamp)| *timestamp)
-        });
-        let Some(timestamp) = timestamp else {
-            continue;
-        };
-        let key = interval_key(timestamp)?;
-        if key <= position {
-            continue;
-        }
-        let block = load_block(archive, block_id)?;
-        if with_tools || is_dialogue(&block) {
-            timeline.push(TimelineBlock { key, block });
-        }
-    }
-    timeline.sort_unstable_by_key(|item| (item.key, item.block.semantic.block));
-    Ok(timeline)
-}
-
-fn split_replay_batch(timeline: Vec<TimelineBlock>, limit: usize) -> (Vec<TimelineBlock>, usize) {
+fn split_replay_batch(
+    timeline: Vec<ArchiveTimelineBlock>,
+    limit: usize,
+) -> (Vec<ArchiveTimelineBlock>, usize) {
     let mut selected = Vec::new();
     let mut remaining = 0usize;
     let mut cutoff = None;
@@ -1094,7 +981,9 @@ fn run_replay(
     let replay = storage.load_replay()?;
     let position = active_cursor_position(&replay.comb_catalog, REPLAY_STREAM, persona)?;
     let (selected, remaining) = split_replay_batch(
-        timeline_after(&replay.archive, position, with_tools)?,
+        replay.archive.timeline_after(position, |block| {
+            with_tools || block.has_modality(archive_schema::content_fact::modality::TEXT)
+        })?,
         limit,
     );
     if selected.is_empty() {
@@ -1426,21 +1315,25 @@ mod tests {
             .map(|projection| projection.block)
             .collect();
         assert_eq!(blocks.len(), 1);
-        let block = load_block(&archive, *blocks.first().unwrap()).unwrap();
+        let block = archive.block(*blocks.first().unwrap()).unwrap();
         let earliest_receipt_key = projections
             .iter()
             .map(|projection| interval_key(projection.source_timestamp.unwrap()).unwrap())
             .min()
             .unwrap();
         assert_eq!(
-            interval_key(semantic_block_timestamp(&block).unwrap().unwrap()).unwrap(),
+            interval_key(block.timeline_timestamp().unwrap().unwrap()).unwrap(),
             earliest_receipt_key
         );
         assert!(!render_block(&archive, &block, false)
             .unwrap()
             .contains("<untimed>"));
 
-        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        let timeline = archive
+            .timeline_after(i128::MIN, |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].key, earliest_receipt_key);
     }
@@ -1580,7 +1473,11 @@ mod tests {
         run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
 
         let archive = storage(&fixture).load().unwrap();
-        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        let timeline = archive
+            .timeline_after(i128::MIN, |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
         assert_eq!(timeline.len(), 3);
         let (selected, remaining) = split_replay_batch(timeline, 1);
         assert_eq!(selected.len(), 2);

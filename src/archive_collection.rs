@@ -7,7 +7,7 @@
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
@@ -102,6 +102,62 @@ pub struct ArchiveProjection {
     pub raw_model: Option<String>,
     pub source_paths: Vec<String>,
     pub parts: Vec<ArchivePart>,
+}
+
+/// One canonical semantic block together with every exact source receipt that
+/// projects to it.
+///
+/// `semantic` is the receipt with the lowest intrinsic id. All receipts for a
+/// block carry the same semantic block value; choosing one canonically avoids
+/// manufacturing an import-order-dependent representative while `receipts`
+/// preserves the complete occurrence evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveBlock {
+    pub semantic: ArchiveProjection,
+    pub receipts: Vec<ArchiveProjection>,
+}
+
+impl ArchiveBlock {
+    /// Whether this block contains at least one part of `modality`.
+    pub fn has_modality(&self, modality: Id) -> bool {
+        self.semantic
+            .parts
+            .iter()
+            .any(|part| part.modality == modality)
+    }
+
+    /// Timestamp used to place this block in the interleaved Archive view.
+    ///
+    /// A canonical semantic timestamp wins. Otherwise the earliest genuine
+    /// source-receipt timestamp supplies the position; an untimed block remains
+    /// absent from the temporal view.
+    pub fn timeline_timestamp(&self) -> Result<Option<Inline<NsTAIInterval>>> {
+        if let Some(timestamp) = self.semantic.block_timestamp {
+            return Ok(Some(timestamp));
+        }
+        let mut earliest = None;
+        for receipt in &self.receipts {
+            let Some(timestamp) = receipt.source_timestamp else {
+                continue;
+            };
+            let key = interval_lower_key(timestamp)?;
+            if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
+                earliest = Some((key, timestamp));
+            }
+        }
+        Ok(earliest.map(|(_, timestamp)| timestamp))
+    }
+}
+
+/// One canonical block positioned in Archive's interleaved temporal view.
+///
+/// `key` is the lower TAI-nanosecond bound of the canonical block timestamp,
+/// or the earliest source-receipt timestamp when the semantic block is
+/// untimed. Equal keys are ordered by canonical block id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveTimelineBlock {
+    pub key: i128,
+    pub block: ArchiveBlock,
 }
 
 /// One ordered content-addressed range in an exact source snapshot.
@@ -595,6 +651,13 @@ fn distinct_ticket_data(commits: &[CollectionCommit]) -> BTreeSet<CollectionData
     commits.iter().map(CollectionCommit::data).collect()
 }
 
+fn interval_lower_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
+    let (lower, _upper): (i128, i128) = interval
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))?;
+    Ok(lower)
+}
+
 /// One frozen Archive view and one resident portable BM25 index attached from
 /// the exact cover of the same admitted source commits.
 pub struct ArchiveSearchSnapshot {
@@ -991,6 +1054,96 @@ impl ArchiveSnapshot {
         .collect();
         projections.sort_unstable();
         projections
+    }
+
+    /// Load one canonical semantic block and every exact source receipt that
+    /// witnesses it.
+    pub fn block(&self, block: Id) -> Result<ArchiveBlock> {
+        let receipt_ids = self.projections_for_block(block);
+        if receipt_ids.is_empty() {
+            bail!("canonical Archive block {block:X} has no source projection");
+        }
+        let mut receipts = receipt_ids
+            .into_iter()
+            .map(|id| self.projection(id))
+            .collect::<Result<Vec<_>>>()?;
+        receipts.sort_unstable_by_key(|projection| projection.id);
+        if receipts.iter().any(|projection| projection.block != block) {
+            bail!("Archive source projection lookup crossed block identities");
+        }
+        Ok(ArchiveBlock {
+            semantic: receipts[0].clone(),
+            receipts,
+        })
+    }
+
+    /// Replay canonical blocks after one TAI-nanosecond position as a pure,
+    /// deterministic temporal view.
+    ///
+    /// The caller supplies the inclusion policy. This deliberately does not
+    /// encode the Archive CLI's dialogue-only default: a human reader may want
+    /// to hide tool-only blocks, while a mind reconstructing its own causal
+    /// history must include them. Cursor ownership and mutation likewise live
+    /// above this pure view.
+    pub fn timeline_after<F>(
+        &self,
+        position: i128,
+        mut include: F,
+    ) -> Result<Vec<ArchiveTimelineBlock>>
+    where
+        F: FnMut(&ArchiveBlock) -> bool,
+    {
+        let catalog = &self.facts;
+        let blocks: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(catalog, [{
+                _?projection @ schema::source_projection::projects_to: ?block
+            }])
+        )
+        .collect();
+        let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
+            (block: Id, timestamp: Inline<NsTAIInterval>),
+            pattern!(catalog, [{ ?block @ schema::block::timestamp: ?timestamp }])
+        )
+        .collect();
+        let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
+        for (block, timestamp) in find!(
+            (block: Id, timestamp: Inline<NsTAIInterval>),
+            pattern!(catalog, [
+                { _?projection @ schema::source_projection::projects_to: ?block },
+                { _?projection @ schema::source_projection::source_timestamp: ?timestamp },
+            ])
+        ) {
+            let key = interval_lower_key(timestamp)?;
+            let entry = earliest_receipt_timestamps
+                .entry(block)
+                .or_insert((key, timestamp));
+            if key < entry.0 {
+                *entry = (key, timestamp);
+            }
+        }
+
+        let mut timeline = Vec::new();
+        for block_id in blocks {
+            let timestamp = canonical_timestamps.get(&block_id).copied().or_else(|| {
+                earliest_receipt_timestamps
+                    .get(&block_id)
+                    .map(|(_, timestamp)| *timestamp)
+            });
+            let Some(timestamp) = timestamp else {
+                continue;
+            };
+            let key = interval_lower_key(timestamp)?;
+            if key <= position {
+                continue;
+            }
+            let block = self.block(block_id)?;
+            if include(&block) {
+                timeline.push(ArchiveTimelineBlock { key, block });
+            }
+        }
+        timeline.sort_unstable_by_key(|item| (item.key, item.block.semantic.block));
+        Ok(timeline)
     }
 
     /// Most recent source receipts by exact source time, falling back to the
@@ -1459,12 +1612,22 @@ mod tests {
     }
 
     fn projection_at(locator: &str, text: &str, unix_seconds: f64) -> Fragment {
-        let fact = blockdag::text_fact(
+        projection_at_modality(
+            locator,
             schema::content_fact::modality::TEXT,
-            schema::content_fact::direction::IN,
             text,
+            unix_seconds,
         )
-        .unwrap();
+    }
+
+    fn projection_at_modality(
+        locator: &str,
+        modality: Id,
+        text: &str,
+        unix_seconds: f64,
+    ) -> Fragment {
+        let fact =
+            blockdag::text_fact(modality, schema::content_fact::direction::IN, text).unwrap();
         let part = blockdag::content_part(0, fact, None).unwrap();
         let epoch = Epoch::from_unix_seconds(unix_seconds);
         let timestamp: Inline<NsTAIInterval> =
@@ -1934,6 +2097,64 @@ mod tests {
         drop(snapshot);
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
         assert!(search.search("anything", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeline_is_pure_and_leaves_inclusion_policy_to_the_caller() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile_path, &key);
+
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        writer
+            .stage_fragment(projection_at_modality(
+                "session:text",
+                schema::content_fact::modality::TEXT,
+                "spoken",
+                1.0,
+            ))
+            .unwrap();
+        writer
+            .stage_fragment(projection_at_modality(
+                "session:tool",
+                schema::content_fact::modality::TOOL_CALL,
+                "memory context",
+                2.0,
+            ))
+            .unwrap();
+        writer.finish(Ok(())).unwrap();
+
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let complete = snapshot.timeline_after(i128::MIN, |_| true).unwrap();
+        assert_eq!(complete.len(), 2);
+        assert!(complete[0].key < complete[1].key);
+        assert!(complete[0]
+            .block
+            .has_modality(schema::content_fact::modality::TEXT));
+        assert!(complete[1]
+            .block
+            .has_modality(schema::content_fact::modality::TOOL_CALL));
+
+        let dialogue = snapshot
+            .timeline_after(i128::MIN, |block| {
+                block.has_modality(schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
+        assert_eq!(dialogue.len(), 1);
+        assert_eq!(
+            dialogue[0].block.semantic.block,
+            complete[0].block.semantic.block
+        );
+
+        let after_first = snapshot.timeline_after(complete[0].key, |_| true).unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(
+            after_first[0].block.semantic.block,
+            complete[1].block.semantic.block
+        );
     }
 
     #[test]
