@@ -29,8 +29,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties::secrets::access::{load_access_envelope, open_access_envelope};
 use faculties::secrets::schema::KIND_ACCESS_ENVELOPE;
 use faculties::secrets::storage::{
-    access_inbox_descriptor, access_inbox_handle, founder_proofs, publish_access_envelope,
-    VaultLocation,
+    access_inbox_descriptor, access_inbox_handle, founder_proofs, persist_proof_bundle,
+    publish_access_envelope, VaultLocation,
 };
 use faculties::secrets::{self, validate_catalog};
 use faculties::storage::{load_signer, open_pile_strict};
@@ -157,6 +157,7 @@ struct PreparedVault {
     current_record_ids: BTreeSet<Id>,
     current_ids: BTreeSet<Id>,
     presentation: Vec<CapabilityPresentation>,
+    successor_proofs: Vec<CapabilityProofBundle>,
     custody: SigningKey,
     founder_access: Option<(CapabilityProofBundle, CapabilityProofBundle)>,
 }
@@ -648,6 +649,25 @@ fn current_presentations(
         .collect()
 }
 
+fn successor_proofs(
+    candidates: &[AccessCandidate],
+    collection: CollectionHandle,
+) -> Vec<CapabilityProofBundle> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.vault == collection)
+        .flat_map(|candidate| {
+            [
+                candidate.read_bundle.clone(),
+                candidate.write_bundle.clone(),
+            ]
+        })
+        .map(|bundle| (bundle.proof().id(), bundle))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
 fn potentially_admitted_current_record(
     commits: &[CollectionCommit],
     collection: CollectionHandle,
@@ -909,6 +929,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             current_record_ids,
             current_ids,
             presentation,
+            successor_proofs: successor_proofs(&current_candidates, new),
             custody,
             founder_access,
         });
@@ -1025,6 +1046,36 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
     let proofs_before = proof_ids(pile)?;
     let mut appended_commits = 0;
     let mut published_envelopes = 0;
+
+    // A legacy proof record can already be discoverable even though its claim
+    // blobs predate Artifact OFFERs. Repair every successor proof this plan
+    // relies on before publishing any target COMMIT. Founder proofs are also
+    // staged here so a newly published envelope cannot race ahead of its DHT
+    // providers; publish_access_envelope's repeat is deliberately idempotent.
+    for vault in &before.vaults {
+        for proof in &vault.successor_proofs {
+            persist_proof_bundle(pile, proof).with_context(|| {
+                format!(
+                    "offer existing successor proof closure for vault {:X}",
+                    vault.summary.vault
+                )
+            })?;
+        }
+        if let Some((read, write)) = &vault.founder_access {
+            persist_proof_bundle(pile, read).with_context(|| {
+                format!(
+                    "stage successor founder READ proof for vault {:X}",
+                    vault.summary.vault
+                )
+            })?;
+            persist_proof_bundle(pile, write).with_context(|| {
+                format!(
+                    "stage successor founder WRITE proof for vault {:X}",
+                    vault.summary.vault
+                )
+            })?;
+        }
+    }
 
     for vault in &before.vaults {
         let descriptor = secrets::vault_descriptor(vault.summary.vault, vault.summary.authority);
@@ -1184,7 +1235,7 @@ mod tests {
     use faculties::storage::initialize_signer;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::capability::{CapabilityAtom, CapabilityClaim};
-    use triblespace::core::repo::BlobStorePut;
+    use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
     use triblespace::prelude::TryToInline;
 
     struct Fixture {
@@ -1272,6 +1323,18 @@ mod tests {
             subject,
         )
         .unwrap()
+    }
+
+    fn persist_legacy_proof_without_offers(pile: &mut Pile, bundle: &CapabilityProofBundle) {
+        let handles = bundle.proof().claim_handles().collect::<Vec<_>>();
+        assert_eq!(handles.len(), bundle.claims().len());
+        for (expected, claim) in handles.into_iter().zip(bundle.claims()) {
+            assert_eq!(
+                pile.put::<SimpleArchive, _>(claim.clone()).unwrap(),
+                expected
+            );
+        }
+        pile.insert_proof(bundle.proof().clone()).unwrap();
     }
 
     fn founder_fixture() -> Fixture {
@@ -1522,6 +1585,60 @@ mod tests {
         let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(report.published_envelopes, 1);
         assert!(report.plan.settled());
+    }
+
+    #[test]
+    fn existing_successor_proof_claims_gain_offers_before_reseat() {
+        let fixture = founder_fixture();
+        let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
+        let (read, write) = founder_proofs(&fixture.signer, location);
+        let claims = read
+            .proof()
+            .claim_handles()
+            .chain(write.proof().claim_handles())
+            .map(|handle| handle.transmute())
+            .collect::<BTreeSet<_>>();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
+        );
+        store_fragment(
+            &mut pile,
+            access_inbox_descriptor(fixture.signer.verifying_key()),
+        );
+        persist_legacy_proof_without_offers(&mut pile, &read);
+        persist_legacy_proof_without_offers(&mut pile, &write);
+        let envelope = build_access_envelope(
+            location.collection(),
+            &fixture.custody,
+            fixture.signer.verifying_key(),
+            &read,
+            fixture.signer.verifying_key(),
+            &write,
+            fixture.signer.verifying_key(),
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        commit_fragment(
+            &mut pile,
+            &fixture.signer,
+            access_inbox_handle(fixture.signer.verifying_key()),
+            envelope,
+        );
+        let offers = pile.offers_snapshot().unwrap();
+        assert!(claims.iter().all(|claim| !offers.contains(*claim)));
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert!(plan.vaults[0].access_ready);
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert!(report.plan.settled());
+
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let offers = pile.offers_snapshot().unwrap();
+        assert!(claims.iter().all(|claim| offers.contains(*claim)));
+        pile.close().unwrap();
     }
 
     #[test]
