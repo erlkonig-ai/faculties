@@ -46,7 +46,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the cover's structure; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about chooses prose within an equal-span position, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
@@ -1458,10 +1458,8 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // CHARACTER count: a bare number, `--chars N`, or (as an alias) `--tokens N`
     // all set it directly — there is no separate token estimate anymore (the old
     // estimate ran ~2× off the real token count, which was confusing; characters
-    // are exact). `--about` switches the cover from recency-first to
-    // relevance-first, concentrating detail on the memories most similar to the
-    // query (so a face can be cast with the slice of the past most relevant to
-    // its goal).
+    // are exact). `--about` chooses among recollections with the exact same
+    // temporal coverage; it never changes the recency-first cover structure.
     let mut budget_chars: usize = 200_000;
     let mut chunk_overhead: usize = 0;
     let mut about: Option<String> = None;
@@ -3128,5 +3126,99 @@ mod tests {
         assert!(!exact.contains("root"));
         assert!(exact.contains("one"));
         assert!(exact.contains("two"));
+    }
+
+    fn rendered_ranges(cover: &str) -> Vec<&str> {
+        cover
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("2026-") && line.contains(".."))
+            .collect()
+    }
+
+    /// Context may recall a different account of the exact same moment, but it
+    /// must not turn the moment into a different autobiography. This exercises
+    /// both halves of that invariant end-to-end:
+    ///
+    /// - exact-span alternatives collapse to one structural position;
+    /// - choosing a differently-sized, query-relevant alternative leaves every
+    ///   selected temporal range unchanged across binding and non-binding
+    ///   budgets.
+    #[test]
+    fn about_only_selects_within_equal_span_positions() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let write = |summary: &str, start: &str, end: &str| {
+            publish_chunk(storage, text_draft(summary, start, end))
+        };
+
+        write("root", "2026-06-01T00:00:00", "2026-06-05T00:00:00");
+        let amber = "amber ".repeat(3);
+        let cobalt = "cobalt ".repeat(10);
+        let amber_id = write(&amber, "2026-06-01T00:00:00", "2026-06-03T00:00:00");
+        let cobalt_id = write(&cobalt, "2026-06-01T00:00:00", "2026-06-03T00:00:00");
+        write(
+            &"recent ".repeat(10),
+            "2026-06-03T00:00:00",
+            "2026-06-05T00:00:00",
+        );
+        for (summary, start, end) in [
+            (
+                "old-left ".repeat(14),
+                "2026-06-01T00:00:00",
+                "2026-06-02T00:00:00",
+            ),
+            (
+                "old-right ".repeat(14),
+                "2026-06-02T00:00:00",
+                "2026-06-03T00:00:00",
+            ),
+            (
+                "new-left ".repeat(14),
+                "2026-06-03T00:00:00",
+                "2026-06-04T00:00:00",
+            ),
+            (
+                "new-right ".repeat(14),
+                "2026-06-04T00:00:00",
+                "2026-06-05T00:00:00",
+            ),
+        ] {
+            write(&summary, start, end);
+        }
+
+        let loaded = storage.load_context(false).expect("load cover fixture");
+        let (query, contextual_summary, plain_summary) = if amber_id < cobalt_id {
+            ("cobalt", cobalt.as_str(), amber.as_str())
+        } else {
+            ("amber", amber.as_str(), cobalt.as_str())
+        };
+        let render = |budget, about| {
+            build_context_cover(&loaded, budget, 0, about, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("render cover")
+        };
+
+        // 160 admits the root split but neither next split. The plain cover
+        // deterministically selects the least-id account; context substitutes
+        // the other, relevant account at that exact same position.
+        let plain = render(160, None);
+        let contextual = render(160, Some(query));
+        assert!(plain.contains(plain_summary.trim_end()));
+        assert!(!plain.contains(contextual_summary.trim_end()));
+        assert!(contextual.contains(contextual_summary.trim_end()));
+        assert!(!contextual.contains(plain_summary.trim_end()));
+        assert_eq!(rendered_ranges(&plain), rendered_ranges(&contextual));
+
+        // Property-style budget sweep: even as the antichain walks through
+        // several levels, contextual ranking can never move a split.
+        for budget in [4usize, 32, 64, 128, 160, 192, 256, 384, 512, 768] {
+            let plain = render(budget, None);
+            let contextual = render(budget, Some(query));
+            assert_eq!(
+                rendered_ranges(&plain),
+                rendered_ranges(&contextual),
+                "context changed structural coverage at budget {budget}"
+            );
+        }
     }
 }

@@ -7,7 +7,9 @@
 //! Keeping the render (and the chunk accessors it needs) here means the two
 //! callers can never drift: the cover semantics — antichain completeness, the
 //! character budget, the `--about`/`--filter`/`--remove` composition — live in
-//! exactly one place.
+//! exactly one place. Context never gets to rewrite the temporal structure:
+//! `--about` may choose one recollection among entries with the exact same
+//! temporal coverage, but cannot change which spans the cover refines.
 //!
 //! Callers hand this module canonical Memory and shared Embeddings collection
 //! views frozen from one pile snapshot, plus the Memory attachment reader and
@@ -242,8 +244,8 @@ pub fn lexical_relevance_scores<B: BlobStoreGet>(
 
 /// Per-chunk relevance scores for `memory context --about`: SEMANTIC (nomic
 /// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
-/// (BM25). Both are non-negative; the cover propagates subtree maxima over them,
-/// so a node is worth descending into iff some memory beneath it is relevant.
+/// (BM25). Both are non-negative. The scores choose between recollections with
+/// identical temporal coverage; they never participate in structural refinement.
 pub fn about_relevance_scores<B: BlobStoreGet>(
     space: &TribleSet,
     embeddings_space: &TribleSet,
@@ -263,8 +265,8 @@ pub fn about_relevance_scores<B: BlobStoreGet>(
 
 /// Semantic relevance via nomic: embed the query, cosine it against every stored
 /// chunk embedding. `None` if no chunk is embedded yet (caller falls back to
-/// BM25). Negative cosines clamp to 0 so "unrelated" is uniform and subtree-max
-/// stays meaningful (matching BM25's non-negative scores).
+/// BM25). Negative cosines clamp to 0 so "unrelated" is uniform (matching
+/// BM25's non-negative scores).
 #[cfg(feature = "local-embed")]
 pub fn semantic_about_scores<B: BlobStoreGet>(
     space: &TribleSet,
@@ -413,7 +415,8 @@ pub struct CoverOpts {
     /// selection accounting only: stored summaries retain their intrinsic
     /// character lengths and rendered cover text is unchanged.
     pub chunk_overhead: usize,
-    /// `--about <query>`: bias detail toward memories relevant to the query.
+    /// `--about <query>`: choose the most relevant recollection whenever
+    /// multiple memories have identical temporal coverage.
     pub about: Option<String>,
     /// `--filter <query>`: keep ONLY chunks whose similarity exceeds the threshold.
     pub filter: Option<String>,
@@ -439,12 +442,14 @@ impl CoverOpts {
 
 /// Render the context-cover text from canonical Memory and shared Embeddings
 /// views, using `reader` for their attachment blobs. The result is the
-/// antichain cover over all memories, coarse → fine, fit to
+/// antichain cover over all temporal memory positions, coarse → fine, fit to
 /// `opts.budget_chars` characters.
 ///
-/// Completeness is invariant — a memory is never dropped to fit. If even the
-/// coarsest cover (all roots) overflows the budget, this ERRORS with
-/// instructions for raising a coarser apex rather than silently losing the past.
+/// Completeness is invariant — every temporal position remains represented.
+/// Exact-span recollections are interchangeable at one position, not additive
+/// structural nodes. If even the coarsest cover (all roots) overflows the
+/// budget, this ERRORS with instructions for raising a coarser apex rather than
+/// silently losing the past.
 /// Containment forest over chunk spans: each chunk's tightest strict container,
 /// the children that induces, and the roots with no container at all.
 ///
@@ -486,6 +491,105 @@ fn containment_forest(
     (parent, children, roots)
 }
 
+/// Collapse memories which are interchangeable to the temporal cover into one
+/// structural position.
+///
+/// The current cover has one axis: chronological, non-lens memories. Its forest
+/// is computed solely from `(start, end)`, so exact equality of those two keys is
+/// the strongest possible notion of structural equivalence: substituting one
+/// member for another cannot alter containment, ancestry, recency, or width.
+/// Content, intrinsic id, and rendered size deliberately do not participate.
+///
+/// The structural id is the least member id. It exists only as a stable final
+/// tie-break for the refinement algorithm; the id of the recollection eventually
+/// rendered is selected separately.
+fn recollection_classes(
+    raw_spans: &[(i128, i128, Id)],
+) -> (Vec<(i128, i128, Id)>, Vec<Vec<usize>>) {
+    let mut order: Vec<usize> = (0..raw_spans.len()).collect();
+    order.sort_by(|&a, &b| {
+        raw_spans[a]
+            .0
+            .cmp(&raw_spans[b].0)
+            .then(raw_spans[a].1.cmp(&raw_spans[b].1))
+            .then(raw_spans[a].2.cmp(&raw_spans[b].2))
+    });
+
+    let mut spans = Vec::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for raw in order {
+        let (start, end, id) = raw_spans[raw];
+        if spans
+            .last()
+            .is_some_and(|&(class_start, class_end, _)| class_start == start && class_end == end)
+        {
+            members.last_mut().expect("class exists").push(raw);
+        } else {
+            spans.push((start, end, id));
+            members.push(vec![raw]);
+        }
+    }
+    (spans, members)
+}
+
+/// Conservative charge of one structural position. A contextual substitution
+/// must not change whether a split fits, so the whole equivalence class is
+/// charged at its largest member rather than at the currently selected prose.
+fn recollection_class_cost<B: BlobStoreGet>(
+    reader: &B,
+    space: &TribleSet,
+    raw_spans: &[(i128, i128, Id)],
+    raw_costs: &mut [Option<usize>],
+    classes: &[Vec<usize>],
+    class_costs: &mut [Option<usize>],
+    class: usize,
+) -> Result<usize> {
+    if let Some(cost) = class_costs[class] {
+        return Ok(cost);
+    }
+    let mut cost = 0;
+    for &raw in &classes[class] {
+        cost = cost.max(context_chunk_cost(
+            reader, space, raw_spans, raw_costs, raw,
+        )?);
+    }
+    class_costs[class] = Some(cost);
+    Ok(cost)
+}
+
+/// Pick one recollection for a structural position. Eligibility is decided
+/// before contextual ranking, so `--about` cannot accidentally hide a span by
+/// choosing a filtered-out alternative when an eligible one exists. Scores tie
+/// by intrinsic id for byte-stable output.
+fn select_recollection(
+    raw_spans: &[(i128, i128, Id)],
+    members: &[usize],
+    about_scores: Option<&HashMap<Id, f32>>,
+    eligible: &[bool],
+) -> usize {
+    let has_eligible = members.iter().any(|&raw| eligible[raw]);
+    members
+        .iter()
+        .copied()
+        .filter(|&raw| !has_eligible || eligible[raw])
+        .max_by(|&a, &b| {
+            let a_score = about_scores
+                .and_then(|scores| scores.get(&raw_spans[a].2))
+                .copied()
+                .unwrap_or(0.0);
+            let b_score = about_scores
+                .and_then(|scores| scores.get(&raw_spans[b].2))
+                .copied()
+                .unwrap_or(0.0);
+            a_score
+                .total_cmp(&b_score)
+                // `max_by` should select the lexicographically least id on a
+                // score tie, hence the deliberately reversed id comparison.
+                .then_with(|| raw_spans[b].2.cmp(&raw_spans[a].2))
+        })
+        .expect("a recollection class is never empty")
+}
+
 /// How close the coarsest possible cover is to the budget.
 ///
 /// `render_cover` refuses when the roots alone overflow, which is correct but
@@ -497,9 +601,11 @@ fn containment_forest(
 /// the cover still works.
 #[derive(Clone, Copy, Debug)]
 pub struct CoverHeadroom {
-    /// Top-level chunks with no coarser parent. These are the coarsest cover.
+    /// Top-level temporal positions with no coarser parent. These are the
+    /// coarsest cover.
     pub roots: usize,
-    /// Characters the coarsest cover needs.
+    /// Characters the coarsest cover needs, conservatively charging the largest
+    /// recollection at each exact-span position.
     pub used: usize,
     /// Characters allowed.
     pub budget: usize,
@@ -531,12 +637,22 @@ pub fn cover_headroom<B: BlobStoreGet>(
     ws: &B,
     budget_chars: usize,
 ) -> Result<CoverHeadroom> {
-    let spans = collect_chunk_spans(space);
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
     let (_, _, roots) = containment_forest(&spans);
-    let mut cost_cache: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
     let mut used = 0usize;
     for &i in &roots {
-        used = used.saturating_add(context_chunk_cost(ws, space, &spans, &mut cost_cache, i)?);
+        used = used.saturating_add(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+        )?);
     }
     Ok(CoverHeadroom {
         roots: roots.len(),
@@ -607,11 +723,12 @@ pub fn render_cover<B: BlobStoreGet>(
     let sim_threshold = opts.sim_threshold;
 
     let mut out = String::new();
-    let spans = collect_chunk_spans(space);
-    if spans.is_empty() {
+    let raw_spans = collect_chunk_spans(space);
+    if raw_spans.is_empty() {
         writeln!(out, "no memory chunks")?;
         return Ok(out);
     }
+    let (spans, classes) = recollection_classes(&raw_spans);
     let n = spans.len();
 
     // Containment is time-range subsumption (the only hierarchy): a chunk's
@@ -628,11 +745,12 @@ pub fn render_cover<B: BlobStoreGet>(
     // similarity to its query is ABOVE the threshold; `--remove` drops chunks
     // whose similarity is above it (an anti-filter — the negation lives in the
     // RETRIEVAL, not the query text, sidestepping embedding-negation failure).
-    // These decide WHICH chunks may appear; `--about` decides DETAIL WEIGHTING
-    // among the eligible; the budget decides how many / how coarse. A removed
-    // chunk must never be emitted at any granularity (enforced by gating the
-    // selected cover below). Both compose with each other and with `--about`.
-    let universe: Vec<Id> = spans.iter().map(|s| s.2).collect();
+    // These decide WHICH chunks may appear; `--about` chooses one recollection
+    // inside an eligible exact-span class; the budget decides how many / how
+    // coarse. A removed chunk must never be emitted at any granularity
+    // (enforced by gating the selected cover below). Both compose with each
+    // other and with `--about`.
+    let universe: Vec<Id> = raw_spans.iter().map(|s| s.2).collect();
     let filter_elig = match filter_q {
         Some(q) => Some(eligibility_scores(
             space,
@@ -669,7 +787,7 @@ pub fn render_cover<B: BlobStoreGet>(
             }
         }
     }
-    let eligible = |id: Id| -> bool {
+    let eligible_id = |id: Id| -> bool {
         if let Some((scores, _)) = &filter_elig {
             if let Some(v) = scores.get(&id) {
                 if *v <= sim_threshold {
@@ -689,20 +807,46 @@ pub fn render_cover<B: BlobStoreGet>(
         true
     };
 
-    // Relevance scoring for detail weighting: score every chunk against a
-    // query, then propagate each node's score up to a subtree maximum (a node
-    // is worth descending into if ANY memory beneath it is relevant). `--about`
-    // drives this when present; with only `--filter`, reuse the filter scores
-    // so the cover descends TOWARD the eligible material instead of staying
-    // coarse (otherwise a filtered cover would surface little detail).
-    let relevance: Vec<f32> = if about.is_some() || filter_q.is_some() {
-        let scores: HashMap<Id, f32> = if let Some(query) = about {
-            about_relevance_scores(space, embeddings_space, reader, query)?
-        } else {
-            filter_elig.as_ref().unwrap().0.clone()
-        };
-        let mut r: Vec<f32> = (0..n)
-            .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
+    let member_eligible: Vec<bool> = raw_spans.iter().map(|span| eligible_id(span.2)).collect();
+    let class_eligible: Vec<bool> = classes
+        .iter()
+        .map(|members| members.iter().any(|&raw| member_eligible[raw]))
+        .collect();
+
+    // Contextual similarity is deliberately *not* a structural score. It may
+    // select one member of an exact-span class, but never changes the forest or
+    // split order. This is the crucial boundary between situated recollection
+    // and a context-dependent autobiography.
+    let about_scores = if classes.iter().any(|class| class.len() > 1) {
+        about
+            .map(|query| about_relevance_scores(space, embeddings_space, reader, query))
+            .transpose()?
+    } else {
+        // With no structural alternatives there is nothing context may choose.
+        // In particular, do not load an embedding model for a guaranteed no-op.
+        None
+    };
+    let representatives: Vec<usize> = classes
+        .iter()
+        .map(|members| {
+            select_recollection(&raw_spans, members, about_scores.as_ref(), &member_eligible)
+        })
+        .collect();
+
+    // `--filter` is an explicit eligibility transformation rather than ambient
+    // context. Preserve its established behavior of refining toward material
+    // that can survive the filter. Even when `--about` is also present, only
+    // the filter score participates here; contextual scores remain local to an
+    // already-fixed structural position.
+    let relevance: Vec<f32> = if let Some((scores, _)) = &filter_elig {
+        let mut r: Vec<f32> = classes
+            .iter()
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|&raw| scores.get(&raw_spans[raw].2).copied())
+                    .fold(0.0_f32, f32::max)
+            })
             .collect();
         // Narrow→wide so children precede parents; lift each subtree maximum up.
         let mut order: Vec<usize> = (0..n).collect();
@@ -719,20 +863,29 @@ pub fn render_cover<B: BlobStoreGet>(
         vec![0.0; n]
     };
 
-    // Floor of the cover: the coarsest antichain (all roots), oldest first.
-    // Completeness is invariant — never drop a memory to fit. If even this
-    // overflows, the hierarchy lacks a coarse-enough apex; tell the caller
-    // how to raise one instead of silently losing the past.
+    // Floor of the cover: the coarsest antichain (all structural roots), oldest
+    // first. Completeness is invariant — never drop a temporal position to fit.
+    // If even this overflows, the hierarchy lacks a coarse-enough apex; tell the
+    // caller how to raise one instead of silently losing the past.
     roots.sort_by(|&a, &b| {
         spans[a]
             .0
             .cmp(&spans[b].0)
             .then(spans[b].1.cmp(&spans[a].1))
     });
-    let mut cost_cache: Vec<Option<usize>> = vec![None; n];
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; n];
     let mut used = 0usize;
     for &i in &roots {
-        let intrinsic = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
+        let intrinsic = recollection_class_cost(
+            reader,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+        )?;
         used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
     }
     if used > budget_chars {
@@ -778,13 +931,27 @@ pub fn render_cover<B: BlobStoreGet>(
             let mut kids_charge = 0i128;
             let mut kids_intrinsic = 0i128;
             for &k in &children[i] {
-                let intrinsic =
-                    context_chunk_cost(reader, space, &spans, &mut cost_cache, k)? as i128;
+                let intrinsic = recollection_class_cost(
+                    reader,
+                    space,
+                    &raw_spans,
+                    &mut raw_costs,
+                    &classes,
+                    &mut class_costs,
+                    k,
+                )? as i128;
                 kids_intrinsic += intrinsic;
                 kids_charge += intrinsic + chunk_overhead as i128;
             }
-            let parent_intrinsic =
-                context_chunk_cost(reader, space, &spans, &mut cost_cache, i)? as i128;
+            let parent_intrinsic = recollection_class_cost(
+                reader,
+                space,
+                &raw_spans,
+                &mut raw_costs,
+                &classes,
+                &mut class_costs,
+                i,
+            )? as i128;
             let parent_charge = parent_intrinsic + chunk_overhead as i128;
             // SIGNED. A split whose children are collectively cheaper than the
             // parent's own summary gives budget back; `saturating_sub` used to
@@ -798,11 +965,10 @@ pub fn render_cover<B: BlobStoreGet>(
             // Consumer overhead determines whether a split fits, while the
             // established priority still measures intrinsic prose growth.
             let detail_gain = kids_intrinsic - parent_intrinsic;
-            // Priority: relevance (subtree-max, when --about) desc → recency
-            // (latest end) desc → width desc → detail gained desc → id asc.
-            // Without --about every relevance is 0, so recency leads exactly as
-            // before; with it, the cover descends into the query-relevant
-            // subtrees first and leaves the rest coarse.
+            // Priority: explicit-filter relevance desc → recency (latest end)
+            // desc → width desc → detail gained desc → stable structural id
+            // asc. `--about` never appears in this key: context can substitute
+            // prose at one position, never redirect the temporal refinement.
             let key = (relevance[i], spans[i].1, width(i), detail_gain, spans[i].2);
             let better = match best_key {
                 None => true,
@@ -841,11 +1007,19 @@ pub fn render_cover<B: BlobStoreGet>(
     // through unchanged, so it may still *mention* removed material in its
     // prose — we drop selected nodes, we do not rewrite ancestor summaries.
     if filter_elig.is_some() || remove_elig.is_some() {
-        cover.retain(|&i| eligible(spans[i].2));
-        // Recompute the character tally honestly over what actually survived.
+        cover.retain(|&i| class_eligible[i]);
+        // Recompute the conservative character tally over what survived.
         used = 0;
         for &i in &cover {
-            let intrinsic = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
+            let intrinsic = recollection_class_cost(
+                reader,
+                space,
+                &raw_spans,
+                &mut raw_costs,
+                &classes,
+                &mut class_costs,
+                i,
+            )?;
             used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
         }
     }
@@ -860,7 +1034,7 @@ pub fn render_cover<B: BlobStoreGet>(
     });
     let mode = {
         let mut parts = vec![match about {
-            Some(q) => format!("most detail on memories about \"{q}\""),
+            Some(q) => format!("recollections about \"{q}\" within equal spans"),
             None => "recent in most detail".to_string(),
         }];
         if let Some(q) = filter_q {
@@ -888,7 +1062,8 @@ pub fn render_cover<B: BlobStoreGet>(
         refinement_pool(budget_chars, floor_used),
     );
     for &i in &cover {
-        let (s, e, id) = spans[i];
+        let (s, e, _) = spans[i];
+        let id = raw_spans[representatives[i]].2;
         let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
         let indent = "  ".repeat(depth);
         writeln!(out)?;
@@ -947,6 +1122,66 @@ mod headroom_tests {
         assert_eq!(roots, vec![2], "the wide apex is the only root");
         assert_eq!(parent[0], Some(2));
         assert_eq!(parent[1], Some(2));
+    }
+
+    #[test]
+    fn exact_span_is_the_structural_equivalence_class() {
+        let spans = vec![(10, 20, C), (10, 21, B), (10, 20, A)];
+        let (structural, classes) = recollection_classes(&spans);
+        assert_eq!(
+            structural,
+            vec![(10, 20, A), (10, 21, B)],
+            "only exact endpoint equality collapses, and the structural id is stable"
+        );
+        let member_ids: Vec<Vec<Id>> = classes
+            .iter()
+            .map(|class| class.iter().map(|&raw| spans[raw].2).collect())
+            .collect();
+        assert_eq!(member_ids, vec![vec![A, C], vec![B]]);
+    }
+
+    #[test]
+    fn recollection_classes_ignore_input_order() {
+        let original = [(0, 100, C), (0, 100, A), (10, 20, B)];
+        for permutation in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let raw: Vec<_> = permutation.into_iter().map(|i| original[i]).collect();
+            let (spans, classes) = recollection_classes(&raw);
+            assert_eq!(spans, vec![(0, 100, A), (10, 20, B)]);
+            let ids: Vec<Vec<Id>> = classes
+                .iter()
+                .map(|members| members.iter().map(|&i| raw[i].2).collect())
+                .collect();
+            assert_eq!(ids, vec![vec![A, C], vec![B]]);
+        }
+    }
+
+    #[test]
+    fn contextual_selection_stays_inside_one_class_and_respects_eligibility() {
+        let spans = vec![(0, 10, A), (0, 10, B), (0, 10, C)];
+        let members = vec![0, 1, 2];
+        let scores = HashMap::from([(A, 0.1), (B, 0.8), (C, 0.5)]);
+        assert_eq!(
+            select_recollection(&spans, &members, Some(&scores), &[true; 3]),
+            1,
+            "the most relevant equal-span recollection wins"
+        );
+        assert_eq!(
+            select_recollection(&spans, &members, Some(&scores), &[true, false, true]),
+            2,
+            "context cannot select an ineligible recollection"
+        );
+        assert_eq!(
+            select_recollection(&spans, &members, None, &[true; 3]),
+            0,
+            "without context the least intrinsic id is deterministic"
+        );
     }
 
     #[test]
