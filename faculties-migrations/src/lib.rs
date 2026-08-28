@@ -23,6 +23,8 @@
 //!   sibling pile and atomically replaces an unchanged live pile.
 //! - [`secrets_direct_proofs`] is the additive, migration-local bridge from
 //!   unpublished subject-bearing access rows to current direct proof records.
+//! - [`descriptor_authority`] is the one-shot additive re-seat from retired
+//!   name/namespace roots to UTF-8 names under mandatory authority.
 //!
 //! The `migrations` binary is the only consumer.
 
@@ -36,6 +38,7 @@ pub mod collection_naming;
 pub mod comb_cutover;
 pub mod compass_cutover;
 pub mod decide_cutover;
+pub mod descriptor_authority;
 pub mod discord_cutover;
 pub mod disposable_cutover;
 pub mod files_cutover;

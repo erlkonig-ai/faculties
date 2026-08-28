@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **A one-shot descriptor-authority migration re-seats ordinary faculty
+  roots.** It registers each UTF-8-name, mandatory-authority descriptor,
+  reuses the retired commits' exact data and metadata handles, and
+  deterministically re-signs their distinct leaves. Planning and verification
+  classify untouched residue; MERGE/DERIVE cache exhaust is rebuilt lazily,
+  and Secrets is explicitly deferred to its handle-aware migration.
+
 - **New Compass goals and notes use intrinsic occurrence ids.** Their immutable
   fields, including creation time, now determine the id returned by the typed
   constructors, so exact retries converge without a caller-minted `genid` and

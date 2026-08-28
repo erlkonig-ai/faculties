@@ -11,6 +11,8 @@
 //!   from named branch pins into native collections.
 //! - `secrets-direct-proofs plan|activate` additively bridges the unpublished
 //!   subject-bearing Secrets access envelopes to direct native proofs.
+//! - `descriptor-authority` re-seats ordinary named roots from the retired
+//!   namespace/open-admission descriptor epoch under one mandatory authority.
 //! - `migrate-legacy <faculty>` migrates one faculty's branch in place, which
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
 //! - `status-register` gives Compass's status register the identity it never
@@ -32,9 +34,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
-    activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
-    mail_credentials, memory_journal, posture_findings, secrets_direct_proofs, status_register,
-    teams_credentials,
+    activation_cutover, collection_cutover, collection_naming, descriptor_authority,
+    disposable_cutover, legacy_password, mail_credentials, memory_journal, posture_findings,
+    secrets_direct_proofs, status_register, teams_credentials,
 };
 use zeroize::Zeroizing;
 
@@ -122,6 +124,18 @@ enum Command {
         /// where the two would quietly drift apart.
         #[arg(long = "name", value_name = "HEX=NAME")]
         names: Vec<String>,
+    },
+
+    /// Re-seat ordinary faculty roots into UTF-8, mandatory-authority descriptors.
+    ///
+    /// This is an additive one-shot epoch migration. It reuses every exact
+    /// data/metadata blob and re-signs each distinct retired leaf under the
+    /// new descriptor. Derived caches are left for lazy reconstruction and
+    /// Secrets is deliberately deferred to its handle-aware migration.
+    DescriptorAuthority {
+        /// Validate and report the exact publication without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Give Compass's status register the identity it never had:
@@ -624,6 +638,70 @@ fn collection_naming(
     Ok(())
 }
 
+fn run_descriptor_authority(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
+    let report = if dry_run {
+        (descriptor_authority::plan_path(pile, key)?, None)
+    } else {
+        let published = descriptor_authority::publish_path(pile, key)?;
+        (published.plan, Some(published.appended_commits))
+    };
+    let (plan, appended) = report;
+
+    println!("Collection descriptor authority epoch");
+    println!("pile             : {}", pile.display());
+    println!("ordinary roots   : {}", plan.roots.len());
+    println!(
+        "source commits   : {}",
+        plan.roots
+            .iter()
+            .map(|root| root.source_commits)
+            .sum::<usize>()
+    );
+    println!(
+        "target commits   : {}",
+        plan.roots
+            .iter()
+            .map(|root| root.target_commits)
+            .sum::<usize>()
+    );
+    println!("missing commits  : {}", plan.missing_commits());
+    println!("invalid records  : {}", plan.invalid_records);
+    if let Some(appended) = appended {
+        println!("appended commits : {appended}");
+    }
+
+    if !plan.roots.is_empty() {
+        println!("\nOrdinary roots:");
+        for root in &plan.roots {
+            println!(
+                "- {:<18} {} source -> {} target, {} missing; skipped {} MERGE / {} DERIVE",
+                root.name,
+                root.source_commits,
+                root.target_commits,
+                root.missing_commits,
+                root.skipped_merges,
+                root.skipped_derives,
+            );
+        }
+    }
+    if !plan.residues.is_empty() {
+        println!("\nResidue (not translated):");
+        for residue in &plan.residues {
+            println!(
+                "- {:.16}… {:?}, {} record(s): {}",
+                hex::encode_upper(residue.collection.raw),
+                residue.kind,
+                residue.records,
+                residue.detail
+            );
+        }
+    }
+    if dry_run {
+        println!("\n(dry run — nothing written; stop old-epoch writers before activation)");
+    }
+    Ok(())
+}
+
 fn posture_findings(pile: &Path, key: Option<&Path>, dry_run: bool) -> Result<()> {
     let (plan, published) = if dry_run {
         (
@@ -842,6 +920,9 @@ fn main() -> Result<()> {
         }
         Some(Command::CollectionNaming { dry_run, names }) => {
             collection_naming(&cli.pile, cli.key.as_deref(), dry_run, &names)
+        }
+        Some(Command::DescriptorAuthority { dry_run }) => {
+            run_descriptor_authority(&cli.pile, cli.key.as_deref(), dry_run)
         }
         Some(Command::StatusRegister { dry_run }) => {
             status_register(&cli.pile, cli.key.as_deref(), dry_run)
