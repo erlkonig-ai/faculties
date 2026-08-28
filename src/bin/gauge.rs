@@ -362,6 +362,7 @@ mod tests {
     use faculties::storage::initialize_signer;
     use faculties::wiki::{author_record, revision_record, tag_record, RevisionDraft};
     use hifitime::Epoch;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::prelude::*;
 
     struct Fixture {
@@ -387,13 +388,13 @@ mod tests {
         fn publish(&self, fragment: Fragment) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            faculties::collection_names::open(
+            let collection = faculties::collection_names::open(
                 &mut pile,
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,
-                signer,
+                signer.verifying_key(),
             )
-            .commit(fragment)
             .unwrap();
+            pile.commit(collection, &signer, fragment).unwrap();
             pile.close().unwrap();
         }
 

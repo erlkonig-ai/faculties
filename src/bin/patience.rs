@@ -200,6 +200,7 @@ mod tests {
     use faculties::schemas::patience::{exec_schema, KIND_TIMEOUT_EXTENSION_ID};
     use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use std::fs::File;
+    use triblespace::core::collection::CollectionStoreExt;
 
     #[test]
     fn cli_definition_is_consistent() {
@@ -254,11 +255,12 @@ mod tests {
             length_after_first
         );
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
-        let facts = collection.materialize().unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let collection =
+            faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
         assert_eq!(facts, expected.into_facts());
-        let reader = collection.storage_mut().reader().unwrap();
         cognition::validate_catalog(&reader, &facts).unwrap();
 
         let (found_request, found_worker, timeout, found_at) = find!(
