@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Orient checkpoint reads now use an exact maintained LWW register.** Each
+  persona's latest checkpoint is selected from a derived index attached to the
+  exact Orient collection ticket, while the checkpoint events remain available
+  for history and validation. A first read may publish missing cache artifacts;
+  semantic checkpoint commits remain independent of that maintenance work.
+
 - **Compass status reads now attach an exact maintained LWW index.** The
   Compass CLI, Orient, and the viewer consume the same exact snapshot rather
   than rebuilding `StatedOrder` joins on every read. The first read of a ticket
