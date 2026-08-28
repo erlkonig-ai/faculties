@@ -7,6 +7,13 @@
 //! its leaves.  Secrets additionally binds the exact vault handle into READ
 //! and WRITE claims and into each recipient-sealed custody frame.
 //!
+//! One consumed predecessor predates capability authority entirely: the same
+//! short-name descriptor with `namespace == durable root` and no authority.
+//! It is never re-seated as another live source.  An exact capability-native
+//! sibling under that root must exist and cover its complete fact union; this
+//! proves the earlier direct-recipient epoch was already absorbed before the
+//! capability sibling alone advances to the current descriptor.
+//!
 //! This migration therefore accepts only vaults founded by the durable local
 //! signer.  It preserves every canonical source data and metadata handle,
 //! opens one strictly valid retired founder envelope to recover the existing
@@ -135,7 +142,13 @@ struct RetiredRoot {
 
 struct RetiredVaultDiscovery {
     vaults: BTreeMap<CollectionHandle, (Id, RetiredRoot)>,
+    direct_predecessors: BTreeMap<CollectionHandle, (Id, RetiredRoot)>,
     unreadable: BTreeMap<CollectionHandle, String>,
+}
+
+struct PreparedPredecessor {
+    collection: CollectionHandle,
+    commit_ids: BTreeSet<Id>,
 }
 
 #[derive(Clone)]
@@ -155,6 +168,7 @@ struct PreparedVault {
     source: Vec<CollectionCommit>,
     expected: Vec<CollectionCommit>,
     source_ids: BTreeSet<Id>,
+    predecessor: Option<PreparedPredecessor>,
     current_record_ids: BTreeSet<Id>,
     current_ids: BTreeSet<Id>,
     presentation: Vec<CapabilityPresentation>,
@@ -294,6 +308,10 @@ fn retired_vault_descriptor(
     retired_descriptor(&secrets::vault_name(vault), namespace, Some(authority))
 }
 
+fn retired_direct_vault_descriptor(vault: Id, namespace: VerifyingKey) -> Fragment {
+    retired_descriptor(&secrets::vault_name(vault), namespace, None)
+}
+
 fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
     fragment.facts().clone().to_blob().get_handle()
 }
@@ -317,6 +335,7 @@ fn discover_retired_vaults(
     commits: &[CollectionCommit],
 ) -> Result<RetiredVaultDiscovery> {
     let mut vaults = BTreeMap::new();
+    let mut direct_predecessors = BTreeMap::new();
     let mut unreadable = BTreeMap::new();
     let collections = commits
         .iter()
@@ -348,16 +367,24 @@ fn discover_retired_vaults(
             }
             Err(_) => continue,
         };
-        let authority = root
-            .authority
-            .context("retired Secrets vault descriptor has no authority")?;
-        let expected = retired_vault_descriptor(vault, root.namespace, authority);
+        let expected = match root.authority {
+            Some(authority) => retired_vault_descriptor(vault, root.namespace, authority),
+            None => retired_direct_vault_descriptor(vault, root.namespace),
+        };
         if expected.facts() != &facts || descriptor_handle(&expected) != collection {
             bail!("retired vault descriptor for {vault:X} is not the exact supported epoch");
         }
-        vaults.insert(collection, (vault, root));
+        if root.authority.is_some() {
+            vaults.insert(collection, (vault, root));
+        } else {
+            direct_predecessors.insert(collection, (vault, root));
+        }
     }
-    Ok(RetiredVaultDiscovery { vaults, unreadable })
+    Ok(RetiredVaultDiscovery {
+        vaults,
+        direct_predecessors,
+        unreadable,
+    })
 }
 
 fn load_proof_bundle(
@@ -506,6 +533,68 @@ fn authorized_source_commits(
         authorized.push(commit);
     }
     Ok(authorized)
+}
+
+fn root_source_commits(
+    commits: &[CollectionCommit],
+    collection: CollectionHandle,
+    root: VerifyingKey,
+) -> Result<Vec<CollectionCommit>> {
+    let source = commits
+        .iter()
+        .copied()
+        .filter(|commit| commit.collection() == collection)
+        .collect::<Vec<_>>();
+    if source.is_empty() {
+        bail!(
+            "retired direct vault {} has no COMMITs",
+            hex::encode_upper(collection.raw)
+        );
+    }
+    for commit in &source {
+        let writer = VerifyingKey::from_bytes(&commit.public_key().raw)
+            .context("retired direct-vault COMMIT has an invalid writer key")?;
+        if writer != root {
+            bail!(
+                "retired direct vault {} has COMMIT {} outside its exact root authority",
+                hex::encode_upper(collection.raw),
+                commit.id()
+            );
+        }
+    }
+    Ok(source)
+}
+
+fn pair_direct_predecessors(
+    discovery: &RetiredVaultDiscovery,
+) -> Result<BTreeMap<CollectionHandle, CollectionHandle>> {
+    let mut paired = BTreeMap::new();
+    for (direct, (vault, root)) in &discovery.direct_predecessors {
+        debug_assert!(root.authority.is_none());
+        let matches = discovery
+            .vaults
+            .iter()
+            .filter(|(_, (candidate_vault, candidate))| {
+                candidate_vault == vault
+                    && candidate.namespace == root.namespace
+                    && candidate.authority == Some(root.namespace)
+            })
+            .map(|(collection, _)| *collection)
+            .collect::<Vec<_>>();
+        let capability = match matches.as_slice() {
+            [capability] => *capability,
+            [] => bail!(
+                "retired direct vault {vault:X} has no exact capability-native successor under its namespace authority"
+            ),
+            _ => bail!(
+                "retired direct vault {vault:X} has more than one exact capability-native successor"
+            ),
+        };
+        if paired.insert(capability, *direct).is_some() {
+            bail!("capability-native vault {vault:X} has more than one direct predecessor");
+        }
+    }
+    Ok(paired)
 }
 
 fn materialize_source(reader: &PileReader, commits: &[CollectionCommit]) -> Result<TribleSet> {
@@ -715,6 +804,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
     let invalid_records = discovered.diagnostics().len();
     let reader = pile.reader().context("open Secrets migration reader")?;
     let discovery = discover_retired_vaults(&reader, &commits)?;
+    let mut predecessor_by_successor = pair_direct_predecessors(&discovery)?;
     let authority_map = discovery
         .vaults
         .iter()
@@ -804,6 +894,25 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         }
         let source = authorized_source_commits(&commits, old, authority, &old_candidates)?;
         let source_facts = materialize_source(&reader, &source)?;
+        let predecessor = predecessor_by_successor.remove(&old).map(|collection| {
+            let (_, root) = discovery
+                .direct_predecessors
+                .get(&collection)
+                .expect("paired direct predecessor came from discovery");
+            let predecessor = root_source_commits(&commits, collection, root.namespace)?;
+            let predecessor_facts = materialize_source(&reader, &predecessor)?;
+            let uncovered = predecessor_facts.difference(&source_facts);
+            if !uncovered.is_empty() {
+                bail!(
+                    "retired direct vault {vault:X} has {} facts absent from its capability-native successor",
+                    uncovered.len()
+                );
+            }
+            Ok(PreparedPredecessor {
+                collection,
+                commit_ids: predecessor.iter().map(CollectionCommit::id).collect(),
+            })
+        }).transpose()?;
         let new = secrets::vault_handle(vault, authority);
         let presentation = current_presentations(&current_candidates, new);
         let current_record_ids = commits
@@ -942,6 +1051,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             source: source.clone(),
             expected,
             source_ids: source.iter().map(CollectionCommit::id).collect(),
+            predecessor,
             current_record_ids,
             current_ids,
             presentation,
@@ -951,6 +1061,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             founder_access,
         });
     }
+    debug_assert!(predecessor_by_successor.is_empty());
     public.vaults.sort_by_key(|vault| (vault.vault, vault.old));
     public
         .delegated
@@ -985,6 +1096,26 @@ fn proof_ids(pile: &mut Pile) -> Result<BTreeSet<CapabilityProofId>> {
         .collect()
 }
 
+fn verify_frozen_predecessors(plan: &PreparedPlan, commits: &[CollectionCommit]) -> Result<()> {
+    for vault in &plan.vaults {
+        let Some(predecessor) = &vault.predecessor else {
+            continue;
+        };
+        let ids = commits
+            .iter()
+            .filter(|commit| commit.collection() == predecessor.collection)
+            .map(CollectionCommit::id)
+            .collect::<BTreeSet<_>>();
+        if ids != predecessor.commit_ids {
+            bail!(
+                "retired direct predecessor for Secrets vault {:X} changed after the final plan; re-plan before publication",
+                vault.summary.vault,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescriptorAuthorityReport> {
     let before = plan_open(pile, signer)?;
     if !before.public.delegated.is_empty() {
@@ -1017,6 +1148,7 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
     if old_inbox_ids != before.old_inbox_ids || current_inbox_ids != before.current_inbox_ids {
         bail!("Secrets access inbox changed after the final plan; re-plan before publication");
     }
+    verify_frozen_predecessors(&before, &commits)?;
     for vault in &before.vaults {
         let source_ids = commits
             .iter()
@@ -1493,6 +1625,125 @@ mod tests {
         assert_eq!(replay.published_envelopes, 0);
         assert_eq!(replay.persisted_proofs, 0);
         assert!(replay.plan.settled());
+    }
+
+    #[test]
+    fn covered_direct_predecessor_is_verified_but_not_independently_reseated() {
+        let fixture = founder_fixture();
+        let direct_descriptor =
+            retired_direct_vault_descriptor(fixture.vault, fixture.signer.verifying_key());
+        let direct = descriptor_handle(&direct_descriptor);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        assert_eq!(store_fragment(&mut pile, direct_descriptor), direct);
+        let subset = {
+            let reader = pile.reader().unwrap();
+            let data: Inline<Handle<SimpleArchive>> = fixture.source[0].data().transmute();
+            let blob: Blob<SimpleArchive> = reader.get(data).unwrap();
+            let facts = TribleSet::try_from_blob(blob).unwrap();
+            let mut subset = TribleSet::new();
+            subset.insert(facts.iter().next().unwrap());
+            subset
+        };
+        let data = pile.put::<SimpleArchive, _>(subset).unwrap();
+        let predecessor = CollectionCommit::sign(
+            &fixture.signer,
+            direct,
+            data.transmute(),
+            fixture.source[0].metadata(),
+        );
+        pile.insert(CollectionRecord::Commit(predecessor)).unwrap();
+        pile.close().unwrap();
+
+        let bytes_before_plan = fs::read(&fixture.pile).unwrap();
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(fs::read(&fixture.pile).unwrap(), bytes_before_plan);
+        assert_eq!(plan.vaults.len(), 1);
+        assert_eq!(plan.vaults[0].source_commits, fixture.source.len());
+        assert_eq!(plan.vaults[0].target_commits, fixture.source.len());
+
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.appended_commits, fixture.source.len());
+        assert!(report.plan.settled());
+        let replay = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(replay.appended_commits, 0);
+        assert_eq!(replay.published_envelopes, 0);
+        assert_eq!(replay.persisted_proofs, 0);
+        assert!(replay.plan.settled());
+    }
+
+    #[test]
+    fn direct_predecessor_append_after_plan_invalidates_the_frozen_prefix() {
+        let fixture = founder_fixture();
+        let direct_descriptor =
+            retired_direct_vault_descriptor(fixture.vault, fixture.signer.verifying_key());
+        let direct = descriptor_handle(&direct_descriptor);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        assert_eq!(store_fragment(&mut pile, direct_descriptor), direct);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &fixture.signer,
+            direct,
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        let plan = plan_open(&mut pile, &fixture.signer).unwrap();
+
+        commit_fragment(
+            &mut pile,
+            &fixture.signer,
+            direct,
+            entity! { _ @ metadata::tag: KIND_ACCESS_ENVELOPE },
+        );
+        let records = discover_collection_records(&mut pile).unwrap();
+        let error = verify_frozen_predecessors(&plan, records.commits()).unwrap_err();
+        assert!(error.to_string().contains("changed after the final plan"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn direct_predecessor_without_a_capability_successor_fails_without_writes() {
+        let fixture = founder_fixture();
+        let direct_vault = id(0x72);
+        let direct_descriptor =
+            retired_direct_vault_descriptor(direct_vault, fixture.signer.verifying_key());
+        let direct = descriptor_handle(&direct_descriptor);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        assert_eq!(store_fragment(&mut pile, direct_descriptor), direct);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &fixture.signer,
+            direct,
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+        let before = fs::read(&fixture.pile).unwrap();
+
+        let error = publish_path(&fixture.pile, Some(&fixture.key)).unwrap_err();
+        assert!(format!("{error:#}").contains("no exact capability-native successor"));
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn uncovered_direct_predecessor_facts_fail_without_writes() {
+        let fixture = founder_fixture();
+        let direct_descriptor =
+            retired_direct_vault_descriptor(fixture.vault, fixture.signer.verifying_key());
+        let direct = descriptor_handle(&direct_descriptor);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        assert_eq!(store_fragment(&mut pile, direct_descriptor), direct);
+        commit_fragment(
+            &mut pile,
+            &fixture.signer,
+            direct,
+            entity! { _ @ metadata::tag: KIND_ACCESS_ENVELOPE },
+        );
+        pile.close().unwrap();
+        let before = fs::read(&fixture.pile).unwrap();
+
+        let error = publish_path(&fixture.pile, Some(&fixture.key)).unwrap_err();
+        assert!(format!("{error:#}").contains("facts absent from its capability-native successor"));
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
     }
 
     #[test]
