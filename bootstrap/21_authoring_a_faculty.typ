@@ -62,8 +62,12 @@ signer. This is the minimal shape:
 
 ```rust
 let signer = load_signer(&cli.pile, cli.key.as_deref())?;
-let pile = open_pile_strict(&cli.pile)?;
-let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
+let mut pile = open_pile_strict(&cli.pile)?;
+let collection = faculties::collection_names::open(
+    &mut pile,
+    DEFAULT_SCOPE_ID,
+    signer.verifying_key(),
+)?;
 
 let mut change = Fragment::empty();
 let body = change.put::<UTF8String, _>(body);
@@ -71,21 +75,28 @@ change += entity! {
     metadata::tag: &KIND_NOTE,
     myverb::text: body,
 };
-collection.commit(change)?;
-collection.into_storage().close()?;
+pile.commit(collection, &signer, change)?;
+pile.close()?;
 ```
 
-`Collection::commit` and the explicit close are substrate APIs. The typed
-constructor makes one self-contained fragment: its intrinsic identity, facts,
-and attachment bytes travel together. Strict readers validate the materialized
-domain model and payload closure; migrations validate untrusted source data.
-Ordinary writes should not rescan the complete current union merely to distrust
-the same constructor that just produced their fragment. Add a pre-publication
-check only for a genuine cross-fragment compatibility invariant.
+`collection_names::open` registers the canonical self-describing descriptor
+and returns its content handle. The authority is mandatory descriptor data and
+therefore already part of that handle; `snapshot` and `commit` need no separate
+authority argument. `CollectionStoreExt::commit` and the explicit close are
+substrate APIs. The typed constructor makes one self-contained fragment: its
+intrinsic identity, facts, and attachment bytes travel together. Strict readers
+validate the materialized domain model and payload closure; migrations validate
+untrusted source data. Ordinary writes should not rescan the complete current
+union merely to distrust the same constructor that just produced their
+fragment. Add a pre-publication check only for a genuine cross-fragment
+compatibility invariant.
 
-The collection's team grants WRITE authority explicitly. Bootstrap and the
-migration boundary initialize the closed faculty manifest; an ordinary faculty
-command never manufactures authority merely because it attempted a write.
+Local publication is unconditional: the signer curates a fragment into its
+local store. Authority is enforced when a snapshot or sync boundary decides
+which resident commits contribute to the collection. The descriptor authority
+is admitted directly; another signer needs an exact WRITE proof for this
+collection. An ordinary faculty command never manufactures authority merely
+because it attempted a write.
 
 The fragment carries its facts, metadata, and attachment closure together. The
 COMMIT *is* the curation record—no separate "log that I did this" step. Its

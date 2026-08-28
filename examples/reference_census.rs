@@ -103,15 +103,17 @@ fn read_content(reader: &PileReader, revision: &wiki_model::RevisionRecord) -> R
 fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
     let signer = load_signer(&pile, None)?;
-    let mut handle = open_pile_strict(&pile)?;
-    let facts = faculties::collection_names::open(
-        &mut handle,
+    let mut store = open_pile_strict(&pile)?;
+    let collection = faculties::collection_names::open(
+        &mut store,
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
-        signer,
+        signer.verifying_key(),
     )
-    .materialize()
-    .context("materialize Wiki collection")?;
-    let reader = handle.reader().context("open Wiki attachment reader")?;
+    .context("register Wiki collection descriptor")?;
+    let (facts, _, reader) = store
+        .snapshot(collection, &[])
+        .context("snapshot Wiki collection")?
+        .into_parts();
     let catalog = wiki_model::load_catalog(&facts)?;
     let model = &catalog.revisions;
 
@@ -238,7 +240,7 @@ fn main() -> Result<()> {
             identical_refs += 1;
         }
     }
-    let _ = handle.close();
+    let _ = store.close();
 
     let legacy = records.iter().filter(|r| !r.is_native()).count();
     println!(

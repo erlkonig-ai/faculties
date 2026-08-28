@@ -41,9 +41,11 @@ fn superseded_by_subtraction(space: &TribleSet) -> HashSet<Id> {
 }
 
 fn scope(pile: &mut Pile, id: Id, signer: &ed25519_dalek::SigningKey) -> Result<TribleSet> {
-    faculties::collection_names::open(pile, id, signer.clone())
-        .materialize()
-        .with_context(|| format!("materialize collection {id:x}"))
+    let collection = faculties::collection_names::open(pile, id, signer.verifying_key())
+        .with_context(|| format!("register collection {id:x} descriptor"))?;
+    pile.snapshot(collection, &[])
+        .map(|snapshot| snapshot.into_facts())
+        .with_context(|| format!("snapshot collection {id:x}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -280,17 +282,16 @@ fn properties(space: &TribleSet) -> Result<()> {
 /// dominated a status event and 778 of 2939 goals reported no status at all.
 ///
 /// The cure is an identity in the data, `board::status_of`, and the
-/// migration that gives it to the events written before it existed. This
-/// applies that migration **in memory** — the pile is never written — and
-/// then asks the register the question, comparing against Compass's old
-/// hand-rolled rule recomputed here from the *unmigrated* facts. Both sides
-/// are therefore independent: one reads `board::task` and sorts in Rust, the
-/// other reads `board::status_of` and resolves in the engine.
+/// migration that gave it to events written before it existed. This derives
+/// the maintained register projection **in memory** — the pile is never
+/// written — and compares it against Compass's old hand-rolled rule. Both
+/// sides are independent: one reads `board::task` and sorts in Rust, the
+/// other projects `board::status_of` and resolves through the register index.
 fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     use faculties::schemas::compass::{
-        board, interval_key, status_register, IntervalValue, KIND_GOAL_ID, KIND_STATUS_ID,
+        board, interval_key, IntervalValue, KIND_GOAL_ID, KIND_STATUS_ID,
     };
-    use faculties_migrations::status_register::status_register_delta;
+    use triblespace::core::collection::lww_register::{derive_element, LwwIndex};
 
     /// Compass's rule before the register, verbatim in behaviour: every
     /// status event grouped under this goal that carries both a status and
@@ -315,15 +316,13 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     )
     .collect();
 
-    // The migration, applied to a local copy. `space` is a materialized
-    // TribleSet; the pile is not touched.
-    let (delta, report) = status_register_delta(space);
-    let mut migrated = space.clone();
-    migrated += delta;
-
-    // Nothing about identity or scope at the call site: the recipe is the
-    // register, and the reader only picks a frame.
-    let order = status_register(&migrated);
+    // The same projection the maintained collection stores, derived directly
+    // from this immutable snapshot so the gate remains read-only.
+    let archive = space.clone().to_blob();
+    let projection = derive_element(&archive, board::status_of.id(), metadata::created_at.id())
+        .map_err(|error| anyhow::anyhow!("derive Compass status register: {error}"))?;
+    let order = LwwIndex::decode(&projection)
+        .map_err(|error| anyhow::anyhow!("decode Compass status register: {error}"))?;
 
     let mut compared = 0usize;
     let mut with_status = 0usize;
@@ -333,12 +332,11 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     for goal in &goals {
         let expected = latest_by_hand(space, *goal);
 
-        // The same question asked of the substrate, over the migrated
-        // facts. Candidates are this goal's status events; the register
-        // does the rest.
+        // The same question asked of the substrate over the current facts.
+        // Candidates are this goal's status events; the register does the rest.
         let events: BTreeSet<Id> = find!(
             event: Id,
-            pattern!(&migrated, [{ ?event @
+                pattern!(space, [{ ?event @
                 metadata::tag: &KIND_STATUS_ID,
                 board::status_of: goal,
                 board::status: _?any_status,
@@ -385,14 +383,10 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
 
     println!("COMPASS (a stated register — an identity and an order, no scope)");
     println!(
-        "  status events: {} · complete (status + time + goal): {} · incomplete: {}",
+        "  status events: {} · complete register coordinates: {} · incomplete: {}",
         all_status.len(),
-        report.complete_events,
-        report.skipped_incomplete
-    );
-    println!(
-        "  migration: {} identities over {} registers · already identified: {}",
-        report.facts, report.registers, report.already_identified
+        order.len(),
+        order.unresolved_count()
     );
     println!("  goals examined: {compared} · goals carrying a status: {with_status}");
     println!("  goals with more than one status event: {multi_event}");
@@ -408,8 +402,8 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
         "no goal has competing status events: the order would never be exercised"
     );
     assert!(
-        report.facts > 0,
-        "the migration wrote nothing: the gate would be testing an empty change"
+        !order.is_empty(),
+        "the register projection is empty: the gate would be testing an empty change"
     );
     assert!(
         broken_by_a_foreign_kind > 0,
