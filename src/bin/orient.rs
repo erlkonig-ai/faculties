@@ -8,6 +8,8 @@ use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
 use faculties::schemas::compass::latest_status_event;
+#[cfg(test)]
+use faculties::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use faculties::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use faculties::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
@@ -240,6 +242,7 @@ struct NativeCatalogs {
     status: TribleSet,
     habits: habits::Catalog,
     checkpoints: TribleSet,
+    checkpoint_register: LwwIndex,
     reader: PileReader,
 }
 
@@ -271,12 +274,8 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         compass::materialize_indexed_collection(pile, signer)?.into_parts();
     let status_facts = materialize_scope(pile, signer, STATUS_SCOPE_ID, "Status")?;
     let habit_facts = materialize_scope(pile, signer, HABIT_SCOPE_ID, "Habit")?;
-    let checkpoint_facts = materialize_scope(
-        pile,
-        signer,
-        faculties::schemas::orient::DEFAULT_SCOPE_ID,
-        "Orient checkpoint",
-    )?;
+    let (checkpoint_facts, _checkpoint_reader, checkpoint_register) =
+        orient_model::materialize_indexed_collection(pile, signer)?.into_parts();
     let reader = pile
         .reader()
         .map_err(|error| anyhow!("open Orient collection reader: {error}"))?;
@@ -306,6 +305,7 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         status: status_facts,
         habits,
         checkpoints: checkpoint_facts,
+        checkpoint_register,
         reader,
     })
 }
@@ -1209,7 +1209,10 @@ fn latest_checkpoint_view(
     persona: Id,
 ) -> Result<Option<orient_model::WatchedView>> {
     let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
-    Ok(orient_model::latest_checkpoint(events, persona)?.map(|event| event.view))
+    Ok(
+        orient_model::latest_checkpoint(events, &catalogs.checkpoint_register, persona)?
+            .map(|event| event.view),
+    )
 }
 
 fn save_checkpoint(
@@ -1274,9 +1277,11 @@ fn migrate_note_frontier(
         );
     }
     let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
-    let checkpoint = orient_model::latest_checkpoint(events, persona)?.ok_or_else(|| {
-        anyhow!("cannot migrate note frontier for {persona:x}: no checkpoint exists")
-    })?;
+    let checkpoint =
+        orient_model::latest_checkpoint(events, &catalogs.checkpoint_register, persona)?
+            .ok_or_else(|| {
+                anyhow!("cannot migrate note frontier for {persona:x}: no checkpoint exists")
+            })?;
     // `created_at` is authored event time, not publication order: a delayed or
     // backdated note may enter the pile after this checkpoint. A stopped-world
     // migration therefore baselines the one coherent current Compass snapshot

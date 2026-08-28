@@ -10,19 +10,71 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
 use triblespace::core::metadata;
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
 use crate::schemas::compass::KIND_NOTE_ID;
 use crate::schemas::orient::{
-    checkpoint, observation, KIND_CHECKPOINT_EVENT, KIND_SEEN, KIND_SEEN_FRONTIER,
+    checkpoint, observation, DEFAULT_SCOPE_ID, KIND_CHECKPOINT_EVENT, KIND_SEEN, KIND_SEEN_FRONTIER,
 };
+
+use crate::legacy_hint::open_scope;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
+
+/// One coherent Orient source snapshot plus its maintained checkpoint order.
+///
+/// Facts, ticket, payload reader, and register are captured from one exact
+/// collection observation. The maintained artifact is cache exhaust and has
+/// no authority beyond that source ticket.
+pub struct OrientSnapshot {
+    facts: TribleSet,
+    reader: PileReader,
+    checkpoints: LwwIndex,
+}
+
+impl OrientSnapshot {
+    /// Materialized facts admitted by this exact source ticket.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// Blob reader captured with the same immutable pile observation.
+    pub fn reader(&self) -> &PileReader {
+        &self.reader
+    }
+
+    /// Maintained checkpoint order attached for this exact ticket.
+    pub fn checkpoint_register(&self) -> &LwwIndex {
+        &self.checkpoints
+    }
+
+    /// Consume the coherent snapshot into facts, reader, and checkpoint index.
+    pub fn into_parts(self) -> (TribleSet, PileReader, LwwIndex) {
+        (self.facts, self.reader, self.checkpoints)
+    }
+}
+
+/// Exact maintained LWW projection for each persona's checkpoint stream.
+pub fn checkpoint_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+    LwwRegisterCollection::new(
+        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
+        namespace,
+        None,
+        checkpoint::persona.id(),
+        metadata::created_at.id(),
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+        None,
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+    )
+}
 
 /// Complete semantic wake state for one persona.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -393,22 +445,33 @@ where
     Ok(events)
 }
 
-/// Latest checkpoint for one exact persona anchor under a deterministic total
-/// order. Observation history deliberately does not follow mutable identity
+/// Latest checkpoint for one exact persona anchor in an exact maintained
+/// register frame.
+///
+/// Observation history deliberately does not follow mutable identity
 /// equivalence: an exact anchor's grow-only ledger must never shrink if a
-/// same-person verdict is later corrected.
+/// same-person verdict is later corrected. The register and event set must
+/// come from the same [`OrientSnapshot`].
 pub fn latest_checkpoint(
     events: impl IntoIterator<Item = CheckpointEvent>,
+    register: &LwwIndex,
     persona: Id,
 ) -> Result<Option<CheckpointEvent>> {
-    let mut latest: Option<((i128, Id), CheckpointEvent)> = None;
-    for event in events.into_iter().filter(|event| event.persona == persona) {
-        let key = (point_time(event.at)?, event.event);
-        if latest.as_ref().is_none_or(|(current, _)| key > *current) {
-            latest = Some((key, event));
-        }
+    let Some(winner) = register.winner(persona) else {
+        return Ok(None);
+    };
+    let mut selected = events
+        .into_iter()
+        .filter(|event| event.persona == persona && event.event == winner);
+    let result = selected.next().ok_or_else(|| {
+        anyhow!(
+            "Orient checkpoint register selects {winner:x} for {persona:x}, but the exact event set does not contain it"
+        )
+    })?;
+    if selected.next().is_some() {
+        bail!("Orient exact event set repeats checkpoint {winner:x}");
     }
-    Ok(latest.map(|(_, event)| event))
+    Ok(Some(result))
 }
 
 pub fn validate_catalog<Store>(reader: &Store, facts: &TribleSet, compass: &TribleSet) -> Result<()>
@@ -442,16 +505,54 @@ where
     Ok(())
 }
 
+/// Capture Orient facts and attach the maintained checkpoint LWW index for
+/// that exact source ticket, constructing missing derived artifacts if needed.
+///
+/// Cross-collection validation of Seen note references remains the caller's
+/// responsibility through [`validate_catalog`], because the Compass frame is
+/// a separate exact collection observation.
+pub fn materialize_indexed_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<OrientSnapshot> {
+    let snapshot = {
+        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+        collection
+            .snapshot()
+            .map_err(|error| anyhow!("snapshot Orient collection: {error}"))?
+    };
+    let (facts, ticket, reader) = snapshot.into_parts();
+    load_checkpoint_events(&reader, &facts).context("validate Orient checkpoint collection")?;
+    let checkpoints = checkpoint_register_collection(signer.verifying_key())
+        .ensure_exact(pile, &ticket)
+        .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
+    Ok(OrientSnapshot {
+        facts,
+        reader,
+        checkpoints,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::compass;
     use hifitime::Epoch;
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::collection::lww_register::derive_element;
     use triblespace::core::repo::BlobStore;
 
     fn at(seconds: f64) -> IntervalValue {
         let at = Epoch::from_unix_seconds(seconds);
         (at, at).try_to_inline().unwrap()
+    }
+
+    fn checkpoint_index(facts: &TribleSet) -> LwwIndex {
+        let source: Blob<SimpleArchive> = facts.clone().to_blob();
+        let projection =
+            derive_element(&source, checkpoint::persona.id(), metadata::created_at.id())
+                .expect("checkpoint facts project into the maintained register algebra");
+        LwwIndex::decode(&projection).expect("checkpoint register projection attaches")
     }
 
     #[test]
@@ -529,7 +630,9 @@ mod tests {
         let mut staged = all.clone();
         let reader = staged.blobs_mut().reader().unwrap();
         let events = load_checkpoint_events(&reader, all.facts()).unwrap();
-        let latest = latest_checkpoint(events, persona).unwrap().unwrap();
+        let latest = latest_checkpoint(events, &checkpoint_index(all.facts()), persona)
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.event, left_id.max(right_id));
         assert_eq!(
             latest.view,
