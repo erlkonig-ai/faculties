@@ -421,7 +421,8 @@ where
 }
 
 /// Persist one explicit proof closure in publication order: all named claims,
-/// then the native proof record that makes its exact id discoverable.
+/// their local service offers, then the native proof record that makes its
+/// exact id discoverable.
 ///
 /// Storage does not confer authority. Callers must verify the bundle against
 /// their exact root, subject, action, resource, mode, and instant before using
