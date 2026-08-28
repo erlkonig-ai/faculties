@@ -646,8 +646,9 @@ mod tests {
 
     fn validated_compass(persona: Id, note: Id) -> Fragment {
         let goal = Id::new([5; 16]).unwrap();
-        let mut compass = compass::goal_fragment(goal, "goal", Vec::new(), None, at(1.0)).unwrap();
-        compass += compass::note_fragment(
+        let mut compass =
+            compass::replay::goal_fragment(goal, "goal", Vec::new(), None, at(1.0)).unwrap();
+        compass += compass::replay::note_fragment(
             note,
             goal,
             "note",

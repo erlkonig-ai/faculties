@@ -65,12 +65,13 @@ env-var support). Set it once per shell — `export PILE=./self.pile`
 
 The `bootstrap` binary imports curated onboarding entries + Compass goals
 as locally signed collection COMMITs. Sources are `bootstrap/*.typ`; their
-declarative manifest and the already-shipped goal/note occurrence anchors live
-in `src/bootstrap.rs`. Import only after explicitly initializing the
-destination's durable signer (`trible pile signing-key init <pile>`). Never
+declarative manifest and fixed occurrence times live in `src/bootstrap.rs`;
+Compass goal and note ids are derived by their normal constructors. Import only
+after explicitly initializing the destination's durable signer
+(`trible pile signing-key init <pile>`). Never
 copy a pre-signed seed pile: a destination's explicit WRITE authority does not
-implicitly authorize its builder key. Run `bootstrap/build.sh` for the fresh-recipient,
-exact-replay, and semantic-closure checks.
+implicitly authorize its builder key. Run `bootstrap/build.sh` for the
+fresh-recipient, exact-replay, and semantic-closure checks.
 
 For each of the 21 seeded Wiki entries, a later bootstrap generation advances
 only the recognizable imported source strand. Recipient edits are never

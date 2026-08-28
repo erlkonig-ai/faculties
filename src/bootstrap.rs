@@ -21,7 +21,7 @@ use crate::storage::{load_signer, open_pile_strict};
 use crate::wiki::{self, RevisionDraft};
 use crate::{compass, wiki as wiki_model};
 
-const GENERATION_DOMAIN: &[u8] = b"faculties.portable-bootstrap.v1";
+const GENERATION_DOMAIN: &[u8] = b"faculties.portable-bootstrap.v2";
 const ROOT_TITLE: &str = "Portable bootstrap entry anchor";
 
 struct WikiSeed {
@@ -167,69 +167,53 @@ const WIKI_SEED: &[WikiSeed] = &[
 ];
 
 struct CompassSeed {
-    goal: Id,
-    occurrence: Id,
     created_nanosecond: u32,
     title: &'static str,
     tags: &'static [&'static str],
     note: &'static str,
 }
 
-// These are the semantic goal and note-occurrence anchors already shipped in
-// the final legacy seed. The builder's branch id and signatures are not data;
-// the goal identities, note occurrences, and their original provenance are.
+// Fixed occurrence times make the declarative records exactly replayable.
+// Goal and note ids are derived from these immutable fields by their normal
+// constructors; bootstrap has no separate identity manifest to keep in sync.
 const COMPASS_SEED: &[CompassSeed] = &[
     CompassSeed {
-        goal: id_hex!("912FA6E9E235D263FF5FE95D6F3E9A20"),
-        occurrence: id_hex!("912FA6E955EE223F11D78FDC6EAC7C9E"),
         created_nanosecond: 81_074_000,
         title: "Read the start-here wiki fragment",
         tags: &["bootstrap", "onboarding"],
         note: "Run `wiki list --tag bootstrap` to find the 'Getting Started: Your First Hour' fragment, then `wiki show <id>` to read it. This is your orientation tour.",
     },
     CompassSeed {
-        goal: id_hex!("912FA6F5CC103BC1FACF8492AC4418FC"),
-        occurrence: id_hex!("912FA6F5C4BD0CA6F67525F2DE505A46"),
         created_nanosecond: 93_142_000,
         title: "Mint your first id with `trible genid`",
         tags: &["bootstrap", "faculties"],
         note: "Stable IDs in TribleSpace are minted, never guessed. Run `trible genid` and copy the 32-char hex output. Try minting 3 in a row — they should all be different.",
     },
     CompassSeed {
-        goal: id_hex!("912FA700A04FE403663F6F182AFC842F"),
-        occurrence: id_hex!("912FA701C22DD8E1CC7D900E3BB3D43C"),
         created_nanosecond: 104_858_000,
         title: "Create your first wiki fragment",
         tags: &["bootstrap", "wiki"],
         note: "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then `wiki create \"My first fragment\" @/tmp/myfrag.typ --tag personal`. Verify with `wiki show <id>`.",
     },
     CompassSeed {
-        goal: id_hex!("912FA70BF4E072597F88787CDAF2B742"),
-        occurrence: id_hex!("912FA70CE6D31327ED9E734C1B4216B1"),
         created_nanosecond: 115_536_000,
         title: "Archive a file with `files add`",
         tags: &["bootstrap", "files"],
         note: "Pick any local file (not a binary in a git repo). Run `files add <path>`. The output `files:<hash>` is a content-addressed reference you can cite from wiki fragments. Confirm the hash is stable: re-run on the same file, same hash.",
     },
     CompassSeed {
-        goal: id_hex!("912FA7161B02418D9CC75A980B8DC2D2"),
-        occurrence: id_hex!("912FA717BC9D2D34B3AD4E7879046A30"),
         created_nanosecond: 126_687_000,
         title: "Run `wiki lint` and `wiki check`",
         tags: &["bootstrap", "wiki", "hygiene"],
         note: "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're the wiki's self-diagnostic surface.",
     },
     CompassSeed {
-        goal: id_hex!("912FA7218AFC6A31E632EF7E6AF3E404"),
-        occurrence: id_hex!("912FA721CFF741621418C61AEC7754FD"),
         created_nanosecond: 137_024_000,
         title: "Scaffold a trivial faculty",
         tags: &["bootstrap", "faculties", "authoring"],
         note: "Mint an id with `trible genid`, add `faculties/src/bin/echofact.rs`: a clap Cli with `#[arg(long, env = \"PILE\")] pile`, that opens the pile and prints one fact (e.g. the id you minted). `cargo install --path faculties --bins`, then run `echofact`. You've added a verb. See the 'Authoring a Faculty' fragment for the full skeleton.",
     },
     CompassSeed {
-        goal: id_hex!("912FA72C738EF64C52FD81FB02913734"),
-        occurrence: id_hex!("912FA72CF6A1BCA0BAB951F50B79DBB4"),
         created_nanosecond: 148_025_000,
         title: "Mark this goal done and write an outcome note",
         tags: &["bootstrap", "compass"],
@@ -438,17 +422,16 @@ fn compass_fragment() -> Result<Fragment> {
     let mut out = compass::kind_catalog_fragment();
     for spec in COMPASS_SEED {
         let at = seed_time(spec.created_nanosecond);
-        out += compass::goal_fragment(
-            spec.goal,
+        let (goal_record, goal) = compass::goal_fragment(
             spec.title,
             spec.tags.iter().map(|tag| (*tag).to_owned()).collect(),
             None,
             at,
         )?;
-        out += compass::status_fragment(spec.goal, "todo", None, at)?;
-        out += compass::note_fragment(
-            spec.occurrence,
-            spec.goal,
+        out += goal_record;
+        out += compass::status_fragment(goal, "todo", None, at)?;
+        let (note_record, _) = compass::note_fragment(
+            goal,
             spec.note,
             Vec::new(),
             Vec::new(),
@@ -456,6 +439,7 @@ fn compass_fragment() -> Result<Fragment> {
             None,
             at,
         )?;
+        out += note_record;
     }
     Ok(out)
 }
@@ -484,8 +468,6 @@ pub fn generation() -> [u8; 32] {
         }
     }
     for spec in COMPASS_SEED {
-        hasher.update(spec.goal.as_ref());
-        hasher.update(spec.occurrence.as_ref());
         hasher.update(&spec.created_nanosecond.to_be_bytes());
         hasher.update(spec.title.as_bytes());
         hasher.update(spec.note.as_bytes());
@@ -508,8 +490,6 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
     let result = (|| {
         let wiki_before = wiki_model::materialize_indexed_collection(&mut pile, &signer)
             .context("materialize Wiki before bootstrap import")?;
-        let (compass_before, compass_reader) = compass::materialize_collection(&mut pile, &signer)
-            .context("materialize Compass before bootstrap import")?;
         let (wiki, wiki_roots) = wiki_fragment(
             &signer.verifying_key(),
             Some((wiki_before.catalog(), wiki_before.reader())),
@@ -519,12 +499,6 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
             compass: compass_fragment()?,
             wiki_roots,
         };
-
-        // Compass seed identities are fixed anchors rather than intrinsic
-        // artifacts. Reject an existing, divergent use of one of those ids
-        // before publishing either half of the seed.
-        compass::validate_candidate(&compass_reader, &compass_before, &seed.compass)
-            .context("validate portable Compass anchor compatibility")?;
 
         let expected_wiki = seed.wiki.facts().clone();
         let expected_compass = seed.compass.facts().clone();
@@ -562,7 +536,6 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
 mod tests {
     use std::fs::File;
 
-    use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::collection::discover_collection_records;
 
     use super::*;
@@ -614,10 +587,10 @@ mod tests {
         assert_eq!(seed.wiki_roots.len(), 21);
         assert_eq!(compass::goal_ids(seed.compass.facts()).len(), 7);
         assert_eq!(compass::note_ids(seed.compass.facts()).len(), 7);
-        for spec in COMPASS_SEED {
-            assert!(compass::goal_ids(seed.compass.facts()).contains(&spec.goal));
-            assert!(compass::note_ids(seed.compass.facts()).contains(&spec.occurrence));
-        }
+        assert_eq!(
+            seed.compass,
+            build(&signer.verifying_key()).unwrap().compass
+        );
     }
 
     #[test]
@@ -653,34 +626,6 @@ mod tests {
             .map(|revision| revision.title)
             .collect();
         assert_eq!(left_titles, right_titles);
-    }
-
-    #[test]
-    fn compass_anchor_preflight_rejects_missing_attachments_without_publishing() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("empty.pile");
-        let key = directory.path().join("empty.key");
-        File::create(&pile_path).unwrap();
-        let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
-        let length_before = std::fs::metadata(&pile_path).unwrap().len();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let (compass_before, compass_reader) =
-            compass::materialize_collection(&mut pile, &signer).unwrap();
-        let seed = build(&signer.verifying_key()).unwrap();
-
-        compass::validate_candidate(&compass_reader, &compass_before, &seed.compass).unwrap();
-        let missing_compass =
-            Fragment::from_facts_and_blobs(seed.compass.facts().clone(), MemoryBlobStore::new());
-        assert!(
-            compass::validate_candidate(&compass_reader, &compass_before, &missing_compass)
-                .is_err()
-        );
-        pile.close().unwrap();
-        assert_eq!(
-            std::fs::metadata(&pile_path).unwrap().len(),
-            length_before,
-            "Compass preflight must not append collection records"
-        );
     }
 
     #[test]
