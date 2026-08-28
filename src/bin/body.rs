@@ -21,6 +21,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use faculties::body as body_model;
 use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
@@ -416,6 +417,24 @@ impl BodyStorage<'_> {
         Ok(())
     }
 
+    fn with_pile<T>(
+        &self,
+        f: impl FnOnce(&mut Pile, &ed25519_dalek::SigningKey) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = f(&mut pile, &signer);
+        let close = pile.close();
+        match (result, close) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                Err(error.context(format!("closing pile also failed: {close_error}")))
+            }
+        }
+    }
+
     fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let pile = open_pile_strict(self.pile)?;
@@ -442,6 +461,16 @@ impl BodyStorage<'_> {
                 .reader()
                 .context("open Body blob reader")?;
             f(&facts, &reader)
+        })
+    }
+
+    fn with_indexed_view<T>(
+        &self,
+        f: impl FnOnce(&body_model::BodySnapshot) -> Result<T>,
+    ) -> Result<T> {
+        self.with_pile(|pile, signer| {
+            let snapshot = body_model::materialize_indexed_collection(pile, signer)?;
+            f(&snapshot)
         })
     }
 }
@@ -658,7 +687,8 @@ fn intent_fragment(text: &str, created: Inline<inlineencodings::NsTAIInterval>) 
     fragment
 }
 
-fn latest_intent(space: &TribleSet, reader: &PileReader) -> Result<Option<(i128, Id, String)>> {
+#[cfg(test)]
+fn latest_intent_jit(space: &TribleSet) -> Option<(i128, Id, TextHandle)> {
     let mut best: Option<(i128, Id, TextHandle)> = None;
     for (intent_id, handle, created) in find!(
         (i: Id, h: TextHandle, t: Inline<inlineencodings::NsTAIInterval>),
@@ -678,13 +708,23 @@ fn latest_intent(space: &TribleSet, reader: &PileReader) -> Result<Option<(i128,
         }
     }
 
-    let Some((time, id, handle)) = best else {
+    best
+}
+
+fn latest_intent(snapshot: &body_model::BodySnapshot) -> Result<Option<(i128, Id, String)>> {
+    let Some(row) = body_model::latest_intent(snapshot.catalog(), snapshot.intent_register())?
+    else {
         return Ok(None);
     };
-    let text: View<str> = reader
-        .get(handle)
-        .map_err(|error| anyhow::anyhow!("read latest intent {id:X}: {error}"))?;
-    Ok(Some((time, id, text.to_string())))
+    let text: View<str> = snapshot
+        .reader()
+        .get(row.text)
+        .map_err(|error| anyhow::anyhow!("read latest intent {:X}: {error}", row.id))?;
+    Ok(Some((
+        interval_key(row.created_at),
+        row.id,
+        text.to_string(),
+    )))
 }
 
 fn cmd_intent(storage: BodyStorage<'_>, text: Option<&str>) -> Result<()> {
@@ -696,8 +736,8 @@ fn cmd_intent(storage: BodyStorage<'_>, text: Option<&str>) -> Result<()> {
             println!("  intent {} set: {t}", &fmt_id(id)[..12]);
         }
         None => {
-            storage.with_view(|space, reader| {
-                match latest_intent(space, reader)? {
+            storage.with_indexed_view(|snapshot| {
+                match latest_intent(snapshot)? {
                     Some((time, _, text)) => {
                         eprintln!("  ({})", format_time(time));
                         println!("{text}");
@@ -1199,28 +1239,91 @@ mod tests {
         storage.publish(second).unwrap();
         storage.publish(first).unwrap();
 
+        let mut capture = Fragment::empty();
+        let pose = capture.put::<blobencodings::UTF8String, _>("{}".to_owned());
+        capture += entity! {
+            metadata::tag: &KIND_CAPTURE,
+            metadata::created_at: at_unix(1_760_000_000.0),
+            capture::modality: "touch",
+            capture::pose: pose,
+        };
+        storage.publish(capture).unwrap();
+
         storage
-            .with_view(|space, reader| {
+            .with_indexed_view(|snapshot| {
                 let intents: Vec<Id> = find!(
                     (i: Id),
-                    pattern!(space, [{ ?i @ metadata::tag: KIND_INTENT }])
+                    pattern!(snapshot.facts(), [{ ?i @ metadata::tag: KIND_INTENT }])
                 )
                 .map(|(id,)| id)
                 .collect();
                 assert_eq!(intents.len(), 2);
 
+                let (_, jit_id, jit_handle) =
+                    latest_intent_jit(snapshot.facts()).expect("JIT latest intent");
                 let (_, selected_id, selected_text) =
-                    latest_intent(space, reader)?.expect("latest intent");
+                    latest_intent(snapshot)?.expect("maintained latest intent");
                 let expected_id = first_id.max(second_id);
                 let expected_text = if expected_id == first_id {
                     "first"
                 } else {
                     "second"
                 };
+                assert_eq!(jit_id, expected_id);
                 assert_eq!(selected_id, expected_id);
+                assert_eq!(snapshot.catalog().intents[&selected_id].text, jit_handle);
                 assert_eq!(selected_text, expected_text);
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn indexed_snapshots_are_attached_to_their_exact_commit_ticket() {
+        let directory = TestDirectory::new();
+        let pile_path = directory.0.join("body.pile");
+        let key = directory.0.join("body.key");
+        File::create(&pile_path).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let signer = load_signer(&pile_path, Some(&key)).unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+
+        let first = intent_fragment("first", at_unix(1_750_000_000.0));
+        let first_id = first.root().unwrap();
+        open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .commit(first)
+            .unwrap();
+        let before = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
+        assert_eq!(
+            body_model::latest_intent(before.catalog(), before.intent_register())
+                .unwrap()
+                .unwrap()
+                .id,
+            first_id
+        );
+
+        let second = intent_fragment("second", at_unix(1_760_000_000.0));
+        let second_id = second.root().unwrap();
+        open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .commit(second)
+            .unwrap();
+        let after = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
+
+        assert_eq!(
+            body_model::latest_intent(before.catalog(), before.intent_register())
+                .unwrap()
+                .unwrap()
+                .id,
+            first_id,
+            "the older snapshot must not borrow a later ticket's register"
+        );
+        assert_eq!(
+            body_model::latest_intent(after.catalog(), after.intent_register())
+                .unwrap()
+                .unwrap()
+                .id,
+            second_id
+        );
+        pile.close().unwrap();
     }
 }
