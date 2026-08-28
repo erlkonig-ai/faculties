@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{CollectionCommit, CollectionHandle};
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStore;
@@ -192,12 +193,18 @@ pub struct DatasetView<'a> {
     pub reader: &'a PileReader,
     pub revision: DatasetRevision,
     lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
+    observed_orders: &'a BTreeMap<Id, ObservedIndex>,
 }
 
 impl DatasetView<'_> {
     /// Maintained LWW order for the requested identity and order attributes.
     pub fn lww_register(&self, identity: Id, orders: Id) -> Option<&LwwIndex> {
         self.lww_registers.get(&(identity, orders))
+    }
+
+    /// Maintained observation order for the requested edge attribute.
+    pub fn observed_order(&self, observes: Id) -> Option<&ObservedIndex> {
+        self.observed_orders.get(&observes)
     }
 }
 
@@ -244,6 +251,7 @@ struct LoadedDataset {
     reader: PileReader,
     revision: DatasetRevision,
     lww_registers: BTreeMap<(Id, Id), LwwIndex>,
+    observed_orders: BTreeMap<Id, ObservedIndex>,
 }
 
 impl LoadedDataset {
@@ -252,6 +260,7 @@ impl LoadedDataset {
         facts: TribleSet,
         reader: PileReader,
         lww_registers: BTreeMap<(Id, Id), LwwIndex>,
+        observed_orders: BTreeMap<Id, ObservedIndex>,
     ) -> Self {
         let revision = DatasetRevision::from_collection(collection, &facts);
         Self {
@@ -259,6 +268,7 @@ impl LoadedDataset {
             reader,
             revision,
             lww_registers,
+            observed_orders,
         }
     }
 
@@ -268,6 +278,7 @@ impl LoadedDataset {
             reader: &self.reader,
             revision: self.revision,
             lww_registers: &self.lww_registers,
+            observed_orders: &self.observed_orders,
         }
     }
 }
@@ -644,6 +655,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         let mut by_scope =
             BTreeMap::<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
+        let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
         for (scope, label) in materialization_scopes(sources) {
             let (collection_id, facts, commits) = {
@@ -678,6 +690,16 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             );
         }
 
+        if let Some((_, _, commits)) = by_scope.get(&WIKI_SCOPE_ID) {
+            let index = crate::wiki::observed_collection(signer.verifying_key())
+                .ensure_exact(&mut pile, commits)
+                .map_err(|error| format!("maintain Wiki supersession index: {error}"))?;
+            observed_by_scope
+                .entry(WIKI_SCOPE_ID)
+                .or_default()
+                .insert(triblespace::core::metadata::supersedes.id(), index);
+        }
+
         let secrets = sources
             .contains(&SourceKey::Secrets)
             .then(|| {
@@ -693,6 +715,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         validate_catalog(
             &reader,
             &by_scope,
+            &observed_by_scope,
             sources,
             secrets.as_ref().map(|loaded| loaded.discovery.snapshot()),
         )?;
@@ -705,9 +728,19 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                     .get(&source.scope)
                     .expect("every fixed viewer scope was materialized");
                 let lww_registers = lww_by_scope.get(&source.scope).cloned().unwrap_or_default();
+                let observed_orders = observed_by_scope
+                    .get(&source.scope)
+                    .cloned()
+                    .unwrap_or_default();
                 (
                     source.key,
-                    LoadedDataset::new(*collection, facts.clone(), reader.clone(), lww_registers),
+                    LoadedDataset::new(
+                        *collection,
+                        facts.clone(),
+                        reader.clone(),
+                        lww_registers,
+                        observed_orders,
+                    ),
                 )
             })
             .collect();
@@ -726,6 +759,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 fn validate_catalog(
     reader: &PileReader,
     by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>,
+    observed_by_scope: &BTreeMap<Id, BTreeMap<Id, ObservedIndex>>,
     sources: &BTreeSet<SourceKey>,
     secrets: Option<&SecretsSnapshot<PileReader>>,
 ) -> Result<(), String> {
@@ -820,7 +854,13 @@ fn validate_catalog(
         .map_err(|error| format!("validate Teams secret references: {error:#}"))?;
     }
     if sources.contains(&SourceKey::Wiki) {
-        crate::wiki::validate_catalog(reader, facts(SourceKey::Wiki))
+        let observed = observed_by_scope
+            .get(&WIKI_SCOPE_ID)
+            .and_then(|orders| orders.get(&triblespace::core::metadata::supersedes.id()))
+            .ok_or_else(|| {
+                "validate Wiki collection: maintained supersession index missing".to_owned()
+            })?;
+        crate::wiki::validate_catalog_with_order(reader, facts(SourceKey::Wiki), observed)
             .map_err(|error| format!("validate Wiki collection: {error:#}"))?;
     }
     if sources.contains(&SourceKey::Reason) || sources.contains(&SourceKey::Triage) {
@@ -1055,6 +1095,65 @@ mod tests {
                 BTreeSet::from([source, SourceKey::Relations])
             );
         }
+    }
+
+    #[test]
+    fn wiki_dataset_attaches_exact_observed_order_without_advancing_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wiki-observed.pile");
+        create_pile(&path);
+        let signer = load_signer(&path, None).unwrap();
+        let (author_fragment, author) = crate::wiki::author_record(&signer.verifying_key());
+        let instant = Epoch::from_tai_seconds(1.0);
+        let (root_fragment, root) = crate::wiki::revision_record(crate::wiki::RevisionDraft {
+            title: "root".to_owned(),
+            content: "root".to_owned(),
+            tags: BTreeSet::new(),
+            predecessors: BTreeSet::new(),
+            author,
+            authored_at: (instant, instant).try_to_inline().unwrap(),
+        })
+        .unwrap();
+        let (successor_fragment, successor) =
+            crate::wiki::revision_record(crate::wiki::RevisionDraft {
+                title: "successor".to_owned(),
+                content: "successor".to_owned(),
+                tags: BTreeSet::new(),
+                predecessors: BTreeSet::from([root]),
+                author,
+                authored_at: (instant, instant).try_to_inline().unwrap(),
+            })
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        crate::wiki::commit_collection(
+            &mut pile,
+            &signer,
+            author_fragment + root_fragment + successor_fragment,
+        )
+        .unwrap();
+        let ticket_before = crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.clone())
+            .ticket()
+            .unwrap();
+        pile.close().unwrap();
+
+        let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
+        let dataset = storage.context().dataset(SourceKey::Wiki).unwrap();
+        let observed = dataset
+            .observed_order(metadata::supersedes.id())
+            .expect("Wiki dataset carries its maintained observation order");
+        let indexed =
+            crate::wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
+                .unwrap();
+        let jit = crate::wiki::validate_catalog(dataset.reader, dataset.facts).unwrap();
+        assert_eq!(indexed, jit);
+        assert_eq!(indexed.revisions.all_entries()[0].frontier[0].id, successor);
+
+        let mut pile = open_pile_strict(&path).unwrap();
+        let ticket_after = crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer)
+            .ticket()
+            .unwrap();
+        pile.close().unwrap();
+        assert_eq!(ticket_after, ticket_before);
     }
 
     #[test]

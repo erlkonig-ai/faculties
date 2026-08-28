@@ -31,6 +31,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -103,11 +104,14 @@ impl WikiLive {
             None => (None, None),
         };
 
+        let observed = wiki
+            .observed_order(metadata::supersedes.id())
+            .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
         Ok(WikiLive {
             // Storage normally admits this exact snapshot first, but the
             // widget remains a safe embedding boundary on its own: structural
             // corruption and missing text blobs become visible diagnostics.
-            catalog: crate::wiki::validate_catalog(wiki.reader, wiki.facts)
+            catalog: crate::wiki::validate_catalog_with_order(wiki.reader, wiki.facts, observed)
                 .map_err(|error| format!("validate Wiki collection: {error:#}"))?,
             files_catalog,
             cached_revision: wiki.revision,
