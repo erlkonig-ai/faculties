@@ -149,6 +149,15 @@ mod tests {
     use faculties::compass::{note_fragment, status_fragment};
     use faculties::schemas::compass::{latest_status_event, IntervalValue};
     use hifitime::Epoch;
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::collection::lww_register::{derive_element, LwwIndex};
+
+    fn status_index(facts: &TribleSet) -> LwwIndex {
+        let source: Blob<SimpleArchive> = facts.clone().to_blob();
+        let projection = derive_element(&source, board::status_of.id(), metadata::created_at.id())
+            .expect("status facts project into the maintained register algebra");
+        LwwIndex::decode(&projection).expect("projected status register attaches")
+    }
 
     /// A point interval, the shape Compass writes and validates.
     fn at(seconds: i128) -> IntervalValue {
@@ -179,7 +188,7 @@ mod tests {
             .clone();
 
         assert_eq!(
-            latest_status_event(&legacy, goal),
+            latest_status_event(&legacy, &status_index(&legacy), goal),
             None,
             "without an identity the event is in no register"
         );
@@ -193,7 +202,8 @@ mod tests {
         let mut migrated = legacy.clone();
         migrated += delta.clone();
         assert_eq!(
-            latest_status_event(&migrated, goal).map(|(id, status, _)| (id, status)),
+            latest_status_event(&migrated, &status_index(&migrated), goal)
+                .map(|(id, status, _)| (id, status)),
             Some((event, "doing".to_owned())),
             "the note carries no status identity, so it cannot dominate"
         );
@@ -234,6 +244,8 @@ mod tests {
         // candidate for the `board::task` sweep.
         assert_eq!(report.complete_events, 0);
         assert_eq!(report.skipped_incomplete, 1);
-        assert!(latest_status_event(fragment.facts(), goal).is_some());
+        assert!(
+            latest_status_event(fragment.facts(), &status_index(fragment.facts()), goal,).is_some()
+        );
     }
 }
