@@ -22,10 +22,9 @@ use faculties::schemas::planner::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use rrule::{RRuleSet, Tz};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -128,21 +127,23 @@ struct LoadedPlanner {
 }
 
 impl PlannerStorage<'_> {
-    fn with_collection<T>(
+    fn with_store<T>(
         &self,
-        operation: impl FnOnce(&mut Collection<Pile>, &LoadedPlanner) -> Result<T>,
+        operation: impl FnOnce(
+            &mut Pile,
+            CollectionHandle,
+            &ed25519_dalek::SigningKey,
+            &LoadedPlanner,
+        ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
                 .context("materialize Planner collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Planner blob reader")?;
             let catalog = planner_model::validate_catalog(&reader, &facts)
                 .context("validate Planner collection")?;
             let loaded = LoadedPlanner {
@@ -150,13 +151,13 @@ impl PlannerStorage<'_> {
                 reader,
                 catalog,
             };
-            operation(&mut collection, &loaded)
+            operation(&mut pile, collection, &signer, &loaded)
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&LoadedPlanner) -> Result<T>) -> Result<T> {
-        self.with_collection(|_, loaded| operation(loaded))
+        self.with_store(|_, _, _, loaded| operation(loaded))
     }
 
     fn update<T>(
@@ -164,14 +165,13 @@ impl PlannerStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&LoadedPlanner) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_collection(|collection, loaded| {
+        self.with_store(|pile, collection, signer, loaded| {
             let (fragment, value) = operation(loaded)?;
             if let Some(mut fragment) = fragment {
                 planner_model::validate_candidate(&loaded.reader, &loaded.facts, &fragment)
                     .context("validate Planner mutation")?;
                 fragment.describe_with(entity! { metadata::description: description });
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
             }
             Ok(value)
@@ -183,15 +183,15 @@ impl PlannerStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
-        let team = signer.verifying_key();
-        let result =
-            faculties::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
-                target
-                    .commits()
-                    .iter()
-                    .filter(|commit| commit.public_key().raw == author)
-                    .count()
-            });
+        let result = (|| {
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let ticket = pile.ticket(collection, &[])?;
+            Ok(ticket
+                .commits()
+                .iter()
+                .filter(|commit| commit.public_key().raw == author)
+                .count())
+        })();
         finish_pile(pile, result)
     }
 }

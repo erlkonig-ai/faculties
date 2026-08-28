@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::trible::Fragment;

@@ -21,7 +21,7 @@ use std::path::Path;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;

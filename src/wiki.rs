@@ -19,7 +19,7 @@ use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;

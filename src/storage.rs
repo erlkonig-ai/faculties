@@ -28,7 +28,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecordDiagnostic, CollectionStore, CollectionStoreExt,
+    CollectionRecordDiagnostic, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
