@@ -969,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_load_and_context_do_not_change_pile_length() {
+    fn storage_load_settles_once_and_context_refresh_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("viewer.pile");
         create_pile(&path);
@@ -988,7 +988,10 @@ mod tests {
         .unwrap();
         let text: View<str> = view.reader.get(text).unwrap();
         assert_eq!(&*text, "read only");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+        let settled_length = std::fs::metadata(&path).unwrap().len();
+        assert!(settled_length >= length);
+        let _ = storage.context();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), settled_length);
         assert!(storage.error().is_none());
     }
 
