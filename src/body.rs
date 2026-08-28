@@ -8,12 +8,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
-use crate::schemas::body::{capture, intent, KIND_CAPTURE, KIND_INTENT};
+use crate::legacy_hint::open_scope;
+use crate::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -47,6 +50,66 @@ pub struct IntentRow {
 pub struct BodyCatalog {
     pub captures: BTreeMap<Id, CaptureRow>,
     pub intents: BTreeMap<Id, IntentRow>,
+}
+
+/// One coherent Body source snapshot plus its maintained intent register.
+///
+/// Facts, admitted commits, and the attachment reader are captured by one
+/// collection observation. The maintained index is then attached for exactly
+/// that commit ticket; it is cache exhaust, never additional authority.
+pub struct BodySnapshot {
+    facts: TribleSet,
+    reader: PileReader,
+    catalog: BodyCatalog,
+    intents: LwwIndex,
+}
+
+impl BodySnapshot {
+    /// Materialized facts admitted by this exact source ticket.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// Blob reader captured while validating this exact source snapshot.
+    pub fn reader(&self) -> &PileReader {
+        &self.reader
+    }
+
+    /// Strictly validated Body ontology for this snapshot.
+    pub fn catalog(&self) -> &BodyCatalog {
+        &self.catalog
+    }
+
+    /// Maintained order for the Body intent register.
+    pub fn intent_register(&self) -> &LwwIndex {
+        &self.intents
+    }
+
+    /// Consume the coherent snapshot into facts, reader, catalog, and index.
+    pub fn into_parts(self) -> (TribleSet, PileReader, BodyCatalog, LwwIndex) {
+        (self.facts, self.reader, self.catalog, self.intents)
+    }
+}
+
+/// Exact maintained tag-order projection used to select the current intent.
+///
+/// `metadata::tag` is the identity coordinate: every intent event states the
+/// single register value [`KIND_INTENT`]. `metadata::created_at` is an
+/// order-preserving point interval, and [`LwwIndex`] breaks equal-time ties by
+/// intrinsic event id, matching the historical JIT reader exactly. Capture
+/// rows form an independent `KIND_CAPTURE` register in the same target bytes;
+/// [`latest_intent`] scopes the read with `winner(KIND_INTENT)`.
+pub fn intent_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+    LwwRegisterCollection::new(
+        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
+        namespace,
+        None,
+        metadata::tag.id(),
+        metadata::created_at.id(),
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+        None,
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+    )
 }
 
 fn fmt_id(id: Id) -> String {
@@ -429,6 +492,54 @@ pub fn validate_candidate(
         }
     }
     Ok(catalog)
+}
+
+/// Select the latest validated intent through the exact maintained register.
+///
+/// The catalog remains the authority for record shape and payload identity;
+/// the index only answers which intrinsic event wins the already-established
+/// total order.
+pub fn latest_intent<'a>(
+    catalog: &'a BodyCatalog,
+    register: &LwwIndex,
+) -> Result<Option<&'a IntentRow>> {
+    let Some(id) = register.winner(KIND_INTENT) else {
+        if catalog.intents.is_empty() {
+            return Ok(None);
+        }
+        bail!(
+            "maintained Body intent register has no winner for {} validated intent(s)",
+            catalog.intents.len()
+        );
+    };
+    catalog.intents.get(&id).map(Some).ok_or_else(|| {
+        anyhow!("maintained Body intent register selected {id:x}, which is not a validated intent")
+    })
+}
+
+/// Capture Body facts and attach the maintained intent LWW index for that
+/// exact source ticket, constructing missing derived artifacts if necessary.
+pub fn materialize_indexed_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<BodySnapshot> {
+    let snapshot = {
+        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+        collection
+            .snapshot()
+            .map_err(|error| anyhow!("snapshot Body collection: {error}"))?
+    };
+    let (facts, ticket, reader) = snapshot.into_parts();
+    let catalog = validate_catalog(&reader, &facts).context("validate Body collection")?;
+    let intents = intent_register_collection(signer.verifying_key())
+        .ensure_exact(pile, &ticket)
+        .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
+    Ok(BodySnapshot {
+        facts,
+        reader,
+        catalog,
+        intents,
+    })
 }
 
 #[cfg(test)]
