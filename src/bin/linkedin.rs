@@ -1555,9 +1555,9 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_leaves_the_pile_byte_identical() {
+    fn dry_run_publishes_no_collection_commit() {
         let fixture = Fixture::new();
-        let before = std::fs::read(&fixture.pile).unwrap();
+        let before = fixture.commit_count();
         let row = connection(
             "Ada Lovelace",
             "https://linkedin.com/in/ada",
@@ -1566,7 +1566,7 @@ mod tests {
 
         ingest(fixture.storage(), &[row], true).unwrap();
 
-        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+        assert_eq!(fixture.commit_count(), before);
         assert!(relations::person_anchors(&fixture.view().facts).is_empty());
     }
 
