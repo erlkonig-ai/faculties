@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn open_status_collection_materializes_foreign_commit_without_claiming_authorship() {
+    fn foreign_commit_is_resident_but_inert_without_write_proof() {
         let fixture = fixture();
         let window = Id::new([0x83; 16]).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
@@ -452,21 +452,23 @@ mod tests {
             .with_pile(|pile, signer| {
                 let catalogs = load_catalogs(pile, signer)?;
                 let rows = status::load_status_rows(&catalogs.status)?;
-                assert_eq!(rows.len(), 1);
-                assert_eq!(
-                    status::read_text(&catalogs.reader, rows[0].text)?,
-                    "foreign"
-                );
+                assert!(rows.is_empty());
 
-                let target =
-                    faculties::storage::discover_target(pile, DEFAULT_SCOPE_ID, namespace)?;
-                assert_eq!(target.commits().len(), 1);
+                let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+                assert!(pile.ticket(collection, &[])?.commits().is_empty());
+                let discovered = triblespace::core::collection::discover_collection_records(pile)?;
+                let resident = discovered
+                    .commits()
+                    .iter()
+                    .filter(|commit| commit.collection() == collection)
+                    .collect::<Vec<_>>();
+                assert_eq!(resident.len(), 1);
                 assert_eq!(
-                    target.commits()[0].public_key().raw,
+                    resident[0].public_key().raw,
                     foreign.verifying_key().to_bytes()
                 );
                 assert_ne!(
-                    target.commits()[0].public_key().raw,
+                    resident[0].public_key().raw,
                     signer.verifying_key().to_bytes()
                 );
                 Ok(())
