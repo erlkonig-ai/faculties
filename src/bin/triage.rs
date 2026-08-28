@@ -1199,10 +1199,12 @@ mod tests {
 
         fn publish(&self, scope: Id, fragment: Fragment) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let pile = open_pile_strict(&self.pile).unwrap();
-            let mut collection = faculties::collection_names::open(pile, scope, signer);
-            collection.commit(fragment).unwrap();
-            collection.into_storage().close().unwrap();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let collection =
+                faculties::collection_names::open(&mut pile, scope, signer.verifying_key())
+                    .unwrap();
+            pile.commit(collection, &signer, fragment).unwrap();
+            pile.close().unwrap();
         }
 
         fn cli(&self, command: Command) -> Cli {

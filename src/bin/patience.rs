@@ -206,7 +206,6 @@ mod tests {
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
     }
-    use triblespace::core::repo::BlobStore;
 
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()

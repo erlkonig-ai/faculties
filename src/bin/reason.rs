@@ -202,7 +202,6 @@ mod tests {
     use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use std::fs::File;
     use triblespace::core::collection::CollectionStoreExt;
-    use triblespace::core::repo::BlobStore;
 
     type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 

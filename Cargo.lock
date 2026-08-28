@@ -3880,7 +3880,6 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "egui",
- "faculties-migrations",
  "faculties-secrets",
  "hex",
  "hifitime",

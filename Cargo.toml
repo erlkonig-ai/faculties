@@ -224,12 +224,6 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 [dev-dependencies]
 tempfile = "3"
 
-# The live-pile gate applies the status-register migration in memory before
-# asking the register anything, so the migration and its proof are the same
-# code. A dev-dependency cycle is exactly the right shape for that: the
-# faculties themselves still carry no migration surface.
-faculties-migrations = { path = "faculties-migrations" }
-
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own
 # patch section is ignored when mary is consumed as a path dep here. We mirror
