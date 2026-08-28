@@ -11,8 +11,9 @@ use faculties::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjec
 use faculties::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSummary};
 use faculties::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
 use faculties::archive_collection::{
-    self as archive_collection, ArchiveImportWriter, ArchivePart, ArchivePayload,
-    ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot,
+    self as archive_collection, ArchiveBlock, ArchiveImportWriter, ArchivePart, ArchivePayload,
+    ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot, ArchiveTimelineBlock,
+    ArchiveTimelineCursor,
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
@@ -31,7 +32,6 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::trible::{Fragment, TribleSet};
-use triblespace::macros::{find, pattern};
 
 #[derive(Parser)]
 #[command(
@@ -95,7 +95,7 @@ enum Command {
         /// `start <from-ts>`, `stop`, or nothing for the next batch.
         #[arg(value_name = "ACTION")]
         action: Vec<String>,
-        /// Blocks per batch. An equal-timestamp run is never split.
+        /// Blocks per batch. The exact block cursor makes every boundary safe.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Include tool, thinking, event, and media-only blocks.
@@ -470,6 +470,7 @@ fn interval_bounds(interval: Inline<NsTAIInterval>) -> Result<(Epoch, Epoch)> {
         .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))
 }
 
+#[cfg(test)]
 fn interval_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
     let (lower, _upper): (i128, i128) = interval
         .try_from_inline()
@@ -679,57 +680,11 @@ fn run_show(storage: ArchiveStorage<'_>, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct LoadedBlock {
-    semantic: ArchiveProjection,
-    receipts: Vec<ArchiveProjection>,
-}
-
-fn load_block(archive: &ArchiveSnapshot, block: Id) -> Result<LoadedBlock> {
-    let receipt_ids = archive.projections_for_block(block);
-    if receipt_ids.is_empty() {
-        bail!("canonical Archive block {block:X} has no source projection");
-    }
-    let mut receipts = receipt_ids
-        .into_iter()
-        .map(|id| archive.projection(id))
-        .collect::<Result<Vec<_>>>()?;
-    receipts.sort_unstable_by_key(|projection| projection.id);
-    if receipts.iter().any(|projection| projection.block != block) {
-        bail!("Archive source projection lookup crossed block identities");
-    }
-    Ok(LoadedBlock {
-        semantic: receipts[0].clone(),
-        receipts,
-    })
-}
-
-fn earliest_receipt_source_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
-    let mut earliest = None;
-    for receipt in &block.receipts {
-        let Some(timestamp) = receipt.source_timestamp else {
-            continue;
-        };
-        let key = interval_key(timestamp)?;
-        if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
-            earliest = Some((key, timestamp));
-        }
-    }
-    Ok(earliest.map(|(_, timestamp)| timestamp))
-}
-
-fn semantic_block_timestamp(block: &LoadedBlock) -> Result<Option<Inline<NsTAIInterval>>> {
-    match block.semantic.block_timestamp {
-        Some(timestamp) => Ok(Some(timestamp)),
-        None => earliest_receipt_source_timestamp(block),
-    }
-}
-
 fn load_thread(
     archive: &ArchiveSnapshot,
     projection_prefix: &str,
     limit: usize,
-) -> Result<Vec<LoadedBlock>> {
+) -> Result<Vec<ArchiveBlock>> {
     if limit == 0 {
         bail!("thread limit must be at least 1");
     }
@@ -746,7 +701,7 @@ fn load_thread(
                 "thread ancestry exceeds {limit} canonical blocks; increase --limit so no fork is hidden"
             );
         }
-        let loaded = load_block(archive, block)?;
+        let loaded = archive.block(block)?;
         pending.extend(loaded.semantic.block_previous.iter().copied());
         nodes.insert(block, loaded);
     }
@@ -786,7 +741,7 @@ fn load_thread(
 
 fn render_block(
     archive: &ArchiveSnapshot,
-    block: &LoadedBlock,
+    block: &ArchiveBlock,
     include_all_parts: bool,
 ) -> Result<String> {
     let mut out = String::new();
@@ -794,7 +749,7 @@ fn render_block(
     writeln!(
         out,
         "timestamp: {}",
-        format_interval(semantic_block_timestamp(block)?)?
+        format_interval(block.timeline_timestamp()?)?
     )?;
     for predecessor in &block.semantic.block_previous {
         writeln!(out, "previous: {predecessor:X}")?;
@@ -831,13 +786,13 @@ fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<(
     let text = faculties::text_arg(text, "search text")?;
     let search = ArchiveSearchSnapshot::ensure_local(storage.pile, storage.key)?;
     for hit in search.search(&text, limit)? {
-        let block = load_block(search.archive(), hit.block)?;
+        let block = search.archive().block(hit.block)?;
         println!(
             "{:.4} {} {} receipt(s) {} {}",
             hit.score,
             short_id(hit.block),
             hit.projections.len(),
-            format_interval(semantic_block_timestamp(&block)?)?,
+            format_interval(block.timeline_timestamp()?)?,
             projection_snippet(&block.semantic),
         );
     }
@@ -878,9 +833,10 @@ fn parse_tai_timestamp(value: &str) -> Result<Epoch> {
     ))
 }
 
-fn cursor_state(position: Option<Epoch>) -> CursorState {
+fn cursor_state(position: Option<Epoch>, anchor: Option<Id>) -> CursorState {
     CursorState {
         position: position.map(|epoch| (epoch, epoch).try_to_inline().unwrap()),
+        anchor,
         grain: None,
     }
 }
@@ -890,8 +846,9 @@ fn plan_cursor_update(
     stream: &str,
     persona: &str,
     position: Option<Epoch>,
+    anchor: Option<Id>,
 ) -> Result<Option<Fragment>> {
-    let state = cursor_state(position);
+    let state = cursor_state(position, anchor);
     let predecessors = match catalog.resolution(stream, persona) {
         None => BTreeSet::new(),
         Some(resolution) => {
@@ -906,6 +863,7 @@ fn plan_cursor_update(
         stream: stream.to_owned(),
         persona: persona.to_owned(),
         position: state.position,
+        anchor: state.anchor,
         grain: state.grain,
         predecessors,
         observed_at: BTreeSet::new(),
@@ -913,7 +871,11 @@ fn plan_cursor_update(
     Ok(Some(fragment))
 }
 
-fn active_cursor_position(catalog: &CombCatalog, stream: &str, persona: &str) -> Result<i128> {
+fn active_archive_cursor(
+    catalog: &CombCatalog,
+    stream: &str,
+    persona: &str,
+) -> Result<ArchiveTimelineCursor> {
     let resolution = catalog.resolution(stream, persona).ok_or_else(|| {
         anyhow!("no active replay for persona {persona}: use `archive replay start <from>`")
     })?;
@@ -927,7 +889,10 @@ fn active_cursor_position(catalog: &CombCatalog, stream: &str, persona: &str) ->
     if lower != upper {
         bail!("archive replay cursor is not a point interval");
     }
-    Ok(lower)
+    Ok(state.anchor.map_or(
+        ArchiveTimelineCursor::AfterTime(lower),
+        ArchiveTimelineCursor::AfterBlock,
+    ))
 }
 
 fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()> {
@@ -957,87 +922,12 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
 
 const REPLAY_STREAM: &str = "archive-replay";
 
-#[derive(Clone)]
-struct TimelineBlock {
-    key: i128,
-    block: LoadedBlock,
-}
-
-fn is_dialogue(block: &LoadedBlock) -> bool {
-    block
-        .semantic
-        .parts
-        .iter()
-        .any(|part| part.modality == archive_schema::content_fact::modality::TEXT)
-}
-
-fn timeline_after(
-    archive: &ArchiveSnapshot,
-    position: i128,
-    with_tools: bool,
-) -> Result<Vec<TimelineBlock>> {
-    let catalog = archive.catalog();
-    let blocks: BTreeSet<Id> = find!(
-        block: Id,
-        pattern!(catalog, [{ _?projection @ archive_schema::source_projection::projects_to: ?block }])
-    )
-    .collect();
-    let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
-        (block: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(catalog, [{ ?block @ archive_schema::block::timestamp: ?timestamp }])
-    )
-    .collect();
-    let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
-    for (block, timestamp) in find!(
-        (block: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(catalog, [
-            { _?projection @ archive_schema::source_projection::projects_to: ?block },
-            { _?projection @ archive_schema::source_projection::source_timestamp: ?timestamp },
-        ])
-    ) {
-        let key = interval_key(timestamp)?;
-        let entry = earliest_receipt_timestamps
-            .entry(block)
-            .or_insert((key, timestamp));
-        if key < entry.0 {
-            *entry = (key, timestamp);
-        }
-    }
-    let mut timeline = Vec::new();
-    for block_id in blocks {
-        let timestamp = canonical_timestamps.get(&block_id).copied().or_else(|| {
-            earliest_receipt_timestamps
-                .get(&block_id)
-                .map(|(_, timestamp)| *timestamp)
-        });
-        let Some(timestamp) = timestamp else {
-            continue;
-        };
-        let key = interval_key(timestamp)?;
-        if key <= position {
-            continue;
-        }
-        let block = load_block(archive, block_id)?;
-        if with_tools || is_dialogue(&block) {
-            timeline.push(TimelineBlock { key, block });
-        }
-    }
-    timeline.sort_unstable_by_key(|item| (item.key, item.block.semantic.block));
-    Ok(timeline)
-}
-
-fn split_replay_batch(timeline: Vec<TimelineBlock>, limit: usize) -> (Vec<TimelineBlock>, usize) {
-    let mut selected = Vec::new();
-    let mut remaining = 0usize;
-    let mut cutoff = None;
-    for item in timeline {
-        if selected.len() < limit || cutoff == Some(item.key) {
-            cutoff = Some(item.key);
-            selected.push(item);
-        } else {
-            remaining += 1;
-        }
-    }
+fn split_replay_batch(
+    timeline: Vec<ArchiveTimelineBlock>,
+    limit: usize,
+) -> (Vec<ArchiveTimelineBlock>, usize) {
+    let remaining = timeline.len().saturating_sub(limit);
+    let selected = timeline.into_iter().take(limit).collect();
     (selected, remaining)
 }
 
@@ -1067,7 +957,7 @@ fn run_replay(
             let position = from - hifitime::Duration::from_total_nanoseconds(1);
             let (facts, catalog) = storage.load_comb()?;
             if let Some(fragment) =
-                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position))?
+                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position), None)?
             {
                 validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
@@ -1080,7 +970,9 @@ fn run_replay(
                 bail!("usage: archive replay stop");
             }
             let (facts, catalog) = storage.load_comb()?;
-            if let Some(fragment) = plan_cursor_update(&catalog, REPLAY_STREAM, persona, None)? {
+            if let Some(fragment) =
+                plan_cursor_update(&catalog, REPLAY_STREAM, persona, None, None)?
+            {
                 validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
             }
@@ -1092,9 +984,11 @@ fn run_replay(
     }
 
     let replay = storage.load_replay()?;
-    let position = active_cursor_position(&replay.comb_catalog, REPLAY_STREAM, persona)?;
+    let cursor = active_archive_cursor(&replay.comb_catalog, REPLAY_STREAM, persona)?;
     let (selected, remaining) = split_replay_batch(
-        timeline_after(&replay.archive, position, with_tools)?,
+        replay.archive.timeline_after(cursor, |block| {
+            with_tools || block.has_modality(archive_schema::content_fact::modality::TEXT)
+        })?,
         limit,
     );
     if selected.is_empty() {
@@ -1109,13 +1003,15 @@ fn run_replay(
         );
         println!("---");
     }
-    let last_key = selected.last().expect("selected is nonempty").key;
-    let last_epoch = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
+    let last = selected.last().expect("selected is nonempty");
+    let last_epoch =
+        Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last.position));
     let fragment = plan_cursor_update(
         &replay.comb_catalog,
         REPLAY_STREAM,
         persona,
         Some(last_epoch),
+        Some(last.block.semantic.block),
     )?
     .ok_or_else(|| anyhow!("replay emitted blocks without advancing its cursor"))?;
     validate_cursor_update(&replay.comb_facts, &fragment)?;
@@ -1426,23 +1322,27 @@ mod tests {
             .map(|projection| projection.block)
             .collect();
         assert_eq!(blocks.len(), 1);
-        let block = load_block(&archive, *blocks.first().unwrap()).unwrap();
+        let block = archive.block(*blocks.first().unwrap()).unwrap();
         let earliest_receipt_key = projections
             .iter()
             .map(|projection| interval_key(projection.source_timestamp.unwrap()).unwrap())
             .min()
             .unwrap();
         assert_eq!(
-            interval_key(semantic_block_timestamp(&block).unwrap().unwrap()).unwrap(),
+            interval_key(block.timeline_timestamp().unwrap().unwrap()).unwrap(),
             earliest_receipt_key
         );
         assert!(!render_block(&archive, &block, false)
             .unwrap()
             .contains("<untimed>"));
 
-        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        let timeline = archive
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
         assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].key, earliest_receipt_key);
+        assert_eq!(timeline[0].position, earliest_receipt_key);
     }
 
     #[test]
@@ -1563,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_zero_limit_and_never_splits_equal_timestamps() {
+    fn replay_rejects_zero_limit_and_exact_cursor_can_split_equal_timestamps() {
         let fixture = fixture();
         let source = fixture._directory.path().join("replay.jsonl");
         fs::write(
@@ -1580,12 +1480,24 @@ mod tests {
         run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
 
         let archive = storage(&fixture).load().unwrap();
-        let timeline = timeline_after(&archive, i128::MIN, false).unwrap();
+        let timeline = archive
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
         assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline[0].position, timeline[1].position);
+        let first_cursor = timeline[0].cursor();
         let (selected, remaining) = split_replay_batch(timeline, 1);
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].key, selected[1].key);
-        assert_eq!(remaining, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(remaining, 2);
+
+        let resumed = archive
+            .timeline_after(first_cursor, |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
+        assert_eq!(resumed.len(), 2, "the equal-time peer is not skipped");
 
         let error = run_replay(storage(&fixture), &[], 0, false, Some("replay-test")).unwrap_err();
         assert_eq!(error.to_string(), "replay limit must be at least 1");

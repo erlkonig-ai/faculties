@@ -289,6 +289,7 @@ fn project_authored_delta(
             stream: row.track.stream.clone(),
             persona: row.track.persona.clone(),
             position: row.state.position,
+            anchor: None,
             grain: row.state.grain.clone(),
             predecessors: predecessors.clone(),
             observed_at: row.observed_at,
@@ -340,6 +341,7 @@ fn parse_legacy_cursor(space: &TribleSet, id: Id) -> Result<Option<LegacyCursor>
         },
         state: CursorState {
             position: one(values(space, id, &cursor_position), id, "cursor_position")?,
+            anchor: None,
             grain: one(values(space, id, &cursor_grain), id, "cursor_grain")?
                 .map(|value| {
                     value.try_from_inline().map_err(|error| {

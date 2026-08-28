@@ -315,11 +315,22 @@ where
 /// `responds_to` is a semantic edge to another canonical part. Unresolved
 /// vendor correlators stay on the raw source receipt instead.
 pub fn content_part(ordinal: u64, fact: Fragment, responds_to: Option<Id>) -> Result<Fragment> {
-    rooted(&fact, "content fact")?;
+    let fact_id = rooted(&fact, "content fact")?;
+    let resolutions: BTreeSet<RawHandle> = find!(
+        resolution: RawHandle,
+        pattern!(&fact, [{ fact_id @ schema::content_fact::resolved_to: ?resolution }])
+    )
+    .collect();
+    // A source occurrence carrying one exact recovered body selects it in the
+    // part's identity. A genuinely unresolved or already-ambiguous fact makes
+    // no such claim; ambiguity remains monotone evidence on the fact itself.
+    let resolution =
+        (resolutions.len() == 1).then(|| *resolutions.first().expect("one resolution exists"));
     let fragment = entity! { _ @
         schema::content_part::ordinal: ordinal,
         schema::content_part::fact*: fact,
         schema::content_part::responds_to?: responds_to,
+        schema::content_part::resolution?: resolution,
     };
     attach_kind(fragment, schema::content_part::KIND, "content part")
 }
@@ -704,6 +715,10 @@ where
         (entity: Id, value: Id),
         pattern!(facts, [{ ?entity @ schema::content_part::responds_to: ?value }])
     ));
+    let part_resolutions = values_by_entity(find!(
+        (entity: Id, value: RawHandle),
+        pattern!(facts, [{ ?entity @ schema::content_part::resolution: ?value }])
+    ));
 
     let block_previous = values_by_entity(find!(
         (entity: Id, value: Id),
@@ -984,10 +999,18 @@ where
                 bail!("content part {id:x} responds to missing part {response:x}");
             }
         }
+        let resolution = one_optional(&part_resolutions, *id, "content part resolution")?;
+        if let Some(resolution) = resolution {
+            let available = values_for(&resolutions, fact);
+            if !available.contains(&resolution) {
+                bail!("content part {id:x} selects resolution absent from content fact {fact:x}");
+            }
+        }
         let core = entity! { _ @
             schema::content_part::ordinal: ordinal,
             schema::content_part::fact: &fact,
             schema::content_part::responds_to?: response,
+            schema::content_part::resolution?: resolution,
         };
         expected +=
             ensure_intrinsic_with_kind(*id, core, schema::content_part::KIND, "content part")?;
@@ -1470,7 +1493,7 @@ fn validate_attachments(
             Err(error) => {
                 return CatalogValidation::Rejected(format!(
                     "invalid canonical media type name {name:?}: {error}"
-                ))
+                ));
             }
         };
         if normalized != name {
@@ -2076,6 +2099,45 @@ mod tests {
         )
         .collect();
         assert_eq!(handles.len(), 1);
+    }
+
+    #[test]
+    fn a_part_selects_the_unique_pointer_resolution_in_its_identity() {
+        let make = |bytes: &'static [u8]| {
+            asset_pointer_fact(
+                schema::content_fact::modality::FILE,
+                schema::content_fact::direction::IN,
+                id(11),
+                "sandbox:/same",
+                Some("application/octet-stream"),
+                Some(bytes.len() as u128),
+            )
+            .and_then(|fact| resolve_pointer_fact(fact, bytes))
+            .unwrap()
+        };
+        let first = make(b"first");
+        let replay = make(b"first");
+        let second = make(b"other");
+        assert_eq!(first, replay);
+        assert_eq!(first.root(), second.root());
+
+        let first = content_part(0, first, None).unwrap();
+        let replay = content_part(0, replay, None).unwrap();
+        let second = content_part(0, second, None).unwrap();
+        assert_eq!(first, replay);
+        assert_ne!(first.root(), second.root());
+
+        for part in [first, second] {
+            let root = part.root().unwrap();
+            let resolutions: Vec<Inline<Handle<RawBytes>>> = find!(
+                resolution: Inline<Handle<RawBytes>>,
+                pattern!(&part, [{
+                    root @ schema::content_part::resolution: ?resolution
+                }])
+            )
+            .collect();
+            assert_eq!(resolutions.len(), 1);
+        }
     }
 
     #[test]

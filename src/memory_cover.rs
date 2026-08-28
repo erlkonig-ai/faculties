@@ -425,6 +425,11 @@ pub fn semantic_eligibility_scores<B: BlobStoreGet>(
 pub struct CoverOpts {
     /// CHARACTER budget for the cover.
     pub budget_chars: usize,
+    /// Fixed CHARACTER-equivalent cost charged for each selected chunk by the
+    /// consumer (framing, tokenization, or other per-chunk overhead). This is
+    /// selection accounting only: stored summaries retain their intrinsic
+    /// character lengths and rendered cover text is unchanged.
+    pub chunk_overhead: usize,
     /// `--about <query>`: bias detail toward memories relevant to the query.
     pub about: Option<String>,
     /// `--filter <query>`: keep ONLY chunks whose similarity exceeds the threshold.
@@ -440,6 +445,7 @@ impl CoverOpts {
     pub fn plain(budget_chars: usize) -> Self {
         CoverOpts {
             budget_chars,
+            chunk_overhead: 0,
             about: None,
             filter: None,
             remove: None,
@@ -460,9 +466,9 @@ impl CoverOpts {
 /// the children that induces, and the roots with no container at all.
 ///
 /// Shared by [`render_cover`] and [`cover_headroom`] so the two cannot disagree
-/// about what a root is — the roots ARE the coarsest possible cover, so a
-/// headroom figure computed from a different notion of root would report safety
-/// the cover does not have.
+/// about what a root is. [`cover_headroom`] reports the intrinsic, zero-consumer-
+/// overhead floor; a caller using [`CoverOpts::chunk_overhead`] additionally
+/// charges that amount once for every selected root.
 fn containment_forest(
     spans: &[(i128, i128, Id)],
 ) -> (Vec<Option<usize>>, Vec<Vec<usize>>, Vec<usize>) {
@@ -611,6 +617,7 @@ pub fn render_cover<B: BlobStoreGet>(
     use std::fmt::Write as _;
 
     let budget_chars = opts.budget_chars;
+    let chunk_overhead = opts.chunk_overhead;
     let about = opts.about.as_deref();
     let filter_q = opts.filter.as_deref();
     let remove_q = opts.remove.as_deref();
@@ -742,13 +749,8 @@ pub fn render_cover<B: BlobStoreGet>(
     let mut cost_cache: Vec<Option<usize>> = vec![None; n];
     let mut used = 0usize;
     for &i in &roots {
-        used = used.saturating_add(context_chunk_cost(
-            reader,
-            space,
-            &spans,
-            &mut cost_cache,
-            i,
-        )?);
+        let intrinsic = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
+        used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
     }
     if used > budget_chars {
         let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
@@ -790,26 +792,35 @@ pub fn render_cover<B: BlobStoreGet>(
             if children[i].len() < 2 {
                 continue;
             }
-            let mut kids_cost = 0i128;
+            let mut kids_charge = 0i128;
+            let mut kids_intrinsic = 0i128;
             for &k in &children[i] {
-                kids_cost += context_chunk_cost(reader, space, &spans, &mut cost_cache, k)? as i128;
+                let intrinsic =
+                    context_chunk_cost(reader, space, &spans, &mut cost_cache, k)? as i128;
+                kids_intrinsic += intrinsic;
+                kids_charge += intrinsic + chunk_overhead as i128;
             }
-            let pcost = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)? as i128;
+            let parent_intrinsic =
+                context_chunk_cost(reader, space, &spans, &mut cost_cache, i)? as i128;
+            let parent_charge = parent_intrinsic + chunk_overhead as i128;
             // SIGNED. A split whose children are collectively cheaper than the
             // parent's own summary gives budget back; `saturating_sub` used to
             // round that to zero, so the pool was under-spent by however much
-            // detail happened to be cheap. Correctness, independent of any
-            // allocation scheme.
-            let delta = kids_cost - pcost;
+            // detail happened to be cheap. Consumer overhead participates in
+            // the same signed accounting once per selected chunk.
+            let delta = kids_charge - parent_charge;
             if delta > remaining {
                 continue;
             }
+            // Consumer overhead determines whether a split fits, while the
+            // established priority still measures intrinsic prose growth.
+            let detail_gain = kids_intrinsic - parent_intrinsic;
             // Priority: relevance (subtree-max, when --about) desc → recency
             // (latest end) desc → width desc → detail gained desc → id asc.
             // Without --about every relevance is 0, so recency leads exactly as
             // before; with it, the cover descends into the query-relevant
             // subtrees first and leaves the rest coarse.
-            let key = (relevance[i], spans[i].1, width(i), delta, spans[i].2);
+            let key = (relevance[i], spans[i].1, width(i), detail_gain, spans[i].2);
             let better = match best_key {
                 None => true,
                 Some((br, be, bw, bx, bid)) => {
@@ -851,13 +862,8 @@ pub fn render_cover<B: BlobStoreGet>(
         // Recompute the character tally honestly over what actually survived.
         used = 0;
         for &i in &cover {
-            used = used.saturating_add(context_chunk_cost(
-                reader,
-                space,
-                &spans,
-                &mut cost_cache,
-                i,
-            )?);
+            let intrinsic = context_chunk_cost(reader, space, &spans, &mut cost_cache, i)?;
+            used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
         }
     }
 

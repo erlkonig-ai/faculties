@@ -7,7 +7,7 @@
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
@@ -76,6 +76,10 @@ pub struct ArchivePart {
     pub ordinal: u64,
     pub fact: Id,
     pub responds_to: Option<Id>,
+    /// Exact recovered body selected by this occurrence of an external fact.
+    /// The fact may accumulate other resolution evidence later without making
+    /// this part ambiguous.
+    pub resolution: Option<RawHandle>,
     pub modality: Id,
     pub direction: Id,
     pub payload: ArchivePayload,
@@ -102,6 +106,81 @@ pub struct ArchiveProjection {
     pub raw_model: Option<String>,
     pub source_paths: Vec<String>,
     pub parts: Vec<ArchivePart>,
+}
+
+/// One canonical semantic block together with every exact source receipt that
+/// projects to it.
+///
+/// `semantic` is the receipt with the lowest intrinsic id. All receipts for a
+/// block carry the same semantic block value; choosing one canonically avoids
+/// manufacturing an import-order-dependent representative while `receipts`
+/// preserves the complete occurrence evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveBlock {
+    pub semantic: ArchiveProjection,
+    pub receipts: Vec<ArchiveProjection>,
+}
+
+impl ArchiveBlock {
+    /// Whether this block contains at least one part of `modality`.
+    pub fn has_modality(&self, modality: Id) -> bool {
+        self.semantic
+            .parts
+            .iter()
+            .any(|part| part.modality == modality)
+    }
+
+    /// Timestamp used to place this block in the interleaved Archive view.
+    ///
+    /// A canonical semantic timestamp wins. Otherwise the earliest genuine
+    /// source-receipt timestamp supplies the position; an untimed block remains
+    /// absent from the temporal view.
+    pub fn timeline_timestamp(&self) -> Result<Option<Inline<NsTAIInterval>>> {
+        if let Some(timestamp) = self.semantic.block_timestamp {
+            return Ok(Some(timestamp));
+        }
+        let mut earliest = None;
+        for receipt in &self.receipts {
+            let Some(timestamp) = receipt.source_timestamp else {
+                continue;
+            };
+            let key = interval_lower_key(timestamp)?;
+            if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
+                earliest = Some((key, timestamp));
+            }
+        }
+        Ok(earliest.map(|(_, timestamp)| timestamp))
+    }
+}
+
+/// Exact position from which to continue Archive's interleaved temporal view.
+///
+/// A time boundary is useful only to begin a replay. Once a block has been
+/// emitted, its content identity is the cursor: unlike a bare timestamp it
+/// distinguishes every member of an equal-time run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveTimelineCursor {
+    AfterTime(i128),
+    AfterBlock(Id),
+}
+
+/// One canonical block positioned in Archive's interleaved temporal view.
+///
+/// `position` is the lower TAI-nanosecond bound of the block's canonical or
+/// earliest source timestamp, lifted to at least the position of every causal
+/// predecessor. It therefore remains monotone even when a source clock moves
+/// backwards. Independent ready roots are still interleaved by their temporal
+/// positions, with canonical block id as the deterministic tie-breaker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveTimelineBlock {
+    pub position: i128,
+    pub block: ArchiveBlock,
+}
+
+impl ArchiveTimelineBlock {
+    pub const fn cursor(&self) -> ArchiveTimelineCursor {
+        ArchiveTimelineCursor::AfterBlock(self.block.semantic.block)
+    }
 }
 
 /// One ordered content-addressed range in an exact source snapshot.
@@ -595,6 +674,13 @@ fn distinct_ticket_data(commits: &[CollectionCommit]) -> BTreeSet<CollectionData
     commits.iter().map(CollectionCommit::data).collect()
 }
 
+fn interval_lower_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
+    let (lower, _upper): (i128, i128) = interval
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))?;
+    Ok(lower)
+}
+
 /// One frozen Archive view and one resident portable BM25 index attached from
 /// the exact cover of the same admitted source commits.
 pub struct ArchiveSearchSnapshot {
@@ -993,6 +1079,191 @@ impl ArchiveSnapshot {
         projections
     }
 
+    /// Load one canonical semantic block and every exact source receipt that
+    /// witnesses it.
+    pub fn block(&self, block: Id) -> Result<ArchiveBlock> {
+        let receipt_ids = self.projections_for_block(block);
+        if receipt_ids.is_empty() {
+            bail!("canonical Archive block {block:X} has no source projection");
+        }
+        let mut receipts = receipt_ids
+            .into_iter()
+            .map(|id| self.projection(id))
+            .collect::<Result<Vec<_>>>()?;
+        receipts.sort_unstable_by_key(|projection| projection.id);
+        if receipts.iter().any(|projection| projection.block != block) {
+            bail!("Archive source projection lookup crossed block identities");
+        }
+        Ok(ArchiveBlock {
+            semantic: receipts[0].clone(),
+            receipts,
+        })
+    }
+
+    /// Replay canonical blocks after one exact cursor as a pure, deterministic
+    /// causal-temporal view.
+    ///
+    /// The caller supplies the inclusion policy. This deliberately does not
+    /// encode the Archive CLI's dialogue-only default: a human reader may want
+    /// to hide tool-only blocks, while a mind reconstructing its own causal
+    /// history must include them. Cursor ownership and mutation likewise live
+    /// above this pure view.
+    pub fn timeline_after<F>(
+        &self,
+        cursor: ArchiveTimelineCursor,
+        mut include: F,
+    ) -> Result<Vec<ArchiveTimelineBlock>>
+    where
+        F: FnMut(&ArchiveBlock) -> bool,
+    {
+        let catalog = &self.facts;
+        let blocks: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(catalog, [{
+                _?projection @ schema::source_projection::projects_to: ?block
+            }])
+        )
+        .collect();
+        let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
+            (block: Id, timestamp: Inline<NsTAIInterval>),
+            pattern!(catalog, [{ ?block @ schema::block::timestamp: ?timestamp }])
+        )
+        .collect();
+        let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
+        for (block, timestamp) in find!(
+            (block: Id, timestamp: Inline<NsTAIInterval>),
+            pattern!(catalog, [
+                { _?projection @ schema::source_projection::projects_to: ?block },
+                { _?projection @ schema::source_projection::source_timestamp: ?timestamp },
+            ])
+        ) {
+            let key = interval_lower_key(timestamp)?;
+            let entry = earliest_receipt_timestamps
+                .entry(block)
+                .or_insert((key, timestamp));
+            if key < entry.0 {
+                *entry = (key, timestamp);
+            }
+        }
+
+        let mut timestamps = BTreeMap::<Id, Option<i128>>::new();
+        let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
+        let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
+        for block_id in &blocks {
+            let timestamp = canonical_timestamps.get(block_id).copied().or_else(|| {
+                earliest_receipt_timestamps
+                    .get(block_id)
+                    .map(|(_, timestamp)| *timestamp)
+            });
+            timestamps.insert(*block_id, timestamp.map(interval_lower_key).transpose()?);
+
+            let previous: BTreeSet<_> = find!(
+                predecessor: Id,
+                pattern!(catalog, [{ block_id @ schema::block::previous: ?predecessor }])
+            )
+            .collect();
+            for predecessor in &previous {
+                successors
+                    .entry(*predecessor)
+                    .or_default()
+                    .insert(*block_id);
+            }
+            predecessors.insert(*block_id, previous);
+        }
+
+        // Kahn's algorithm makes causality authoritative and time merely the
+        // priority among blocks which are already ready. Untimed blocks are
+        // contracted eagerly: they emit nothing, but carry their ancestors'
+        // lifted position into timed descendants.
+        let mut remaining: BTreeMap<Id, usize> = predecessors
+            .iter()
+            .map(|(block, previous)| (*block, previous.len()))
+            .collect();
+        let mut inherited = BTreeMap::<Id, Option<i128>>::new();
+        let mut ready_untimed = BTreeSet::<Id>::new();
+        let mut ready_timed = BTreeSet::<(i128, Id)>::new();
+        for block in &blocks {
+            inherited.insert(*block, None);
+            if remaining[block] == 0 {
+                match timestamps[block] {
+                    Some(position) => {
+                        ready_timed.insert((position, *block));
+                    }
+                    None => {
+                        ready_untimed.insert(*block);
+                    }
+                }
+            }
+        }
+
+        let mut positioned = Vec::<(i128, Id)>::new();
+        let mut visited = 0usize;
+        while visited < blocks.len() {
+            let (block, position, emits) = if let Some(block) = ready_untimed.pop_first() {
+                (block, inherited[&block], false)
+            } else if let Some((position, block)) = ready_timed.pop_first() {
+                (block, Some(position), true)
+            } else {
+                bail!("canonical Archive block graph became cyclic while building its timeline");
+            };
+            visited += 1;
+            if let Some(position) = position.filter(|_| emits) {
+                positioned.push((position, block));
+            }
+
+            for successor in successors.get(&block).into_iter().flatten() {
+                if let Some(position) = position {
+                    let inherited = inherited
+                        .get_mut(successor)
+                        .expect("every successor belongs to the canonical block set");
+                    *inherited = Some(inherited.map_or(position, |current| current.max(position)));
+                }
+                let count = remaining
+                    .get_mut(successor)
+                    .expect("every successor has a dependency count");
+                *count -= 1;
+                if *count == 0 {
+                    let inherited = inherited[successor];
+                    match timestamps[successor] {
+                        Some(timestamp) => {
+                            ready_timed.insert((
+                                inherited.map_or(timestamp, |value| value.max(timestamp)),
+                                *successor,
+                            ));
+                        }
+                        None => {
+                            ready_untimed.insert(*successor);
+                        }
+                    }
+                }
+            }
+        }
+
+        let start = match cursor {
+            ArchiveTimelineCursor::AfterTime(position) => {
+                positioned.partition_point(|(candidate, _)| *candidate <= position)
+            }
+            ArchiveTimelineCursor::AfterBlock(anchor) => positioned
+                .iter()
+                .position(|(_, block)| *block == anchor)
+                .map(|index| index + 1)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Archive timeline cursor block {anchor:X} is absent or has no timestamp"
+                    )
+                })?,
+        };
+
+        let mut timeline = Vec::new();
+        for (position, block_id) in positioned.into_iter().skip(start) {
+            let block = self.block(block_id)?;
+            if include(&block) {
+                timeline.push(ArchiveTimelineBlock { position, block });
+            }
+        }
+        Ok(timeline)
+    }
+
     /// Most recent source receipts by exact source time, falling back to the
     /// canonical block time for sources which carry time semantically.
     ///
@@ -1213,12 +1484,24 @@ impl ArchiveSnapshot {
                 part,
                 "responds-to",
             )?;
+            let resolution = optional_one(
+                find!(
+                    value: RawHandle,
+                    pattern!(catalog, [{
+                        part @ schema::content_part::resolution: ?value
+                    }])
+                )
+                .collect(),
+                part,
+                "resolution",
+            )?;
             let payload = self.payload(catalog, fact)?;
             Ok(ArchivePart {
                 id: part,
                 ordinal,
                 fact,
                 responds_to,
+                resolution,
                 modality,
                 direction,
                 payload,
@@ -1459,12 +1742,22 @@ mod tests {
     }
 
     fn projection_at(locator: &str, text: &str, unix_seconds: f64) -> Fragment {
-        let fact = blockdag::text_fact(
+        projection_at_modality(
+            locator,
             schema::content_fact::modality::TEXT,
-            schema::content_fact::direction::IN,
             text,
+            unix_seconds,
         )
-        .unwrap();
+    }
+
+    fn projection_at_modality(
+        locator: &str,
+        modality: Id,
+        text: &str,
+        unix_seconds: f64,
+    ) -> Fragment {
+        let fact =
+            blockdag::text_fact(modality, schema::content_fact::direction::IN, text).unwrap();
         let part = blockdag::content_part(0, fact, None).unwrap();
         let epoch = Epoch::from_unix_seconds(unix_seconds);
         let timestamp: Inline<NsTAIInterval> =
@@ -1477,6 +1770,35 @@ mod tests {
             block,
         )
         .unwrap()
+    }
+
+    fn projection_after_at(
+        locator: &str,
+        text: &str,
+        unix_seconds: Option<f64>,
+        predecessors: &[Id],
+    ) -> (Fragment, Id) {
+        let fact = blockdag::text_fact(
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::direction::IN,
+            text,
+        )
+        .unwrap();
+        let part = blockdag::content_part(0, fact, None).unwrap();
+        let timestamp = unix_seconds.map(|seconds| {
+            let epoch = Epoch::from_unix_seconds(seconds);
+            (epoch, epoch).try_to_inline().expect("valid test interval")
+        });
+        let block = blockdag::block(predecessors.iter().copied(), timestamp, part).unwrap();
+        let block_id = block.root().unwrap();
+        let projection = blockdag::source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            locator,
+            format!("{{\"text\":{text:?}}}").into_bytes(),
+            block,
+        )
+        .unwrap();
+        (projection, block_id)
     }
 
     fn projection_split_across_source_elements(locator: &str, text: &str) -> (Fragment, Fragment) {
@@ -1934,6 +2256,120 @@ mod tests {
         drop(snapshot);
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
         assert!(search.search("anything", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeline_is_pure_and_leaves_inclusion_policy_to_the_caller() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile_path, &key);
+
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        writer
+            .stage_fragment(projection_at_modality(
+                "session:text",
+                schema::content_fact::modality::TEXT,
+                "spoken",
+                1.0,
+            ))
+            .unwrap();
+        writer
+            .stage_fragment(projection_at_modality(
+                "session:tool",
+                schema::content_fact::modality::TOOL_CALL,
+                "memory context",
+                2.0,
+            ))
+            .unwrap();
+        writer.finish(Ok(())).unwrap();
+
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let complete = snapshot
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
+            .unwrap();
+        assert_eq!(complete.len(), 2);
+        assert!(complete[0].position < complete[1].position);
+        assert!(complete[0]
+            .block
+            .has_modality(schema::content_fact::modality::TEXT));
+        assert!(complete[1]
+            .block
+            .has_modality(schema::content_fact::modality::TOOL_CALL));
+
+        let dialogue = snapshot
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
+                block.has_modality(schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
+        assert_eq!(dialogue.len(), 1);
+        assert_eq!(
+            dialogue[0].block.semantic.block,
+            complete[0].block.semantic.block
+        );
+
+        let after_first = snapshot
+            .timeline_after(complete[0].cursor(), |_| true)
+            .unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(
+            after_first[0].block.semantic.block,
+            complete[1].block.semantic.block
+        );
+    }
+
+    #[test]
+    fn timeline_cursor_preserves_equal_time_blocks_and_causal_order() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile_path, &key);
+
+        let (parent, parent_id) = projection_after_at("thread/parent", "parent", Some(10.0), &[]);
+        let (untimed, untimed_id) =
+            projection_after_at("thread/untimed", "untimed", None, &[parent_id]);
+        let (regressed_child, child_id) =
+            projection_after_at("thread/child", "regressed child", Some(5.0), &[untimed_id]);
+        let (independent, independent_id) =
+            projection_after_at("other/root", "independent", Some(7.0), &[]);
+
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        // Deliberately stage out of causal and temporal order. The collection
+        // is a set; replay order must come solely from canonical semantics.
+        writer.stage_fragment(regressed_child).unwrap();
+        writer.stage_fragment(independent).unwrap();
+        writer.stage_fragment(untimed).unwrap();
+        writer.stage_fragment(parent).unwrap();
+        writer.finish(Ok(())).unwrap();
+
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let timeline = snapshot
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
+            .unwrap();
+        assert_eq!(timeline.len(), 3, "the untimed conduit stays invisible");
+        assert_eq!(timeline[0].block.semantic.block, independent_id);
+        assert_eq!(timeline[1].block.semantic.block, parent_id);
+        assert_eq!(timeline[2].block.semantic.block, child_id);
+        assert!(timeline[0].position < timeline[1].position);
+        assert_eq!(
+            timeline[1].position, timeline[2].position,
+            "the regressed child is lifted to its predecessor's position"
+        );
+
+        let after_parent = snapshot
+            .timeline_after(timeline[1].cursor(), |_| true)
+            .unwrap();
+        assert_eq!(after_parent.len(), 1);
+        assert_eq!(after_parent[0].block.semantic.block, child_id);
+        assert!(snapshot
+            .timeline_after(ArchiveTimelineCursor::AfterBlock(untimed_id), |_| true)
+            .unwrap_err()
+            .to_string()
+            .contains("absent or has no timestamp"));
     }
 
     #[test]

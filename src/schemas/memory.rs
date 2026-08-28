@@ -106,6 +106,10 @@ pub mod comb {
         /// Replay granularity as typed (e.g. "2h", "1d", "30d") — stored on
         /// memory-replay cursors so a bare `memory replay` knows its zoom.
         "AEF10362CC939FA43CBED29D84CCAC13" unsafe as cursor_grain: ShortString;
+        /// Exact content identity at `cursor_position`. Streams with several
+        /// items at one position use this anchor to resume after one item
+        /// without skipping the rest. Minted 2026-08-28 with `trible genid`.
+        "C87DAFECBAA04E7B217C17877EA74839" as cursor_anchor: GenId;
     }
 }
 

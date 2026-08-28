@@ -13,7 +13,7 @@ use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 use crate::schemas::memory::comb::{
-    cursor_grain, cursor_persona, cursor_position, cursor_stream, kind_comb_cursor,
+    cursor_anchor, cursor_grain, cursor_persona, cursor_position, cursor_stream, kind_comb_cursor,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -105,6 +105,8 @@ pub struct CursorTrack {
 pub struct CursorState {
     /// `None` is an explicit stopped state.
     pub position: Option<IntervalValue>,
+    /// Exact item consumed at `position` when timestamp alone is ambiguous.
+    pub anchor: Option<Id>,
     /// Present only for active practices whose next read needs a grain.
     pub grain: Option<String>,
 }
@@ -172,6 +174,7 @@ pub struct CursorDraft {
     pub stream: String,
     pub persona: String,
     pub position: Option<IntervalValue>,
+    pub anchor: Option<Id>,
     pub grain: Option<String>,
     pub predecessors: BTreeSet<Id>,
     pub observed_at: BTreeSet<IntervalValue>,
@@ -230,6 +233,7 @@ fn cursor_core(track: &CursorTrack, state: &CursorState, predecessors: &BTreeSet
         cursor_stream: track.stream.as_str(),
         cursor_persona: track.persona.as_str(),
         cursor_position?: state.position.as_ref(),
+        cursor_anchor?: state.anchor.as_ref(),
         cursor_grain?: state.grain.as_deref(),
         metadata::supersedes*: predecessors.iter(),
     }
@@ -251,8 +255,8 @@ pub fn cursor_fragment(draft: CursorDraft) -> Result<(Fragment, Id)> {
     validate_short("cursor persona", &draft.persona)?;
     if let Some(position) = draft.position {
         point(None, "cursor position", position)?;
-    } else if draft.grain.is_some() {
-        bail!("a stopped cursor cannot retain a grain");
+    } else if draft.grain.is_some() || draft.anchor.is_some() {
+        bail!("a stopped cursor cannot retain a grain or anchor");
     }
     if let Some(grain) = &draft.grain {
         validate_short("cursor grain", grain)?;
@@ -266,6 +270,7 @@ pub fn cursor_fragment(draft: CursorDraft) -> Result<(Fragment, Id)> {
     };
     let state = CursorState {
         position: draft.position,
+        anchor: draft.anchor,
         grain: draft.grain,
     };
     let mut fragment = cursor_core(&track, &state, &draft.predecessors);
@@ -308,6 +313,11 @@ fn load_cursor(space: &TribleSet, id: Id) -> Result<CursorRow> {
                 id,
                 "cursor_position",
             )?,
+            anchor: one(
+                find!(value: Id, pattern!(space, [{ id @ cursor_anchor: ?value }])).collect(),
+                id,
+                "cursor_anchor",
+            )?,
             grain: one(
                 find!(value: String, pattern!(space, [{ id @ cursor_grain: ?value }])).collect(),
                 id,
@@ -324,8 +334,8 @@ fn load_cursor(space: &TribleSet, id: Id) -> Result<CursorRow> {
     validate_short("cursor persona", &row.track.persona)?;
     if let Some(position) = row.state.position {
         point(Some(id), "cursor position", position)?;
-    } else if row.state.grain.is_some() {
-        bail!("stopped comb cursor {id:x} retains a grain");
+    } else if row.state.grain.is_some() || row.state.anchor.is_some() {
+        bail!("stopped comb cursor {id:x} retains a grain or anchor");
     }
     if let Some(grain) = &row.state.grain {
         validate_short("cursor grain", grain)?;
@@ -435,6 +445,7 @@ mod tests {
             stream: "memory-replay".to_owned(),
             persona: "agent-a".to_owned(),
             position: position.map(point),
+            anchor: None,
             grain: position.map(|_| "2h".to_owned()),
             predecessors: predecessors.into_iter().collect(),
             observed_at: BTreeSet::from([point(100.0)]),
@@ -493,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_state_has_no_position_or_grain() {
+    fn stopped_state_has_no_position_anchor_or_grain() {
         let stopped = cursor_fragment(draft(None, [])).unwrap();
         let catalog = load_catalog(&facts([stopped.0])).unwrap();
         let state = catalog
@@ -502,7 +513,36 @@ mod tests {
             .settled_state()
             .unwrap();
         assert_eq!(state.position, None);
+        assert_eq!(state.anchor, None);
         assert_eq!(state.grain, None);
+    }
+
+    #[test]
+    fn exact_anchor_participates_in_cursor_identity() {
+        let (_, anchor) = cursor_fragment(draft(Some(1.0), [])).unwrap();
+        let plain = cursor_fragment(draft(Some(2.0), [])).unwrap();
+        let mut anchored = draft(Some(2.0), []);
+        anchored.anchor = Some(anchor);
+        let anchored = cursor_fragment(anchored).unwrap();
+        assert_ne!(plain.1, anchored.1);
+
+        let catalog = load_catalog(&facts([anchored.0])).unwrap();
+        assert_eq!(
+            catalog
+                .resolution("memory-replay", "agent-a")
+                .unwrap()
+                .settled_state()
+                .unwrap()
+                .anchor,
+            Some(anchor)
+        );
+
+        let mut stopped = draft(None, []);
+        stopped.anchor = Some(anchor);
+        assert!(cursor_fragment(stopped)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot retain a grain or anchor"));
     }
 
     #[test]
