@@ -537,6 +537,7 @@ mod tests {
     use std::fs::File;
 
     use triblespace::core::collection::discover_collection_records;
+    use triblespace::prelude::CollectionStoreExt;
 
     use super::*;
     use crate::storage::{initialize_signer, load_signer, open_pile_strict};

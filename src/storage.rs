@@ -283,7 +283,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
-    use triblespace::core::collection::{empty_metadata_handle, CollectionRecord};
+    use triblespace::core::blob::IntoBlob;
+    use triblespace::core::collection::{empty_metadata_handle, CollectionRecord, CollectionStore};
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
