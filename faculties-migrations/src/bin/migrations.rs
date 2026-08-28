@@ -72,9 +72,33 @@ fn print_posture(plan: &posture_findings::FindingBridgePlan) {
     for entry in plan.unbridged() {
         println!(
             "  {}  {}  ({})",
-            entry.occurrence, entry.locator, entry.reason
+            entry.occurrence,
+            concise_diagnostic(&entry.locator, 240),
+            concise_diagnostic(&entry.reason, 240),
         );
     }
+}
+
+/// Keep one pathological source line from turning a migration census into
+/// megabytes of terminal output. Diagnostics remain individually identified;
+/// the full legacy record is still present in the pile for deeper inspection.
+fn concise_diagnostic(value: &str, limit: usize) -> String {
+    let mut characters = value.chars();
+    let mut concise = String::with_capacity(limit.saturating_add(1));
+    for _ in 0..limit {
+        let Some(character) = characters.next() else {
+            return concise;
+        };
+        concise.push(if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        });
+    }
+    if characters.next().is_some() {
+        concise.push('…');
+    }
+    concise
 }
 
 fn print_descriptor(plan: &descriptor_authority::DescriptorAuthorityPlan) {
@@ -197,4 +221,16 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::concise_diagnostic;
+
+    #[test]
+    fn diagnostics_are_single_line_and_bounded_by_characters() {
+        assert_eq!(concise_diagnostic("alpha\nbeta", 20), "alpha beta");
+        assert_eq!(concise_diagnostic("αβγδε", 3), "αβγ…");
+        assert_eq!(concise_diagnostic("abc", 3), "abc");
+    }
 }
