@@ -377,12 +377,12 @@ mod tests {
                 let current = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
                 let reader = pile.reader().unwrap();
                 relations::validate_catalog_union(&reader, &current, &fragment)?;
-                let mut collection = faculties::collection_names::open(
+                let collection = faculties::collection_names::open(
                     &mut *pile,
                     RELATIONS_SCOPE_ID,
-                    signer.clone(),
-                );
-                collection.commit(fragment)?;
+                    signer.verifying_key(),
+                )?;
+                pile.commit(collection, signer, fragment)?;
                 Ok(())
             })
             .unwrap();

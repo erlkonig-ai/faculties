@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(found_worker, worker);
         assert_eq!(u256be_to_u64(timeout), Some(90_000));
         assert_eq!(found_at, requested_at);
-        collection.into_storage().close().unwrap();
+        pile.close().unwrap();
     }
 
     #[test]

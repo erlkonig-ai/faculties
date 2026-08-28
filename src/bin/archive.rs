@@ -27,10 +27,11 @@ use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::trible::{Fragment, TribleSet};
 
 #[derive(Parser)]
@@ -138,17 +139,18 @@ impl ArchiveStorage<'_> {
 
     fn load_comb(&self) -> Result<(TribleSet, CombCatalog)> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_COMB_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
+            let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let facts = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_facts())
                 .context("materialize Comb cursor collection")?;
             let catalog =
                 comb_model::load_catalog(&facts).context("validate Comb cursor collection")?;
             Ok((facts, catalog))
         })();
-        finish_collection(collection, result)
+        finish_pile(pile, result)
     }
 
     /// Materialize the Archive and its separate Comb cursor collection from
@@ -165,11 +167,8 @@ impl ArchiveStorage<'_> {
     }
 }
 
-fn finish_collection<T>(
-    collection: Collection<triblespace::core::repo::pile::Pile>,
-    result: Result<T>,
-) -> Result<T> {
-    let close = collection.into_storage().close();
+fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+    let close = pile.close();
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -905,19 +904,19 @@ fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()
 
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
     let signer = load_signer(storage.pile, storage.key)?;
-    let pile = open_pile_strict(storage.pile)?;
-    let mut collection = open_scope(pile, DEFAULT_COMB_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(storage.pile)?;
     let result = (|| {
-        let current = collection
-            .materialize()
+        let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+        let current = pile
+            .snapshot(collection, &[])
+            .map(|snapshot| snapshot.into_facts())
             .context("materialize Comb cursor collection before publication")?;
         validate_cursor_update(&current, &fragment)?;
-        collection
-            .commit(fragment)
+        pile.commit(collection, &signer, fragment)
             .context("publish archive replay cursor")?;
         Ok(())
     })();
-    finish_collection(collection, result)
+    finish_pile(pile, result)
 }
 
 const REPLAY_STREAM: &str = "archive-replay";

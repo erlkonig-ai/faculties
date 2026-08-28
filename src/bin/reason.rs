@@ -301,7 +301,7 @@ mod tests {
             &*reader.get::<View<str>, _>(command).unwrap(),
             "cargo test --lib"
         );
-        collection.into_storage().close().unwrap();
+        pile.close().unwrap();
     }
 
     #[test]
