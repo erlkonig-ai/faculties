@@ -29,6 +29,10 @@ RANGE_LINE = re.compile(
 )
 
 
+class CoverCapacityError(RuntimeError):
+    """The mandatory coarsest antichain no longer fits the requested budget."""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-pile", type=Path, required=True)
@@ -99,6 +103,8 @@ def render(
         text=True,
     )
     if result.returncode != 0:
+        if "incomplete cover:" in result.stderr:
+            raise CoverCapacityError(result.stderr.strip())
         raise RuntimeError(
             f"{binary} context {budget} failed: {result.stderr.strip()}"
         )
@@ -173,19 +179,30 @@ def create(
         raise RuntimeError(f"memory create {index} appended no bytes")
 
 
-def describe(samples: list[dict[str, object]]) -> dict[str, object]:
+def describe(
+    samples: list[dict[str, object]],
+    capacity_failure: dict[str, object] | None,
+) -> dict[str, object]:
     percentages = [float(sample["percent"]) for sample in samples]
-    return {
+    result: dict[str, object] = {
         "writes": len(samples),
-        "median_percent": statistics.median(percentages),
-        "mean_percent": statistics.fmean(percentages),
-        "minimum_percent": min(percentages),
-        "minimum_write": min(samples, key=lambda sample: float(sample["percent"]))[
-            "write"
-        ],
         "free_writes": sum(bool(sample["free"]) for sample in samples),
         "samples": samples,
     }
+    if samples:
+        result.update(
+            {
+                "median_percent": statistics.median(percentages),
+                "mean_percent": statistics.fmean(percentages),
+                "minimum_percent": min(percentages),
+                "minimum_write": min(
+                    samples, key=lambda sample: float(sample["percent"])
+                )["write"],
+            }
+        )
+    if capacity_failure is not None:
+        result["terminal_capacity_failure"] = capacity_failure
+    return result
 
 
 def main() -> int:
@@ -216,6 +233,7 @@ def main() -> int:
 
         covers: dict[tuple[str, int], list[str]] = {}
         samples: dict[tuple[str, int], list[dict[str, object]]] = {}
+        capacity_failures: dict[tuple[str, int], dict[str, object]] = {}
         for name, binary in arms.items():
             for budget in args.budget:
                 first_text, first = render(binary, arm_piles[name], key, budget)
@@ -240,8 +258,18 @@ def main() -> int:
                 clone(sequence, pile)
             for name, binary in arms.items():
                 for budget in args.budget:
+                    if (name, budget) in capacity_failures:
+                        continue
                     before = covers[name, budget]
-                    _, after = render(binary, arm_piles[name], key, budget)
+                    try:
+                        _, after = render(binary, arm_piles[name], key, budget)
+                    except CoverCapacityError as error:
+                        capacity_failures[name, budget] = {
+                            "write": index,
+                            "before_chunks": len(before),
+                            "error": str(error),
+                        }
+                        continue
                     retained = leading_equal(before, after)
                     percent = 100.0 if not before else 100.0 * retained / len(before)
                     samples[name, budget].append(
@@ -255,11 +283,19 @@ def main() -> int:
                         }
                     )
                     covers[name, budget] = after
-            progress = ", ".join(
-                f"{name}/{budget}={samples[name, budget][-1]['percent']:.2f}%"
-                for budget in args.budget
-                for name in arms
-            )
+            progress_items = []
+            for budget in args.budget:
+                for name in arms:
+                    failure = capacity_failures.get((name, budget))
+                    if failure is not None:
+                        progress_items.append(
+                            f"{name}/{budget}=CAPACITY@{failure['write']}"
+                        )
+                    else:
+                        progress_items.append(
+                            f"{name}/{budget}={samples[name, budget][-1]['percent']:.2f}%"
+                        )
+            progress = ", ".join(progress_items)
             print(f"write {index:02}/{args.writes}: {progress}", file=sys.stderr, flush=True)
 
         report = {
@@ -282,7 +318,9 @@ def main() -> int:
             },
             "results": {
                 name: {
-                    str(budget): describe(samples[name, budget])
+                    str(budget): describe(
+                        samples[name, budget], capacity_failures.get((name, budget))
+                    )
                     for budget in args.budget
                 }
                 for name in arms
