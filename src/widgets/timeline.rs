@@ -466,7 +466,10 @@ fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Even
 
 /// Emit a Wiki event per fragment-version.
 fn collect_wiki_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let catalog = crate::wiki::validate_catalog(dataset.reader, dataset.facts)
+    let observed = dataset
+        .observed_order(metadata::supersedes.id())
+        .expect("StorageState attached the exact Wiki supersession index");
+    let catalog = crate::wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
         .expect("StorageState validated the Wiki collection");
     for revision in catalog.revisions.revision_records() {
         let Some(authored_at) = revision.authored_at() else {

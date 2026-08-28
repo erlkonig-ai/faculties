@@ -507,6 +507,9 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
+        // This preflight deliberately stays on the live/JIT resolver. Ensuring
+        // a durable derived index can append cache evidence; bootstrap must
+        // validate both staged candidates before it writes anything at all.
         let (wiki_before, wiki_reader) = wiki_model::materialize_collection(&mut pile, &signer)
             .context("materialize Wiki before bootstrap import")?;
         let (compass_before, compass_reader) = compass::materialize_collection(&mut pile, &signer)
@@ -532,9 +535,8 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
         let wiki_commit = wiki_model::commit_collection(&mut pile, &signer, seed.wiki)?;
         let compass_commit = compass::commit_collection(&mut pile, &signer, seed.compass)?;
 
-        let (wiki_after, reader) = wiki_model::materialize_collection(&mut pile, &signer)?;
-        wiki_model::validate_catalog(&reader, &wiki_after)?;
-        if !expected_wiki.difference(&wiki_after).is_empty() {
+        let wiki_after = wiki_model::materialize_indexed_collection(&mut pile, &signer)?;
+        if !expected_wiki.difference(wiki_after.facts()).is_empty() {
             bail!("Wiki collection omitted portable bootstrap facts after publication");
         }
         let (compass_after, reader) = compass::materialize_collection(&mut pile, &signer)?;
@@ -664,6 +666,7 @@ mod tests {
         let key = directory.path().join("empty.key");
         File::create(&pile_path).unwrap();
         let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
+        let length_before = std::fs::metadata(&pile_path).unwrap().len();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let (wiki_before, wiki_reader) =
             wiki_model::materialize_collection(&mut pile, &signer).unwrap();
@@ -688,21 +691,50 @@ mod tests {
                 .is_err()
         );
         pile.close().unwrap();
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            length_before,
+            "preflight and rejected staged candidates must not append cache evidence"
+        );
     }
 
     #[test]
     fn import_is_collection_only_and_idempotent() {
         let imported = imported("native");
         let first = imported.report.clone();
+        let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
+        let mut pile = open_pile_strict(&imported.pile).unwrap();
+        let ticket_before = crate::collection_names::open(
+            &mut pile,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer,
+        )
+        .ticket()
+        .unwrap();
+        pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
         let bytes_after = std::fs::metadata(&imported.pile).unwrap().len();
+        let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
+        let mut pile = open_pile_strict(&imported.pile).unwrap();
+        let ticket_after = crate::collection_names::open(
+            &mut pile,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer,
+        )
+        .ticket()
+        .unwrap();
+        pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
         assert_eq!(first.compass_commit.id(), second.compass_commit.id());
         assert_eq!(
             bytes_before, bytes_after,
             "exact replay must not grow the pile"
+        );
+        assert_eq!(
+            ticket_before, ticket_after,
+            "maintaining the Wiki index must not advance source authority"
         );
 
         let mut pile = open_pile_strict(&imported.pile).unwrap();

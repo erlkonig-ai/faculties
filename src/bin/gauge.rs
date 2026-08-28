@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::legacy_hint::open_scope;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{self as wiki_model, FrontierEntry, FrontierModel, LinkResolution};
 use triblespace::prelude::*;
@@ -318,17 +317,9 @@ fn with_model<T>(
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let facts = open_scope(
-            &mut pile,
-            faculties::schemas::wiki::DEFAULT_SCOPE_ID,
-            signer,
-        )
-        .materialize()
-        .context("materialize Wiki collection")?;
-        let reader = pile.reader().context("open Wiki attachment reader")?;
-        let catalog =
-            wiki_model::validate_catalog(&reader, &facts).context("validate Wiki collection")?;
-        let model = GaugeModel::load(&catalog, &reader, &facts)?;
+        let snapshot = wiki_model::materialize_indexed_collection(&mut pile, &signer)
+            .context("materialize indexed Wiki collection")?;
+        let model = GaugeModel::load(snapshot.catalog(), snapshot.reader(), snapshot.facts())?;
         operation(&model)
     })();
     let close = pile.close().map_err(anyhow::Error::from);

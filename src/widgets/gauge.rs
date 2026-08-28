@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use triblespace::core::metadata;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
@@ -87,7 +88,10 @@ struct GaugeLive {
 
 impl GaugeLive {
     fn refresh(dataset: DatasetView<'_>) -> Result<Self, String> {
-        let catalog = wiki::validate_catalog(dataset.reader, dataset.facts)
+        let observed = dataset
+            .observed_order(metadata::supersedes.id())
+            .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
+        let catalog = wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
             .map_err(|error| format!("validate Wiki collection for Gauge: {error:#}"))?;
         let entries = catalog.revisions.list_entries();
         let total_entries = entries.len();
