@@ -55,8 +55,9 @@ pub mod attrs {
     attributes! {
         // Revision DAG.
         //
-        // `supersedes` is NOT minted here: the canonical `metadata::supersedes`
-        // already means exactly this and is what `memory supersede` writes.
+        // `supersedes` is NOT minted here: the canonical
+        // `metadata::supersedes` already means exactly this. Wiki revisions
+        // use it as lineage; Memory's episodic journal deliberately does not.
         //
         // `author` REUSES the shared relation already declared by memory,
         // archive and blockdag. It is an existing relation with rows under it,

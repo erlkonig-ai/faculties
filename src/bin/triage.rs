@@ -86,13 +86,13 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         recent: usize,
     },
-    /// Show the complete canonical Memory frontier and context budget.
+    /// Show every canonical Memory chunk and the context budget.
     Cover {
         /// Show complete text instead of a one-line preview.
         #[arg(long)]
         full: bool,
     },
-    /// Inspect every canonical Memory node or alias matching an ID prefix.
+    /// Inspect every canonical Memory chunk or alias matching an ID prefix.
     Chunk {
         /// Intrinsic node ID or historical alias prefix.
         #[arg(value_name = "ID")]
@@ -276,12 +276,6 @@ struct ContextCandidate {
     result: Id,
     thought: Id,
     messages: Vec<ChatMessage>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum FrontierNode {
-    Chunk(Id),
-    Retraction(Id),
 }
 
 fn fmt_id(id: Id) -> String {
@@ -681,22 +675,6 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     Ok(())
 }
 
-fn memory_frontier(catalog: &MemoryCatalog) -> Vec<FrontierNode> {
-    catalog
-        .head_ids()
-        .into_iter()
-        .filter_map(|id| {
-            if catalog.chunks.contains_key(&id) {
-                Some(FrontierNode::Chunk(id))
-            } else if catalog.retractions.contains_key(&id) {
-                Some(FrontierNode::Retraction(id))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 fn chunk_text(reader: &PileReader, chunk: &memory_model::ChunkRow) -> Result<String> {
     match chunk.content {
         ChunkContent::Text(handle) => memory_model::read_text(reader, handle),
@@ -721,35 +699,20 @@ fn format_span(chunk: &memory_model::ChunkRow) -> String {
 fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
     let (memory, catalog) = snapshot.memory()?;
     let (_, headspace) = snapshot.headspace()?;
-    let frontier = memory_frontier(&catalog);
-    let content_heads = frontier
-        .iter()
-        .filter(|node| matches!(node, FrontierNode::Chunk(_)))
-        .count();
-    let retraction_heads = frontier.len() - content_heads;
-    let mut cover_chars = 0usize;
-    for node in &frontier {
-        if let FrontierNode::Chunk(id) = node {
-            cover_chars += chunk_text(&memory.reader, &catalog.chunks[id])?.len();
-        }
+    let chunk_ids = catalog.chunk_ids();
+    let mut all_chunk_chars = 0usize;
+    for id in &chunk_ids {
+        all_chunk_chars += chunk_text(&memory.reader, &catalog.chunks[id])?.len();
     }
     let budget = headspace.budget()?;
     let fill = if budget.body_budget_chars > 0 {
-        cover_chars as f64 / budget.body_budget_chars as f64 * 100.0
+        all_chunk_chars as f64 / budget.body_budget_chars as f64 * 100.0
     } else {
         0.0
     };
     println!("Memory cover");
     println!("- Memory facts: {}", memory.facts.len());
-    println!(
-        "- catalog: {} chunks, {} retractions",
-        catalog.chunks.len(),
-        catalog.retractions.len()
-    );
-    println!(
-        "- complete frontier: {} content, {} retraction",
-        content_heads, retraction_heads
-    );
+    println!("- catalog: {} chunks", catalog.chunks.len());
     println!();
     println!("Budget");
     println!(
@@ -760,50 +723,27 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
         budget.chars_per_token
     );
     println!(
-        "- system={} chars body={} chars cover={} chars fill={fill:.1}%",
-        budget.system_prompt_chars, budget.body_budget_chars, cover_chars
+        "- system={} chars body={} chars all-chunks={} chars ratio={fill:.1}%",
+        budget.system_prompt_chars, budget.body_budget_chars, all_chunk_chars
     );
     println!();
-    println!("Frontier (canonical ID order; no clock arbitration)");
-    if frontier.is_empty() {
+    println!("Chunks (canonical ID order; every episode coexists)");
+    if chunk_ids.is_empty() {
         println!("- empty");
     }
-    for node in frontier {
-        match node {
-            FrontierNode::Chunk(id) => {
-                let chunk = &catalog.chunks[&id];
-                let text = chunk_text(&memory.reader, chunk)?;
-                println!(
-                    "- content {} | {} | {} predecessor(s) | {}",
-                    fmt_id(id),
-                    format_span(chunk),
-                    chunk.predecessors.len(),
-                    if full {
-                        text
-                    } else {
-                        truncate_single_line(&text, 100)
-                    }
-                );
+    for id in chunk_ids {
+        let chunk = &catalog.chunks[&id];
+        let text = chunk_text(&memory.reader, chunk)?;
+        println!(
+            "- chunk {} | {} | {}",
+            fmt_id(id),
+            format_span(chunk),
+            if full {
+                text
+            } else {
+                truncate_single_line(&text, 100)
             }
-            FrontierNode::Retraction(id) => {
-                let row = &catalog.retractions[&id];
-                let reason = row
-                    .reason
-                    .map(|handle| memory_model::read_text(&memory.reader, handle))
-                    .transpose()?
-                    .unwrap_or_else(|| "<no reason>".to_owned());
-                println!(
-                    "- retraction {} | {} predecessor(s) | {}",
-                    fmt_id(id),
-                    row.predecessors.len(),
-                    if full {
-                        reason
-                    } else {
-                        truncate_single_line(&reason, 100)
-                    }
-                );
-            }
-        }
+        );
     }
     Ok(())
 }
@@ -853,50 +793,34 @@ fn cmd_chunk(snapshot: &TriageSnapshot, prefix: &str) -> Result<()> {
     let (memory, catalog) = snapshot.memory()?;
     let matches = matching_memory_nodes(&catalog, prefix);
     if matches.is_empty() {
-        bail!("no canonical Memory node or alias matches prefix '{prefix}'");
+        bail!("no canonical Memory chunk or alias matches prefix '{prefix}'");
     }
-    let heads: BTreeSet<Id> = catalog.head_ids().into_iter().collect();
     println!(
-        "Memory match set for '{prefix}' ({} node(s))",
+        "Memory match set for '{prefix}' ({} chunk(s))",
         matches.len()
     );
     for (index, id) in matches.into_iter().enumerate() {
         if index > 0 {
             println!();
         }
-        if let Some(chunk) = catalog.chunks.get(&id) {
-            println!("Chunk {}", fmt_id(id));
-            println!("  frontier: {}", heads.contains(&id));
-            println!("  span: {}", format_span(chunk));
-            print_ids("predecessors", chunk.predecessors.iter().copied());
-            print_ids("references", chunk.references.iter().copied());
-            print_ids("aliases", chunk.aliases.iter().copied());
-            if let Some(exec) = chunk.about_exec_result {
-                println!("  about exec result: {}", fmt_id(exec));
-            }
-            if let Some(message) = chunk.about_archive_message {
-                println!("  about archive message: {}", fmt_id(message));
-            }
-            if let Some(lens) = chunk.lens {
-                println!("  lens: {}", memory_model::read_text(&memory.reader, lens)?);
-            }
-            print_observations(&chunk.observed_at);
-            println!("  content:");
-            for line in chunk_text(&memory.reader, chunk)?.lines() {
-                println!("    {line}");
-            }
-        } else {
-            let row = &catalog.retractions[&id];
-            println!("Retraction {}", fmt_id(id));
-            println!("  frontier: {}", heads.contains(&id));
-            print_ids("predecessors", row.predecessors.iter().copied());
-            print_observations(&row.observed_at);
-            let reason = row
-                .reason
-                .map(|handle| memory_model::read_text(&memory.reader, handle))
-                .transpose()?
-                .unwrap_or_else(|| "<no reason>".to_owned());
-            println!("  reason: {reason}");
+        let chunk = &catalog.chunks[&id];
+        println!("Chunk {}", fmt_id(id));
+        println!("  span: {}", format_span(chunk));
+        print_ids("references", chunk.references.iter().copied());
+        print_ids("aliases", chunk.aliases.iter().copied());
+        if let Some(exec) = chunk.about_exec_result {
+            println!("  about exec result: {}", fmt_id(exec));
+        }
+        if let Some(message) = chunk.about_archive_message {
+            println!("  about archive message: {}", fmt_id(message));
+        }
+        if let Some(lens) = chunk.lens {
+            println!("  lens: {}", memory_model::read_text(&memory.reader, lens)?);
+        }
+        print_observations(&chunk.observed_at);
+        println!("  content:");
+        for line in chunk_text(&memory.reader, chunk)?.lines() {
+            println!("    {line}");
         }
     }
     Ok(())
@@ -1230,7 +1154,7 @@ mod tests {
     use std::path::PathBuf;
 
     use faculties::headspace::{self, Resolution};
-    use faculties::memory::{ChunkDraft, ChunkDraftContent, RetractionDraft};
+    use faculties::memory::{ChunkDraft, ChunkDraftContent};
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
     use faculties::storage::initialize_signer;
     use triblespace::core::metadata;
@@ -1298,7 +1222,7 @@ mod tests {
         }
     }
 
-    fn chunk(text: &str, predecessors: impl IntoIterator<Item = Id>, start: f64) -> (Fragment, Id) {
+    fn chunk(text: &str, start: f64) -> (Fragment, Id) {
         memory_model::chunk_fragment(ChunkDraft {
             content: ChunkDraftContent::Text(text.to_owned()),
             start_at: point(start),
@@ -1307,7 +1231,6 @@ mod tests {
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,
-            predecessors: predecessors.into_iter().collect(),
             observed_at: BTreeSet::from([point(start + 2.0)]),
             aliases: BTreeSet::new(),
         })
@@ -1315,35 +1238,17 @@ mod tests {
     }
 
     #[test]
-    fn memory_frontier_keeps_forks_and_retractions_visible() {
+    fn memory_chunks_coexist() {
         let fixture = Fixture::new();
-        let (genesis, genesis_id) = chunk("genesis", [], 10.0);
-        fixture.publish(MEMORY_SCOPE_ID, genesis);
-        let (left, left_id) = chunk("left", [genesis_id], 20.0);
-        let (right, right_id) = chunk("right", [genesis_id], 30.0);
+        let (left, left_id) = chunk("one telling", 10.0);
+        let (right, right_id) = chunk("another telling", 10.0);
         fixture.publish(MEMORY_SCOPE_ID, left);
         fixture.publish(MEMORY_SCOPE_ID, right);
-        let (retraction, retraction_id) = memory_model::retraction_fragment(RetractionDraft {
-            reason: Some("withdraw left".to_owned()),
-            predecessors: BTreeSet::from([left_id]),
-            observed_at: BTreeSet::from([point(40.0)]),
-        })
-        .unwrap();
-        fixture.publish(MEMORY_SCOPE_ID, retraction);
 
         let (view, catalog) = fixture.snapshot().memory().unwrap();
         assert!(!view.facts.is_empty());
-        assert_eq!(
-            memory_frontier(&catalog)
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                FrontierNode::Chunk(right_id),
-                FrontierNode::Retraction(retraction_id),
-            ])
-        );
-        assert!(!catalog.is_live(left_id));
-        assert!(catalog.is_live(right_id));
+        assert_eq!(catalog.node_ids(), BTreeSet::from([left_id, right_id]));
+        assert_eq!(catalog.chunks.len(), 2);
     }
 
     #[test]

@@ -1697,7 +1697,7 @@ mod tests {
             catalog.chunks[&successor].predecessors,
             BTreeSet::from([old_canonical, replacement_base])
         );
-        assert_eq!(catalog.head_ids(), vec![successor]);
+        assert!(catalog.chunk_ids().contains(&successor));
         assert!(plan.facts_by_commit[&commit(4)].is_empty());
         assert_disjoint(&plan);
 
@@ -1723,9 +1723,17 @@ mod tests {
         assert_eq!(profile.fork_state_clones, 1);
         assert_eq!(profile.peak_retained_states, 2);
         let catalog = memory::load_catalog(&plan.facts).unwrap();
-        assert_eq!(catalog.head_ids().len(), 2);
-        assert_eq!(catalog.live_chunk_ids(), vec![plan.aliases[&corrected]]);
-        assert_eq!(catalog.retractions.len(), 1);
+        assert_eq!(catalog.chunks.len(), 2);
+        assert!(catalog.chunk_ids().contains(&plan.aliases[&base]));
+        assert!(catalog.chunk_ids().contains(&plan.aliases[&corrected]));
+        assert_eq!(
+            find!(
+                id: Id,
+                pattern!(&plan.facts, [{ ?id @ metadata::tag: &KIND_RETRACTION }])
+            )
+            .count(),
+            1
+        );
         assert!(!plan.facts_by_commit.contains_key(&commit(4)));
         assert!(plan.facts_by_commit[&commit(5)].is_empty());
         assert_disjoint(&plan);
@@ -1760,11 +1768,6 @@ mod tests {
 
         let plan = plan_legacy_memory(deltas.clone()).unwrap();
         let catalog = memory::load_catalog(&plan.facts).unwrap();
-        assert_eq!(catalog.head_ids().len(), 2);
-        assert!(catalog
-            .head_ids()
-            .iter()
-            .all(|head| catalog.chunks.contains_key(head)));
         assert_eq!(catalog.chunks.len(), 5);
         assert_eq!(catalog.alias_targets(amended), vec![plan.aliases[&amended]]);
         assert_disjoint(&plan);
@@ -1796,8 +1799,10 @@ mod tests {
         .unwrap();
 
         let catalog = memory::load_catalog(&plan.facts).unwrap();
-        assert_eq!(catalog.head_ids().len(), 1);
-        assert_ne!(catalog.head_ids()[0], plan.aliases[&amended]);
+        assert!(catalog
+            .chunks
+            .values()
+            .any(|row| !row.predecessors.is_empty() && row.id != plan.aliases[&amended]));
         assert!(plan.facts_by_commit[&commit(5)]
             .iter()
             .any(|fact| fact.a() == &metadata::created_at.id()));
@@ -1829,15 +1834,23 @@ mod tests {
         ])
         .unwrap();
         let catalog = memory::load_catalog(&plan.facts).unwrap();
-        assert_eq!(catalog.retractions.len(), 1);
-        let retraction = catalog.retractions.values().next().unwrap();
-        assert_eq!(retraction.predecessors.len(), 1);
-        let amended_head = *retraction.predecessors.first().unwrap();
+        let retraction = find!(
+            id: Id,
+            pattern!(&plan.facts, [{ ?id @ metadata::tag: &KIND_RETRACTION }])
+        )
+        .next()
+        .expect("one canonical historical retraction");
+        let predecessors: BTreeSet<Id> = find!(
+            predecessor: Id,
+            pattern!(&plan.facts, [{ retraction @ metadata::supersedes: ?predecessor }])
+        )
+        .collect();
+        assert_eq!(predecessors.len(), 1);
+        let amended_head = *predecessors.first().unwrap();
         assert!(catalog.chunks.contains_key(&amended_head));
         assert_ne!(amended_head, plan.aliases[&base]);
         assert!(!plan.aliases.contains_key(&marker));
-        assert_eq!(catalog.head_ids(), vec![retraction.id]);
-        assert!(catalog.live_chunk_ids().is_empty());
+        assert!(!catalog.chunk_ids().is_empty());
         assert!(!plan
             .facts
             .iter()

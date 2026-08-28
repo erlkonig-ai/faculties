@@ -46,6 +46,7 @@ pub(crate) mod legacy_secrets_v1;
 pub mod mail_credentials;
 pub mod mail_cutover;
 pub mod memory_cutover;
+pub mod memory_journal;
 pub mod message_cutover;
 pub mod orient_cutover;
 pub mod planner_cutover;

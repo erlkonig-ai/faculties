@@ -15,6 +15,8 @@
 //!   is what that faculty's own `migrate-legacy` subcommand used to do.
 //! - `status-register` gives Compass's status register the identity it never
 //!   had, on the events written before that identity existed.
+//! - `memory-journal` inspects and activates the source-bound transition from
+//!   Memory's retired revision DAG to its immutable episodic journal.
 //! - `mail-credentials` recovers the mail account the Secrets cutover sealed
 //!   and retired, so `mail` can be configured again without re-deriving a
 //!   password nobody wrote down.
@@ -31,7 +33,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use faculties_migrations::per_faculty::{self, Faculty};
 use faculties_migrations::{
     activation_cutover, collection_cutover, collection_naming, disposable_cutover, legacy_password,
-    mail_credentials, posture_findings, secrets_direct_proofs, status_register, teams_credentials,
+    mail_credentials, memory_journal, posture_findings, secrets_direct_proofs, status_register,
+    teams_credentials,
 };
 use zeroize::Zeroizing;
 
@@ -69,6 +72,15 @@ enum Command {
     SecretsDirectProofs {
         #[command(subcommand)]
         action: AdditiveAction,
+    },
+
+    /// Move selected canonical chunks from the retired Memory revision DAG
+    /// into the immutable episodic journal. The private omission manifest is
+    /// bound to one exact source fact set; stop old Memory writers between
+    /// inspection, planning, and activation.
+    MemoryJournal {
+        #[command(subcommand)]
+        action: MemoryJournalAction,
     },
 
     /// With every pile writer stopped, migrate one faculty's legacy branch
@@ -176,6 +188,87 @@ enum AdditiveAction {
     Plan,
     /// Append missing proof closures and one successor inbox COMMIT per vault.
     Activate,
+}
+
+#[derive(Clone, Subcommand)]
+enum MemoryJournalAction {
+    /// Print the frozen legacy source shape and digest needed by a private
+    /// omission manifest. Nothing is written.
+    Inspect,
+    /// Validate one exact source-bound omission manifest and target candidate
+    /// without writing.
+    Plan {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+    },
+    /// Append the exact selected journal seed, then rematerialize and verify
+    /// it. Exact replay appends nothing.
+    Activate {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+    },
+}
+
+fn print_memory_journal_report(plan: &memory_journal::JournalPlan) {
+    println!("Memory revision DAG -> episodic journal");
+    println!("source facts          : {}", plan.source.facts);
+    println!("source commits        : {}", plan.source.commits);
+    println!("source chunks         : {}", plan.source.chunks);
+    println!(
+        "source digest         : blake3:{}",
+        plan.source.digest_hex()
+    );
+    println!("selected chunks       : {}", plan.selected_chunks);
+    println!("omitted chunks        : {}", plan.omitted_chunks);
+    println!("selected facts        : {}", plan.selected_facts);
+    println!("target chunks before  : {}", plan.target_chunks_before);
+    println!(
+        "publication           : {}",
+        if plan.already_complete {
+            "already complete"
+        } else {
+            "pending"
+        }
+    );
+}
+
+fn memory_journal(pile: &Path, key: Option<&Path>, action: MemoryJournalAction) -> Result<()> {
+    match action {
+        MemoryJournalAction::Inspect => {
+            let source = memory_journal::inspect_path(pile, key)?;
+            println!("Memory revision-DAG source");
+            println!("pile          : {}", pile.display());
+            println!("source-facts  : {}", source.facts);
+            println!("source-chunks : {}", source.chunks);
+            println!("source-commits: {}", source.commits);
+            println!("source-digest : {}", source.digest_hex());
+            println!();
+            println!("Manifest header:");
+            println!("memory-journal-omit-v1");
+            println!("source-facts {}", source.facts);
+            println!("source-chunks {}", source.chunks);
+            println!("source-digest {}", source.digest_hex());
+            println!("omit <32-hex-memory-id>");
+        }
+        MemoryJournalAction::Plan { manifest } => {
+            let plan = memory_journal::plan_path(pile, key, &manifest)?;
+            print_memory_journal_report(&plan);
+            println!("\n(dry run — nothing written)");
+        }
+        MemoryJournalAction::Activate { manifest } => {
+            let (plan, outcome) = memory_journal::activate(pile, key, &manifest)?;
+            print_memory_journal_report(&plan);
+            match outcome {
+                memory_journal::ActivationOutcome::Published(commit) => {
+                    println!("\npublished and verified COMMIT {:X}", commit.id());
+                }
+                memory_journal::ActivationOutcome::AlreadyComplete => {
+                    println!("\ntarget already contained the complete selected journal; nothing appended");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_secrets_direct_proofs(pile: &Path, key: Option<&Path>) -> Result<()> {
@@ -738,6 +831,9 @@ fn main() -> Result<()> {
                 activate_secrets_direct_proofs(&cli.pile, cli.key.as_deref())
             }
         },
+        Some(Command::MemoryJournal { action }) => {
+            memory_journal(&cli.pile, cli.key.as_deref(), action)
+        }
         Some(Command::MigrateLegacy { faculty }) => {
             per_faculty::migrate(faculty, &cli.pile, cli.key.as_deref())
         }

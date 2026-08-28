@@ -1,5 +1,6 @@
-//! Memory schema: compacted context chunks with time spans, tree structure,
-//! and provenance links back to exec results or archived messages.
+//! Memory schema: immutable episodic journal chunks with time spans and
+//! provenance links back to exec results or archived messages. Cover trees are
+//! derived from temporal containment rather than stored as revision state.
 //!
 //! Used by `memory.rs` (the faculty CLI) and by any downstream consumer
 //! that wants to read memory chunks from a pile.
@@ -9,11 +10,18 @@ use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-/// Stable extrinsic scope of the durable Memory journal collection.
+/// Stable extrinsic scope of the immutable episodic Memory journal.
+///
+/// Minted with `trible genid` on 2026-08-28:
+/// `E2C3B4C4BE14218DE4B3EAC63EC1DEB5`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("E2C3B4C4BE14218DE4B3EAC63EC1DEB5");
+
+/// Retired native Memory revision-DAG scope. Its named collection is read only
+/// by the explicit journal-epoch migration; ordinary faculties never open it.
 ///
 /// Minted with `trible genid` on 2026-08-09:
 /// `E12E0AF29345CA6D9C58A32B50BAC9D8`.
-pub const DEFAULT_SCOPE_ID: Id = id_hex!("E12E0AF29345CA6D9C58A32B50BAC9D8");
+pub const LEGACY_DAG_SCOPE_ID: Id = id_hex!("E12E0AF29345CA6D9C58A32B50BAC9D8");
 
 /// Historical input consumed only by the stopped-world additive cutover.
 /// Ordinary Memory readers and writers never resolve a named branch.
@@ -31,12 +39,9 @@ pub const LEGACY_COMB_BRANCH_NAME: &str = "comb-state";
 
 pub const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 
-/// Marks a *retraction* tombstone: an entity that retracts a chunk (via
-/// `ctx::supersedes`) without being a chunk itself. Deliberately distinct from
-/// `KIND_CHUNK_ID` so retractions never enumerate in chunk views, yet remain
-/// queryable as their own class ("what have I walked back, and why"). The
-/// reason, when given, is stored as the tombstone's `ctx::summary`. Minted
-/// 2026-07-03.
+/// Historical Memory retraction marker, retained only so migrations can decode
+/// the retired revision-DAG collection. The episodic journal never emits or
+/// interprets it.
 pub const KIND_RETRACTION: Id = id_hex!("89ACC4C9A8B961A529CC5DB19C2D393B");
 
 pub const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
@@ -136,11 +141,9 @@ pub mod ctx {
         "087D07E3D9D94F0C4E96813C7BC5E74C" unsafe as right: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" unsafe as about_exec_result: GenId;
         "A4E2B712CA28AB1EED76C34DE72AFA39" unsafe as about_archive_message: GenId;
-        /// This chunk replaces another (wrong span, superseded retelling).
-        /// Monotonic correction: the fact is appended, never removed; readers
-        /// exclude any chunk that something else supersedes (read-side policy,
-        /// periphery principle). Mis-created chunks stay in history but leave
-        /// every view.
+        /// Retired branch-era Memory lineage marker. Kept solely so the
+        /// migration crate can decode historical rows; the episodic journal
+        /// neither emits nor interprets it.
         "0381735B64BFE71EA0341B95EA42C984" unsafe as supersedes: GenId;
         /// Marks this chunk as a thematic LENS rather than part of the
         /// chronological spine; the value is the theme name. Lens chunks are

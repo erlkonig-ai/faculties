@@ -13,7 +13,10 @@
 //! views frozen from one pile snapshot, plus the Memory attachment reader and
 //! parsed [`CoverOpts`]. The result is the cover text.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
+
+#[cfg(feature = "local-embed")]
+use std::collections::BTreeSet;
 
 #[cfg(feature = "local-embed")]
 use anyhow::anyhow;
@@ -76,26 +79,6 @@ pub fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> 
 
 pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
-}
-
-/// The chunks nothing in `space` has corrected — [`latest`] over the Memory
-/// supersedes DAG, restricted to chunk-tagged candidates.
-///
-/// Monotonic correction: the `supersedes` fact is appended, never removed;
-/// covers and trees show only this frontier (read-side policy), while direct
-/// id lookup still resolves superseded chunks for history inspection. A
-/// retraction node observes without replacing, and it is an observer here like
-/// any other — retracting a chunk removes it from the frontier and puts
-/// nothing in its place, which is exactly what a retraction means.
-pub fn live_chunk_ids(space: &TribleSet) -> BTreeSet<Id> {
-    latest(space, metadata::supersedes.id(), all_chunk_ids(space))
-}
-
-/// [`latest`] over an arbitrary candidate set of Memory nodes — one
-/// reverse-index probe per candidate, so a caller holding a handful of ids
-/// never pays for a scan of the whole corpus.
-pub fn live_among(space: &TribleSet, candidates: impl IntoIterator<Item = Id>) -> BTreeSet<Id> {
-    latest(space, metadata::supersedes.id(), candidates)
 }
 
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
@@ -172,11 +155,11 @@ pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 // cover helpers
 // ---------------------------------------------------------------------------
 
-/// Load the non-superseded chunks of canonical Memory as `(start_key, end_key, id)`.
+/// Load every canonical Memory chunk as `(start_key, end_key, id)`.
 /// Chunks missing a start/end interval are skipped. Shared by `list` and `check`.
 pub fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
     let mut spans = Vec::new();
-    for id in live_chunk_ids(space) {
+    for id in all_chunk_ids(space) {
         // Thematic lenses are a parallel weave, not part of the chronological
         // spine — exclude them so a wide lens can't hijack the containment tree.
         if chunk_lens_handle(space, id).is_some() {
@@ -232,7 +215,7 @@ pub const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
 
 /// Rebuild the exact lexical view from the frozen canonical Memory facts.
 /// BM25 is query-time machinery, not durable journal state: there is no stale
-/// index entity to arbitrate and every live text revision visible in `space`
+/// index entity to arbitrate and every text journal entry visible in `space`
 /// participates in this one scored postings walk.
 pub fn lexical_relevance_scores<B: BlobStoreGet>(
     space: &TribleSet,
@@ -240,7 +223,7 @@ pub fn lexical_relevance_scores<B: BlobStoreGet>(
     query: &str,
 ) -> Result<HashMap<Id, f32>> {
     let mut builder = BM25Builder::new();
-    for chunk in live_chunk_ids(space) {
+    for chunk in all_chunk_ids(space) {
         let Some(handle) = chunk_summary_handle(space, chunk) else {
             continue;
         };
@@ -327,8 +310,8 @@ pub fn semantic_about_scores<B: BlobStoreGet>(
 /// negates in the RETRIEVAL LOGIC (drop the high-match chunks), never by embedding
 /// a negated query — that is the whole point, and it sidesteps embedding-negation
 /// failure.
-/// `universe` is the exact set of chunks that can appear in the cover (non-
-/// superseded, non-lens — what `collect_chunk_spans` selects), so the unscorable
+/// `universe` is the exact set of chunks that can appear in the cover (all
+/// chronological, non-lens chunks selected by `collect_chunk_spans`), so the unscorable
 /// warning never lists chunks that could never surface anyway.
 pub fn eligibility_scores<B: BlobStoreGet>(
     space: &TribleSet,

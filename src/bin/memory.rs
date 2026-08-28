@@ -19,8 +19,8 @@ use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{
     all_chunk_ids, chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_span_str,
     chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, live_among,
-    live_chunk_ids, CoverOpts, DEFAULT_SIM_THRESHOLD,
+    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, CoverOpts,
+    DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
@@ -59,10 +59,6 @@ use triblespace::prelude::*;
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
-             memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
-             memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
-             memory retract <id> [reason]      — retire a mistaken/duplicate chunk with NO replacement (invisible tombstone; target leaves all views, nothing new shows up as a memory)\n  \
-             memory retractions               — audit surface: list retractions (what was retracted, and why)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -333,8 +329,6 @@ fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
     let mut children: Vec<Id> =
         find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
     // Sort referenced chunks by their start_at time.
-    let live = live_among(space, children.iter().copied());
-    children.retain(|child_id| live.contains(child_id));
     children.sort_by_key(|child_id| {
         chunk_start_at(space, *child_id)
             .map(interval_key)
@@ -398,7 +392,7 @@ fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Ep
 
     let mut best: Option<(Id, i128)> = None; // (id, specificity score)
 
-    for chunk_id in live_chunk_ids(space) {
+    for chunk_id in all_chunk_ids(space) {
         let start_val = chunk_start_at(space, chunk_id);
         let end_val = chunk_end_at(space, chunk_id);
         let (Some(start_v), Some(end_v)) = (start_val, end_val) else {
@@ -477,9 +471,9 @@ fn cmd_search(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 #[cfg(feature = "local-embed")]
 use faculties::nomic;
 
-/// `memory embed` — embed every live chunk summary that lacks a vector and
+/// `memory embed` — embed every journal chunk that lacks a vector and
 /// store it as an observation in the shared Embeddings collection. Idempotent:
-/// re-running only embeds live chunks absent from the frozen observation set.
+/// re-running only embeds chunks absent from the frozen observation set.
 #[cfg(feature = "local-embed")]
 fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     use mary::embed::LocalEmbedder;
@@ -495,7 +489,7 @@ fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     let loaded = storage.load_context(true)?;
     let space = &loaded.memory.memory.facts;
     let mut todo: Vec<(Id, Src)> = Vec::new();
-    for chunk in loaded.memory.catalog.live_chunk_ids() {
+    for chunk in loaded.memory.catalog.chunk_ids() {
         if chunk_embedding_handle(&loaded.embeddings.facts, chunk)?.is_some() {
             continue;
         }
@@ -508,7 +502,7 @@ fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
         }
     }
     if todo.is_empty() {
-        println!("all live chunks already embedded.");
+        println!("all journal chunks already embedded.");
         return Ok(());
     }
     let total = todo.len();
@@ -600,7 +594,7 @@ fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load_context(true)?;
     let space = &loaded.memory.memory.facts;
     let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-    for chunk in loaded.memory.catalog.live_chunk_ids() {
+    for chunk in loaded.memory.catalog.chunk_ids() {
         if let Some(h) = chunk_embedding_handle(&loaded.embeddings.facts, chunk)? {
             let v: View<[f32]> = loaded
                 .embeddings
@@ -613,10 +607,10 @@ fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if pairs.is_empty() {
         bail!("no chunk embeddings on this pile yet — run `memory embed` first");
     }
-    if pairs.len() < loaded.memory.catalog.live_chunk_ids().len() {
+    if pairs.len() < loaded.memory.catalog.chunk_ids().len() {
         eprintln!(
-            "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
-            loaded.memory.catalog.live_chunk_ids().len() - pairs.len()
+            "note: {} journal chunk(s) not yet embedded — run `memory embed` to refresh",
+            loaded.memory.catalog.chunk_ids().len() - pairs.len()
         );
     }
     let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
@@ -673,18 +667,6 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "meta") {
         return cmd_meta(storage, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "respan") {
-        return cmd_respan(storage, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "supersede") {
-        return cmd_supersede(storage, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "retract") {
-        return cmd_retract(storage, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "retractions") {
-        return cmd_retractions(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "provenance") {
         return cmd_provenance(storage, &cli.ids[1..]);
@@ -895,7 +877,6 @@ fn create_chunk(
         references: reference_ids,
         about_exec_result: None,
         about_archive_message: None,
-        predecessors: BTreeSet::new(),
         observed_at: BTreeSet::from([observed_at]),
         aliases: BTreeSet::new(),
     })?;
@@ -975,7 +956,6 @@ fn create_image_chunk(
         references: BTreeSet::new(),
         about_exec_result: None,
         about_archive_message: None,
-        predecessors: BTreeSet::new(),
         observed_at: BTreeSet::from([observed_at]),
         aliases: BTreeSet::new(),
     })?;
@@ -1158,7 +1138,7 @@ fn replay_take_count(batch: &[(i128, i128, Id)], requested: usize) -> usize {
 /// `memory replay start <grain> [<from>] | stop | [<count>]`
 ///
 /// Streams the memory itself, chronologically, at a zoom level: maximal
-/// non-superseded chunks whose span-width fits the grain. This is how upper
+/// journal chunks whose span-width fits the grain. This is how upper
 /// layers get written — replay the layer below, consolidate up. Reads ALL
 /// chunks regardless of which session wrote them: one being, one memory.
 fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
@@ -1221,11 +1201,11 @@ fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             let grain_ns = parse_grain(grain_raw)?;
             let space = &loaded.memory.memory.facts;
 
-            // Chunks at this zoom: width fits the grain, not superseded,
-            // and maximal among grain-fitting chunks (not contained in a
+            // Chunks at this zoom: width fits the grain and is maximal among
+            // grain-fitting chunks (not contained in a
             // wider one that also fits — that one IS this zoom's voice).
             let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
-            for chunk_id in loaded.memory.catalog.live_chunk_ids() {
+            for chunk_id in loaded.memory.catalog.chunk_ids() {
                 let (Some(s), Some(e)) = (
                     chunk_start_at(space, chunk_id),
                     chunk_end_at(space, chunk_id),
@@ -1299,205 +1279,6 @@ fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// supersede subcommand
-// ---------------------------------------------------------------------------
-
-fn chunk_draft_from_row(
-    loaded: &LoadedMemory,
-    row: &memory_model::ChunkRow,
-    start_at: Inline<NsTAIInterval>,
-    end_at: Inline<NsTAIInterval>,
-    predecessors: BTreeSet<Id>,
-) -> Result<memory_model::ChunkDraft> {
-    let content = match row.content {
-        memory_model::ChunkContent::Text(handle) => memory_model::ChunkDraftContent::Text(
-            memory_model::read_text(&loaded.memory.reader, handle)
-                .with_context(|| format!("read Memory chunk {:x} summary", row.id))?,
-        ),
-        memory_model::ChunkContent::Image(handle) => memory_model::ChunkDraftContent::Image(
-            memory_model::read_image(&loaded.memory.reader, handle)
-                .with_context(|| format!("read Memory chunk {:x} image", row.id))?
-                .to_vec(),
-        ),
-    };
-    let lens = row
-        .lens
-        .map(|handle| memory_model::read_text(&loaded.memory.reader, handle))
-        .transpose()
-        .with_context(|| format!("read Memory chunk {:x} lens", row.id))?;
-    Ok(memory_model::ChunkDraft {
-        content,
-        start_at,
-        end_at,
-        lens,
-        references: row.references.clone(),
-        about_exec_result: row.about_exec_result,
-        about_archive_message: row.about_archive_message,
-        predecessors,
-        observed_at: BTreeSet::from([clock::point_now()?]),
-        aliases: BTreeSet::new(),
-    })
-}
-
-fn descends_from(catalog: &memory_model::MemoryCatalog, node: Id, ancestor: Id) -> bool {
-    let mut pending = vec![node];
-    let mut seen = BTreeSet::new();
-    while let Some(current) = pending.pop() {
-        if !seen.insert(current) {
-            continue;
-        }
-        let predecessors = catalog
-            .chunks
-            .get(&current)
-            .map(|row| &row.predecessors)
-            .or_else(|| {
-                catalog
-                    .retractions
-                    .get(&current)
-                    .map(|row| &row.predecessors)
-            });
-        for predecessor in predecessors.into_iter().flatten() {
-            if *predecessor == ancestor {
-                return true;
-            }
-            pending.push(*predecessor);
-        }
-    }
-    false
-}
-
-/// Reconcile two revisions by copying `new`'s complete state into a fresh
-/// intrinsic join which names both histories. If `new` already contains
-/// `old` in its ancestry the operation is already satisfied and is a no-op.
-fn cmd_supersede(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
-    if args.len() != 2 {
-        bail!("usage: memory supersede <new-id> <old-id>");
-    }
-    let loaded = storage.load()?;
-    let new =
-        resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("new chunk {}: {e}", args[0]))?;
-    let old =
-        resolve_chunk_id(&loaded, &args[1]).map_err(|e| anyhow!("old chunk {}: {e}", args[1]))?;
-    if new == old || descends_from(&loaded.catalog, new, old) {
-        println!("{new:x} already descends from {old:x}; no change");
-        return Ok(());
-    }
-    if descends_from(&loaded.catalog, old, new) {
-        bail!(
-            "old chunk {old:x} already descends from new chunk {new:x}; \
-             refusing a backwards reconciliation"
-        );
-    }
-    let row = &loaded.catalog.chunks[&new];
-    let draft = chunk_draft_from_row(
-        &loaded,
-        row,
-        row.start_at,
-        row.end_at,
-        BTreeSet::from([new, old]),
-    )?;
-    let (fragment, joined) = memory_model::chunk_fragment(draft)?;
-    storage.publish_memory(&loaded, fragment)?;
-    println!("{joined:x} joins {new:x} and {old:x}");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// retract subcommand
-// ---------------------------------------------------------------------------
-
-/// Retire a chunk with NO replacement. Mints a *retraction* tombstone: a fresh
-/// entity tagged `KIND_RETRACTION` (never `KIND_CHUNK_ID`, so it never
-/// enumerates as a chunk) carrying the `supersedes` edge, plus the reason as
-/// its `ctx::summary` when one is given. The target leaves every view; the
-/// retraction stays invisible to covers/trees/recall yet queryable as a class
-/// ("what have I walked back, and why"). Use this for mistaken/duplicate
-/// ingests, where `supersede` would otherwise force a bogus replacement chunk
-/// that then shows up as a memory of its own. Nothing is destroyed: the retired
-/// chunk's own facts survive for direct-id / provenance lookup.
-fn cmd_retract(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        bail!("usage: memory retract <id> [reason...]");
-    }
-    let reason = args[1..].join(" ");
-    let loaded = storage.load()?;
-    let old = resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
-    let (fragment, retraction) =
-        memory_model::retraction_fragment(memory_model::RetractionDraft {
-            reason: (!reason.is_empty()).then_some(reason.clone()),
-            predecessors: BTreeSet::from([old]),
-            observed_at: BTreeSet::from([clock::point_now()?]),
-        })?;
-    storage.publish_memory(&loaded, fragment)?;
-
-    if reason.is_empty() {
-        println!("retracted {old:x} (retraction {retraction:x})");
-    } else {
-        println!("retracted {old:x} — {reason} (retraction {retraction:x})");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// retractions subcommand
-// ---------------------------------------------------------------------------
-
-/// Audit surface for `retract`: list every `KIND_RETRACTION` tombstone, the
-/// chunk(s) it retracts, and the recorded reason. Retracted chunks are gone from
-/// covers/trees/recall but never lost — what was walked back, and why, is always
-/// answerable here.
-fn cmd_retractions(storage: MemoryStorage<'_>, _args: &[String]) -> Result<()> {
-    let loaded = storage.load()?;
-    if loaded.catalog.retractions.is_empty() {
-        println!("no retractions.");
-        return Ok(());
-    }
-    for row in loaded.catalog.retractions.values() {
-        let reason = row
-            .reason
-            .map(|handle| memory_model::read_text(&loaded.memory.reader, handle))
-            .transpose()?
-            .unwrap_or_else(|| "(no reason recorded)".to_string());
-        println!("retraction {:x} — {reason}", row.id);
-        for target in &row.predecessors {
-            println!("    -> retracted {target:x}");
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// respan subcommand
-// ---------------------------------------------------------------------------
-
-/// Correct a chunk's time span while preserving every other component of its
-/// state: text or image, lens, contextual references, and provenance links.
-fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
-    if args.len() != 2 || !args[1].contains("..") {
-        bail!(
-            "usage: memory respan <id> <from>..<to>\n\
-             \n\
-             Creates a corrected chunk (same summary, new span) that\n\
-             supersedes the old one. Views exclude superseded chunks."
-        );
-    }
-    let (range_start, range_end) = parse_time_range(&args[1])?;
-
-    let loaded = storage.load()?;
-    let old = resolve_chunk_id(&loaded, &args[0]).map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
-    let row = &loaded.catalog.chunks[&old];
-    let start_at = clock::point(range_start)?;
-    let end_at = clock::point(range_end)?;
-    let draft = chunk_draft_from_row(&loaded, row, start_at, end_at, BTreeSet::from([old]))?;
-    let (fragment, new_chunk) = memory_model::chunk_fragment(draft)?;
-    storage.publish_memory(&loaded, fragment)?;
-
-    println!("range: {}", format_time_range(range_start, range_end));
-    println!("id: {new_chunk:x} (supersedes {old:x})");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // meta subcommand
 // ---------------------------------------------------------------------------
 
@@ -1528,7 +1309,7 @@ fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
     let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
-    for id in loaded.catalog.live_chunk_ids() {
+    for id in loaded.catalog.chunk_ids() {
         let Some(lh) = chunk_lens_handle(space, id) else {
             continue;
         };
@@ -1587,9 +1368,9 @@ fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 
 /// `memory list [<grain>]` — show the SHAPE of the memory as time-ranges only,
 /// never content (coverage is by time range, not by reference). With a grain,
-/// lists the maximal non-superseded chunks whose width fits that zoom — the
+/// lists the maximal journal chunks whose width fits that zoom — the
 /// same layer `replay <grain>` would stream. Without a grain, prints every
-/// non-superseded chunk as a containment outline: indentation expresses how
+/// journal chunk as a containment outline: indentation expresses how
 /// wider ranges cover narrower ones.
 fn cmd_list(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let grain: Option<(String, i128)> = match args.first() {
@@ -2389,18 +2170,7 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         );
     }
     println!("id: {chunk_id:x}");
-    println!("live: {}", memory.catalog.is_live(chunk_id));
     let row = &memory.catalog.chunks[&chunk_id];
-    if !row.predecessors.is_empty() {
-        println!(
-            "supersedes: {}",
-            row.predecessors
-                .iter()
-                .map(|id| format!("{id:x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
 
     let outgoing = chunk_references(space, chunk_id);
     if !outgoing.is_empty() {
@@ -2419,9 +2189,8 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             .collect();
         println!("references: {}", refs.join(", "));
     }
-    let incoming: Vec<Id> = find!(s: Id, pattern!(space, [{ ?s @ ctx::reference: chunk_id }]))
-        .filter(|id| memory.catalog.is_live(*id))
-        .collect();
+    let incoming: Vec<Id> =
+        find!(s: Id, pattern!(space, [{ ?s @ ctx::reference: chunk_id }])).collect();
     if !incoming.is_empty() {
         println!(
             "referenced_by: {}",
@@ -2965,7 +2734,6 @@ mod tests {
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,
-            predecessors: BTreeSet::new(),
             observed_at: BTreeSet::from([point(end)]),
             aliases: BTreeSet::new(),
         }
@@ -2987,122 +2755,6 @@ mod tests {
         assert_eq!(replay_take_count(&batch, 3), 4);
         assert_eq!(replay_take_count(&batch, 5), 5);
         assert_eq!(replay_take_count(&batch, 99), 5);
-    }
-
-    #[test]
-    fn supersede_joins_unrelated_heads_without_losing_new_state() {
-        let pile = TestPile::new();
-        let storage = pile.storage();
-        let reference = publish_chunk(
-            storage,
-            text_draft(
-                "referenced context",
-                "2026-01-01T00:00:00",
-                "2026-01-01T01:00:00",
-            ),
-        );
-        let old = publish_chunk(
-            storage,
-            text_draft(
-                "older competing recollection",
-                "2026-01-02T00:00:00",
-                "2026-01-02T01:00:00",
-            ),
-        );
-        let exec = Id::new([0xE1; 16]).unwrap();
-        let archive = Id::new([0xA1; 16]).unwrap();
-        let mut rich = text_draft(
-            "new state with every optional field",
-            "2026-01-03T00:00:00",
-            "2026-01-03T01:00:00",
-        );
-        rich.lens = Some("integration".to_string());
-        rich.references.insert(reference);
-        rich.about_exec_result = Some(exec);
-        rich.about_archive_message = Some(archive);
-        let new = publish_chunk(storage, rich);
-
-        cmd_supersede(storage, &[format!("{new:x}"), format!("{old:x}")])
-            .expect("join unrelated revisions");
-        let after = storage.load().expect("load joined Memory collection");
-        let source = &after.catalog.chunks[&new];
-        let joined = after
-            .catalog
-            .chunks
-            .values()
-            .find(|row| row.predecessors == BTreeSet::from([new, old]))
-            .expect("fresh join revision");
-        assert_ne!(joined.id, new);
-        assert_ne!(joined.id, old);
-        assert_eq!(joined.content, source.content);
-        assert_eq!(joined.start_at, source.start_at);
-        assert_eq!(joined.end_at, source.end_at);
-        assert_eq!(joined.lens, source.lens);
-        assert_eq!(joined.references, source.references);
-        assert_eq!(joined.about_exec_result, source.about_exec_result);
-        assert_eq!(joined.about_archive_message, source.about_archive_message);
-
-        let pile_len = std::fs::metadata(&pile.pile).unwrap().len();
-        let joined_id = joined.id;
-        drop(after);
-        cmd_supersede(storage, &[format!("{joined_id:x}"), format!("{old:x}")])
-            .expect("already-descended join is idempotent");
-        assert_eq!(
-            std::fs::metadata(&pile.pile).unwrap().len(),
-            pile_len,
-            "no-op supersede must not publish another root"
-        );
-        let error = cmd_supersede(storage, &[format!("{old:x}"), format!("{joined_id:x}")])
-            .expect_err("a descendant cannot be named beside its own ancestor");
-        assert!(error.to_string().contains("backwards reconciliation"));
-        assert_eq!(std::fs::metadata(&pile.pile).unwrap().len(), pile_len);
-    }
-
-    #[test]
-    fn respan_preserves_content_lens_references_and_provenance() {
-        let pile = TestPile::new();
-        let storage = pile.storage();
-        let reference = publish_chunk(
-            storage,
-            text_draft("reference", "2026-02-01T00:00:00", "2026-02-01T01:00:00"),
-        );
-        let mut rich = text_draft(
-            "state whose span needs correction",
-            "2026-02-02T00:00:00",
-            "2026-02-02T01:00:00",
-        );
-        rich.lens = Some("correction".to_string());
-        rich.references.insert(reference);
-        rich.about_exec_result = Some(Id::new([0xE2; 16]).unwrap());
-        rich.about_archive_message = Some(Id::new([0xA2; 16]).unwrap());
-        let old = publish_chunk(storage, rich);
-
-        cmd_respan(
-            storage,
-            &[
-                format!("{old:x}"),
-                "2026-02-03T00:00:00..2026-02-03T02:00:00".to_string(),
-            ],
-        )
-        .expect("respan rich revision");
-        let after = storage.load().unwrap();
-        let source = &after.catalog.chunks[&old];
-        let corrected = after
-            .catalog
-            .chunks
-            .values()
-            .find(|row| row.predecessors == BTreeSet::from([old]))
-            .expect("corrected revision");
-        assert_eq!(corrected.content, source.content);
-        assert_eq!(corrected.lens, source.lens);
-        assert_eq!(corrected.references, source.references);
-        assert_eq!(corrected.about_exec_result, source.about_exec_result);
-        assert_eq!(
-            corrected.about_archive_message,
-            source.about_archive_message
-        );
-        assert_eq!(corrected.start_at, point("2026-02-03T00:00:00"));
-        assert_eq!(corrected.end_at, point("2026-02-03T02:00:00"));
     }
 
     #[test]

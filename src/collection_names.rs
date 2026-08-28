@@ -72,7 +72,7 @@ pub fn table() -> Vec<(Id, &'static str, Fragment)> {
         (habit::DEFAULT_SCOPE_ID, "habit", reach::private()),
         (headspace::DEFAULT_SCOPE_ID, "headspace", reach::private()),
         (mail::DEFAULT_SCOPE_ID, "mail", reach::private()),
-        (memory::DEFAULT_SCOPE_ID, "memory", reach::private()),
+        (memory::DEFAULT_SCOPE_ID, "memory-journal", reach::private()),
         (
             memory::DEFAULT_COMB_SCOPE_ID,
             "memory-comb",

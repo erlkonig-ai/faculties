@@ -1,10 +1,9 @@
 //! Read-only GORBIE-embeddable viewer for the `memory` faculty.
 //!
-//! Memory chunks are immutable states in an intrinsic supersedes DAG. This
-//! widget projects the canonical Memory collection and shows the most-recent
-//! N live content heads as cards. Concurrent content and retraction heads stay
-//! visible as an unresolved frontier; presentation order never arbitrates a
-//! fork.
+//! Memory chunks are immutable episodes. This widget projects the canonical
+//! Memory collection and shows the most-recent N chunks as cards. Multiple
+//! tellings of the same moment coexist; presentation order does not choose a
+//! current truth.
 //!
 //! Each card:
 //! - colored header with the time range (start → end), span chip,
@@ -15,17 +14,13 @@
 //!   (`☞ exec` / `☞ msg`) when the chunk is anchored to an exec
 //!   result or archived message.
 //!
-//! v1 limits: no tree drill-down (children render in their own
-//! card by virtue of being chunks too — the relationship isn't
-//! drawn), no archive-message blob resolution (only the link is
-//! shown), no live time-range filter.
+//! v1 limits: no archive-message blob resolution (only the link is shown), no
+//! time-range filter.
 //!
 //! ```ignore
 //! let mut panel = MemoryViewer::default();
 //! panel.render(ctx, memory_ws);
 //! ```
-
-use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use hifitime::Epoch;
@@ -33,11 +28,11 @@ use hifitime::Epoch;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::memory::{self, ChunkContent, MemoryCatalog};
+use crate::memory::{self, ChunkContent};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 use triblespace::core::id::Id;
 
-/// How many of the most-recent chunks to keep in the live snapshot.
+/// How many of the most-recent chunks to keep in the rendered snapshot.
 /// Bounded so the widget stays responsive when a long-running agent
 /// has accumulated thousands of chunks — older ones are still in the
 /// pile, but the CLI is the right tool for time-range archeology.
@@ -86,8 +81,6 @@ struct ChunkRow {
     reference_count: usize,
     about_exec_result: Option<Id>,
     about_archive_message: Option<Id>,
-    predecessors: Vec<Id>,
-    frontier: Option<FrontierView>,
 }
 
 impl ChunkRow {
@@ -96,44 +89,18 @@ impl ChunkRow {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FrontierKind {
-    Chunk,
-    Retraction,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FrontierHead {
-    id: Id,
-    kind: FrontierKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FrontierView {
-    heads: Vec<FrontierHead>,
-}
-
-#[derive(Clone, Debug)]
-struct RetractionView {
-    id: Id,
-    reason: Option<String>,
-    frontier: Option<FrontierView>,
-}
-
-struct MemoryLive {
+struct MemorySnapshot {
     cached_revision: DatasetRevision,
     chunks: Vec<ChunkRow>,
     /// Total chunk count regardless of MAX_CHUNKS clamp — surfaced in
     /// the section header so the user can tell when they're seeing a
     /// truncated window.
     total: usize,
-    retractions: Vec<RetractionView>,
-    forked_components: usize,
 }
 
-// ── Live snapshot ────────────────────────────────────────────────────
+// ── Snapshot ─────────────────────────────────────────────────────────
 
-impl MemoryLive {
+impl MemorySnapshot {
     fn refresh(dataset: DatasetView<'_>) -> Result<Self, String> {
         // Use the domain validator even though StorageState normally admitted
         // this exact snapshot already.  Keeping the widget boundary strict
@@ -141,21 +108,8 @@ impl MemoryLive {
         // missing payloads as a diagnostic instead of partially rendering it.
         let catalog = memory::validate_catalog(dataset.reader, dataset.facts)
             .map_err(|error| format!("validate Memory collection: {error:#}"))?;
-        let frontiers = component_frontiers(&catalog);
-        let forked_components = frontiers.iter().filter(|view| view.heads.len() > 1).count();
-        let fork_by_head: BTreeMap<Id, FrontierView> = frontiers
-            .iter()
-            .filter(|view| view.heads.len() > 1)
-            .flat_map(|view| {
-                view.heads
-                    .iter()
-                    .map(|head| (head.id, view.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
         let mut chunks = Vec::new();
-        for id in catalog.live_chunk_ids() {
+        for id in catalog.chunk_ids() {
             let row = &catalog.chunks[&id];
             let (start, _): (Epoch, Epoch) = row
                 .start_at
@@ -180,95 +134,21 @@ impl MemoryLive {
                 reference_count: row.references.len(),
                 about_exec_result: row.about_exec_result,
                 about_archive_message: row.about_archive_message,
-                predecessors: row.predecessors.iter().copied().collect(),
-                frontier: fork_by_head.get(&id).cloned(),
             });
         }
         let total = chunks.len();
 
-        let mut retractions = Vec::new();
-        for id in catalog.head_ids() {
-            let Some(row) = catalog.retractions.get(&id) else {
-                continue;
-            };
-            let reason = row
-                .reason
-                .map(|handle| memory::read_text(dataset.reader, handle))
-                .transpose()
-                .map_err(|error| format!("read Memory retraction {id:x}: {error:#}"))?;
-            retractions.push(RetractionView {
-                id,
-                reason,
-                frontier: fork_by_head.get(&id).cloned(),
-            });
-        }
-
         // Newest-first is presentation only. The id tie-break makes equal
-        // spans deterministic without pretending that time resolves a fork.
+        // spans deterministic without choosing between coexisting episodes.
         chunks.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| a.id.cmp(&b.id)));
         chunks.truncate(MAX_CHUNKS);
 
-        Ok(MemoryLive {
+        Ok(MemorySnapshot {
             cached_revision: dataset.revision,
             chunks,
             total,
-            retractions,
-            forked_components,
         })
     }
-}
-
-fn component_frontiers(catalog: &MemoryCatalog) -> Vec<FrontierView> {
-    let mut neighbours: BTreeMap<Id, BTreeSet<Id>> = catalog
-        .node_ids()
-        .into_iter()
-        .map(|id| (id, BTreeSet::new()))
-        .collect();
-    for (id, predecessors) in catalog
-        .chunks
-        .values()
-        .map(|row| (row.id, &row.predecessors))
-        .chain(
-            catalog
-                .retractions
-                .values()
-                .map(|row| (row.id, &row.predecessors)),
-        )
-    {
-        for predecessor in predecessors {
-            neighbours.entry(id).or_default().insert(*predecessor);
-            neighbours.entry(*predecessor).or_default().insert(id);
-        }
-    }
-
-    let heads: BTreeSet<Id> = catalog.head_ids().into_iter().collect();
-    let mut unseen: BTreeSet<Id> = neighbours.keys().copied().collect();
-    let mut frontiers = Vec::new();
-    while let Some(seed) = unseen.pop_first() {
-        let mut stack = vec![seed];
-        let mut component = BTreeSet::new();
-        while let Some(node) = stack.pop() {
-            if !component.insert(node) {
-                continue;
-            }
-            unseen.remove(&node);
-            stack.extend(neighbours[&node].iter().copied());
-        }
-        let frontier = component
-            .intersection(&heads)
-            .map(|id| FrontierHead {
-                id: *id,
-                kind: if catalog.chunks.contains_key(id) {
-                    FrontierKind::Chunk
-                } else {
-                    FrontierKind::Retraction
-                },
-            })
-            .collect();
-        frontiers.push(FrontierView { heads: frontier });
-    }
-    frontiers.sort_by_key(|frontier| frontier.heads.first().map(|head| head.id));
-    frontiers
 }
 
 fn epoch_to_chrono(e: Epoch) -> Option<DateTime<Utc>> {
@@ -355,14 +235,14 @@ fn first_line(text: &str, max_chars: usize) -> String {
 // ── Widget ───────────────────────────────────────────────────────────
 
 pub struct MemoryViewer {
-    live: Option<MemoryLive>,
+    snapshot: Option<MemorySnapshot>,
     error: Option<(DatasetRevision, String)>,
 }
 
 impl Default for MemoryViewer {
     fn default() -> Self {
         Self {
-            live: None,
+            snapshot: None,
             error: None,
         }
     }
@@ -374,7 +254,7 @@ impl MemoryViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.live.as_ref() {
+        let need_refresh = match self.snapshot.as_ref() {
             None => self
                 .error
                 .as_ref()
@@ -382,13 +262,13 @@ impl MemoryViewer {
             Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            match MemoryLive::refresh(dataset) {
-                Ok(live) => {
-                    self.live = Some(live);
+            match MemorySnapshot::refresh(dataset) {
+                Ok(snapshot) => {
+                    self.snapshot = Some(snapshot);
                     self.error = None;
                 }
                 Err(error) => {
-                    self.live = None;
+                    self.snapshot = None;
                     self.error = Some((dataset.revision, error));
                 }
             }
@@ -408,28 +288,21 @@ impl MemoryViewer {
                 });
                 return;
             }
-            let Some(live) = self.live.as_ref() else {
+            let Some(snapshot) = self.snapshot.as_ref() else {
                 return;
             };
 
             ctx.grid(|g| {
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let shown = live.chunks.len();
-                    let label = if shown < live.total {
+                    let shown = snapshot.chunks.len();
+                    let label = if shown < snapshot.total {
                         format!(
-                            "SHOWING {shown} OF {} LIVE CHUNKS (NEWEST FIRST) · {} RETRACTION HEAD{}",
-                            live.total,
-                            live.retractions.len(),
-                            if live.retractions.len() == 1 { "" } else { "S" },
+                            "SHOWING {shown} OF {} MEMORY CHUNKS (NEWEST FIRST)",
+                            snapshot.total,
                         )
                     } else {
-                        format!(
-                            "{shown} LIVE CHUNK{} · {} RETRACTION HEAD{}",
-                            if shown == 1 { "" } else { "S" },
-                            live.retractions.len(),
-                            if live.retractions.len() == 1 { "" } else { "S" },
-                        )
+                        format!("{shown} MEMORY CHUNK{}", if shown == 1 { "" } else { "S" },)
                     };
                     ui.label(
                         egui::RichText::new(label)
@@ -440,19 +313,7 @@ impl MemoryViewer {
                     );
                 });
 
-                if live.forked_components > 0 {
-                    g.full(|ctx| {
-                        render_frontier_warning(ctx.ui_mut(), live.forked_components);
-                    });
-                }
-
-                for retraction in &live.retractions {
-                    g.full(|ctx| {
-                        render_retraction(ctx.ui_mut(), retraction);
-                    });
-                }
-
-                if live.chunks.is_empty() {
+                if snapshot.chunks.is_empty() {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
@@ -463,13 +324,8 @@ impl MemoryViewer {
                                     .color(color_muted(ui)),
                             );
                             ui.add_space(4.0);
-                            let message = if live.retractions.is_empty() {
-                                "No memory chunks yet."
-                            } else {
-                                "No live content heads; retractions are shown above."
-                            };
                             ui.label(
-                                egui::RichText::new(message)
+                                egui::RichText::new("No memory chunks yet.")
                                     .monospace()
                                     .small()
                                     .strong()
@@ -481,7 +337,7 @@ impl MemoryViewer {
                     return;
                 }
 
-                for chunk in &live.chunks {
+                for chunk in &snapshot.chunks {
                     g.full(|ctx| {
                         render_chunk_card(ctx.ui_mut(), chunk);
                     });
@@ -502,7 +358,7 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
 
     egui::Frame::NONE
         .fill(bubble_fill)
-        .stroke(egui::Stroke::new(1.0, color_frame(ui)))
+        .stroke(egui::Stroke::new(1.0_f32, color_frame(ui)))
         .shadow(egui::epaint::Shadow {
             offset: [2, 2],
             blur: 0,
@@ -515,7 +371,7 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            // ── Header: time range + span + reference/fork state ──
+            // ── Header: time range + span + reference count ──
             egui::Frame::NONE
                 .fill(accent)
                 .corner_radius(egui::CornerRadius::ZERO)
@@ -552,18 +408,6 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
                                 ))
                                 .monospace()
                                 .small()
-                                .color(text_on_accent),
-                            );
-                        }
-                        if let Some(frontier) = chunk.frontier.as_ref() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "· FORK {} HEADS",
-                                    frontier.heads.len()
-                                ))
-                                .monospace()
-                                .small()
-                                .strong()
                                 .color(text_on_accent),
                             );
                         }
@@ -622,13 +466,6 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
                         });
                     }
 
-                    if !chunk.predecessors.is_empty() {
-                        render_id_list(ui, "SUPERSEDES", &chunk.predecessors, body_muted);
-                    }
-                    if let Some(frontier) = chunk.frontier.as_ref() {
-                        render_frontier_heads(ui, frontier, body_muted);
-                    }
-
                     // Canonical chunk id at the bottom — quiet but
                     // always reachable for cross-referencing with
                     // `memory <id-prefix>` on the CLI.
@@ -640,103 +477,6 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
                     );
                 });
         });
-}
-
-fn render_frontier_warning(ui: &mut egui::Ui, count: usize) {
-    let color = egui::Color32::from_rgb(0xb0, 0x55, 0xc9);
-    egui::Frame::NONE
-        .fill(egui::Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            40,
-        ))
-        .stroke(egui::Stroke::new(1.0, color))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "⚠ {count} FORKED LINEAGE{} · ALL HEADS SHOWN · NONE SELECTED",
-                    if count == 1 { "" } else { "S" }
-                ))
-                .monospace()
-                .small()
-                .strong()
-                .color(color),
-            );
-        });
-}
-
-fn render_retraction(ui: &mut egui::Ui, retraction: &RetractionView) {
-    let color = egui::Color32::from_rgb(0xcc, 0x0a, 0x17);
-    let fork = retraction
-        .frontier
-        .as_ref()
-        .map(|frontier| format!(" · FORK {} HEADS", frontier.heads.len()))
-        .unwrap_or_default();
-    egui::Frame::NONE
-        .fill(egui::Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            28,
-        ))
-        .stroke(egui::Stroke::new(1.0, color))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("RETRACTION HEAD {}{fork}", id_hex(retraction.id)))
-                    .monospace()
-                    .small()
-                    .strong()
-                    .color(color),
-            );
-            if let Some(reason) = retraction.reason.as_ref() {
-                ui.label(
-                    egui::RichText::new(reason)
-                        .small()
-                        .color(ui.visuals().text_color()),
-                );
-            }
-            if let Some(frontier) = retraction.frontier.as_ref() {
-                render_frontier_heads(ui, frontier, color_muted(ui));
-            }
-        });
-}
-
-fn render_frontier_heads(ui: &mut egui::Ui, frontier: &FrontierView, color: egui::Color32) {
-    let heads = frontier
-        .heads
-        .iter()
-        .map(|head| {
-            let kind = match head.kind {
-                FrontierKind::Chunk => "CHUNK",
-                FrontierKind::Retraction => "RETRACTION",
-            };
-            format!("{kind} {}", id_hex(head.id))
-        })
-        .collect::<Vec<_>>()
-        .join(" · ");
-    ui.label(
-        egui::RichText::new(format!("FRONTIER · {heads}"))
-            .monospace()
-            .small()
-            .color(color),
-    );
-}
-
-fn render_id_list(ui: &mut egui::Ui, label: &str, ids: &[Id], color: egui::Color32) {
-    let values = ids
-        .iter()
-        .map(|id| id_hex(*id))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    ui.label(
-        egui::RichText::new(format!("{label} · {values}"))
-            .monospace()
-            .small()
-            .color(color),
-    );
 }
 
 fn render_provenance_chip(ui: &mut egui::Ui, label: &str, id: Id) {
@@ -778,6 +518,8 @@ fn body_rest(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
     use triblespace::prelude::{Fragment, TryToInline};
 
     fn point(seconds: f64) -> memory::IntervalValue {
@@ -785,7 +527,7 @@ mod tests {
         (at, at).try_to_inline().unwrap()
     }
 
-    fn chunk(summary: &str, predecessors: impl IntoIterator<Item = Id>) -> (Fragment, Id) {
+    fn chunk(summary: &str) -> (Fragment, Id) {
         memory::chunk_fragment(memory::ChunkDraft {
             content: memory::ChunkDraftContent::Text(summary.to_owned()),
             start_at: point(10.0),
@@ -794,7 +536,6 @@ mod tests {
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,
-            predecessors: predecessors.into_iter().collect(),
             observed_at: BTreeSet::new(),
             aliases: BTreeSet::new(),
         })
@@ -802,85 +543,15 @@ mod tests {
     }
 
     #[test]
-    fn independent_memory_roots_are_not_mislabelled_as_a_fork() {
-        let (mut fragment, first) = chunk("first", []);
-        let (second_fragment, second) = chunk("second", []);
+    fn multiple_tellings_of_one_span_coexist() {
+        let (mut fragment, first) = chunk("first telling");
+        let (second_fragment, second) = chunk("second telling");
         fragment += second_fragment;
 
         let catalog = memory::load_catalog(fragment.facts()).unwrap();
-        let frontiers = component_frontiers(&catalog);
-        assert_eq!(frontiers.len(), 2);
-        assert!(frontiers.iter().all(|frontier| frontier.heads.len() == 1));
         let mut expected = vec![first, second];
         expected.sort_unstable();
-        assert_eq!(catalog.live_chunk_ids(), expected);
-    }
-
-    #[test]
-    fn content_retraction_race_keeps_both_heads_visible() {
-        let (mut fragment, base) = chunk("base", []);
-        let (content_fragment, content) = chunk("edited", [base]);
-        fragment += content_fragment;
-        let (retraction_fragment, retraction) =
-            memory::retraction_fragment(memory::RetractionDraft {
-                reason: Some("withdrawn elsewhere".to_owned()),
-                predecessors: BTreeSet::from([base]),
-                observed_at: BTreeSet::new(),
-            })
-            .unwrap();
-        fragment += retraction_fragment;
-
-        let catalog = memory::load_catalog(fragment.facts()).unwrap();
-        let frontiers = component_frontiers(&catalog);
-        assert_eq!(frontiers.len(), 1);
-        assert_eq!(
-            frontiers[0].heads,
-            vec![
-                FrontierHead {
-                    id: content.min(retraction),
-                    kind: if content < retraction {
-                        FrontierKind::Chunk
-                    } else {
-                        FrontierKind::Retraction
-                    },
-                },
-                FrontierHead {
-                    id: content.max(retraction),
-                    kind: if content > retraction {
-                        FrontierKind::Chunk
-                    } else {
-                        FrontierKind::Retraction
-                    },
-                },
-            ]
-        );
-        assert_eq!(catalog.live_chunk_ids(), vec![content]);
-        assert!(catalog.head_ids().contains(&retraction));
-    }
-
-    #[test]
-    fn explicit_join_collapses_a_content_fork_without_time_arbitration() {
-        let (mut fragment, base) = chunk("base", []);
-        let (left_fragment, left) = chunk("left", [base]);
-        fragment += left_fragment;
-        let (right_fragment, right) = chunk("right", [base]);
-        fragment += right_fragment;
-
-        let fork = memory::load_catalog(fragment.facts()).unwrap();
-        assert_eq!(component_frontiers(&fork)[0].heads.len(), 2);
-
-        let (join_fragment, join) = chunk("joined", [left, right]);
-        fragment += join_fragment;
-        let joined = memory::load_catalog(fragment.facts()).unwrap();
-        assert_eq!(
-            component_frontiers(&joined),
-            vec![FrontierView {
-                heads: vec![FrontierHead {
-                    id: join,
-                    kind: FrontierKind::Chunk,
-                }],
-            }]
-        );
-        assert_eq!(joined.live_chunk_ids(), vec![join]);
+        assert_eq!(catalog.chunk_ids(), expected);
+        assert_eq!(catalog.chunks.len(), 2);
     }
 }

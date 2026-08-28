@@ -1,12 +1,10 @@
 //! The gate that licensed replacing nine hand-rolled "which states are
 //! current" scans with one shared query-layer operation, `latest`.
 //!
-//! Wiki and Memory now ask `latest(C, metadata::supersedes, candidates)`
-//! instead of collecting a superseded-id set and subtracting it. That is a
-//! pure set computation — no arithmetic moves, nothing rounds — so the only
-//! honest expectation is bit-identical output, and that is what this asserts:
-//! it recomputes each faculty's *old* algorithm here, in this file, and
-//! requires the same set with the same membership over the real pile.
+//! Wiki asks `latest(C, metadata::supersedes, candidates)` instead of
+//! collecting a superseded-id set and subtracting it. That is a pure set
+//! computation — no arithmetic moves, nothing rounds — so the only honest
+//! expectation is bit-identical output, and that is what this asserts.
 //!
 //! It also censuses Compass, which the port deliberately left alone, and
 //! checks two properties on live data rather than on fixtures:
@@ -28,8 +26,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use faculties::memory as memory_model;
-use faculties::memory_cover;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki as wiki_model;
 use triblespace::core::metadata;
@@ -163,100 +159,6 @@ fn gate_wiki(space: &TribleSet) -> Result<()> {
         for frontier in by_hand.difference(&shipped).take(10) {
             println!("    hand-rolled-only frontier: {frontier:x?}");
         }
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------------
-
-fn gate_memory(space: &TribleSet) -> Result<()> {
-    let catalog = memory_model::load_catalog(space)?;
-
-    // The old `MemoryCatalog::head_ids`: union every row's predecessors, then
-    // subtract from the node set.
-    let node_ids = catalog.node_ids();
-    let superseded: BTreeSet<Id> = catalog
-        .chunks
-        .values()
-        .flat_map(|row| row.predecessors.iter().copied())
-        .chain(
-            catalog
-                .retractions
-                .values()
-                .flat_map(|row| row.predecessors.iter().copied()),
-        )
-        .collect();
-    let heads_by_hand: BTreeSet<Id> = node_ids.difference(&superseded).copied().collect();
-    let heads_shipped: BTreeSet<Id> = catalog.head_ids().into_iter().collect();
-
-    // The old `memory_cover::superseded_ids` filter over every chunk id.
-    let all_chunks = memory_cover::all_chunk_ids(space);
-    let superseded_in_space = superseded_by_subtraction(space);
-    let live_by_hand: BTreeSet<Id> = all_chunks
-        .iter()
-        .copied()
-        .filter(|id| !superseded_in_space.contains(id))
-        .collect();
-    let live_shipped = memory_cover::live_chunk_ids(space);
-
-    println!("MEMORY");
-    println!(
-        "  nodes examined: {} (chunks {}, retractions {})",
-        node_ids.len(),
-        catalog.chunks.len(),
-        catalog.retractions.len()
-    );
-    println!("  superseded nodes: {}", superseded.len());
-    println!(
-        "  frontier (catalog heads): {} · live chunks: {}",
-        heads_shipped.len(),
-        live_shipped.len()
-    );
-    assert!(!node_ids.is_empty(), "gate compared zero Memory nodes");
-    assert!(
-        !superseded.is_empty(),
-        "no Memory node is superseded on this pile: the comparison would be vacuous"
-    );
-    assert!(!heads_shipped.is_empty(), "gate compared zero Memory heads");
-    assert!(!all_chunks.is_empty(), "gate compared zero Memory chunks");
-
-    let mut ok = true;
-    if heads_shipped == heads_by_hand {
-        println!("  GATE PASS: catalog heads identical to the predecessor-subtraction rule");
-    } else {
-        ok = false;
-        println!(
-            "  GATE FAIL (heads): only in latest(): {:?}, only in hand-rolled: {:?}",
-            heads_shipped
-                .difference(&heads_by_hand)
-                .take(10)
-                .collect::<Vec<_>>(),
-            heads_by_hand
-                .difference(&heads_shipped)
-                .take(10)
-                .collect::<Vec<_>>()
-        );
-    }
-    if live_shipped == live_by_hand {
-        println!("  GATE PASS: live chunks identical to the superseded-id subtraction");
-    } else {
-        ok = false;
-        println!(
-            "  GATE FAIL (live chunks): only in latest(): {:?}, only in hand-rolled: {:?}",
-            live_shipped
-                .difference(&live_by_hand)
-                .take(10)
-                .collect::<Vec<_>>(),
-            live_by_hand
-                .difference(&live_shipped)
-                .take(10)
-                .collect::<Vec<_>>()
-        );
-    }
-    if !ok {
         std::process::exit(1);
     }
     Ok(())
@@ -684,11 +586,6 @@ fn main() -> Result<()> {
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
         &signer,
     )?;
-    let memory = scope(
-        &mut handle,
-        faculties::schemas::memory::DEFAULT_SCOPE_ID,
-        &signer,
-    )?;
     let compass = scope(
         &mut handle,
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
@@ -702,8 +599,6 @@ fn main() -> Result<()> {
     let _ = handle.close();
 
     gate_wiki(&wiki)?;
-    println!();
-    gate_memory(&memory)?;
     println!();
     census_compass(&compass)?;
     println!();
