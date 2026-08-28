@@ -18,7 +18,6 @@ use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
-use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::{
     clock, compass, habits, mail as mail_model, memory as memory_model, message,
@@ -1842,7 +1841,8 @@ fn render_tags(tags: &[String]) -> String {
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
-/// goals. READ-ONLY: it materializes or checks out, but publishes nothing.
+/// goals. Semantically read-only: it publishes no authoritative collection
+/// commits, though exact derived indexes may be maintained as cache exhaust.
 fn cmd_wake(
     pile: &Path,
     key: Option<&Path>,
@@ -1850,7 +1850,10 @@ fn cmd_wake(
     doing_limit: usize,
     todo_limit: usize,
 ) -> Result<()> {
-    // Memory, Wiki, and Compass all come from one refreshed native snapshot.
+    // Memory, Wiki, and Compass share one open Pile handle, but each collection
+    // captures its own coherent known-prefix observation; this is deliberately
+    // not described as a cross-collection transaction. Wiki carries facts,
+    // reader, and maintained supersession order from one exact source ticket.
     // A plain wake cover never consults rebuildable embeddings, so it
     // deliberately cannot be taken down by a missing or corrupt embedding
     // artifact. Exact preserved legacy rows remain durable evidence without
@@ -1859,7 +1862,8 @@ fn cmd_wake(
     let mut storage = open_pile_strict(pile)?;
     let result = (|| {
         let memory_facts = materialize_scope(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory")?;
-        let wiki_facts = materialize_scope(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki")?;
+        let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
+            .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
         let catalogs = load_native_catalogs(&mut storage, &signer)?;
 
         let memory_catalog = memory_model::validate_catalog(&catalogs.reader, &memory_facts)
@@ -1876,9 +1880,7 @@ fn cmd_wake(
             &CoverOpts::plain(chars),
         )?;
 
-        let wiki_catalog = wiki_model::validate_catalog(&catalogs.reader, &wiki_facts)
-            .map_err(|error| anyhow!("validate Wiki collection: {error:#}"))?;
-        let beliefs = wiki_model::cover_fragments(&catalogs.reader, &wiki_catalog)?;
+        let beliefs = wiki_model::cover_fragments(wiki.reader(), wiki.catalog())?;
         let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
         Ok((cover, beliefs, goals))
     })();
