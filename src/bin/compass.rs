@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -232,10 +233,13 @@ impl CompassStorage<'_> {
         }
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+    fn with_view<T>(
+        &self,
+        f: impl FnOnce(&TribleSet, &PileReader, &LwwIndex) -> Result<T>,
+    ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let (facts, reader) = compass::materialize_collection(pile, signer)?;
-            f(&facts, &reader)
+            let view = compass::materialize_indexed_collection(pile, signer)?;
+            f(view.facts(), view.reader(), view.status_register())
         })
     }
 
@@ -247,20 +251,22 @@ impl CompassStorage<'_> {
         f: impl FnOnce(&TribleSet, &PileReader, Option<Id>) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let (facts, reader) = compass::materialize_collection(pile, signer)?;
+            let view = compass::materialize_indexed_collection(pile, signer)?;
+            let facts = view.facts();
+            let reader = view.reader();
             let by = if let Some(persona) = persona {
                 let relation_facts = open_scope(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
                     .materialize()
                     .context("materialize Relations collection for Compass persona")?;
-                relations::validate_catalog(&reader, &relation_facts)
+                relations::validate_catalog(reader, &relation_facts)
                     .context("validate Relations collection for Compass persona")?;
-                Some(resolve_persona_id(&relation_facts, &reader, persona)?)
+                Some(resolve_persona_id(&relation_facts, reader, persona)?)
             } else {
                 None
             };
-            let (fragment, value) = f(&facts, &reader, by)?;
+            let (fragment, value) = f(facts, reader, by)?;
             if let Some(fragment) = fragment {
-                compass::validate_candidate(&reader, &facts, &fragment)
+                compass::validate_candidate(reader, facts, &fragment)
                     .context("validate Compass action before publication")?;
                 compass::commit_collection(pile, signer, fragment)?;
             }
@@ -296,8 +302,12 @@ fn task_created_at(space: &TribleSet, task_id: Id) -> Option<IntervalValue> {
 }
 
 /// Latest status for a task.
-fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
-    latest_status_event(space, task_id).map(|(_, status, at)| (status, at))
+fn task_latest_status(
+    space: &TribleSet,
+    status_register: &LwwIndex,
+    task_id: Id,
+) -> Option<(String, IntervalValue)> {
+    latest_status_event(space, status_register, task_id).map(|(_, status, at)| (status, at))
 }
 
 /// All goal IDs.
@@ -408,6 +418,7 @@ fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
 fn render_board(
     reader: &PileReader,
     space: &TribleSet,
+    status_register: &LwwIndex,
     status_filter: &[String],
     tag_filter: &[String],
     show_done: bool,
@@ -421,7 +432,7 @@ fn render_board(
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
     for &task_id in &goal_ids {
-        let (status, status_at) = task_latest_status(space, task_id)
+        let (status, status_at) = task_latest_status(space, status_register, task_id)
             .map(|(s, at)| (s, Some(at)))
             .unwrap_or_else(|| ("todo".to_string(), None));
 
@@ -690,8 +701,15 @@ fn cmd_list(
         validate_short("status", status)?;
     }
 
-    storage.with_view(|space, reader| {
-        render_board(reader, space, &status_filter, &tag_filter, show_done);
+    storage.with_view(|space, reader, status_register| {
+        render_board(
+            reader,
+            space,
+            status_register,
+            &status_filter,
+            &tag_filter,
+            show_done,
+        );
         Ok(())
     })
 }
@@ -760,7 +778,7 @@ fn cmd_note(
 }
 
 fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
-    storage.with_view(|space, reader| {
+    storage.with_view(|space, reader, status_register| {
         let task_id = resolve_task_id(&id, space)?;
 
         let title = task_title(reader, space, task_id);
@@ -774,7 +792,7 @@ fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
             println!("Created: {}", format_interval(created));
         }
 
-        if let Some((status, at)) = task_latest_status(space, task_id) {
+        if let Some((status, at)) = task_latest_status(space, status_register, task_id) {
             println!("Status: {} (since {})", status, format_interval(at));
         }
 
@@ -1001,7 +1019,7 @@ fn cmd_deprioritize(
 }
 
 fn cmd_resolve(storage: CompassStorage<'_>, prefix: String) -> Result<()> {
-    storage.with_view(|space, _reader| {
+    storage.with_view(|space, _reader, _status_register| {
         let id = resolve_task_id(&prefix, space)?;
         println!("{:x}", id);
         Ok(())
@@ -1156,7 +1174,39 @@ mod tests {
         )
         .unwrap();
         let goal = storage
-            .with_view(|facts, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
+            .with_view(|facts, _, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
+            .unwrap();
+
+        // Compass preserves unrelated open-world facts. Multiple values on
+        // the order attribute alone do not form a status coordinate and must
+        // not make the maintained register reject the exact ticket.
+        let unrelated = ufoid();
+        let first: IntervalValue = {
+            let value = Epoch::from_unix_seconds(1.0);
+            (value, value).try_to_inline().unwrap()
+        };
+        let second: IntervalValue = {
+            let value = Epoch::from_unix_seconds(2.0);
+            (value, value).try_to_inline().unwrap()
+        };
+        let mut fragment = entity! { &unrelated @ metadata::created_at: first };
+        fragment += entity! { &unrelated @ metadata::created_at: second };
+        storage
+            .with_pile(|pile, signer| {
+                compass::commit_collection(pile, signer, fragment)?;
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .with_view(|facts, _, status_register| {
+                assert_eq!(
+                    latest_status_event(facts, status_register, goal)
+                        .map(|(_, value, _)| value)
+                        .as_deref(),
+                    Some("todo")
+                );
+                Ok(())
+            })
             .unwrap();
 
         let before = std::fs::metadata(&pile).unwrap().len();
@@ -1165,9 +1215,9 @@ mod tests {
 
         cmd_move(storage, format!("{goal:x}"), "doing".to_owned(), None).unwrap();
         storage
-            .with_view(|facts, _| {
+            .with_view(|facts, _, status_register| {
                 assert_eq!(
-                    latest_status_event(facts, goal)
+                    latest_status_event(facts, status_register, goal)
                         .map(|(_, value, _)| value)
                         .as_deref(),
                     Some("doing")

@@ -4,6 +4,7 @@
 //! pile. Status names are intentionally open-ended; the defaults only define
 //! the lanes presented first by clients.
 
+use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
 use triblespace::core::query::intersectionconstraint::and;
 use triblespace::macros::{find, id_hex, pattern};
@@ -87,26 +88,17 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
-/// The status register: states identified by `board::status_of`, ordered by
-/// `metadata::created_at`, with an id tie-break so the order is total and a
-/// last-write-wins read always answers.
-///
-/// Both attributes are the register, and neither is a filter. Which measure
-/// of domination this is, is [`StatedOrder::recipe_id`] — not something a
-/// call site restates.
-pub fn status_register(
-    space: &TribleSet,
-) -> StatedOrder<'_, TribleSet, inlineencodings::NsTAIInterval> {
-    StatedOrder::new(space, board::status_of.id(), metadata::created_at.id()).tiebreak_by_id()
-}
-
 /// Deterministic latest status event for one goal.
 ///
-/// The maximal state of that goal's status register. `maximal` never
-/// proposes, so the pattern enumerates the goal's status events and the
-/// register kills the dominated ones; the total order leaves exactly one.
-pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String, IntervalValue)> {
-    let register = status_register(space);
+/// `register` is the maintained LWW index for `board::status_of` ordered by
+/// `metadata::created_at`. `maximal` never proposes, so the pattern enumerates
+/// the goal's status events and the index kills the dominated ones; its
+/// `(created_at, event-id)` total order leaves exactly one.
+pub fn latest_status_event(
+    space: &TribleSet,
+    register: &LwwIndex,
+    goal_id: Id,
+) -> Option<(Id, String, IntervalValue)> {
     let current = find!(
         (event: Id, status: String, at: IntervalValue),
         and!(
@@ -116,7 +108,7 @@ pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String
                 board::status: ?status,
                 metadata::created_at: ?at,
             }]),
-            maximal(event, &register),
+            maximal(event, register),
         )
     )
     .next();

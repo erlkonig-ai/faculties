@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Compass status reads now attach an exact maintained LWW index.** The
+  Compass CLI, Orient, and the viewer consume the same exact snapshot rather
+  than rebuilding `StatedOrder` joins on every read. The first read of a ticket
+  may publish derived cache artifacts; subsequent reads of that ticket are
+  read-only. Semantic commit success never depends on post-commit cache work.
+  Wiki observation-frontier reads remain live until their
+  staged-fragment API can carry an exact collection ticket without changing
+  its in-memory semantics.
+
 - **`wiki show` follows the entry forward by DEFAULT; `--exact` pins the named
   revision, and `--latest` is gone.** The default was inverted: naming a
   revision returned that revision's frozen text, and following the entry to its
