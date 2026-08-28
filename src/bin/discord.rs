@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
@@ -38,7 +39,7 @@ use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -128,7 +129,9 @@ struct CollectionView {
 }
 
 struct DiscordSession<'a> {
-    collection: &'a mut Collection<Pile>,
+    pile: &'a mut Pile,
+    collection: CollectionHandle,
+    signer: SigningKey,
     facts: TribleSet,
     reader: PileReader,
 }
@@ -147,13 +150,12 @@ impl DiscordSession<'_> {
         let added = fragment.facts().clone();
         fragment.describe_with(entity! { metadata::description: description });
         let commit = self
-            .collection
-            .commit(fragment)
+            .pile
+            .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
         self.facts += added;
         self.reader = self
-            .collection
-            .storage_mut()
+            .pile
             .reader()
             .context("refresh Discord attachment snapshot")?;
         Ok(commit)
@@ -166,25 +168,24 @@ impl DiscordStorage<'_> {
         operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
-                .context("materialize Discord collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Discord attachment reader")?;
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .context("materialize Discord collection")?
+                .into_parts();
             discord_model::validate_catalog(&reader, &facts)
                 .context("validate Discord collection")?;
             operation(&mut DiscordSession {
-                collection: &mut collection,
+                pile: &mut pile,
+                collection,
+                signer,
                 facts,
                 reader,
             })
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     #[cfg(test)]

@@ -17,10 +17,10 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
@@ -385,7 +385,8 @@ struct CollectionView {
 }
 
 struct TeamsSession<'a> {
-    collection: &'a mut Collection<Pile>,
+    pile: &'a mut Pile,
+    collection: CollectionHandle,
     facts: TribleSet,
     reader: PileReader,
     signer: ed25519_dalek::SigningKey,
@@ -415,22 +416,20 @@ impl TeamsSession<'_> {
         let added = fragment.facts().clone();
         fragment.describe_with(entity! { metadata::description: description });
         let commit = self
-            .collection
-            .commit(fragment)
+            .pile
+            .commit(self.collection, &self.signer, fragment)
             .context("commit Teams fragment")?;
         self.facts += added;
         self.reader = self
-            .collection
-            .storage_mut()
+            .pile
             .reader()
             .context("refresh Teams attachment snapshot")?;
         Ok(Some(commit))
     }
 
     fn refresh_secrets(&mut self) -> Result<()> {
-        self.secrets =
-            secrets_vaults::discover_local_vaults(self.collection.storage_mut(), &self.signer)
-                .context("rediscover Secrets vaults for Teams")?;
+        self.secrets = secrets_vaults::discover_local_vaults(self.pile, &self.signer)
+            .context("rediscover Secrets vaults for Teams")?;
         Ok(())
     }
 
@@ -447,7 +446,7 @@ impl TeamsSession<'_> {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("vault {vault} is not ready for this node"))?;
         let secret = secrets_vaults::add_secret(
-            self.collection.storage_mut(),
+            self.pile,
             &self.signer,
             &location,
             self.secrets.snapshot(),
@@ -473,27 +472,25 @@ impl TeamsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
             .context("discover Secrets vaults for Teams")?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer.clone());
         let result = (|| {
-            let facts = collection
-                .materialize()
-                .context("materialize Teams collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Teams attachment reader")?;
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .context("materialize Teams collection")?
+                .into_parts();
             validate_catalog(&reader, &facts).context("validate Teams collection")?;
             teams_core::validate_auth_secret_references(&facts, secrets.snapshot())
                 .context("validate Teams auth-profile Secrets references")?;
             operation(&mut TeamsSession {
-                collection: &mut collection,
+                pile: &mut pile,
+                collection,
                 facts,
                 reader,
                 signer,
                 secrets,
             })
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     #[cfg(test)]

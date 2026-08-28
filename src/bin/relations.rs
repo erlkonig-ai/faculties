@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::relations::{
@@ -19,9 +20,8 @@ use faculties::relations::{
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -269,14 +269,16 @@ struct RelationsStorage<'a> {
 }
 
 impl RelationsStorage<'_> {
-    fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
+    fn with_pile<T>(
+        &self,
+        operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
+    ) -> Result<T> {
         // Reads and writes share the same durable authority. Ordinary CLI
         // commands never mint a key or substitute an ephemeral identity.
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
-        let result = f(&mut collection);
-        let close = collection.into_storage().close();
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = operation(&mut pile, &signer);
+        let close = pile.close();
         match (result, close) {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
@@ -288,14 +290,12 @@ impl RelationsStorage<'_> {
     }
 
     fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
-        self.with_collection(|collection| {
-            let facts = collection
-                .materialize()
-                .context("materialize authored Relations collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Relations blob reader")?;
+        self.with_pile(|pile, signer| {
+            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .context("materialize authored Relations collection")?
+                .into_parts();
             relations::validate_catalog(&reader, &facts)
                 .context("validate authored Relations collection")?;
             f(&facts, &reader)
@@ -308,22 +308,19 @@ impl RelationsStorage<'_> {
         &self,
         f: impl FnOnce(&TribleSet, &PileReader) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_collection(|collection| {
-            let facts = collection
-                .materialize()
-                .context("materialize authored Relations collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Relations blob reader")?;
+        self.with_pile(|pile, signer| {
+            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .context("materialize authored Relations collection")?
+                .into_parts();
             relations::validate_catalog(&reader, &facts)
                 .context("validate authored Relations collection")?;
             let (fragment, result) = f(&facts, &reader)?;
             if let Some(fragment) = fragment {
                 relations::validate_catalog_union(&reader, &facts, &fragment)
                     .context("preflight authored Relations union")?;
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
             }
             Ok(result)

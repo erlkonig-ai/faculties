@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::legacy_hint::open_scope;
 use faculties::message::{self, IntervalValue, MessageRow};
@@ -15,10 +16,9 @@ use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -86,53 +86,53 @@ struct MessageStorage<'a> {
 impl MessageStorage<'_> {
     /// Open the pile once, materialize both fixed collections under the same
     /// durable authority, run one operation, and close explicitly.
-    fn with_collection<T>(
+    fn with_views<T>(
         &self,
-        operation: impl FnOnce(&mut Collection<Pile>, &TribleSet, &TribleSet, &PileReader) -> Result<T>,
+        operation: impl FnOnce(
+            &mut Pile,
+            &SigningKey,
+            CollectionHandle,
+            &TribleSet,
+            &TribleSet,
+            &PileReader,
+        ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-
-        let mut relations_collection = open_scope(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
-        let relations_result = (|| {
-            let facts = relations_collection
-                .materialize()
-                .context("materialize authored Relations collection")?;
-            let reader = relations_collection
-                .storage_mut()
-                .reader()
-                .context("open Relations blob reader")?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let relations_collection = open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(relations_collection, &[])
+                .context("materialize authored Relations collection")?
+                .into_parts();
             relations::validate_catalog(&reader, &facts)
                 .context("validate authored Relations collection")?;
-            Ok(facts)
-        })();
-        let pile = relations_collection.into_storage();
-        let relations_facts = match relations_result {
-            Ok(facts) => facts,
-            Err(error) => return finish_pile(pile, Err(error)),
-        };
+            let relations_facts = facts;
 
-        let mut messages = open_scope(pile, DEFAULT_SCOPE_ID, signer);
-        let result = (|| {
-            let message_facts = messages
-                .materialize()
-                .context("materialize authored Message collection")?;
-            let reader = messages
-                .storage_mut()
-                .reader()
-                .context("open Message blob reader")?;
+            let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (message_facts, _, reader) = pile
+                .snapshot(messages, &[])
+                .context("materialize authored Message collection")?
+                .into_parts();
             message::validate_catalog(&reader, &message_facts, &relations_facts)
                 .context("validate authored Message collection")?;
-            operation(&mut messages, &message_facts, &relations_facts, &reader)
+            operation(
+                &mut pile,
+                &signer,
+                messages,
+                &message_facts,
+                &relations_facts,
+                &reader,
+            )
         })();
-        finish_pile(messages.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     fn with_view<T>(
         &self,
         operation: impl FnOnce(&TribleSet, &TribleSet, &PileReader) -> Result<T>,
     ) -> Result<T> {
-        self.with_collection(|_, messages, relations, reader| {
+        self.with_views(|_, _, _, messages, relations, reader| {
             operation(messages, relations, reader)
         })
     }
@@ -143,14 +143,13 @@ impl MessageStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&TribleSet, &TribleSet, &PileReader) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_collection(|collection, messages, relations, reader| {
+        self.with_views(|pile, signer, collection, messages, relations, reader| {
             let (fragment, value) = operation(messages, relations, reader)?;
             if let Some(mut fragment) = fragment {
                 message::validate_catalog_union(reader, messages, &fragment, relations)
                     .context("preflight authored Message union")?;
                 fragment.describe_with(entity! { metadata::description: description });
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Message fragment")?;
             }
             Ok(value)
