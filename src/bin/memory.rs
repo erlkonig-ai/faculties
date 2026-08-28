@@ -46,7 +46,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
@@ -1681,6 +1681,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // query (so a face can be cast with the slice of the past most relevant to
     // its goal).
     let mut budget_chars: usize = 200_000;
+    let mut chunk_overhead: usize = 0;
     let mut about: Option<String> = None;
     // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
     // ELIGIBILITY by positive similarity to their query; `--sim-threshold <f>` is
@@ -1699,7 +1700,13 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         let is_flag = |s: &str| {
             matches!(
                 s,
-                "--about" | "--filter" | "--remove" | "--tokens" | "--chars" | "--sim-threshold"
+                "--about"
+                    | "--filter"
+                    | "--remove"
+                    | "--tokens"
+                    | "--chars"
+                    | "--chunk-overhead"
+                    | "--sim-threshold"
             )
         };
         let mut i = 0;
@@ -1726,6 +1733,18 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 sim_threshold = raw
                     .parse()
                     .map_err(|_| anyhow!("--sim-threshold expects a float, got `{raw}`"))?;
+                i += 2;
+                continue;
+            }
+            if args[i] == "--chunk-overhead" {
+                let raw = args.get(i + 1).ok_or_else(|| {
+                    anyhow!(
+                        "--chunk-overhead needs a non-negative integer, e.g. `--chunk-overhead 64`"
+                    )
+                })?;
+                chunk_overhead = raw.parse().map_err(|_| {
+                    anyhow!("--chunk-overhead expects a non-negative integer, got `{raw}`")
+                })?;
                 i += 2;
                 continue;
             }
@@ -1758,6 +1777,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let cover = build_context_cover(
         &loaded,
         budget_chars,
+        chunk_overhead,
         about.as_deref(),
         filter_q.as_deref(),
         remove_q.as_deref(),
@@ -1777,6 +1797,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 fn build_context_cover(
     loaded: &LoadedContext,
     budget_chars: usize,
+    chunk_overhead: usize,
     about: Option<&str>,
     filter_q: Option<&str>,
     remove_q: Option<&str>,
@@ -1788,6 +1809,7 @@ fn build_context_cover(
 
     let opts = CoverOpts {
         budget_chars,
+        chunk_overhead,
         about: about.map(str::to_string),
         filter: filter_q.map(str::to_string),
         remove: remove_q.map(str::to_string),
@@ -2061,6 +2083,7 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             let cover = build_context_cover(
                 &loaded,
                 budget_chars,
+                0,
                 None,
                 None,
                 None,
@@ -3308,8 +3331,9 @@ mod tests {
         let loaded = storage
             .load_context(false)
             .expect("load seeded collections");
-        let cover = build_context_cover(&loaded, 10_000, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect("build context cover");
+        let cover =
+            build_context_cover(&loaded, 10_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("build context cover");
         // The status header now goes to stderr, not into the returned/ingested
         // cover text (prefix-stability + ranges-are-the-drill-key de-noise).
         assert!(!cover.contains("memory context — "));
@@ -3328,5 +3352,62 @@ mod tests {
             cover,
             "chunk reassembly must equal the stored cover"
         );
+    }
+
+    fn seed_cover_cost_fixture(pile: &TestPile) -> LoadedContext {
+        let storage = pile.storage();
+        publish_chunk(
+            storage,
+            text_draft("root", "2026-05-01T00:00:00", "2026-05-03T00:00:00"),
+        );
+        publish_chunk(
+            storage,
+            text_draft("one", "2026-05-01T00:00:00", "2026-05-02T00:00:00"),
+        );
+        publish_chunk(
+            storage,
+            text_draft("two", "2026-05-02T00:00:00", "2026-05-03T00:00:00"),
+        );
+        storage.load_context(false).expect("load cost fixture")
+    }
+
+    #[test]
+    fn chunk_overhead_can_keep_an_otherwise_affordable_split_coarse() {
+        let pile = TestPile::new();
+        let loaded = seed_cover_cost_fixture(&pile);
+
+        // Intrinsic lengths: root=4, children=3+3. With no consumer overhead,
+        // a budget of six admits the two-child split exactly.
+        let intrinsic = build_context_cover(&loaded, 6, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect("intrinsic split");
+        assert!(!intrinsic.contains("root"));
+        assert!(intrinsic.contains("one"));
+        assert!(intrinsic.contains("two"));
+
+        // Charging two per selected chunk makes root=6 and children=10, so the
+        // same budget remains complete by retaining the coarse root.
+        let charged = build_context_cover(&loaded, 6, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect("charged coarse cover");
+        assert!(charged.contains("root"));
+        assert!(!charged.contains("one"));
+        assert!(!charged.contains("two"));
+    }
+
+    #[test]
+    fn chunk_overhead_is_charged_once_per_selected_chunk_at_exact_boundaries() {
+        let pile = TestPile::new();
+        let loaded = seed_cover_cost_fixture(&pile);
+
+        // The coarsest complete cover costs root(4) + one overhead(2) = 6.
+        let error = build_context_cover(&loaded, 5, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect_err("budget below the charged root must remain incomplete");
+        assert!(error.to_string().contains("needs ~6 characters"));
+
+        // The refined cover costs (one(3)+2) + (two(3)+2) = 10 exactly.
+        let exact = build_context_cover(&loaded, 10, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect("exact charged split");
+        assert!(!exact.contains("root"));
+        assert!(exact.contains("one"));
+        assert!(exact.contains("two"));
     }
 }
