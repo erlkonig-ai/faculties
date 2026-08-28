@@ -22,8 +22,7 @@ use triblespace::core::capability::{
     CapabilityResource,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, CapabilityPresentation, CollectionAdmission, CollectionHandle,
-    ACTION_WRITE,
+    reach, simplearchive_union, CapabilityPresentation, CollectionHandle, ACTION_WRITE,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
@@ -67,7 +66,7 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 /// Canonical fixed-width collection name of one nonzero vault id.
-pub fn vault_name(vault: Id) -> CollectionName {
+pub fn vault_name(vault: Id) -> String {
     let mut value = u128::from_be_bytes(vault.raw());
     let mut digits = [b'0'; VAULT_NAME_DIGITS];
     for digit in digits.iter_mut().rev() {
@@ -76,14 +75,12 @@ pub fn vault_name(vault: Id) -> CollectionName {
     }
     debug_assert_eq!(value, 0, "25 base36 digits cover every u128");
     let suffix = std::str::from_utf8(&digits).expect("base36 is ASCII");
-    CollectionName::new(&format!("{VAULT_NAME_PREFIX}{suffix}"))
-        .expect("canonical vault names satisfy CollectionName")
+    format!("{VAULT_NAME_PREFIX}{suffix}")
 }
 
 /// Reverse one exact canonical vault collection name to its nonzero id.
-pub fn parse_vault_name(name: &CollectionName) -> Result<Id> {
-    let text = name.as_str();
-    let suffix = text
+pub fn parse_vault_name(name: &str) -> Result<Id> {
+    let suffix = name
         .strip_prefix(VAULT_NAME_PREFIX)
         .ok_or_else(|| anyhow!("vault collection name must begin with '{VAULT_NAME_PREFIX}'"))?;
     if suffix.len() != VAULT_NAME_DIGITS {
@@ -103,50 +100,23 @@ pub fn parse_vault_name(name: &CollectionName) -> Result<Id> {
     }
     let id = Id::new(value.to_be_bytes())
         .ok_or_else(|| anyhow!("vault collection name encodes the forbidden nil id"))?;
-    if vault_name(id).as_str() != name.as_str() {
+    if vault_name(id) != name {
         bail!("vault collection name is not canonical");
     }
     Ok(id)
 }
 
 /// Canonical private `SimpleArchive`-union descriptor of one vault epoch.
-pub fn vault_descriptor(vault: Id, namespace: VerifyingKey, authority: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(
-        &vault_name(vault),
-        namespace,
-        Some(authority),
-        reach::private(),
-    )
+pub fn vault_descriptor(vault: Id, authority: VerifyingKey) -> Fragment {
+    simplearchive_union::descriptor(&vault_name(vault), authority, reach::private())
 }
 
 /// Exact collection resource governed by `WRITE` and `READ` authority.
-pub fn vault_handle(
-    vault: Id,
-    namespace: VerifyingKey,
-    authority: VerifyingKey,
-) -> CollectionHandle {
-    vault_descriptor(vault, namespace, authority)
+pub fn vault_handle(vault: Id, authority: VerifyingKey) -> CollectionHandle {
+    vault_descriptor(vault, authority)
         .into_facts()
         .to_blob()
         .get_handle()
-}
-
-/// Construct the ordinary collection facade for one vault epoch.
-pub fn vault_collection<S>(
-    storage: S,
-    vault: Id,
-    namespace: VerifyingKey,
-    signing_key: SigningKey,
-    admission: CollectionAdmission,
-) -> Collection<S> {
-    Collection::new(
-        storage,
-        &vault_name(vault),
-        namespace,
-        signing_key,
-        reach::private(),
-        admission,
-    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,7 +211,6 @@ pub struct VaultAccess {
 impl VaultAccess {
     pub(crate) fn new(
         vault: Id,
-        namespace: VerifyingKey,
         trust_root: VerifyingKey,
         subject: VerifyingKey,
         custody: SigningKey,
@@ -254,7 +223,7 @@ impl VaultAccess {
         if write_presentations.is_empty() {
             bail!("vault access requires at least one exact WRITE presentation");
         }
-        let collection = vault_handle(vault, namespace, trust_root);
+        let collection = vault_handle(vault, trust_root);
         let access = Self {
             vault,
             trust_root,
@@ -298,10 +267,6 @@ impl VaultAccess {
         &self.write_presentations
     }
 
-    pub fn admission(&self) -> CollectionAdmission {
-        CollectionAdmission::capability(self.trust_root, self.write_presentations.clone())
-    }
-
     pub fn verify_read_at(&self, instant: Epoch) -> Result<()> {
         let atom = CapabilityAtom::new(
             CapabilityAction::new(ACTION_READ),
@@ -324,7 +289,7 @@ impl VaultAccess {
     /// Reverify every supplied collection writer at an explicit instant.
     ///
     /// Vault WRITE evidence must be unbounded. Collection admission is checked
-    /// at materialization time, so a bounded writer would otherwise make
+    /// when taking a snapshot, so a bounded writer would otherwise make
     /// already-committed ciphertext disappear when its lease expired.
     pub fn verify_write_at(&self, instant: Epoch) -> Result<()> {
         let atom = CapabilityAtom::new(
@@ -1261,7 +1226,7 @@ mod tests {
             "A6378B816786E9F08A579B8E5F8F4FF4"
         );
         let one = Id::new(1u128.to_be_bytes()).unwrap();
-        assert_eq!(vault_name(one).as_str(), "vault-0000000000000000000000001");
+        assert_eq!(vault_name(one), "vault-0000000000000000000000001");
         for value in [1, 35, 36, u64::MAX as u128, u128::MAX] {
             let value = Id::new(value.to_be_bytes()).unwrap();
             assert_eq!(parse_vault_name(&vault_name(value)).unwrap(), value);
@@ -1272,32 +1237,22 @@ mod tests {
             "vault-0000000000000000000000000",
             "vault-zzzzzzzzzzzzzzzzzzzzzzzzz",
         ] {
-            let name = CollectionName::new(malformed).unwrap();
-            assert!(parse_vault_name(&name).is_err(), "accepted {malformed}");
+            assert!(parse_vault_name(malformed).is_err(), "accepted {malformed}");
         }
     }
 
     #[test]
-    fn descriptor_is_exact_private_union_with_namespace_and_authority() {
+    fn descriptor_is_exact_private_union_with_authority() {
         let vault = id(7);
-        let namespace = key(1).verifying_key();
         let authority = key(2).verifying_key();
-        let descriptor = vault_descriptor(vault, namespace, authority);
+        let descriptor = vault_descriptor(vault, authority);
 
         assert_eq!(
             descriptor_facts::name(descriptor.facts()).unwrap().unwrap(),
-            vault_name(vault)
+            vault_name(vault).to_blob().get_handle()
         );
         assert_eq!(
-            descriptor_facts::namespace(descriptor.facts())
-                .unwrap()
-                .unwrap(),
-            namespace
-        );
-        assert_eq!(
-            descriptor_facts::authority(descriptor.facts())
-                .unwrap()
-                .unwrap(),
+            descriptor_facts::authority(descriptor.facts()).unwrap(),
             authority
         );
         assert_eq!(
@@ -1310,16 +1265,12 @@ mod tests {
         );
         assert!(!reach::travels(descriptor.facts()));
         assert_eq!(
-            vault_handle(vault, namespace, authority),
+            vault_handle(vault, authority),
             descriptor.into_facts().to_blob().get_handle()
         );
         assert_ne!(
-            vault_handle(vault, namespace, authority),
-            vault_handle(vault, namespace, key(3).verifying_key())
-        );
-        assert_ne!(
-            vault_handle(vault, namespace, authority),
-            vault_handle(vault, key(4).verifying_key(), authority)
+            vault_handle(vault, authority),
+            vault_handle(vault, key(3).verifying_key())
         );
     }
 
@@ -1559,11 +1510,10 @@ mod tests {
     fn vault_access_binds_exact_read_and_write_proofs() {
         let vault = id(40);
         let root = key(1);
-        let namespace = key(2).verifying_key();
         let subject = key(3);
         let outsider = key(4);
         let custody = SigningKey::generate(&mut OsRng);
-        let collection = vault_handle(vault, namespace, root.verifying_key());
+        let collection = vault_handle(vault, root.verifying_key());
         let read = root_bundle(
             &root,
             subject.verifying_key(),
@@ -1589,7 +1539,6 @@ mod tests {
 
         let access = VaultAccess::new(
             vault,
-            namespace,
             root.verifying_key(),
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
@@ -1619,14 +1568,21 @@ mod tests {
         fragment += sealed.fragment;
         let facts = fragment.facts().clone();
 
-        let mut authorized = vault_collection(
-            MemoryRepo::default(),
-            vault,
-            namespace,
-            SigningKey::from_bytes(&subject.to_bytes()),
-            access.admission(),
+        let mut authorized = MemoryRepo::default();
+        let registered = authorized
+            .collection(vault_descriptor(vault, root.verifying_key()))
+            .unwrap();
+        assert_eq!(registered, collection);
+        authorized
+            .commit(collection, &subject, fragment.clone())
+            .unwrap();
+        assert_eq!(
+            authorized
+                .snapshot(collection, access.write_presentations())
+                .unwrap()
+                .facts(),
+            &facts
         );
-        authorized.commit(fragment.clone()).unwrap();
 
         let reader = fragment.blobs_mut().reader().unwrap();
         let snapshot =
@@ -1635,7 +1591,7 @@ mod tests {
         assert_eq!(snapshot.open(secret, &subject).unwrap(), b"hunter2");
         assert!(snapshot.open(secret, &outsider).is_err());
 
-        let wrong_resource = vault_handle(id(41), namespace, root.verifying_key());
+        let wrong_resource = vault_handle(id(41), root.verifying_key());
         let wrong_read = root_bundle(
             &root,
             subject.verifying_key(),
@@ -1645,7 +1601,6 @@ mod tests {
         );
         assert!(VaultAccess::new(
             vault,
-            namespace,
             root.verifying_key(),
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
@@ -1666,7 +1621,6 @@ mod tests {
         );
         assert!(VaultAccess::new(
             vault,
-            namespace,
             root.verifying_key(),
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
@@ -1681,7 +1635,6 @@ mod tests {
         let wrong_custody = SigningKey::generate(&mut OsRng);
         let wrong_custody_access = VaultAccess::new(
             vault,
-            namespace,
             root.verifying_key(),
             subject.verifying_key(),
             wrong_custody,
@@ -1707,7 +1660,6 @@ mod tests {
         );
         assert!(VaultAccess::new(
             vault,
-            namespace,
             root.verifying_key(),
             subject.verifying_key(),
             custody,
