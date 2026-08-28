@@ -24,8 +24,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{
-    collection_recipe, collection_representation, collection_source, CollectionHandle,
-    KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_recipe, collection_representation, collection_source,
+    CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
@@ -91,13 +91,14 @@ impl MetaDescribe for ArchiveBlockTextBm25V1 {
 /// Exact descriptor for the derived Archive BM25 collection.
 ///
 /// This collection is a derivation of the archive's canonical SimpleArchive
-/// union, so it names that collection as its SOURCE and carries neither a name
-/// nor a team of its own: a derive inherits both from what it derives from,
-/// transitively, and a second copy of them is a second thing that can go stale.
-pub fn descriptor(team: VerifyingKey) -> Fragment {
+/// union, so it names that collection as its SOURCE and carries no independent
+/// name. Authority is descriptor-local rather than inherited through the
+/// source relation, and is therefore stated explicitly here.
+pub fn descriptor(authority: VerifyingKey) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_source: source_collection(team),
+        collection_authority: authority,
+        collection_source: source_collection(authority),
         collection_representation*: <PortableBM25Blob as MetaDescribe>::describe(),
         collection_recipe*: <ArchiveBlockTextBm25V1 as MetaDescribe>::describe(),
     }
@@ -110,9 +111,9 @@ pub fn descriptor(team: VerifyingKey) -> Fragment {
 /// hashing a descriptor it did not store, because a handle computed beside a
 /// store instead of by it can name a collection whose descriptor is absent.
 /// Naming a source is exactly a place where that has to be conspicuous.
-pub fn source_collection(team: VerifyingKey) -> CollectionHandle {
+pub fn source_collection(authority: VerifyingKey) -> CollectionHandle {
     IntoBlob::<SimpleArchive>::to_blob(
-        crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, team)
+        crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority)
             .facts()
             .clone(),
     )
