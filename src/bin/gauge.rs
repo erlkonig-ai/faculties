@@ -362,6 +362,7 @@ mod tests {
     use faculties::storage::initialize_signer;
     use faculties::wiki::{author_record, revision_record, tag_record, RevisionDraft};
     use hifitime::Epoch;
+    use triblespace::prelude::*;
 
     struct Fixture {
         _directory: tempfile::TempDir,

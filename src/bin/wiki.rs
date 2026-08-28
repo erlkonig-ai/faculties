@@ -1930,7 +1930,6 @@ mod tests {
     fn edit_joins_the_complete_current_frontier() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let root = stage_revision(
             storage,
@@ -1985,7 +1984,6 @@ mod tests {
 
     /// Publish `root`, then supersede it, and hand back both ids.
     fn superseded_pair(storage: WikiStorage<'_>) -> (Id, Id) {
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let root = stage_revision(
             storage,
@@ -2093,7 +2091,6 @@ mod tests {
     fn a_forked_frontier_shows_every_head_and_export_refuses() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let root = stage_revision(
             storage,
@@ -2154,7 +2151,6 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         assert!(load_files(storage).unwrap().is_empty());
-        let before = storage.view().unwrap();
         let mut fragment = Fragment::empty();
         let revision = stage_revision(
             storage,
@@ -2180,7 +2176,6 @@ mod tests {
     fn lint_preserves_typed_link_while_expanding_the_selector() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let before = storage.view().unwrap();
         let mut fragment = Fragment::empty();
         let revision = stage_revision(
             storage,
@@ -2219,7 +2214,6 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
 
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let target = stage_revision(
             storage,
@@ -2290,7 +2284,6 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
 
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let target = stage_revision(
             storage,
@@ -2344,7 +2337,6 @@ mod tests {
     fn backlink_summaries_index_typed_links_and_source_tags() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let before = storage.view().unwrap();
         let mut fragment = Fragment::empty();
         let target = stage_revision(
             storage,
@@ -2472,7 +2464,6 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
 
-        let before = storage.view().unwrap();
         let mut genesis = Fragment::empty();
         let target = stage_revision(
             storage,
@@ -2486,7 +2477,6 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let truncated = format!("{target:x}")[..12].to_owned();
-        let current = storage.view().unwrap();
         let mut fragment = Fragment::empty();
         let citing = stage_revision(
             storage,

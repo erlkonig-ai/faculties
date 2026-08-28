@@ -11,7 +11,7 @@ use triblespace::prelude::*;
 /// Text handle type for wiki content/title blobs.
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
-/// Stable scope of the authored Wiki collection.
+/// Stable scope of the curated Wiki collection.
 ///
 /// Minted with `trible genid` on 2026-08-09 and retained from the reviewed
 /// collection-cutover lineage.
@@ -141,8 +141,9 @@ pub fn revision_fragment(
 
 /// Canonical revision facts when the text handles are already available.
 ///
-/// This is the admission-side inverse of [`revision_fragment`]. It deliberately
-/// carries no blobs; callers validating persisted rows already have a reader.
+/// This is the strict read-side reconstruction of [`revision_fragment`]. It
+/// deliberately carries no blobs; callers validating persisted rows already
+/// have a reader.
 pub fn revision_fragment_from_handles(
     author: Id,
     title: TextHandle,

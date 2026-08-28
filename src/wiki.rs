@@ -1,10 +1,12 @@
-//! Collection-native Wiki values, strict revision-DAG reads, and admission.
+//! Collection-native Wiki values and strict revision-DAG reads.
 //!
 //! Native revision identity is the authored artifact
 //! (author, title, content, tags, supersedes). Legacy version entities remain
-//! byte-for-byte present after migration; additive supersedes edges connect
-//! their existing ids. No fragment anchor, alias entity, mutable head, or
-//! migration marker participates in either model.
+//! byte-for-byte present after migration; additive supersession facts connect
+//! their existing ids. A collection COMMIT records curation: its signer chose
+//! to publish the artifact, but is not thereby asserted to be its author. No
+//! fragment anchor, alias entity, mutable head, or migration marker
+//! participates in either model.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +19,7 @@ use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStore, BlobStoreGet};
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
@@ -736,53 +738,29 @@ where
     })
 }
 
-/// Load a Wiki catalog by querying its supersession relation directly.
+/// Reference implementation that derives the supersession order directly.
 ///
-/// This is the intentional JIT path for validating an unpublished candidate:
-/// its newly staged edges cannot yet be present in a durable maintained index.
+/// Migrations, detached fact-set validation, and tests use this as an oracle.
+/// Durable application reads use [`materialize_indexed_collection`] so the
+/// exact collection ticket and its maintained order stay attached.
 pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
     let order = ObservationOrder::new(space, metadata::supersedes.id());
     load_catalog_with_order(space, &order)
 }
 
-fn read_text_overlay<Overlay>(
-    reader: &PileReader,
-    overlay: Option<&Overlay>,
-    handle: TextHandle,
-) -> Result<String>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    if let Some(overlay) = overlay {
-        if overlay.metadata(handle)?.is_some() {
-            let value: View<str> = overlay.get(handle)?;
-            return Ok(value.to_string());
-        }
-    }
-    let value: View<str> = reader.get(handle)?;
-    Ok(value.to_string())
-}
-
-fn validate_payloads<Overlay>(
-    reader: &PileReader,
-    overlay: Option<&Overlay>,
-    catalog: &WikiCatalog,
-) -> Result<()>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
+fn validate_payloads(reader: &PileReader, catalog: &WikiCatalog) -> Result<()> {
     for revision in catalog.revisions.revision_records() {
-        let title = read_text_overlay(reader, overlay, revision.title)
+        let title = read_text(reader, revision.title)
             .with_context(|| format!("read Wiki revision {:x} title", revision.id))?;
         if title.trim().is_empty() {
             bail!("Wiki revision {:x} has an empty title", revision.id);
         }
-        read_text_overlay(reader, overlay, revision.content)
+        read_text(reader, revision.content)
             .with_context(|| format!("read Wiki revision {:x} content", revision.id))?;
     }
     for (&tag, &handle) in &catalog.tag_names {
-        let name = read_text_overlay(reader, overlay, handle)
-            .with_context(|| format!("read Wiki tag {tag:x} name"))?;
+        let name =
+            read_text(reader, handle).with_context(|| format!("read Wiki tag {tag:x} name"))?;
         if name.trim().is_empty() {
             bail!("Wiki tag {tag:x} has an empty name");
         }
@@ -813,9 +791,13 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
     Ok(())
 }
 
+/// Strictly validate a detached Wiki snapshot with the reference resolver.
+///
+/// This is the migration/import and test-oracle boundary. Durable application
+/// reads should use [`materialize_indexed_collection`].
 pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<WikiCatalog> {
     let catalog = load_catalog(facts)?;
-    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    validate_payloads(reader, &catalog)?;
     Ok(catalog)
 }
 
@@ -830,7 +812,7 @@ where
     O: RegisterOrder + ?Sized,
 {
     let catalog = load_catalog_with_order(facts, order)?;
-    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    validate_payloads(reader, &catalog)?;
     Ok(catalog)
 }
 
@@ -883,7 +865,8 @@ pub fn tag_record(name: &str) -> Result<(Fragment, Id, String)> {
 }
 
 pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
-    read_text_overlay(reader, None::<&PileReader>, handle)
+    let value: View<str> = reader.get(handle)?;
+    Ok(value.to_string())
 }
 
 /// Every cover-tagged maximal Wiki revision as `(title, content)`.
@@ -1290,6 +1273,11 @@ impl FrontierModel {
     }
 }
 
+/// Strict reference materialization for migrations and tests.
+///
+/// This deliberately resolves the supersession order from the complete fact
+/// set. Durable application readers should use
+/// [`materialize_indexed_collection`] instead.
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1340,6 +1328,9 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
+    // The signature is curation of this fragment into the collection. Author
+    // attribution lives inside the revision artifact and is intentionally not
+    // inferred from, or forced equal to, this signer.
     open_scope(pile, DEFAULT_SCOPE_ID, signer.clone())
         .commit(fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
@@ -1351,6 +1342,7 @@ mod tests {
     use std::fs::File;
 
     use hifitime::Epoch;
+    use triblespace::core::blob::MemoryBlobStore;
 
     fn at(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);
@@ -1624,9 +1616,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        let reader = pile.reader().unwrap();
-        pile.close().unwrap();
 
         let signer = SigningKey::from_bytes(&[11; 32]);
         let (author_fragment, author) = author_record(&signer.verifying_key());
@@ -1644,13 +1633,37 @@ mod tests {
         let (revision, _) = revision_record(tagged).unwrap();
         bad_tag += author_record(&signer.verifying_key()).0;
         bad_tag += revision;
-        let catalog = load_catalog(bad_tag.facts()).unwrap();
-        let mut staged = bad_tag.clone();
-        let overlay = staged.blobs_mut().reader().unwrap();
-        assert!(validate_payloads(&reader, Some(&overlay), &catalog)
-            .unwrap_err()
-            .to_string()
-            .contains("not normalized"));
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        commit_collection(&mut pile, &signer, bad_tag).unwrap();
+        let error = match materialize_indexed_collection(&mut pile, &signer) {
+            Ok(_) => panic!("unnormalized tag unexpectedly materialized"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not normalized"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn strict_durable_read_rejects_missing_revision_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wiki.pile");
+        File::create(&path).unwrap();
+
+        let signer = SigningKey::from_bytes(&[12; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (revision_fragment, _) = revision_record(draft(author, "missing", [])).unwrap();
+        let complete = author_fragment + revision_fragment;
+        let missing =
+            Fragment::from_facts_and_blobs(complete.facts().clone(), MemoryBlobStore::new());
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        commit_collection(&mut pile, &signer, missing).unwrap();
+        let error = match materialize_indexed_collection(&mut pile, &signer) {
+            Ok(_) => panic!("missing revision payload unexpectedly materialized"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("read Wiki revision"));
+        pile.close().unwrap();
     }
 
     /// The legacy anchor is nothing at all now — not an edge, not a selector.

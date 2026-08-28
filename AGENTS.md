@@ -102,9 +102,12 @@ reconciliation.
   small projection over that library.
 * **Faithful CLI to pile.** Each publication into one collection commits one
   self-contained `Fragment`; a compound operation may publish to several fixed
-  collections. Validate every candidate union before the first dependent
-  `Collection::commit`; never introduce a mutable head, branch selector, or
-  CAS loop.
+  collections. Construct all dependent fragments before the first
+  `Collection::commit`, and make an interrupted operation safely replayable.
+  Strictly validate untrusted reads and migration inputs; do not rescan the
+  entire current union before ordinary writes unless the domain has a real
+  cross-fragment compatibility invariant. Never introduce a mutable head,
+  branch selector, or CAS loop.
 * **No shadow datamodels.** If state belongs in the pile, query the
   pile on demand via `pattern!` / `find!`. Don't pre-materialise
   into structs/maps.

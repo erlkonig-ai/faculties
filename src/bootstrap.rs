@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_attachment_closure_is_strict() {
+    fn compass_anchor_preflight_rejects_missing_attachments_without_publishing() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("empty.pile");
         let key = directory.path().join("empty.key");
@@ -664,20 +664,9 @@ mod tests {
         let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
         let length_before = std::fs::metadata(&pile_path).unwrap().len();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let (wiki_before, wiki_reader) =
-            wiki_model::materialize_collection(&mut pile, &signer).unwrap();
         let (compass_before, compass_reader) =
             compass::materialize_collection(&mut pile, &signer).unwrap();
-        let (_, author) = wiki_model::author_record(&signer.verifying_key());
         let seed = build(&signer.verifying_key()).unwrap();
-
-        wiki_model::validate_candidate(&wiki_reader, &wiki_before, &seed.wiki, author).unwrap();
-        let missing_wiki =
-            Fragment::from_facts_and_blobs(seed.wiki.facts().clone(), MemoryBlobStore::new());
-        assert!(
-            wiki_model::validate_candidate(&wiki_reader, &wiki_before, &missing_wiki, author)
-                .is_err()
-        );
 
         compass::validate_candidate(&compass_reader, &compass_before, &seed.compass).unwrap();
         let missing_compass =
@@ -690,7 +679,7 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&pile_path).unwrap().len(),
             length_before,
-            "preflight and rejected staged candidates must not append cache evidence"
+            "Compass preflight must not append collection records"
         );
     }
 

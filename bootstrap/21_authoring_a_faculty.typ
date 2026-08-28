@@ -64,8 +64,6 @@ signer. This is the minimal shape:
 let signer = load_signer(&cli.pile, cli.key.as_deref())?;
 let pile = open_pile_strict(&cli.pile)?;
 let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
-let current = collection.materialize()?;
-let reader = collection.storage_mut().reader()?;
 
 let mut change = Fragment::empty();
 let body = change.put::<UTF8String, _>(body);
@@ -73,38 +71,43 @@ change += entity! {
     metadata::tag: &KIND_NOTE,
     myverb::text: body,
 };
-myverb::validate_candidate(&reader, &current, &change)?;
 collection.commit(change)?;
 collection.into_storage().close()?;
 ```
 
-`Collection::materialize`, `Collection::commit`, and the explicit close are
-substrate APIs. `myverb::validate_candidate` is the domain validator you write:
-it checks the exact additive union and staged attachment closure before the
-COMMIT becomes visible.
+`Collection::commit` and the explicit close are substrate APIs. The typed
+constructor makes one self-contained fragment: its intrinsic identity, facts,
+and attachment bytes travel together. Strict readers validate the materialized
+domain model and payload closure; migrations validate untrusted source data.
+Ordinary writes should not rescan the complete current union merely to distrust
+the same constructor that just produced their fragment. Add a pre-publication
+check only for a genuine cross-fragment compatibility invariant.
 
 The collection's team grants WRITE authority explicitly. Bootstrap and the
 migration boundary initialize the closed faculty manifest; an ordinary faculty
 command never manufactures authority merely because it attempted a write.
 
 The fragment carries its facts, metadata, and attachment closure together. The
-COMMIT *is* the publication record—no separate "log that I did this" step. An
-exact retry converges by content identity; distinct COMMITs coexist without a
-branch head or compare-and-swap loop. That is
+COMMIT *is* the curation record—no separate "log that I did this" step. Its
+signer publishes the artifact but need not be the person named as its author.
+An exact retry converges by content identity; distinct COMMITs coexist without
+a branch head or compare-and-swap loop. That is
 [work as its own ledger](wiki:996e648886cccb61d1afd48296b0a0cb): provenance
 falls out of the write.
 
 The scope follows semantic ownership, not binary count. A read-only faculty may
 own no collection; a compound faculty may read or publish several fixed
 collections. There is no staged atomic publication across those collections.
-Validate every candidate first, publish in dependency-safe order, and make an
+Construct every fragment first, publish in dependency-safe order, and make an
 idempotent rerun finish any missing COMMITs after interruption. Never add a
 caller-selected scope merely to make the CLI generic.
 
 == 4. Install, iterate, land
 
-  - *Install*: `cargo install --path faculties --bins` — your
-    verb is now on `PATH` next to the rest.
+  - *Install*: run `cargo build --manifest-path=faculties/Cargo.toml --release
+    --workspace --bins --locked`, then
+    `faculties/scripts/install-release-cohort faculties/target/release` so the
+    complete binary cohort is activated atomically.
   - *Iterate*: `cargo run --manifest-path=faculties/Cargo.toml
     --bin myverb -- <args>` runs source without reinstalling.
   - *Land it*: `git commit` + push. `faculties` is a standalone
