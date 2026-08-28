@@ -8,9 +8,7 @@ use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
 use faculties::schemas::compass::latest_status_event;
-use faculties::schemas::compass::{
-    board, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
-};
+use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use faculties::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use faculties::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
