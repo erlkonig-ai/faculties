@@ -146,7 +146,7 @@ pub fn publish(pile: &Path, key: Option<&Path>) -> Result<StatusRegisterReport> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::compass::{note_fragment, status_fragment};
+    use faculties::compass::{replay, status_fragment};
     use faculties::schemas::compass::{latest_status_event, IntervalValue};
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -182,7 +182,7 @@ mod tests {
             board::status: "doing",
             metadata::created_at: at(10),
         };
-        legacy += note_fragment(note, goal, "later", vec![], vec![], vec![], None, at(20))
+        legacy += replay::note_fragment(note, goal, "later", vec![], vec![], vec![], None, at(20))
             .unwrap()
             .facts()
             .clone();

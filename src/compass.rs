@@ -163,26 +163,48 @@ pub fn kind_catalog_fragment() -> Fragment {
     fragment
 }
 
-/// One immutable goal anchor. Its random id is the goal's durable identity;
-/// the descriptive facts are authored once and thereafter only accumulated.
+/// One immutable goal occurrence with an identity derived from all of its
+/// defining fields. Exact replay converges; the creation time distinguishes
+/// otherwise-equal occurrences.
 pub fn goal_fragment(
-    goal: Id,
     title: impl Into<String>,
     tags: Vec<String>,
     parent: Option<Id>,
     created_at: IntervalValue,
-) -> Result<Fragment> {
+) -> Result<(Fragment, Id)> {
+    goal_fragment_impl(None, title, tags, parent, created_at)
+}
+
+fn goal_fragment_impl(
+    goal: Option<Id>,
+    title: impl Into<String>,
+    tags: Vec<String>,
+    parent: Option<Id>,
+    created_at: IntervalValue,
+) -> Result<(Fragment, Id)> {
     let tags = canonical_tags(tags)?;
     let mut fragment = Fragment::empty();
     let title = fragment.put::<blobencodings::UTF8String, _>(title.into());
-    fragment += entity! { ExclusiveId::force_ref(&goal) @
-        metadata::tag: &KIND_GOAL_ID,
-        board::title: title,
-        metadata::created_at: created_at,
-        board::parent?: parent.as_ref(),
-        board::tag*: tags.iter().map(String::as_str),
+    let record = if let Some(goal) = goal {
+        entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: created_at,
+            board::parent?: parent.as_ref(),
+            board::tag*: tags.iter().map(String::as_str),
+        }
+    } else {
+        entity! {
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: created_at,
+            board::parent?: parent.as_ref(),
+            board::tag*: tags.iter().map(String::as_str),
+        }
     };
-    Ok(fragment)
+    let goal = record.root().expect("goal record exports one root");
+    fragment += record;
+    Ok((fragment, goal))
 }
 
 /// One intrinsic status event. Exact replay has the same entity id; two
@@ -209,12 +231,11 @@ pub fn status_fragment(
     })
 }
 
-/// One independent note occurrence. The explicit random id is intentional:
-/// identical prose entered twice represents two ledger occurrences, and the
-/// id is also the stable target of `metadata::supersedes` links.
+/// One independent note occurrence whose identity includes every immutable
+/// field. Creation time distinguishes repeated prose while exact retries
+/// converge to one occurrence.
 #[allow(clippy::too_many_arguments)]
 pub fn note_fragment(
-    note: Id,
     goal: Id,
     body: impl Into<String>,
     tags: Vec<String>,
@@ -222,7 +243,23 @@ pub fn note_fragment(
     supersedes: Vec<Id>,
     by: Option<Id>,
     created_at: IntervalValue,
-) -> Result<Fragment> {
+) -> Result<(Fragment, Id)> {
+    note_fragment_impl(
+        None, goal, body, tags, references, supersedes, by, created_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn note_fragment_impl(
+    note: Option<Id>,
+    goal: Id,
+    body: impl Into<String>,
+    tags: Vec<String>,
+    references: Vec<String>,
+    supersedes: Vec<Id>,
+    by: Option<Id>,
+    created_at: IntervalValue,
+) -> Result<(Fragment, Id)> {
     let tags = canonical_tags(tags)?;
     let references = sorted_strings(references);
     let supersedes = sorted_ids(supersedes);
@@ -232,17 +269,79 @@ pub fn note_fragment(
         .into_iter()
         .map(|value| fragment.put::<blobencodings::UTF8String, _>(value))
         .collect();
-    fragment += entity! { ExclusiveId::force_ref(&note) @
-        metadata::tag: &KIND_NOTE_ID,
-        board::task: &goal,
-        board::note: body,
-        board::by?: by.as_ref(),
-        board::tag*: tags.iter().map(String::as_str),
-        board::reference*: references.iter(),
-        metadata::supersedes*: supersedes.iter(),
-        metadata::created_at: created_at,
+    let record = if let Some(note) = note {
+        entity! { ExclusiveId::force_ref(&note) @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: body,
+            board::by?: by.as_ref(),
+            board::tag*: tags.iter().map(String::as_str),
+            board::reference*: references.iter(),
+            metadata::supersedes*: supersedes.iter(),
+            metadata::created_at: created_at,
+        }
+    } else {
+        entity! {
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: body,
+            board::by?: by.as_ref(),
+            board::tag*: tags.iter().map(String::as_str),
+            board::reference*: references.iter(),
+            metadata::supersedes*: supersedes.iter(),
+            metadata::created_at: created_at,
+        }
     };
-    Ok(fragment)
+    let note = record.root().expect("note record exports one root");
+    fragment += record;
+    Ok((fragment, note))
+}
+
+/// Explicit-id constructors for migrations and fixtures which must replay a
+/// preserved identity. Ordinary authoring must use [`goal_fragment`] and
+/// [`note_fragment`], whose intrinsic roots make exact retries idempotent.
+///
+/// Readers deliberately do not distinguish records produced here from records
+/// produced by the intrinsic constructors. The identifier substitution law is
+/// load-bearing: changing only an entity id may affect idempotence, never
+/// meaning.
+pub mod replay {
+    use super::*;
+
+    pub fn goal_fragment(
+        goal: Id,
+        title: impl Into<String>,
+        tags: Vec<String>,
+        parent: Option<Id>,
+        created_at: IntervalValue,
+    ) -> Result<Fragment> {
+        super::goal_fragment_impl(Some(goal), title, tags, parent, created_at)
+            .map(|(fragment, _)| fragment)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_fragment(
+        note: Id,
+        goal: Id,
+        body: impl Into<String>,
+        tags: Vec<String>,
+        references: Vec<String>,
+        supersedes: Vec<Id>,
+        by: Option<Id>,
+        created_at: IntervalValue,
+    ) -> Result<Fragment> {
+        super::note_fragment_impl(
+            Some(note),
+            goal,
+            body,
+            tags,
+            references,
+            supersedes,
+            by,
+            created_at,
+        )
+        .map(|(fragment, _)| fragment)
+    }
 }
 
 /// One intrinsic priority assertion or retraction event.
@@ -473,9 +572,9 @@ fn validate_status(facts: &TribleSet, event: Id) -> Result<()> {
     // A status event names at most one register and at most one goal. Both
     // are `at_most_one` rather than `exactly_one` because the two eras
     // disagree about which attribute carries it, and the pile holds both:
-    // events written before `status_of` have only `task`, and new events
-    // only `status_of`. `require_canonical_status` is what makes the
-    // identity mandatory on everything written from here on.
+    // events written before `status_of` have only `task`, and current events
+    // only `status_of`. Candidate validation requires the complete current
+    // shape for newly introduced events without making identity observable.
     let _register = at_most_one(
         event,
         "board::status_of",
@@ -619,8 +718,8 @@ fn validate_candidate_kind_ownership(
     Ok(())
 }
 
-fn require_canonical_status(facts: &TribleSet, event: Id) -> Result<()> {
-    let task = exactly_one(
+fn require_current_status_shape(facts: &TribleSet, event: Id) -> Result<()> {
+    let _task = exactly_one(
         event,
         "board::status_of",
         find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
@@ -630,32 +729,14 @@ fn require_canonical_status(facts: &TribleSet, event: Id) -> Result<()> {
         "board::status",
         find!(value: String, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
     )?;
-    let by = at_most_one(
-        event,
-        "board::by",
-        find!(value: Id, pattern!(facts, [{ event @ board::by: ?value }])).collect(),
-    )?;
-    let created_at = exactly_one(
-        event,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ event @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    let canonical = status_fragment(task, status, by, created_at)?
-        .root()
-        .unwrap();
-    if canonical != event {
-        bail!(
-            "new Compass status event {event:x} is non-canonical; canonical identity is {canonical:x}"
-        );
+    let canonical = canonical_status(status.clone())?;
+    if canonical != status {
+        bail!("new Compass status event {event:x} has non-canonical status {status:?}");
     }
-    Ok(())
+    require_complete_occurrence(facts, event, "status event")
 }
 
-fn require_complete_extrinsic(facts: &TribleSet, entity: Id, label: &str) -> Result<()> {
+fn require_complete_occurrence(facts: &TribleSet, entity: Id, label: &str) -> Result<()> {
     let created_at = exactly_one(
         entity,
         "metadata::created_at",
@@ -667,37 +748,6 @@ fn require_complete_extrinsic(facts: &TribleSet, entity: Id, label: &str) -> Res
     )?;
     require_point(entity, "metadata::created_at", created_at)
         .with_context(|| format!("validate new Compass {label} {entity:x}"))
-}
-
-fn require_canonical_priority(facts: &TribleSet, event: Id, active: bool) -> Result<()> {
-    let higher = exactly_one(
-        event,
-        "board::higher",
-        find!(value: Id, pattern!(facts, [{ event @ board::higher: ?value }])).collect(),
-    )?;
-    let lower = exactly_one(
-        event,
-        "board::lower",
-        find!(value: Id, pattern!(facts, [{ event @ board::lower: ?value }])).collect(),
-    )?;
-    let created_at = exactly_one(
-        event,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ event @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    let canonical = priority_fragment(higher, lower, active, created_at)
-        .root()
-        .unwrap();
-    if canonical != event {
-        bail!(
-            "new Compass priority event {event:x} is non-canonical; canonical identity is {canonical:x}"
-        );
-    }
-    Ok(())
 }
 
 fn validate_candidate_structure(current: &TribleSet, candidate: &TribleSet) -> Result<TribleSet> {
@@ -731,27 +781,27 @@ fn validate_candidate_structure(current: &TribleSet, candidate: &TribleSet) -> R
         .difference(&ids_of_kind(current, KIND_GOAL_ID))
         .copied()
     {
-        require_complete_extrinsic(&union, goal, "goal")?;
+        require_complete_occurrence(&union, goal, "goal")?;
     }
     for note in ids_of_kind(candidate, KIND_NOTE_ID)
         .difference(&ids_of_kind(current, KIND_NOTE_ID))
         .copied()
     {
-        require_complete_extrinsic(&union, note, "note")?;
+        require_complete_occurrence(&union, note, "note")?;
     }
 
     for event in ids_of_kind(candidate, KIND_STATUS_ID)
         .difference(&ids_of_kind(current, KIND_STATUS_ID))
         .copied()
     {
-        require_canonical_status(&union, event)?;
+        require_current_status_shape(&union, event)?;
     }
-    for (kind, active) in [(KIND_PRIORITIZE_ID, true), (KIND_DEPRIORITIZE_ID, false)] {
+    for kind in [KIND_PRIORITIZE_ID, KIND_DEPRIORITIZE_ID] {
         for event in ids_of_kind(candidate, kind)
             .difference(&ids_of_kind(current, kind))
             .copied()
         {
-            require_canonical_priority(&union, event, active)?;
+            require_complete_occurrence(&union, event, "priority event")?;
         }
     }
     Ok(union)
@@ -934,13 +984,13 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 }
 
 /// Validate the exact union and text-attachment closure of an additive Compass
-/// publication.
+/// publication assembled outside the typed constructors.
 ///
 /// Existing facts must remain readable from the pile snapshot; newly staged
 /// title, note, and reference handles must be owned by the candidate fragment.
-/// This is the pre-publication boundary used by compound importers such as the
-/// portable bootstrap, so a late missing attachment cannot strand an earlier
-/// collection COMMIT.
+/// Identity policy is intentionally absent here: intrinsic and extrinsic ids
+/// are substitutable to every reader and validator. The normal constructors
+/// provide intrinsic idempotence; replay/import paths may retain old ids.
 pub fn validate_candidate(
     reader: &PileReader,
     current: &TribleSet,
@@ -1110,38 +1160,90 @@ mod tests {
     }
 
     #[test]
-    fn equal_notes_remain_distinct_occurrences() {
+    fn exact_goal_and_note_retries_converge() {
+        let (first_goal, first_goal_id) =
+            goal_fragment("same", vec!["one".into()], None, at(4)).unwrap();
+        let (second_goal, second_goal_id) =
+            goal_fragment("same", vec!["one".into()], None, at(4)).unwrap();
+        assert_eq!(first_goal.root(), Some(first_goal_id));
+        assert_eq!(second_goal.root(), Some(second_goal_id));
+        assert_eq!(first_goal_id, second_goal_id);
+        assert_eq!(first_goal, second_goal);
+
+        let (first_note, first_note_id) = note_fragment(
+            first_goal_id,
+            "same",
+            vec!["one".into()],
+            vec!["wiki:abc".into()],
+            vec![],
+            None,
+            at(5),
+        )
+        .unwrap();
+        let (second_note, second_note_id) = note_fragment(
+            second_goal_id,
+            "same",
+            vec!["one".into()],
+            vec!["wiki:abc".into()],
+            vec![],
+            None,
+            at(5),
+        )
+        .unwrap();
+        assert_eq!(first_note.root(), Some(first_note_id));
+        assert_eq!(second_note.root(), Some(second_note_id));
+        assert_eq!(first_note_id, second_note_id);
+        assert_eq!(first_note, second_note);
+    }
+
+    #[test]
+    fn creation_time_distinguishes_repeated_goal_and_note_occurrences() {
+        let (_, first_goal) = goal_fragment("same", vec![], None, at(4)).unwrap();
+        let (_, second_goal) = goal_fragment("same", vec![], None, at(5)).unwrap();
+        assert_ne!(first_goal, second_goal);
+
+        let (_, first_note) =
+            note_fragment(first_goal, "same", vec![], vec![], vec![], None, at(6)).unwrap();
+        let (_, second_note) =
+            note_fragment(first_goal, "same", vec![], vec![], vec![], None, at(7)).unwrap();
+        assert_ne!(first_note, second_note);
+    }
+
+    #[test]
+    fn extrinsic_goal_and_note_ids_are_substitutable_in_validation_and_queries() {
         let goal = genid().id;
-        let first = note_fragment(
-            genid().id,
+        let note = genid().id;
+        let mut records =
+            replay::goal_fragment(goal, "preserved", vec!["legacy".into()], None, at(4)).unwrap();
+        records += replay::note_fragment(
+            note,
             goal,
-            "same",
+            "preserved note",
             vec![],
             vec![],
             vec![],
             None,
-            at(4),
+            at(5),
         )
         .unwrap();
-        let second = note_fragment(
-            genid().id,
-            goal,
-            "same",
-            vec![],
-            vec![],
-            vec![],
-            None,
-            at(4),
-        )
-        .unwrap();
-        assert_ne!(first.root(), second.root());
+
+        validate_structure(records.facts()).unwrap();
+        validate_candidate_structure(&TribleSet::new(), records.facts()).unwrap();
+        assert_eq!(goal_ids(records.facts()), BTreeSet::from([goal]));
+        assert_eq!(note_ids(records.facts()), BTreeSet::from([note]));
+        assert_eq!(
+            find!(task: Id, pattern!(records.facts(), [{ note @ board::task: ?task }]))
+                .collect::<Vec<_>>(),
+            vec![goal]
+        );
     }
 
     #[test]
     fn additive_union_rejects_a_reused_goal_anchor_with_divergent_shape() {
         let goal = genid().id;
-        let first = goal_fragment(goal, "first", vec!["one".into()], None, at(4)).unwrap();
-        let second = goal_fragment(goal, "second", vec!["two".into()], None, at(5)).unwrap();
+        let first = replay::goal_fragment(goal, "first", vec!["one".into()], None, at(4)).unwrap();
+        let second =
+            replay::goal_fragment(goal, "second", vec!["two".into()], None, at(5)).unwrap();
         let mut union = first.facts().clone();
         union += second.facts().clone();
 
@@ -1152,7 +1254,8 @@ mod tests {
     #[test]
     fn exact_replay_of_an_extrinsic_anchor_remains_valid() {
         let goal = genid().id;
-        let fragment = goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
+        let fragment =
+            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
         let mut union = fragment.facts().clone();
         union += fragment.facts().clone();
 
@@ -1162,21 +1265,24 @@ mod tests {
     #[test]
     fn preserved_goal_accepts_orthogonal_annotations_and_legacy_time() {
         let goal = genid().id;
-        let mut fragment = goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
+        let mut fragment =
+            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
         fragment += entity! { ExclusiveId::force_ref(&goal) @ metadata::updated_at: at(5) };
 
         validate_structure(fragment.facts()).unwrap();
 
-        let replay = goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-        validate_candidate_structure(fragment.facts(), replay.facts()).unwrap();
+        let exact = replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
+        validate_candidate_structure(fragment.facts(), exact.facts()).unwrap();
     }
 
     #[test]
     fn candidate_rejects_tag_removal_hidden_by_additive_union() {
         let goal = genid().id;
         let current =
-            goal_fragment(goal, "same", vec!["one".into(), "two".into()], None, at(4)).unwrap();
-        let candidate = goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
+            replay::goal_fragment(goal, "same", vec!["one".into(), "two".into()], None, at(4))
+                .unwrap();
+        let candidate =
+            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
 
         let error = validate_candidate_structure(current.facts(), candidate.facts())
             .unwrap_err()
@@ -1187,49 +1293,43 @@ mod tests {
     #[test]
     fn orthogonal_candidate_fact_does_not_mutate_goal_core() {
         let goal = genid().id;
-        let current = goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
+        let current = replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
         let candidate = entity! { ExclusiveId::force_ref(&goal) @ metadata::updated_at: at(5) };
 
         validate_candidate_structure(current.facts(), candidate.facts()).unwrap();
     }
 
     #[test]
-    fn new_status_must_have_its_intrinsic_core_identity() {
+    fn current_status_shape_accepts_an_extrinsic_id() {
         let goal = genid().id;
         let canonical = status_fragment(goal, "doing", None, at(7)).unwrap();
         validate_candidate_structure(&TribleSet::new(), canonical.facts()).unwrap();
 
-        let forged_id = genid().id;
-        let forged = entity! { ExclusiveId::force_ref(&forged_id) @
+        let extrinsic_id = genid().id;
+        let extrinsic = entity! { ExclusiveId::force_ref(&extrinsic_id) @
             metadata::tag: &KIND_STATUS_ID,
             board::status_of: &goal,
             board::status: "doing",
             metadata::created_at: at(7),
         };
-        let error = validate_candidate_structure(&TribleSet::new(), forged.facts())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("status event") && error.contains("non-canonical"));
+        validate_candidate_structure(&TribleSet::new(), extrinsic.facts()).unwrap();
     }
 
     #[test]
-    fn new_priority_must_have_its_intrinsic_core_identity() {
+    fn current_priority_shape_accepts_an_extrinsic_id() {
         let higher = genid().id;
         let lower = genid().id;
         let canonical = priority_fragment(higher, lower, true, at(7));
         validate_candidate_structure(&TribleSet::new(), canonical.facts()).unwrap();
 
-        let forged_id = genid().id;
-        let forged = entity! { ExclusiveId::force_ref(&forged_id) @
+        let extrinsic_id = genid().id;
+        let extrinsic = entity! { ExclusiveId::force_ref(&extrinsic_id) @
             metadata::tag: &KIND_PRIORITIZE_ID,
             board::higher: &higher,
             board::lower: &lower,
             metadata::created_at: at(7),
         };
-        let error = validate_candidate_structure(&TribleSet::new(), forged.facts())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("priority event") && error.contains("non-canonical"));
+        validate_candidate_structure(&TribleSet::new(), extrinsic.facts()).unwrap();
     }
 
     #[test]

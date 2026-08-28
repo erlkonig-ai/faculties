@@ -659,26 +659,18 @@ fn cmd_add(
             Some(parent) => Some(resolve_task_id(parent, space)?),
             None => None,
         };
-        let task_ref = genid().id;
         let now = clock::point_now()?;
         let mut change = compass::kind_catalog_fragment();
-        change += compass::goal_fragment(task_ref, title, tags, parent_id, now)?;
+        let (goal, task_ref) = compass::goal_fragment(title, tags, parent_id, now)?;
+        change += goal;
         change += compass::status_fragment(task_ref, status, by_id, now)?;
 
         let mut note_ref = None;
         if let Some(note) = note {
-            let note_id = genid().id;
             let references = extract_reference_values(&note);
-            change += compass::note_fragment(
-                note_id,
-                task_ref,
-                note,
-                vec![],
-                references,
-                vec![],
-                by_id,
-                now,
-            )?;
+            let (record, note_id) =
+                compass::note_fragment(task_ref, note, vec![], references, vec![], by_id, now)?;
+            change += record;
             note_ref = Some(note_id);
         }
         Ok((Some(change), (task_ref, note_ref)))
@@ -759,18 +751,10 @@ fn cmd_note(
             .map(|input| resolve_note_id(input, space))
             .collect::<Result<_>>()?;
         let now = clock::point_now()?;
-        let note_id = genid().id;
         let mut change = compass::kind_catalog_fragment();
-        change += compass::note_fragment(
-            note_id,
-            task_id,
-            note,
-            tags,
-            references,
-            superseded_ids,
-            by_id,
-            now,
-        )?;
+        let (record, note_id) =
+            compass::note_fragment(task_id, note, tags, references, superseded_ids, by_id, now)?;
+        change += record;
         Ok((Some(change), (task_id, note_id)))
     })?;
     println!("Added note {:x} to goal {:x}", note_id, task_id);

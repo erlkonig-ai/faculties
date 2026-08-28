@@ -2368,7 +2368,7 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
 
-        let mut history = compass::goal_fragment(
+        let mut history = compass::replay::goal_fragment(
             goal,
             "unrelated history",
             Vec::new(),
@@ -2376,7 +2376,7 @@ mod tests {
             epoch_interval(Epoch::from_unix_seconds(1.0)),
         )
         .unwrap();
-        history += compass::note_fragment(
+        history += compass::replay::note_fragment(
             old_note,
             goal,
             "old invisible note",
@@ -2393,7 +2393,7 @@ mod tests {
         assert!(!baseline.notes.contains_key(&old_note));
         save_checkpoint(&mut pile, &signer, persona, &baseline, [old_note]).unwrap();
 
-        let participation = compass::note_fragment(
+        let participation = compass::replay::note_fragment(
             own_note,
             goal,
             "joining",
@@ -2411,7 +2411,7 @@ mod tests {
             NewsCheck::Quiet
         ));
 
-        let response = compass::note_fragment(
+        let response = compass::replay::note_fragment(
             new_note,
             goal,
             "new response",
@@ -2625,7 +2625,7 @@ mod tests {
             faculties::schemas::orient::DEFAULT_SCOPE_ID,
             checkpoint,
         );
-        let mut notes = compass::goal_fragment(
+        let mut notes = compass::replay::goal_fragment(
             goal,
             "goal",
             vec!["persona".to_owned()],
@@ -2633,7 +2633,7 @@ mod tests {
             epoch_interval(Epoch::from_unix_seconds(1.0)),
         )
         .unwrap();
-        notes += compass::note_fragment(
+        notes += compass::replay::note_fragment(
             existing_note,
             goal,
             "existing note",
@@ -2666,7 +2666,7 @@ mod tests {
         // Publication order—not authored time—defines what was in the
         // migration snapshot. A deliberately backdated note appended now must
         // remain unseen and therefore wake.
-        let later = compass::note_fragment(
+        let later = compass::replay::note_fragment(
             later_note,
             goal,
             "later backdated note",

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **New Compass goals and notes use intrinsic occurrence ids.** Their immutable
+  fields, including creation time, now determine the id returned by the typed
+  constructors, so exact retries converge without a caller-minted `genid` and
+  repeated occurrences at different times remain distinct. Existing extrinsic
+  ids remain valid and indistinguishable to queries and validators; an explicit
+  replay API is retained only for migrations and fixtures. Portable bootstrap
+  now uses the same constructors and no longer preflights Compass for random-id
+  collisions before publication.
+
 - **Orient checkpoint reads now use an exact maintained LWW register.** Each
   persona's latest checkpoint is selected from a derived index attached to the
   exact Orient collection ticket, while the checkpoint events remain available
