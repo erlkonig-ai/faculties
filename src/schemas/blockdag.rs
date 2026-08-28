@@ -74,6 +74,10 @@ pub mod content_part {
         /// target part. An unresolved vendor correlator stays in raw source
         /// provenance; resolving it yields a richer immutable projection.
         "A7CC0F4A24275330DD48F2836B70F0EC" unsafe as pub responds_to: GenId;
+        /// IDENTITY when present. The exact resident representation selected
+        /// for this occurrence of an external pointer fact. The handle must
+        /// also occur among that fact's monotone `resolved_to` evidence.
+        "884A0F9A519D486B07C3CDDDCC6F5BC9" as pub resolution: Handle<RawBytes>;
     }
 
     /// Nonidentity kind marker attached after intrinsic part construction.

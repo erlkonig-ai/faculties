@@ -76,6 +76,10 @@ pub struct ArchivePart {
     pub ordinal: u64,
     pub fact: Id,
     pub responds_to: Option<Id>,
+    /// Exact recovered body selected by this occurrence of an external fact.
+    /// The fact may accumulate other resolution evidence later without making
+    /// this part ambiguous.
+    pub resolution: Option<RawHandle>,
     pub modality: Id,
     pub direction: Id,
     pub payload: ArchivePayload,
@@ -1366,12 +1370,24 @@ impl ArchiveSnapshot {
                 part,
                 "responds-to",
             )?;
+            let resolution = optional_one(
+                find!(
+                    value: RawHandle,
+                    pattern!(catalog, [{
+                        part @ schema::content_part::resolution: ?value
+                    }])
+                )
+                .collect(),
+                part,
+                "resolution",
+            )?;
             let payload = self.payload(catalog, fact)?;
             Ok(ArchivePart {
                 id: part,
                 ordinal,
                 fact,
                 responds_to,
+                resolution,
                 modality,
                 direction,
                 payload,
