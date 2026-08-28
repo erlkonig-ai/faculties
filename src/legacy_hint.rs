@@ -1,17 +1,17 @@
 //! The one place a faculty opens a native collection — and the one place a
 //! pre-collection pile is told that its facts are still on a legacy branch.
 //!
-//! Every faculty reads native `Collection`s now. A pile written before the
+//! Every faculty reads native collection records now. A pile written before the
 //! storage cutover still has all of its data, but it lives on named legacy
 //! repository branches that no current command consults, so the faculty shows
 //! an empty board, an empty wiki, an empty inbox — with nothing on screen to
 //! suggest that a migration exists. That silence is the failure this module
 //! closes.
 //!
-//! The check is identical for all 23 migrated scopes ("this native scope has
+//! The check is identical for all migrated scopes ("this native scope has
 //! no commits, but the legacy branch it replaced still has authored history"),
 //! so it is implemented exactly once here and every faculty routes its
-//! `Collection::new` through [`open_scope`]. The only per-faculty knowledge is
+//! its descriptor registered through [`open_scope`]. The only per-faculty knowledge is
 //! [`LEGACY_SOURCES`], a scope-id → legacy-branch-name table assembled from the
 //! canonical constants in [`crate::schemas`]. The transforms that consume those
 //! branches live in the separate `faculties-migrations` crate; this table is
@@ -27,15 +27,17 @@
 //! once per scope per process, and any failure while probing is swallowed. A
 //! diagnostic must not be able to break a command that would otherwise work.
 
-use std::borrow::BorrowMut;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::{Collection, CollectionRecord, CollectionStore};
+use triblespace::core::collection::{
+    CollectionHandle, CollectionRecord, CollectionStore, CollectionStoreExt,
+};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
@@ -154,24 +156,23 @@ const MAX_WALKED_COMMITS: usize = 100_000;
 
 /// Open one native collection, warning first if this scope looks unmigrated.
 ///
-/// This is the call every faculty makes instead of [`Collection::new`], so the
-/// legacy-pile diagnostic exists in exactly one place. The returned collection
-/// is exactly the one `crate::collection_names::open(storage, scope, signer)` would return.
-///
-/// `storage` is whatever the caller already holds — an owned [`Pile`] or a
-/// `&mut Pile` — so routing a call site through here never forces it to change
-/// the lifetime it was built around.
-pub fn open_scope<S>(mut storage: S, scope: Id, signer: SigningKey) -> Collection<S>
-where
-    S: BorrowMut<Pile>,
-{
-    let namespace = signer.verifying_key();
-    warn_once(storage.borrow_mut(), scope, namespace);
-    crate::collection_names::open(storage, scope, signer)
+/// This is the call every faculty makes before a store-centric collection
+/// operation. It idempotently registers the descriptor and returns its handle;
+/// the pile and signer remain owned by the caller.
+pub fn open_scope(pile: &mut Pile, scope: Id, signer: &SigningKey) -> Result<CollectionHandle> {
+    let collection = crate::collection_names::open(pile, scope, signer.verifying_key())
+        .with_context(|| {
+            format!(
+                "register collection {}",
+                crate::collection_names::require_name(scope)
+            )
+        })?;
+    warn_once(pile, scope, collection);
+    Ok(collection)
 }
 
 /// Emit the hint for `scope` at most once per process, to stderr.
-fn warn_once(pile: &mut Pile, scope: Id, namespace: VerifyingKey) {
+fn warn_once(pile: &mut Pile, scope: Id, collection: CollectionHandle) {
     static WARNED: Mutex<Option<BTreeSet<Id>>> = Mutex::new(None);
 
     if !LEGACY_SOURCES.iter().any(|(known, _)| *known == scope) {
@@ -186,7 +187,7 @@ fn warn_once(pile: &mut Pile, scope: Id, namespace: VerifyingKey) {
             return;
         }
     }
-    if let Some(hint) = legacy_migration_hint(pile, scope, namespace) {
+    if let Some(hint) = legacy_migration_hint(pile, scope, collection) {
         eprintln!("{hint}");
     }
 }
@@ -202,14 +203,14 @@ fn warn_once(pile: &mut Pile, scope: Id, namespace: VerifyingKey) {
 pub fn legacy_migration_hint(
     pile: &mut Pile,
     scope: Id,
-    namespace: VerifyingKey,
+    collection: CollectionHandle,
 ) -> Option<String> {
     let branch_name = LEGACY_SOURCES
         .iter()
         .find(|(known, _)| *known == scope)
         .map(|(_, name)| *name)?;
 
-    if !native_scope_is_empty(pile, scope, namespace)? {
+    if !native_scope_is_empty(pile, collection)? {
         return None;
     }
 
@@ -300,33 +301,12 @@ fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
     Some(false)
 }
 
-/// Whether `scope` has no strictly verified commits, or `None` if its records
-/// cannot be observed.
-///
-/// Open-admission root collections accept every strictly verified commit to
-/// their exact descriptor. Invalid signatures and commits to another
-/// descriptor remain inert diagnostically just as they are semantically.
-fn native_scope_is_empty(pile: &mut Pile, scope: Id, namespace: VerifyingKey) -> Option<bool> {
-    // Written out rather than reached for: this is the handle of a descriptor
-    // that has NOT been stored here, and core deliberately offers no helper for
-    // that, because one computed beside a store instead of by it can name a
-    // collection whose descriptor is absent. On this read path it is only ever
-    // compared against, never published under.
-    let collection = IntoBlob::<SimpleArchive>::to_blob(
-        crate::collection_names::root_descriptor(scope, namespace)
-            .facts()
-            .clone(),
-    )
-    .get_handle();
-    let records = pile.records().ok()?;
-    for record in records {
-        if let Ok(CollectionRecord::Commit(commit)) = record {
-            if commit.collection() == collection && commit.verify_strict().is_ok() {
-                return Some(false);
-            }
-        }
-    }
-    Some(true)
+/// Whether one collection has no authority-admitted commits, or `None` if its
+/// descriptor or records cannot be observed.
+fn native_scope_is_empty(pile: &mut Pile, collection: CollectionHandle) -> Option<bool> {
+    pile.ticket(collection, &[])
+        .ok()
+        .map(|ticket| ticket.is_empty())
 }
 
 /// Count authored commits reachable from the head of the legacy branch named
@@ -423,8 +403,8 @@ fn legacy_branch_head(pile: &mut Pile, name: &str) -> Option<CommitHandle> {
 
 #[cfg(test)]
 mod tests {
-    /// Historical namespace used by these open-admission fixtures.
-    fn test_namespace() -> VerifyingKey {
+    /// Authority used by these collection fixtures.
+    fn test_authority() -> ed25519_dalek::VerifyingKey {
         signer().verifying_key()
     }
 
@@ -472,6 +452,10 @@ mod tests {
         path
     }
 
+    fn current_collection(pile: &mut Pile, scope: Id) -> CollectionHandle {
+        crate::collection_names::open(pile, scope, test_authority()).unwrap()
+    }
+
     #[test]
     fn hint_fires_when_native_scope_is_empty_and_legacy_branch_has_history() {
         let directory = TempDir::new().unwrap();
@@ -479,11 +463,9 @@ mod tests {
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(
-            native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_namespace()),
-            Some(true)
-        );
-        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace())
+        let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
+        assert_eq!(native_scope_is_empty(&mut pile, collection), Some(true));
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection)
             .expect("a legacy-only pile must say so");
         pile.close().unwrap();
 
@@ -502,29 +484,41 @@ mod tests {
     }
 
     #[test]
-    fn any_verified_native_commit_suppresses_the_legacy_hint() {
+    fn only_an_authority_commit_suppresses_the_legacy_hint() {
         let directory = TempDir::new().unwrap();
         let path = new_pile(&directory);
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace()).is_some());
+        let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
+        assert!(legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection).is_some());
         let foreign = SigningKey::from_bytes(&[0x73; 32]);
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &crate::collection_names::root_descriptor(DEFAULT_SCOPE_ID, test_namespace()),
-            goal_fragment("open-admission native goal"),
+        pile.commit(
+            collection,
             &foreign,
+            goal_fragment("inert foreign native goal"),
         )
         .unwrap();
 
         assert_eq!(
-            native_scope_is_empty(&mut pile, DEFAULT_SCOPE_ID, test_namespace()),
+            native_scope_is_empty(&mut pile, collection),
+            Some(true),
+            "a foreign commit is resident but inert without a presentation"
+        );
+
+        pile.commit(
+            collection,
+            &signer(),
+            goal_fragment("authority native goal"),
+        )
+        .unwrap();
+        assert_eq!(
+            native_scope_is_empty(&mut pile, collection),
             Some(false),
-            "open admission accepts any strictly verified commit to the exact descriptor"
+            "the descriptor authority's commit is admitted directly"
         );
         assert_eq!(
-            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace()),
+            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection),
             None
         );
         pile.close().unwrap();
@@ -542,7 +536,7 @@ mod tests {
         use triblespace::core::inline::IntoInline;
         use triblespace::core::trible::Trible;
 
-        let current = crate::collection_names::root_descriptor(scope, test_namespace());
+        let current = crate::collection_names::root_descriptor(scope, test_authority());
         let root = ExclusiveId::force(current.root().expect("a descriptor has one root"));
         let mut facts = current.into_facts();
         facts.insert(&Trible::new(
@@ -573,7 +567,8 @@ mod tests {
         )
         .unwrap();
 
-        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace())
+        let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection)
             .expect("a pile whose collections cannot be found by name must say so");
         pile.close().unwrap();
 
@@ -601,7 +596,8 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         assert_eq!(any_scope_anchored_collection(&mut pile), Some(false));
-        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace()).unwrap();
+        let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
+        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection).unwrap();
         pile.close().unwrap();
 
         assert!(hint.contains("legacy-branches activate"), "{hint}");
@@ -615,17 +611,15 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         // A brand new pile has neither side.
+        let compass = current_collection(&mut pile, DEFAULT_SCOPE_ID);
         assert_eq!(
-            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, test_namespace()),
+            legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, compass),
             None
         );
         // A scope with no legacy predecessor never speaks, even when empty.
+        let orient = current_collection(&mut pile, crate::schemas::orient::DEFAULT_SCOPE_ID);
         assert_eq!(
-            legacy_migration_hint(
-                &mut pile,
-                crate::schemas::orient::DEFAULT_SCOPE_ID,
-                test_namespace()
-            ),
+            legacy_migration_hint(&mut pile, crate::schemas::orient::DEFAULT_SCOPE_ID, orient),
             None
         );
         pile.close().unwrap();

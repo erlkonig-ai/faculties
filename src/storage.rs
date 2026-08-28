@@ -24,13 +24,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::IntoBlob;
 #[cfg(test)]
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
     discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecordDiagnostic, CollectionStore,
+    CollectionRecordDiagnostic, CollectionStore, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
@@ -92,27 +90,25 @@ impl TargetDiscovery {
 
 /// Discover one target directly through the native collection-record store.
 ///
-/// The canonical descriptor and its collection handle are derived from `scope`
-/// and `namespace`; no definition registry, blob scan, or legacy pin lookup
-/// participates in target discovery.
+/// The canonical descriptor is built from `scope` and `authority`, registered
+/// through the store, and the returned handle selects records. No definition
+/// registry, blob scan, or legacy pin lookup participates in target discovery.
 ///
-/// The namespace is an identity-bearing descriptor fact, not an authorization
-/// decision. It is explicit because a collection named under the wrong key is
-/// a different collection that nothing else can find.
+/// Authority is an identity-bearing descriptor fact and the root for snapshot
+/// admission. A collection named under another authority is intentionally a
+/// different collection.
 pub fn discover_target<S>(
     store: &mut S,
     scope: Id,
-    namespace: VerifyingKey,
+    authority: VerifyingKey,
 ) -> Result<TargetDiscovery>
 where
-    S: CollectionStore,
+    S: CollectionStoreExt,
 {
-    let descriptor = crate::collection_names::root_descriptor(scope, namespace);
-    // Written out rather than reached for: core deliberately offers no helper
-    // for hashing a descriptor it did not store, because a handle computed
-    // beside a store instead of by it can name a collection whose descriptor is
-    // absent. Discovery only ever compares against this one.
-    let collection = IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
+    let descriptor = crate::collection_names::root_descriptor(scope, authority);
+    let collection = store
+        .collection(descriptor.clone())
+        .context("register target collection descriptor")?;
     let records =
         discover_collection_records(store).context("discover native collection records")?;
     let commits = records
@@ -188,8 +184,8 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
 /// The signer is loaded before the pile is touched. Facts become collection
 /// data, metafacts become signed commit metadata, and the fragment's shared
 /// blob store supplies attachments referenced by either channel. Publication
-/// is performed only by [`triblespace::core::collection::Collection::commit`],
-/// whose record identity makes exact replay idempotent.
+/// is performed only by [`CollectionStoreExt::commit`], whose record identity
+/// makes exact replay idempotent.
 pub fn publish_fragment(
     pile_path: &Path,
     key_path: Option<&Path>,
@@ -206,7 +202,7 @@ pub fn publish_fragment(
 ///
 /// This is the authored-commit migration path: the target pile is opened once,
 /// each input crosses the same narrow
-/// [`triblespace::core::collection::Collection::commit`] boundary, and the
+/// [`CollectionStoreExt::commit`] boundary, and the
 /// pile is closed even if a later publication fails. Replaying a prefix or the
 /// whole sequence is idempotent because both blobs and collection records are
 /// content addressed.
@@ -217,20 +213,20 @@ pub fn publish_fragments(
     fragments: impl IntoIterator<Item = Fragment>,
 ) -> Result<Vec<CollectionCommit>> {
     let signer = load_signer(pile_path, key_path)?;
-    let pile = open_pile_strict(pile_path)?;
-    let mut collection = crate::collection_names::open(pile, scope, signer);
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection = crate::collection_names::open(&mut pile, scope, signer.verifying_key())
+        .context("register native collection descriptor")?;
     let result = (|| {
         let mut commits = Vec::new();
         for fragment in fragments {
             commits.push(
-                collection
-                    .commit(fragment)
+                pile.commit(collection, &signer, fragment)
                     .context("publish native collection fragment")?,
             );
         }
         Ok(commits)
     })();
-    finish_pile(collection.into_storage(), result)
+    finish_pile(pile, result)
 }
 
 /// Render one non-mutating pile read failure without presenting data loss as
@@ -367,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn target_discovery_uses_descriptor_handle_without_registry_record() {
+    fn target_discovery_registers_descriptor_without_definition_record() {
         // Two REAL scopes rather than two arbitrary ids: a root is anchored by
         // a name now, and an id this build has never named is one it cannot
         // open at all. Any two distinct faculties prove the same thing.
@@ -427,7 +423,10 @@ mod tests {
         assert_eq!(discovered.merges(), &[target_merge]);
         assert_eq!(discovered.derives(), &[derive_to_target]);
         assert!(discovered.diagnostics().is_empty());
-        assert!(store.blobs.is_empty());
+        assert!(
+            !store.blobs.is_empty(),
+            "registration retains the descriptor attachment closure"
+        );
     }
 
     #[test]

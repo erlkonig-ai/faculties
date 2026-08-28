@@ -1,22 +1,24 @@
-//! The name each faculty's root collection is known by within its namespace.
+//! Canonical root descriptors for faculty collections.
 //!
 //! A root collection used to be anchored by an opaque minted scope id. It
 //! discriminated roots correctly and told a reader nothing: the id lived as a
 //! hex constant in one faculty's source, so "which collection is this?" was
-//! answerable only by someone holding the code. A root is now anchored by a
-//! NAME plus its historical namespace public key, and this is where a faculty
-//! says its name out loud.
+//! answerable only by someone holding the code. A root is now a self-describing
+//! fragment containing its name, mandatory authority, representation, recipe,
+//! and reach. The fragment's content handle is the collection identity.
 //!
 //! The scope ids have not gone anywhere — they remain each schema's stable
 //! identifier and the key this table is read by, because the migration that
 //! re-seats existing data has to speak both languages at once.
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 
 use triblespace::core::collection::reach;
-use triblespace::core::collection::records::CollectionName;
-use triblespace::core::collection::{simplearchive_union, Collection, CollectionAdmission};
+use triblespace::core::collection::{
+    simplearchive_union, CollectionHandle, CollectionRegistrationError, CollectionStoreExt,
+};
 use triblespace::core::id::Id;
+use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
 use triblespace::core::trible::Fragment;
 
 use crate::schemas::{
@@ -36,14 +38,7 @@ use crate::schemas::{
 /// default you never saw.
 ///
 /// **Everything here is [`reach::private`], and that is a decision rather than
-/// a default.** Two things force it. First, all of these collections already
-/// exist: their handles were computed from descriptors that named no reach, so
-/// declaring one public would not publish the collection, it would *rename*
-/// it, and every commit already written would belong to a collection nothing
-/// looks up any more. Publishing existing material is a re-commit into the new
-/// collection, deliberately, not a one-word edit here.
-///
-/// Second, and more interesting: most of the ones that plausibly want to
+/// a default.** Most of the collections that plausibly want to
 /// travel do not want [`reach::public`]. `message`, `status`, `relations` and
 /// `teams` coordinate peers on one team; what they want is "this team and
 /// no one else", which is a reach law that does not exist yet. Declaring them
@@ -101,13 +96,11 @@ pub fn table() -> Vec<(Id, &'static str, Fragment)> {
 }
 
 /// The name for one scope, or `None` if this build does not know it.
-pub fn name_for(scope: Id) -> Option<CollectionName> {
+pub fn name_for(scope: Id) -> Option<&'static str> {
     table()
         .into_iter()
         .find(|(candidate, _, _)| *candidate == scope)
-        .map(|(_, name, _)| {
-            CollectionName::new(name).expect("a name in this table is a legal collection name")
-        })
+        .map(|(_, name, _)| name)
 }
 
 /// How far one scope's collection travels, or `None` if this build does not
@@ -140,7 +133,7 @@ pub fn require_reach(scope: Id) -> Fragment {
 /// absence is a bug in this crate rather than anything a pile can cause. It is
 /// loud because the alternative — inventing a name — would root real data at a
 /// collection nothing else can find.
-pub fn require_name(scope: Id) -> CollectionName {
+pub fn require_name(scope: Id) -> &'static str {
     name_for(scope).unwrap_or_else(|| {
         panic!(
             "no collection name for scope {scope:X}; add it to \
@@ -149,30 +142,35 @@ pub fn require_name(scope: Id) -> CollectionName {
     })
 }
 
-/// The canonical root descriptor for one scope within `namespace`.
+/// The canonical root descriptor for one scope under `authority`.
 ///
-/// Existing faculties historically used the pile signer's public key for this
-/// namespace. It remains identity-bearing to preserve their collection
-/// handles, but authority is explicitly absent and admission is open.
-pub fn root_descriptor(scope: Id, namespace: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(&require_name(scope), namespace, None, require_reach(scope))
+/// The authority is a mandatory descriptor fact and therefore participates in
+/// the returned collection's content identity. There is no parallel namespace
+/// or caller-supplied admission policy which can disagree with it.
+pub fn root_descriptor(scope: Id, authority: VerifyingKey) -> Fragment {
+    simplearchive_union::descriptor(require_name(scope), authority, require_reach(scope))
 }
 
-/// Open one existing faculty collection under its historical local namespace.
+/// Register one faculty root and return its descriptor handle.
 ///
-/// Namespace and admission are both explicit. The namespace preserves the
-/// already-published descriptor handle; open admission means authorization is
-/// not inferred from it.
-pub fn open<S>(storage: S, scope: Id, signer: SigningKey) -> Collection<S> {
-    let namespace = signer.verifying_key();
-    Collection::new(
-        storage,
-        &require_name(scope),
-        namespace,
-        signer,
-        require_reach(scope),
-        CollectionAdmission::open(),
-    )
+/// Registration is idempotent and owns the descriptor's complete attachment
+/// closure. Later publication and snapshots take only the returned handle;
+/// the store remains owned by its caller.
+pub fn open<S>(
+    storage: &mut S,
+    scope: Id,
+    authority: VerifyingKey,
+) -> Result<
+    CollectionHandle,
+    CollectionRegistrationError<
+        <S as BlobStorePut>::PutError,
+        <S as ArtifactOfferStore>::OfferError,
+    >,
+>
+where
+    S: CollectionStoreExt,
+{
+    storage.collection(root_descriptor(scope, authority))
 }
 
 #[cfg(test)]
@@ -180,20 +178,19 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+
+    use ed25519_dalek::SigningKey;
     use triblespace::core::collection::descriptor;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::macros::entity;
 
     #[test]
-    fn every_name_is_legal_and_no_two_scopes_share_one() {
+    fn every_name_is_nonempty_and_no_two_scopes_share_one() {
         let mut names = BTreeSet::new();
         let mut scopes = BTreeSet::new();
         for (scope, name, _reach) in table() {
-            assert!(
-                CollectionName::new(name).is_ok(),
-                "{name} is not a legal collection name"
-            );
+            assert!(!name.is_empty());
             assert!(names.insert(name), "two scopes both claim the name {name}");
             assert!(scopes.insert(scope), "scope {scope:X} appears twice");
         }
@@ -205,31 +202,27 @@ mod tests {
     }
 
     #[test]
-    fn existing_roots_preserve_namespace_without_implying_authority() {
+    fn root_authority_is_identity_and_snapshot_admission() {
         let local = SigningKey::from_bytes(&[0x31; 32]);
         let foreign = SigningKey::from_bytes(&[0x73; 32]);
         let scope = wiki::DEFAULT_SCOPE_ID;
         let descriptor_fragment = root_descriptor(scope, local.verifying_key());
         assert_eq!(
-            descriptor::namespace(descriptor_fragment.facts())
-                .expect("a root descriptor has a namespace")
-                .expect("its namespace decodes"),
+            descriptor::authority(descriptor_fragment.facts()).unwrap(),
             local.verifying_key()
         );
-        assert!(descriptor::authority(descriptor_fragment.facts()).is_none());
 
         let evidence = entity! { _ @ metadata::tag: &scope };
         let expected = evidence.facts().clone();
         let mut store = MemoryRepo::default();
-        simplearchive_union::publish_fragment_commit(
-            &mut store,
-            &descriptor_fragment,
-            evidence,
-            &foreign,
-        )
-        .unwrap();
-        let mut collection = open(store, scope, local);
-        let materialized = collection.materialize().unwrap();
-        assert!(expected.difference(&materialized).is_empty());
+        let collection = store.collection(descriptor_fragment).unwrap();
+        store
+            .commit(collection, &foreign, evidence.clone())
+            .unwrap();
+        assert!(store.snapshot(collection, &[]).unwrap().facts().is_empty());
+
+        store.commit(collection, &local, evidence).unwrap();
+        let snapshot = store.snapshot(collection, &[]).unwrap();
+        assert!(expected.difference(snapshot.facts()).is_empty());
     }
 }
