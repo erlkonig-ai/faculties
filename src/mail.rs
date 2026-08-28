@@ -3196,6 +3196,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    use crate::legacy_hint::open_scope;
     use crate::relations::{self, ProfileInput};
     use crate::schemas::{
         decide as decide_schema, files as files_schema, mail as mail_schema,
@@ -3204,6 +3205,7 @@ mod tests {
     use crate::secrets::storage as vaults;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_open_collection_fixture;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::pile::{Pile, PileReader};
 
     fn id(byte: u8) -> Id {
@@ -3276,11 +3278,10 @@ mod tests {
                 .unwrap()
                 .into_parts()
                 .0;
-            let mut materialize = |scope| CollectionView {
-                facts: crate::collection_names::open(&mut pile, scope, signer.clone())
-                    .materialize()
-                    .unwrap(),
-                reader: pile.reader().unwrap(),
+            let mut materialize = |scope| {
+                let collection = open_scope(&mut pile, scope, &signer).unwrap();
+                let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+                CollectionView { facts, reader }
             };
             let views = Views {
                 mail: materialize(mail_schema::DEFAULT_SCOPE_ID),

@@ -853,6 +853,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::legacy_hint::open_scope;
     use crate::schemas::message::DEFAULT_SCOPE_ID;
     use crate::schemas::relations::{
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
@@ -860,6 +861,7 @@ mod tests {
     use crate::storage::{discover_target, open_pile_strict};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
+    use triblespace::core::collection::CollectionStoreExt;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1389,40 +1391,42 @@ mod tests {
         .0;
         let relation_facts = relations_fragment.facts().clone();
 
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut relations_collection =
-            crate::collection_names::open(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.clone());
-        relations_collection.commit(relations_fragment).unwrap();
-        let pile = relations_collection.into_storage();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let relations_collection =
+            open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer).unwrap();
+        pile.commit(relations_collection, &signer, relations_fragment)
+            .unwrap();
 
         let team = signer.verifying_key();
-        let mut messages = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
+        let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
         let (fragment, message_id) = message_fragment(
             sender,
             &Recipient::Person(recipient),
             "one immutable envelope",
             at_unix(15.0),
         );
-        let reader = messages.storage_mut().reader().unwrap();
+        let reader = pile.reader().unwrap();
         validate_catalog_union(&reader, &TribleSet::new(), &fragment, &relation_facts).unwrap();
         drop(reader);
 
-        let first = messages.commit(fragment.clone()).unwrap();
-        let second = messages.commit(fragment).unwrap();
+        let first = pile.commit(messages, &signer, fragment.clone()).unwrap();
+        let second = pile.commit(messages, &signer, fragment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            discover_target(messages.storage_mut(), DEFAULT_SCOPE_ID, team)
+            discover_target(&mut pile, DEFAULT_SCOPE_ID, team)
                 .unwrap()
                 .commits()
                 .len(),
             1
         );
-        let facts = messages.materialize().unwrap();
-        let reader = messages.storage_mut().reader().unwrap();
-        validate_catalog(&reader, &facts, &relation_facts).unwrap();
-        assert_eq!(load_message_rows(&facts).unwrap()[0].id, message_id);
-        drop(reader);
-        messages.into_storage().close().unwrap();
+        let snapshot = pile.snapshot(messages, &[]).unwrap();
+        validate_catalog(snapshot.reader(), snapshot.facts(), &relation_facts).unwrap();
+        assert_eq!(
+            load_message_rows(snapshot.facts()).unwrap()[0].id,
+            message_id
+        );
+        drop(snapshot);
+        pile.close().unwrap();
     }
 
     #[test]

@@ -1090,9 +1090,11 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStore;
 
+    use crate::legacy_hint::open_scope;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
     fn test_id(byte: u8) -> Id {
@@ -1112,11 +1114,14 @@ mod tests {
     }
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileReader) {
-        let facts = crate::collection_names::open(&mut *pile, scope, signer.clone())
-            .materialize()
-            .unwrap();
-        let reader = pile.reader().unwrap();
+        let collection = open_scope(pile, scope, signer).unwrap();
+        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
         (facts, reader)
+    }
+
+    fn commit(pile: &mut Pile, scope: Id, signer: &SigningKey, fragment: Fragment) {
+        let collection = open_scope(pile, scope, signer).unwrap();
+        pile.commit(collection, signer, fragment).unwrap();
     }
 
     #[test]
@@ -1140,9 +1145,7 @@ mod tests {
         let profile = default_profile(anchor, "default");
         let config = default_config(anchor);
         let (genesis, profile_head, _) = add_profile_fragment(&profile, &config, &[]).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(genesis)
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, genesis);
 
         let mut left = profile.clone();
         left.model = "left".to_owned();
@@ -1151,12 +1154,8 @@ mod tests {
         let (left_fragment, left_id) = profile_snapshot_fragment(&left, &[profile_head]).unwrap();
         let (right_fragment, right_id) =
             profile_snapshot_fragment(&right, &[profile_head]).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(left_fragment)
-            .unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(right_fragment)
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, left_fragment);
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, right_fragment);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
@@ -1167,12 +1166,8 @@ mod tests {
 
         let (left_join, left_join_id) = profile_snapshot_fragment(&profile, &[left_id]).unwrap();
         let (right_join, right_join_id) = profile_snapshot_fragment(&profile, &[right_id]).unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(left_join)
-            .unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(right_join)
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, left_join);
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, right_join);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
@@ -1195,9 +1190,7 @@ mod tests {
         let profile = default_profile(anchor, "only-profile");
         let mut profile_only = profile_anchor_fragment(anchor);
         profile_only += profile_snapshot_fragment(&profile, &[]).unwrap().0;
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(profile_only)
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, profile_only);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
@@ -1208,12 +1201,18 @@ mod tests {
         let first = default_config(anchor);
         let mut second = first.clone();
         second.author = "other".to_owned();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(config_snapshot_fragment(&first, &[]).unwrap().0)
-            .unwrap();
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(config_snapshot_fragment(&second, &[]).unwrap().0)
-            .unwrap();
+        commit(
+            &mut pile,
+            DEFAULT_SCOPE_ID,
+            &signer,
+            config_snapshot_fragment(&first, &[]).unwrap().0,
+        );
+        commit(
+            &mut pile,
+            DEFAULT_SCOPE_ID,
+            &signer,
+            config_snapshot_fragment(&second, &[]).unwrap().0,
+        );
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
         assert!(matches!(catalog.config, Resolution::Forked(ref heads) if heads.len() == 2));
@@ -1296,9 +1295,12 @@ mod tests {
         let mut profile = default_profile(anchor, "exact");
         profile.model_secret_version = Some(first_id);
         let config = default_config(anchor);
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(add_profile_fragment(&profile, &config, &[]).unwrap().0)
-            .unwrap();
+        commit(
+            &mut pile,
+            DEFAULT_SCOPE_ID,
+            &signer,
+            add_profile_fragment(&profile, &config, &[]).unwrap().0,
+        );
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
@@ -1321,9 +1323,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x53; 32]);
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(fragment)
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
         let mut empty = Fragment::empty();
@@ -1353,9 +1353,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x62; 32]);
-        crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(legacy.clone())
-            .unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, legacy.clone());
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         assert!(legacy.facts().iter().all(|fact| facts.contains(fact)));
         let catalog = project_result(&reader, &facts).unwrap();

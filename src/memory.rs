@@ -478,9 +478,19 @@ mod tests {
     use super::*;
     use std::fs::File;
 
+    use crate::legacy_hint::open_scope;
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
     use crate::storage::open_pile_strict;
     use crate::test_support::initialize_open_collection_fixture;
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+
+    fn collection(
+        pile: &mut triblespace::core::repo::pile::Pile,
+        signer: &SigningKey,
+    ) -> CollectionHandle {
+        open_scope(pile, DEFAULT_SCOPE_ID, signer).unwrap()
+    }
 
     fn point(seconds: f64) -> IntervalValue {
         let at = hifitime::Epoch::from_tai_seconds(seconds);
@@ -647,11 +657,8 @@ mod tests {
         File::create(&pile).unwrap();
         let signer = initialize_open_collection_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
-        let before = {
-            let mut collection =
-                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
-            collection.materialize().unwrap()
-        };
+        let collection = collection(&mut pile_store, &signer);
+        let before = pile_store.snapshot(collection, &[]).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
         let fragment = chunk_fragment(draft("resident only in fragment"))
             .unwrap()
@@ -659,16 +666,8 @@ mod tests {
         let catalog = validate_candidate(&reader, &before, &fragment).unwrap();
         assert_eq!(catalog.chunks.len(), 1);
 
-        {
-            let mut collection =
-                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
-            collection.commit(fragment).unwrap();
-        }
-        let after = {
-            let mut collection =
-                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
-            collection.materialize().unwrap()
-        };
+        pile_store.commit(collection, &signer, fragment).unwrap();
+        let after = pile_store.snapshot(collection, &[]).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
         let catalog = validate_catalog(&reader, &after).unwrap();
         assert_eq!(catalog.chunks.len(), 1);
@@ -687,16 +686,9 @@ mod tests {
         let (right, right_id) = chunk_fragment(draft("right")).unwrap();
         let mut initial = left;
         initial += right;
-        {
-            let mut collection =
-                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer.clone());
-            collection.commit(initial).unwrap();
-        }
-        let current = {
-            let mut collection =
-                crate::collection_names::open(&mut pile_store, DEFAULT_SCOPE_ID, signer);
-            collection.materialize().unwrap()
-        };
+        let collection = collection(&mut pile_store, &signer);
+        pile_store.commit(collection, &signer, initial).unwrap();
+        let current = pile_store.snapshot(collection, &[]).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
 
         for mutation in [

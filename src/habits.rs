@@ -13,7 +13,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -1153,42 +1153,34 @@ pub fn publish(
 ) -> Result<CollectionCommit> {
     validate_publication_fragment(&fragment)?;
     let signer = load_signer(pile_path, key_path)?;
-    let pile = open_pile_strict(pile_path)?;
-    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let current = collection
-            .materialize()
+        let snapshot = pile
+            .snapshot(collection, &[])
             .context("materialize native Habit collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Habit attachment reader")?;
-        validate_catalog_union(&reader, &current, &fragment)
+        validate_catalog_union(snapshot.reader(), snapshot.facts(), &fragment)
             .context("preflight complete Habit publication")?;
-        collection
-            .commit(fragment)
+        drop(snapshot);
+        pile.commit(collection, &signer, fragment)
             .context("commit complete Habit record")
     })();
-    finish_pile(collection.into_storage(), result)
+    finish_pile(pile, result)
 }
 
 /// Materialize the fixed collection through its durable signer and return the
 /// strict decoded set value.
 pub fn read_catalog(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog> {
     let signer = load_signer(pile_path, key_path)?;
-    let pile = open_pile_strict(pile_path)?;
-    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let facts = collection
-            .materialize()
+        let snapshot = pile
+            .snapshot(collection, &[])
             .context("materialize native Habit collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Habit attachment reader")?;
-        load_catalog(&reader, &facts).context("validate native Habit catalog")
+        load_catalog(snapshot.reader(), snapshot.facts()).context("validate native Habit catalog")
     })();
-    finish_pile(collection.into_storage(), result)
+    finish_pile(pile, result)
 }
 
 fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
@@ -1519,10 +1511,10 @@ mod tests {
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let team = signer.verifying_key();
-        let pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
-        assert_eq!(collection.descriptor().facts(), descriptor(team).facts());
-        collection.into_storage().close().unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        assert_eq!(collection, pile.collection(descriptor(team)).unwrap());
+        pile.close().unwrap();
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::path::Path;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -118,34 +118,30 @@ pub fn publish_events(
         validate_fragment(fragment).context("validate self-contained Cognition event")?;
     }
     let signer = load_signer(pile_path, key_path)?;
-    let pile = open_pile_strict(pile_path)?;
-    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let current = collection
-            .materialize()
+        let snapshot = pile
+            .snapshot(collection, &[])
             .context("materialize native Cognition collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Cognition attachment reader")?;
         let staged = fragments
             .iter()
             .fold(Fragment::empty(), |mut all, fragment| {
                 all += fragment.clone();
                 all
             });
-        validate_candidate(&reader, &current, &staged)
+        validate_candidate(snapshot.reader(), snapshot.facts(), &staged)
             .context("preflight authored Cognition events")?;
+        drop(snapshot);
         fragments
             .into_iter()
             .map(|fragment| {
-                collection
-                    .commit(fragment)
+                pile.commit(collection, &signer, fragment)
                     .context("commit authored Cognition event")
             })
             .collect()
     })();
-    finish_pile(collection.into_storage(), result)
+    finish_pile(pile, result)
 }
 
 /// Verify that one authored event is structurally valid and carries every
@@ -522,13 +518,12 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let facts = crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer)
-            .materialize()
-            .unwrap();
-        let reader = pile.reader().unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
         validate_catalog(&reader, &facts).unwrap();
         assert_eq!(facts, event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));
+        drop(reader);
         pile.close().unwrap();
     }
 

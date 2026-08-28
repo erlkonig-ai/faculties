@@ -18,7 +18,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -964,45 +964,34 @@ where
 /// Materialize the complete WRITE-authorized Files collection through an already
 /// open pile.
 ///
-/// The borrowed collection facade introduces no second pile handle and owns no
-/// lifecycle policy. Callers can drop the borrow immediately, continue using
-/// their source repository, and still retain the returned immutable reader for
-/// attachment access.
+/// Opening the scope introduces no second pile handle or lifecycle policy.
+/// The returned immutable reader is the same coherent snapshot which admitted
+/// the materialized facts.
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileReader)> {
-    let facts = open_scope(
-        &mut *pile,
-        crate::schemas::files::DEFAULT_SCOPE_ID,
-        signer.clone(),
-    )
-    .materialize()
-    .map_err(|error| anyhow!("materialize Files collection: {error}"))?;
-    let reader = pile
-        .reader()
-        .map_err(|error| anyhow!("open Files attachment reader: {error}"))?;
+    let collection = open_scope(pile, crate::schemas::files::DEFAULT_SCOPE_ID, signer)?;
+    let (facts, _, reader) = pile
+        .snapshot(collection, &[])
+        .map_err(|error| anyhow!("materialize Files collection: {error}"))?
+        .into_parts();
     Ok((facts, reader))
 }
 
 /// Publish one complete Files fragment through an already open pile.
 ///
-/// This is the Files-first boundary used by attachment producers. The native
-/// collection commit is crash-durable before this returns; callers may then
-/// publish the source occurrence or cursor through whatever independent
-/// collection/legacy path owns it.
+/// This is the Files-first boundary used by attachment producers. The signed
+/// record is appended before this returns; the caller retains ownership of the
+/// pile's flush/close boundary.
 pub fn commit_collection(
     pile: &mut Pile,
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    open_scope(
-        pile,
-        crate::schemas::files::DEFAULT_SCOPE_ID,
-        signer.clone(),
-    )
-    .commit(fragment)
-    .map_err(|error| anyhow!("commit Files collection fragment: {error}"))
+    let collection = open_scope(pile, crate::schemas::files::DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
+        .map_err(|error| anyhow!("commit Files collection fragment: {error}"))
 }
 
 #[cfg(test)]
@@ -1010,6 +999,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
 
@@ -1512,11 +1502,13 @@ mod tests {
     #[test]
     fn complete_fragment_survives_native_collection_commit_and_materialization() {
         let signer = SigningKey::generate(&mut OsRng);
-        let mut collection = crate::collection_names::open(
-            MemoryRepo::default(),
-            crate::schemas::files::DEFAULT_SCOPE_ID,
-            signer.clone(),
-        );
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(crate::collection_names::root_descriptor(
+                crate::schemas::files::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            ))
+            .unwrap();
         let file = stage(
             b"slides".to_vec(),
             "deck.pptx",
@@ -1526,11 +1518,15 @@ mod tests {
         let file_id = file.root().expect("file root");
 
         // The Fragment is the ownership unit: collapsing it into a TribleSet
-        // would discard its attachment store before Collection::commit can
-        // persist the closure.
-        collection.commit(file).expect("commit canonical file");
-        let catalog = collection.materialize().expect("materialize files");
-        let reader = collection.storage_mut().reader().expect("blob reader");
+        // would discard its attachment store before commit can persist the
+        // closure.
+        store
+            .commit(collection, &signer, file)
+            .expect("commit canonical file");
+        let (catalog, _, reader) = store
+            .snapshot(collection, &[])
+            .expect("materialize files")
+            .into_parts();
         let content_handle = find!(
             content: ContentHandle,
             pattern!(&catalog, [{ file_id @ file::content: ?content }])

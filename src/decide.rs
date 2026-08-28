@@ -827,10 +827,12 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
+    use crate::legacy_hint::open_scope;
     use crate::schemas::decide::DEFAULT_SCOPE_ID;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
+    use triblespace::core::collection::CollectionStoreExt;
 
     fn at(second: u8) -> IntervalValue {
         let epoch = Epoch::from_gregorian_utc(2026, 8, 8, 0, 0, second, 0);
@@ -868,11 +870,10 @@ mod tests {
 
         fn view(&self) -> TestView {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let pile = open_pile_strict(&self.pile).unwrap();
-            let mut collection = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
-            let facts = collection.materialize().unwrap();
-            let reader = collection.storage_mut().reader().unwrap();
-            collection.into_storage().close().unwrap();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+            let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+            pile.close().unwrap();
             TestView { facts, reader }
         }
     }
