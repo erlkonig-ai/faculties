@@ -28,6 +28,7 @@ use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
+use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
@@ -236,6 +237,7 @@ struct NativeCatalogs {
     mail: TribleSet,
     teams: TribleSet,
     compass: TribleSet,
+    compass_status: LwwIndex,
     relations: TribleSet,
     status: TribleSet,
     habits: habits::Catalog,
@@ -267,7 +269,8 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     // authorship, all of which are structural.
     let teams_facts = materialize_scope(pile, signer, TEAMS_SCOPE_ID, "Teams")?;
     let message_facts = materialize_scope(pile, signer, MESSAGE_SCOPE_ID, "Message")?;
-    let compass_facts = materialize_scope(pile, signer, COMPASS_SCOPE_ID, "Compass")?;
+    let (compass_facts, _compass_reader, compass_status) =
+        compass::materialize_indexed_collection(pile, signer)?.into_parts();
     let status_facts = materialize_scope(pile, signer, STATUS_SCOPE_ID, "Status")?;
     let habit_facts = materialize_scope(pile, signer, HABIT_SCOPE_ID, "Habit")?;
     let checkpoint_facts = materialize_scope(
@@ -300,6 +303,7 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         mail: mail_facts,
         teams: teams_facts,
         compass: compass_facts,
+        compass_status,
         relations: relations_facts,
         status: status_facts,
         habits,
@@ -645,9 +649,10 @@ fn render_native_compass_goals(
     let mut doing = Vec::<(usize, i128, Id)>::new();
     let mut todo = Vec::<(usize, i128, Id)>::new();
     for task in goals {
-        let (status, status_at) = latest_status_event(&catalogs.compass, task)
-            .map(|(_, value, at)| (value.to_ascii_lowercase(), Some(interval_key(at))))
-            .unwrap_or_else(|| ("todo".to_owned(), None));
+        let (status, status_at) =
+            latest_status_event(&catalogs.compass, &catalogs.compass_status, task)
+                .map(|(_, value, at)| (value.to_ascii_lowercase(), Some(interval_key(at))))
+                .unwrap_or_else(|| ("todo".to_owned(), None));
         let created = find!(
             at: IntervalValue,
             pattern!(&catalogs.compass, [{ task @ metadata::created_at: ?at }])
@@ -1090,7 +1095,7 @@ fn load_watched_view(
             relevant_goals.insert(id);
         }
 
-        let line = match latest_status_event(&catalogs.compass, id) {
+        let line = match latest_status_event(&catalogs.compass, &catalogs.compass_status, id) {
             Some((event, status, _)) => {
                 let by = find!(
                     by: Id,

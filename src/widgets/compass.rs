@@ -469,10 +469,13 @@ impl CompassBoard {
         let live = self.live.as_ref().expect("refreshed above");
 
         // Enumerate every goal with the collection's canonical effective
-        // status. Equal timestamps are resolved by event id in
-        // `latest_status_event`, exactly as in the CLI and independent of
-        // query iteration order.
+        // status. The storage boundary attached this index for the exact same
+        // source ticket; equal timestamps resolve by event id without doing
+        // the identity/order joins again here.
         let space = &live.space;
+        let status_register = dataset
+            .lww_register(compass::status_of.id(), metadata::created_at.id())
+            .expect("Compass datasets carry their maintained status register");
         let mut goals: Vec<(Id, String, i128)> = Vec::new();
         for (gid, _t, created) in find!(
             (gid: Id, _t: TextHandle, created: (i128, i128)),
@@ -483,7 +486,7 @@ impl CompassBoard {
                 metadata::created_at: ?created,
             }])
         ) {
-            let (status, sort_at) = latest_status_event(space, gid)
+            let (status, sort_at) = latest_status_event(space, status_register, gid)
                 .map(|(_, status, at)| (status, interval_key(at)))
                 .unwrap_or_else(|| ("todo".to_string(), created.0));
             goals.push((gid, status, sort_at));

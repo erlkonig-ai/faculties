@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -27,6 +28,53 @@ use crate::schemas::compass::{
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+
+/// One coherent Compass source snapshot plus its maintained status register.
+///
+/// Facts, commits, and blob reader are captured at one collection observation;
+/// the index is then attached for exactly that commit ticket. Maintained
+/// artifacts are cache exhaust, never additional semantic authority.
+pub struct CompassSnapshot {
+    facts: TribleSet,
+    reader: PileReader,
+    status: LwwIndex,
+}
+
+impl CompassSnapshot {
+    /// Materialized facts admitted by this exact snapshot.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// Blob reader captured while validating this exact snapshot.
+    pub fn reader(&self) -> &PileReader {
+        &self.reader
+    }
+
+    /// Maintained LWW order attached for this snapshot's commit ticket.
+    pub fn status_register(&self) -> &LwwIndex {
+        &self.status
+    }
+
+    /// Consume the coherent snapshot into facts, blob reader, and status index.
+    pub fn into_parts(self) -> (TribleSet, PileReader, LwwIndex) {
+        (self.facts, self.reader, self.status)
+    }
+}
+
+/// The exact maintained LWW projection used for current Compass status.
+pub fn status_register_collection(namespace: VerifyingKey) -> LwwRegisterCollection {
+    LwwRegisterCollection::new(
+        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
+        namespace,
+        None,
+        board::status_of.id(),
+        metadata::created_at.id(),
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+        None,
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+    )
+}
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
     if value.len() > 32 {
@@ -938,7 +986,36 @@ pub fn materialize_collection(
     Ok((facts, reader))
 }
 
+/// Capture Compass facts and attach the maintained status LWW index for that
+/// exact source ticket, constructing missing derived artifacts if necessary.
+pub fn materialize_indexed_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<CompassSnapshot> {
+    let snapshot = {
+        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+        collection
+            .snapshot()
+            .map_err(|error| anyhow!("snapshot Compass collection: {error}"))?
+    };
+    let (facts, ticket, reader) = snapshot.into_parts();
+    validate_known_payloads(&reader, &facts)?;
+    let status = status_register_collection(signer.verifying_key())
+        .ensure_exact(pile, &ticket)
+        .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
+    Ok(CompassSnapshot {
+        facts,
+        reader,
+        status,
+    })
+}
+
 /// Publish one complete Compass action through an already-open pile.
+///
+/// Maintained status artifacts are deliberately attached at read boundaries.
+/// Once this returns, the authoritative commit is durable; cache maintenance
+/// must never turn that success into an error which tempts a caller to retry
+/// the semantic action.
 pub fn commit_collection(
     pile: &mut Pile,
     signer: &SigningKey,

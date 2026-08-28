@@ -7,15 +7,19 @@
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
 //! not participate in this boundary. The interactive viewer loads the full
 //! catalog; focused capture binaries request only their source dependency
-//! closure. Most sources are fixed descriptor-handle collections. Secrets is
-//! deliberately different: it is the aggregate of exact vault epochs for
-//! which the pile signer has one verified exact `READ` capability.
+//! closure. Loading may ensure deterministic derived indexes for the exact
+//! admitted ticket; those unsigned artifacts are cache exhaust, not an
+//! authoritative write path. Most sources are fixed descriptor-handle
+//! collections. Secrets is deliberately different: it is the aggregate of
+//! exact vault epochs for which the pile signer has one verified exact `READ`
+//! capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::collection::CollectionHandle;
+use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::{CollectionCommit, CollectionHandle};
 use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::trible::TribleSet;
@@ -187,6 +191,14 @@ pub struct DatasetView<'a> {
     pub facts: &'a TribleSet,
     pub reader: &'a PileReader,
     pub revision: DatasetRevision,
+    lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
+}
+
+impl DatasetView<'_> {
+    /// Maintained LWW order for the requested identity and order attributes.
+    pub fn lww_register(&self, identity: Id, orders: Id) -> Option<&LwwIndex> {
+        self.lww_registers.get(&(identity, orders))
+    }
 }
 
 /// Keyed borrowed inputs for one viewer render.
@@ -231,15 +243,22 @@ struct LoadedDataset {
     facts: TribleSet,
     reader: PileReader,
     revision: DatasetRevision,
+    lww_registers: BTreeMap<(Id, Id), LwwIndex>,
 }
 
 impl LoadedDataset {
-    fn new(collection: CollectionHandle, facts: TribleSet, reader: PileReader) -> Self {
+    fn new(
+        collection: CollectionHandle,
+        facts: TribleSet,
+        reader: PileReader,
+        lww_registers: BTreeMap<(Id, Id), LwwIndex>,
+    ) -> Self {
         let revision = DatasetRevision::from_collection(collection, &facts);
         Self {
             facts,
             reader,
             revision,
+            lww_registers,
         }
     }
 
@@ -248,6 +267,7 @@ impl LoadedDataset {
             facts: &self.facts,
             reader: &self.reader,
             revision: self.revision,
+            lww_registers: &self.lww_registers,
         }
     }
 }
@@ -621,10 +641,12 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, (CollectionHandle, TribleSet)>::new();
+        let mut by_scope =
+            BTreeMap::<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>::new();
+        let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
 
         for (scope, label) in materialization_scopes(sources) {
-            let (collection_id, facts) = {
+            let (collection_id, facts, commits) = {
                 let mut collection = open_scope(&mut pile, scope, signer.clone());
                 // Written out rather than reached for: core deliberately offers
                 // no helper for hashing a descriptor it did not store. This one
@@ -634,12 +656,26 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                         triblespace::core::blob::encodings::simplearchive::SimpleArchive,
                     >::to_blob(collection.descriptor().facts().clone())
                     .get_handle();
-                let facts = collection
-                    .materialize()
+                let snapshot = collection
+                    .snapshot()
                     .map_err(|error| format!("materialize {label} collection: {error}"))?;
-                (collection_id, facts)
+                let (facts, commits, _reader) = snapshot.into_parts();
+                (collection_id, facts, commits)
             };
-            by_scope.insert(scope, (collection_id, facts));
+            by_scope.insert(scope, (collection_id, facts, commits));
+        }
+
+        if let Some((_, _, commits)) = by_scope.get(&COMPASS_SCOPE_ID) {
+            let index = crate::compass::status_register_collection(signer.verifying_key())
+                .ensure_exact(&mut pile, commits)
+                .map_err(|error| format!("maintain Compass status register: {error}"))?;
+            lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
+                (
+                    crate::schemas::compass::board::status_of.id(),
+                    triblespace::core::metadata::created_at.id(),
+                ),
+                index,
+            );
         }
 
         let secrets = sources
@@ -665,12 +701,13 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             .iter()
             .filter(|source| sources.contains(&source.key))
             .map(|source| {
-                let (collection, facts) = by_scope
+                let (collection, facts, _) = by_scope
                     .get(&source.scope)
                     .expect("every fixed viewer scope was materialized");
+                let lww_registers = lww_by_scope.get(&source.scope).cloned().unwrap_or_default();
                 (
                     source.key,
-                    LoadedDataset::new(*collection, facts.clone(), reader.clone()),
+                    LoadedDataset::new(*collection, facts.clone(), reader.clone(), lww_registers),
                 )
             })
             .collect();
@@ -688,7 +725,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 
 fn validate_catalog(
     reader: &PileReader,
-    by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet)>,
+    by_scope: &BTreeMap<Id, (CollectionHandle, TribleSet, Vec<CollectionCommit>)>,
     sources: &BTreeSet<SourceKey>,
     secrets: Option<&SecretsSnapshot<PileReader>>,
 ) -> Result<(), String> {
