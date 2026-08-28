@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki::{self as wiki_model, FrontierEntry, FrontierModel, LinkResolution};
-use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
