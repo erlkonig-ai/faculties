@@ -252,4 +252,8 @@ pub mod source_projection {
     /// Gemini Antigravity transcript source namespace. Minted with `trible
     /// genid` on 2026-08-17.
     pub const SOURCE_AGY: Id = id_hex!("29D3BFFAF4AC6C2AD2EFD1C7D22B60FB");
+
+    /// Native Drive cognition source namespace. Minted with `trible genid` on
+    /// 2026-08-27.
+    pub const SOURCE_DRIVE: Id = id_hex!("3F9B847D70B5720F81DD303499F95898");
 }
