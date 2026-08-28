@@ -167,7 +167,6 @@ impl DatasetRevision {
                 .vault_exact(*collection)
                 .expect("every ready vault location has one snapshot");
             hasher.update(&location.vault().raw());
-            hasher.update(&location.namespace().to_bytes());
             hasher.update(&location.authority().to_bytes());
             hasher.update(&location.collection().raw);
             match snapshot.facts().fingerprint().as_u128() {
