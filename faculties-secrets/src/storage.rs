@@ -29,7 +29,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileReader};
 use triblespace::core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
+    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
 };
 use triblespace::prelude::*;
 
@@ -428,7 +428,7 @@ where
 /// it for an authorization decision.
 pub fn persist_proof_bundle<S>(store: &mut S, bundle: &CapabilityProofBundle) -> Result<()>
 where
-    S: BlobStorePut + CapabilityProofStore,
+    S: ArtifactOfferStore + BlobStorePut + CapabilityProofStore,
 {
     let handles = bundle.proof().claim_handles().collect::<Vec<_>>();
     if handles.len() != bundle.claims().len() {
@@ -438,6 +438,7 @@ where
             bundle.claims().len()
         );
     }
+    let mut claims = Vec::with_capacity(handles.len());
     for (step, (expected, claim)) in handles.into_iter().zip(bundle.claims()).enumerate() {
         let actual = store
             .put::<SimpleArchive, _>(claim.clone())
@@ -445,7 +446,11 @@ where
         if actual != expected {
             bail!("capability claim {step} does not match its proof handle");
         }
+        claims.push(actual.transmute());
     }
+    store
+        .offer_all(claims)
+        .map_err(|error| anyhow!("offer capability proof claim closure: {error}"))?;
     store
         .insert_proof(bundle.proof().clone())
         .map_err(|error| anyhow!("persist exact capability proof: {error}"))
@@ -1304,6 +1309,26 @@ mod tests {
     fn at(second: i64) -> IntervalValue {
         let epoch = Epoch::from_unix_seconds(second as f64);
         (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    #[test]
+    fn proof_claims_are_offered_before_the_proof_becomes_discoverable() {
+        let founder = key(99);
+        let location = VaultLocation::new(id(99), founder.verifying_key());
+        let (read, _) = founder_proofs(&founder, location);
+        let expected = read.proof().claim_handles().collect::<Vec<_>>();
+        let mut store = MemoryRepo::default();
+
+        persist_proof_bundle(&mut store, &read).unwrap();
+
+        let offers = store.offers_snapshot().unwrap();
+        assert!(expected
+            .into_iter()
+            .all(|claim| offers.contains(claim.transmute())));
+        assert_eq!(
+            store.proof(read.proof().id()).unwrap(),
+            Some(read.proof().clone())
+        );
     }
 
     #[test]
