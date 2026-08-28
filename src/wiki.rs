@@ -12,8 +12,10 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
+use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetCollection};
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
+use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
@@ -171,6 +173,58 @@ pub struct WikiCatalog {
     pub revisions: RevisionReadModel,
     pub tag_names: BTreeMap<Id, TextHandle>,
     pub author_keys: BTreeMap<Id, PublicKeyValue>,
+}
+
+/// One coherent Wiki source snapshot and its exact maintained observation order.
+///
+/// Facts, commits, and reader are captured by one collection observation. The
+/// observed-set projection is then attached for exactly that commit ticket;
+/// its unsigned artifacts are cache exhaust and never additional authority.
+pub struct WikiSnapshot {
+    facts: TribleSet,
+    reader: PileReader,
+    observed: ObservedIndex,
+    catalog: WikiCatalog,
+}
+
+impl WikiSnapshot {
+    /// Materialized facts admitted by this exact snapshot.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// Blob reader captured while validating this exact snapshot.
+    pub fn reader(&self) -> &PileReader {
+        &self.reader
+    }
+
+    /// Maintained observation order attached for this snapshot's ticket.
+    pub fn observed(&self) -> &ObservedIndex {
+        &self.observed
+    }
+
+    /// Strict Wiki read model resolved through the maintained observation order.
+    pub fn catalog(&self) -> &WikiCatalog {
+        &self.catalog
+    }
+
+    /// Consume the coherent snapshot into its application-facing parts.
+    pub fn into_parts(self) -> (TribleSet, PileReader, ObservedIndex, WikiCatalog) {
+        (self.facts, self.reader, self.observed, self.catalog)
+    }
+}
+
+/// Exact maintained dominated-set projection used for Wiki frontiers.
+pub fn observed_collection(namespace: VerifyingKey) -> ObservedSetCollection {
+    ObservedSetCollection::new(
+        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
+        namespace,
+        None,
+        metadata::supersedes.id(),
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+        None,
+        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,12 +433,15 @@ fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
 /// it is append-only — and the additive migration still consumes them as legacy
 /// input, but no read path in the wiki resolves one.
 ///
-/// Each entry's frontier is [`latest`] over `space` — the shared query-layer
+/// Each entry's frontier is [`resolve`] over `order` — the shared query-layer
 /// operation, not a local rule. Asking it per component rather than once over
 /// every revision is only a scoping convenience: a supersedes edge always
 /// unites its endpoints above, so no revision can be observed from outside its
 /// own component and the two framings agree by construction.
-fn entry_records(space: &TribleSet, revisions: &BTreeMap<Id, RevisionRecord>) -> Vec<EntryRecord> {
+fn entry_records<O>(order: &O, revisions: &BTreeMap<Id, RevisionRecord>) -> Vec<EntryRecord>
+where
+    O: RegisterOrder + ?Sized,
+{
     let mut parent: BTreeMap<Id, Id> = revisions.keys().map(|id| (*id, *id)).collect();
 
     fn root(parent: &mut BTreeMap<Id, Id>, id: Id) -> Id {
@@ -438,10 +495,9 @@ fn entry_records(space: &TribleSet, revisions: &BTreeMap<Id, RevisionRecord>) ->
             })
             .collect();
         roots.sort_unstable();
-        let frontier_ids: Vec<Id> =
-            latest(space, metadata::supersedes.id(), members.iter().copied())
-                .into_iter()
-                .collect();
+        let frontier_ids: Vec<Id> = resolve(order, members.iter().copied())
+            .into_iter()
+            .collect();
         let frontier = frontier_ids
             .iter()
             .filter_map(|id| revisions.get(id).cloned())
@@ -456,8 +512,12 @@ fn entry_records(space: &TribleSet, revisions: &BTreeMap<Id, RevisionRecord>) ->
     entries
 }
 
-/// Load both immutable native revisions and preserved legacy version entities.
-pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
+/// Load both immutable native revisions and preserved legacy version entities
+/// using a caller-supplied supersession order.
+pub fn load_catalog_with_order<O>(space: &TribleSet, order: &O) -> Result<WikiCatalog>
+where
+    O: RegisterOrder + ?Sized,
+{
     let fact_index = entity_fact_index(space);
     let native = ids_of_kind(space, KIND_REVISION);
     let legacy = ids_of_kind(space, KIND_VERSION_ID);
@@ -578,6 +638,24 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
         revision.authorships.sort_by_key(|record| record.id);
     }
 
+    for fact in space
+        .iter()
+        .filter(|fact| fact.a() == &metadata::supersedes.id())
+    {
+        let successor = *fact.e();
+        let predecessor: Id = fact
+            .v::<inlineencodings::GenId>()
+            .try_from_inline()
+            .map_err(|error| {
+                anyhow!("Wiki supersedes target on {successor:x} is not an id: {error:?}")
+            })?;
+        if !revisions.contains_key(&successor) {
+            bail!("Wiki supersedes source {successor:x} is not a known Wiki revision");
+        }
+        if !revisions.contains_key(&predecessor) {
+            bail!("Wiki supersedes target {predecessor:x} is not a known Wiki revision");
+        }
+    }
     validate_graph(&revisions)?;
 
     let mut author_keys: BTreeMap<Id, PublicKeyValue> = BTreeMap::new();
@@ -650,12 +728,21 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
         }
     }
 
-    let entries = entry_records(space, &revisions);
+    let entries = entry_records(order, &revisions);
     Ok(WikiCatalog {
         revisions: RevisionReadModel { revisions, entries },
         tag_names,
         author_keys,
     })
+}
+
+/// Load a Wiki catalog by querying its supersession relation directly.
+///
+/// This is the intentional JIT path for validating an unpublished candidate:
+/// its newly staged edges cannot yet be present in a durable maintained index.
+pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
+    let order = ObservationOrder::new(space, metadata::supersedes.id());
+    load_catalog_with_order(space, &order)
 }
 
 fn read_text_overlay<Overlay>(
@@ -728,6 +815,21 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 
 pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<WikiCatalog> {
     let catalog = load_catalog(facts)?;
+    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    Ok(catalog)
+}
+
+/// Validate one Wiki fact snapshot using an already attached supersession
+/// order for exactly that snapshot's commit ticket.
+pub fn validate_catalog_with_order<O>(
+    reader: &PileReader,
+    facts: &TribleSet,
+    order: &O,
+) -> Result<WikiCatalog>
+where
+    O: RegisterOrder + ?Sized,
+{
+    let catalog = load_catalog_with_order(facts, order)?;
     validate_payloads(reader, None::<&PileReader>, &catalog)?;
     Ok(catalog)
 }
@@ -1289,6 +1391,37 @@ pub fn materialize_collection(
     Ok((facts, reader))
 }
 
+/// Capture and validate one durable Wiki snapshot with its exact maintained
+/// supersession index.
+///
+/// The source facts, commit ticket, and attachment reader come from one
+/// [`Collection::snapshot`](triblespace::core::collection::Collection::snapshot)
+/// observation. Index maintenance happens only afterward and is attached to
+/// that exact ticket, so it cannot change which authoritative commits this
+/// read admits even if newer commits arrive concurrently.
+pub fn materialize_indexed_collection(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<WikiSnapshot> {
+    let snapshot = {
+        let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
+        collection
+            .snapshot()
+            .map_err(|error| anyhow!("snapshot Wiki collection: {error}"))?
+    };
+    let (facts, ticket, reader) = snapshot.into_parts();
+    let observed = observed_collection(signer.verifying_key())
+        .ensure_exact(pile, &ticket)
+        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
+    let catalog = validate_catalog_with_order(&reader, &facts, &observed)?;
+    Ok(WikiSnapshot {
+        facts,
+        reader,
+        observed,
+        catalog,
+    })
+}
+
 pub fn commit_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1329,6 +1462,16 @@ mod tests {
             author,
             authored_at: at(1.0),
         }
+    }
+
+    fn observed_index(facts: &TribleSet) -> ObservedIndex {
+        let archive = facts.clone().to_blob();
+        let observed = triblespace::core::collection::observed_union::derive_element(
+            &archive,
+            metadata::supersedes.id(),
+        )
+        .unwrap();
+        ObservedIndex::decode(&observed).unwrap()
     }
 
     #[test]
@@ -1389,6 +1532,114 @@ mod tests {
         let history = model.history(entry);
         assert_eq!(history.first().map(|record| record.id), Some(root));
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn maintained_order_matches_jit_across_fork_and_merge() {
+        let signer = SigningKey::from_bytes(&[31; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+        let (left_fragment, left) = revision_record(draft(author, "left", [root])).unwrap();
+        let (right_fragment, right) = revision_record(draft(author, "right", [root])).unwrap();
+        let (merge_fragment, merge) =
+            revision_record(draft(author, "merge", [left, right])).unwrap();
+
+        let mut fork = author_fragment + root_fragment + left_fragment + right_fragment;
+        let fork_index = observed_index(fork.facts());
+        assert_eq!(
+            load_catalog_with_order(fork.facts(), &fork_index).unwrap(),
+            load_catalog(fork.facts()).unwrap()
+        );
+        assert_eq!(
+            resolve(&fork_index, [root, left, right]),
+            BTreeSet::from([left, right])
+        );
+
+        fork += merge_fragment;
+        let merge_index = observed_index(fork.facts());
+        assert_eq!(
+            load_catalog_with_order(fork.facts(), &merge_index).unwrap(),
+            load_catalog(fork.facts()).unwrap()
+        );
+        assert_eq!(
+            resolve(&merge_index, [root, left, right, merge]),
+            BTreeSet::from([merge])
+        );
+    }
+
+    #[test]
+    fn supersedes_rejects_non_revision_sources_and_targets() {
+        let legacy = genid().id;
+        let outsider = genid().id;
+        let base = entity! { ExclusiveId::force_ref(&legacy) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::title: "legacy".to_blob().get_handle(),
+            attrs::content: "body".to_blob().get_handle(),
+            metadata::created_at: at(1.0),
+        };
+
+        let mut bad_source = base.facts().clone();
+        bad_source += entity! { ExclusiveId::force_ref(&outsider) @
+            metadata::supersedes: legacy,
+        }
+        .into_facts();
+        assert!(load_catalog(&bad_source)
+            .unwrap_err()
+            .to_string()
+            .contains("supersedes source"));
+
+        let mut bad_target = base.into_facts();
+        bad_target += entity! { ExclusiveId::force_ref(&legacy) @
+            metadata::supersedes: outsider,
+        }
+        .into_facts();
+        assert!(load_catalog(&bad_target)
+            .unwrap_err()
+            .to_string()
+            .contains("supersedes target"));
+    }
+
+    #[test]
+    fn exact_snapshot_index_does_not_advance_authority_or_stage_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wiki.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[32; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
+        let ticket_before = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .ticket()
+            .unwrap();
+        let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
+        let ticket_after_index = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .ticket()
+            .unwrap();
+        assert_eq!(ticket_after_index, ticket_before);
+        assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
+
+        let (successor_fragment, successor) =
+            revision_record(draft(author, "successor", [root])).unwrap();
+        let staged = validate_candidate(
+            snapshot.reader(),
+            snapshot.facts(),
+            &successor_fragment,
+            author,
+        )
+        .unwrap();
+        assert_eq!(staged.revisions.all_entries()[0].frontier[0].id, successor);
+        assert_eq!(
+            resolve(snapshot.observed(), [root]),
+            BTreeSet::from([root]),
+            "staged validation must not mutate the attached durable order"
+        );
+        let ticket_after_stage = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
+            .ticket()
+            .unwrap();
+        assert_eq!(ticket_after_stage, ticket_before);
+        pile.close().unwrap();
     }
 
     #[test]
