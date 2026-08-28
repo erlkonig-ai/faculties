@@ -12,7 +12,7 @@ use faculties::legacy_hint::open_scope;
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -118,30 +118,37 @@ struct CollectionView {
 }
 
 impl DecideStorage<'_> {
-    fn with_collection<T>(
+    fn with_store<T>(
         &self,
-        operation: impl FnOnce(&mut Collection<Pile>, &CollectionView) -> Result<T>,
+        operation: impl FnOnce(
+            &mut Pile,
+            CollectionHandle,
+            &ed25519_dalek::SigningKey,
+            &CollectionView,
+        ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (facts, _ticket, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
                 .context("materialize authored Decide collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Decide attachment reader")?;
             decide::validate_catalog(&reader, &facts)
                 .context("validate authored Decide collection")?;
-            operation(&mut collection, &CollectionView { facts, reader })
+            operation(
+                &mut pile,
+                collection,
+                &signer,
+                &CollectionView { facts, reader },
+            )
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
-        self.with_collection(|_, view| operation(view))
+        self.with_store(|_, _, _, view| operation(view))
     }
 
     fn update<T>(
@@ -149,13 +156,12 @@ impl DecideStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&CollectionView) -> Result<(Fragment, T)>,
     ) -> Result<T> {
-        self.with_collection(|collection, view| {
+        self.with_store(|pile, collection, signer, view| {
             let (mut fragment, value) = operation(view)?;
             decide::validate_catalog_union(&view.reader, &view.facts, &fragment)
                 .context("preflight authored Decide union")?;
             fragment.describe_with(entity! { metadata::description: description });
-            collection
-                .commit(fragment)
+            pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
             Ok(value)
         })

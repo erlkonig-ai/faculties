@@ -48,7 +48,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::macros::entity;
@@ -205,30 +205,37 @@ impl RelationsStorage<'_> {
     /// Keep planning, union validation, and publication on one observed pile
     /// prefix. No repository workspace, branch head, CAS cell, or reopen sits
     /// between the semantic decision and its signed collection commit.
-    fn with_collection<T>(
+    fn with_store<T>(
         &self,
-        operation: impl FnOnce(&mut Collection<Pile>, &RelationsView) -> Result<T>,
+        operation: impl FnOnce(
+            &mut Pile,
+            CollectionHandle,
+            &ed25519_dalek::SigningKey,
+            &RelationsView,
+        ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let (facts, _ticket, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
                 .context("materialize authored Relations collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Relations blob reader")?;
             relations::validate_catalog(&reader, &facts)
                 .context("validate authored Relations collection")?;
-            operation(&mut collection, &RelationsView { facts, reader })
+            operation(
+                &mut pile,
+                collection,
+                &signer,
+                &RelationsView { facts, reader },
+            )
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
-        self.with_collection(|_, view| operation(view))
+        self.with_store(|_, _, _, view| operation(view))
     }
 
     /// Validate and publish at most one complete Relations fragment.
@@ -237,14 +244,13 @@ impl RelationsStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&RelationsView) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_collection(|collection, view| {
+        self.with_store(|pile, collection, signer, view| {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
                 relations::validate_catalog_union(&view.reader, &view.facts, &fragment)
                     .context("preflight authored Relations union")?;
                 fragment.describe_with(entity! { metadata::description: description });
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
             }
             Ok(value)
@@ -266,14 +272,15 @@ impl RelationsStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
-        let team = signer.verifying_key();
-        let result = storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, team).map(|target| {
-            target
+        let result = (|| {
+            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let ticket = pile.ticket(collection, &[])?;
+            Ok(ticket
                 .commits()
                 .iter()
                 .filter(|commit| commit.public_key().raw == author)
-                .count()
-        });
+                .count())
+        })();
         finish_pile(pile, result)
     }
 }

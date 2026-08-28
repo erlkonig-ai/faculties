@@ -34,10 +34,10 @@ use std::process::Command as PCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -435,32 +435,13 @@ impl BodyStorage<'_> {
         }
     }
 
-    fn with_collection<T>(&self, f: impl FnOnce(&mut Collection<Pile>) -> Result<T>) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
-        let result = f(&mut collection);
-        let close = collection.into_storage().close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
-    }
-
     fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
-        self.with_collection(|collection| {
-            let facts = collection
-                .materialize()
+        self.with_pile(|pile, signer| {
+            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let snapshot = pile
+                .snapshot(collection, &[])
                 .context("materialize Body collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Body blob reader")?;
-            f(&facts, &reader)
+            f(snapshot.facts(), snapshot.reader())
         })
     }
 
@@ -660,11 +641,16 @@ fn felt_fragment(
     fragment
 }
 
-fn keep_felt(collection: &mut Collection<Pile>, felt: &Felt, note: Option<&str>) -> Result<()> {
+fn keep_felt(
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &ed25519_dalek::SigningKey,
+    felt: &Felt,
+    note: Option<&str>,
+) -> Result<()> {
     let fragment = felt_fragment(felt, note, now_tai()?);
     let id = fragment.root().expect("capture id");
-    collection
-        .commit(fragment)
+    pile.commit(collection, signer, fragment)
         .context("publish felt Body capture")?;
     println!("  kept it — {}", &fmt_id(id)[..12]);
     Ok(())
@@ -752,12 +738,11 @@ fn cmd_intent(storage: BodyStorage<'_>, text: Option<&str>) -> Result<()> {
 }
 
 fn cmd_feel(
-    mut collection: Option<&mut Collection<Pile>>,
+    mut keep: Option<&mut dyn FnMut(&Felt) -> Result<()>>,
     daemon: &str,
     secs: Option<f64>,
     loop_: bool,
     respond: bool,
-    note: Option<&str>,
 ) -> Result<()> {
     if loop_ {
         let session = secs.unwrap_or(300.0);
@@ -778,8 +763,8 @@ fn cmd_feel(
                         eprintln!("  (couldn't wiggle back: {e})");
                     }
                 }
-                if let Some(writer) = collection.as_deref_mut() {
-                    keep_felt(writer, &felt, note)?;
+                if let Some(keep) = keep.as_mut() {
+                    keep(&felt)?;
                 }
             }
         }
@@ -808,8 +793,8 @@ fn cmd_feel(
                 eprintln!("  (couldn't wiggle back: {e})");
             }
         }
-        if let Some(writer) = collection.as_deref_mut() {
-            keep_felt(writer, &felt, note)?;
+        if let Some(keep) = keep.as_mut() {
+            keep(&felt)?;
         }
     } else {
         println!(
@@ -1138,18 +1123,14 @@ fn main() -> Result<()> {
         }) => {
             if keep {
                 let storage = require_storage(pile.as_deref(), key.as_deref())?;
-                storage.with_collection(|collection| {
-                    cmd_feel(
-                        Some(collection),
-                        &daemon,
-                        secs,
-                        loop_,
-                        respond,
-                        note.as_deref(),
-                    )
+                storage.with_pile(|pile, signer| {
+                    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+                    let mut keep_touch =
+                        |felt: &Felt| keep_felt(pile, collection, signer, felt, note.as_deref());
+                    cmd_feel(Some(&mut keep_touch), &daemon, secs, loop_, respond)
                 })?;
             } else {
-                cmd_feel(None, &daemon, secs, loop_, respond, note.as_deref())?;
+                cmd_feel(None, &daemon, secs, loop_, respond)?;
             }
         }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
@@ -1290,9 +1271,8 @@ mod tests {
 
         let first = intent_fragment("first", at_unix(1_750_000_000.0));
         let first_id = first.root().unwrap();
-        open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(first)
-            .unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        pile.commit(collection, &signer, first).unwrap();
         let before = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
         assert_eq!(
             body_model::latest_intent(before.catalog(), before.intent_register())
@@ -1304,9 +1284,7 @@ mod tests {
 
         let second = intent_fragment("second", at_unix(1_760_000_000.0));
         let second_id = second.root().unwrap();
-        open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .commit(second)
-            .unwrap();
+        pile.commit(collection, &signer, second).unwrap();
         let after = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
 
         assert_eq!(

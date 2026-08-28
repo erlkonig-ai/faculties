@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::files as file_capability;
 use faculties::legacy_hint::open_scope;
@@ -14,10 +15,10 @@ use hifitime::Epoch;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::Collection;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
@@ -335,20 +336,22 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
 
 // ── native collection boundary ───────────────────────────────────────────
 
-/// Open the WRITE-authorized Files collection for append-only work, then close its
-/// pile exactly once. Commands that construct a complete fragment locally do
-/// not pay to reconstruct the existing collection value.
-fn with_files_collection<T>(
+/// Register the Files collection for append-only work, then close its pile
+/// exactly once. Commands that construct a complete fragment locally do not
+/// pay to reconstruct the existing collection value.
+fn with_files_store<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Collection<Pile>) -> Result<T>,
+    f: impl FnOnce(&mut Pile, CollectionHandle, &SigningKey) -> Result<T>,
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
     let signer = load_signer(pile, None)?;
-    let storage = open_pile_strict(pile)?;
-    let mut collection = open_scope(storage, DEFAULT_SCOPE_ID, signer);
-    let result = f(&mut collection);
-    let close = collection.into_storage().close();
+    let mut storage = open_pile_strict(pile)?;
+    let result = (|| {
+        let collection = open_scope(&mut storage, DEFAULT_SCOPE_ID, &signer)?;
+        f(&mut storage, collection, &signer)
+    })();
+    let close = storage.close();
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
@@ -363,17 +366,14 @@ fn with_files_collection<T>(
 /// mutation depends on facts already present in the collection.
 fn with_files_view<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Collection<Pile>, &TribleSet, &PileReader) -> Result<T>,
+    f: impl FnOnce(&mut Pile, CollectionHandle, &SigningKey, &TribleSet, &PileReader) -> Result<T>,
 ) -> Result<T> {
-    with_files_collection(pile, |collection| {
-        let space = collection
-            .materialize()
+    with_files_store(pile, |store, collection, signer| {
+        let (space, _ticket, reader) = store
+            .snapshot(collection, &[])
+            .map(|snapshot| snapshot.into_parts())
             .context("materialize Files collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Files blob reader")?;
-        f(collection, &space, &reader)
+        f(store, collection, signer, &space, &reader)
     })
 }
 
@@ -717,7 +717,9 @@ fn cmd_add_dry_run(path: &Path, tags: &[String]) -> Result<()> {
 }
 
 fn cmd_add(
-    collection: &mut Collection<Pile>,
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &SigningKey,
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
@@ -756,7 +758,8 @@ fn cmd_add(
         change += entity! { ExclusiveId::force_ref(&import_id) @ file::tag: t.as_str() };
     }
 
-    collection.commit(change).context("commit Files import")?;
+    pile.commit(collection, signer, change)
+        .context("commit Files import")?;
 
     if stats.dirs > 0 {
         println!(
@@ -784,7 +787,9 @@ fn cmd_add(
 }
 
 fn cmd_fetch(
-    collection: &mut Collection<Pile>,
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &SigningKey,
     url: &str,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -847,7 +852,14 @@ fn cmd_fetch(
     fs::write(&tmp_path, bytes.as_ref())
         .with_context(|| format!("write temp file {}", tmp_path.display()))?;
 
-    let result = cmd_add(collection, &tmp_path, Some(mime.as_str()), tags);
+    let result = cmd_add(
+        pile,
+        collection,
+        signer,
+        &tmp_path,
+        Some(mime.as_str()),
+        tags,
+    );
     let _ = fs::remove_file(&tmp_path);
     let _ = fs::remove_dir(&tmp_dir);
     result
@@ -1092,7 +1104,9 @@ fn extract_tree<R: BlobStoreGet>(
 }
 
 fn cmd_tag(
-    collection: &mut Collection<Pile>,
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,
     id: &str,
@@ -1107,7 +1121,8 @@ fn cmd_tag(
     }
 
     let change = entity! { ExclusiveId::force_ref(&eid) @ file::tag: tag_name };
-    collection.commit(change).context("commit Files tag")?;
+    pile.commit(collection, signer, change)
+        .context("commit Files tag")?;
 
     let name = read_name(space, reader, eid).unwrap_or_else(|| fmt_id(eid));
     println!("Tagged {name} with '{tag_name}'");
@@ -1475,7 +1490,9 @@ fn read_embedding<R: BlobStoreGet>(reader: &R, h: EmbHandle) -> Result<Vec<f32>>
 /// `--force`. Identical bytes (duplicate imports) are embedded once and the
 /// vector fanned out to every entity that shares the content.
 fn cmd_embed7b(
-    collection: &mut Collection<Pile>,
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,
     force: bool,
@@ -1561,8 +1578,7 @@ fn cmd_embed7b(
         return Ok(());
     }
 
-    collection
-        .commit(change)
+    pile.commit(collection, signer, change)
         .context("commit Files 7b embeddings")?;
 
     println!(
@@ -1668,7 +1684,9 @@ fn which_pdftoppm() -> Option<PathBuf> {
 /// PDF bytes are rendered+embedded once and the per-page vectors fan out to every
 /// file entity that shares the content.
 fn cmd_embed7b_pdf(
-    collection: &mut Collection<Pile>,
+    pile: &mut Pile,
+    collection: CollectionHandle,
+    signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,
     force: bool,
@@ -1799,8 +1817,7 @@ fn cmd_embed7b_pdf(
         return Ok(());
     }
 
-    collection
-        .commit(change)
+    pile.commit(collection, signer, change)
         .context("commit Files PDF page embeddings")?;
 
     println!(
@@ -2024,32 +2041,36 @@ fn run_command(pile: &Path, command: Command) -> Result<()> {
             if dry_run {
                 cmd_add_dry_run(&path, &tag)
             } else {
-                with_files_collection(pile, |collection| {
-                    cmd_add(collection, &path, mime.as_deref(), &tag)
+                with_files_store(pile, |store, collection, signer| {
+                    cmd_add(store, collection, signer, &path, mime.as_deref(), &tag)
                 })
             }
         }
-        Command::List { tag, mime } => with_files_view(pile, |_collection, space, reader| {
+        Command::List { tag, mime } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_list(space, reader, &tag, mime.as_deref())
         }),
-        Command::Show { id } => with_files_view(pile, |_collection, space, reader| {
-            cmd_show(space, reader, &id)
-        }),
-        Command::Get { id, output } => with_files_view(pile, |_collection, space, reader| {
+        Command::Show { id } => {
+            with_files_view(pile, |_, _, _, space, reader| cmd_show(space, reader, &id))
+        }
+        Command::Get { id, output } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_get(space, reader, &id, output.as_deref())
         }),
-        Command::Tag { id, name } => with_files_view(pile, |collection, space, reader| {
-            cmd_tag(collection, space, reader, &id, &name)
-        }),
+        Command::Tag { id, name } => {
+            with_files_view(pile, |store, collection, signer, space, reader| {
+                cmd_tag(store, collection, signer, space, reader, &id, &name)
+            })
+        }
         Command::Fetch {
             url,
             mime,
             name,
             tag,
             max_bytes,
-        } => with_files_collection(pile, |collection| {
+        } => with_files_store(pile, |store, collection, signer| {
             cmd_fetch(
+                store,
                 collection,
+                signer,
                 &url,
                 mime.as_deref(),
                 name.as_deref(),
@@ -2057,7 +2078,7 @@ fn run_command(pile: &Path, command: Command) -> Result<()> {
                 max_bytes,
             )
         }),
-        Command::Search { query } => with_files_view(pile, |_collection, space, reader| {
+        Command::Search { query } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_search(space, reader, &query)
         }),
         Command::Similar {
@@ -2067,7 +2088,7 @@ fn run_command(pile: &Path, command: Command) -> Result<()> {
             limit,
             tag,
             mm7b,
-        } => with_files_view(pile, |_collection, space, reader| {
+        } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_similar(
                 space,
                 reader,
@@ -2085,23 +2106,25 @@ fn run_command(pile: &Path, command: Command) -> Result<()> {
             dpi,
             limit,
             max_pages,
-        } => with_files_view(pile, |collection, space, reader| {
+        } => with_files_view(pile, |store, collection, signer, space, reader| {
             if pdf {
-                cmd_embed7b_pdf(collection, space, reader, force, dpi, limit, max_pages)
+                cmd_embed7b_pdf(
+                    store, collection, signer, space, reader, force, dpi, limit, max_pages,
+                )
             } else {
-                cmd_embed7b(collection, space, reader, force)
+                cmd_embed7b(store, collection, signer, space, reader, force)
             }
         }),
-        Command::Imports => with_files_view(pile, |_collection, space, reader| {
-            cmd_imports(space, reader)
-        }),
-        Command::Tree { id, depth } => with_files_view(pile, |_collection, space, reader| {
+        Command::Imports => {
+            with_files_view(pile, |_, _, _, space, reader| cmd_imports(space, reader))
+        }
+        Command::Tree { id, depth } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_tree(space, reader, &id, depth)
         }),
-        Command::Resolve { input } => with_files_view(pile, |_collection, space, _reader| {
-            cmd_resolve(space, &input)
-        }),
-        Command::Diff { left, right } => with_files_view(pile, |_collection, space, reader| {
+        Command::Resolve { input } => {
+            with_files_view(pile, |_, _, _, space, _reader| cmd_resolve(space, &input))
+        }
+        Command::Diff { left, right } => with_files_view(pile, |_, _, _, space, reader| {
             cmd_diff(space, reader, &left, &right)
         }),
     }
@@ -2345,7 +2368,7 @@ mod tests {
     #[test]
     fn empty_native_collection_opens_as_an_empty_catalog() {
         let test_pile = TestPile::new();
-        with_files_view(&test_pile.path, |_collection, space, _reader| {
+        with_files_view(&test_pile.path, |_, _, _, space, _reader| {
             assert!(space.is_empty());
             cmd_list(space, _reader, &[], None)
         })
@@ -2389,16 +2412,20 @@ mod tests {
         let first_id = first.root().unwrap();
         let second_id = second.root().unwrap();
 
-        with_files_collection(&test_pile.path, |collection| {
-            collection.commit(first).context("commit first fixture")?;
-            collection.commit(second).context("commit second fixture")?;
+        with_files_store(&test_pile.path, |store, collection, signer| {
+            store
+                .commit(collection, signer, first)
+                .context("commit first fixture")?;
+            store
+                .commit(collection, signer, second)
+                .context("commit second fixture")?;
             Ok(())
         })
         .unwrap();
 
         let first_out = test_pile.dir.join("first.png");
         let second_out = test_pile.dir.join("second.txt");
-        with_files_view(&test_pile.path, |_collection, space, reader| {
+        with_files_view(&test_pile.path, |_, _, _, space, reader| {
             assert_eq!(
                 find!(
                     entity: Id,
@@ -2435,15 +2462,19 @@ mod tests {
         let file = file_capability::stage(b"same".to_vec(), "same.txt", "text/plain").unwrap();
         let file_id = file.root().unwrap();
 
-        with_files_collection(&test_pile.path, |collection| {
-            let first = collection.commit(file.clone()).context("first replay")?;
-            let second = collection.commit(file).context("second replay")?;
+        with_files_store(&test_pile.path, |store, collection, signer| {
+            let first = store
+                .commit(collection, signer, file.clone())
+                .context("first replay")?;
+            let second = store
+                .commit(collection, signer, file)
+                .context("second replay")?;
             assert_eq!(first.id(), second.id());
             Ok(())
         })
         .unwrap();
 
-        with_files_view(&test_pile.path, |_collection, space, _reader| {
+        with_files_view(&test_pile.path, |_, _, _, space, _reader| {
             assert_eq!(
                 file_capability::resolve_selector(space, &format!("{file_id:x}"))?,
                 file_id

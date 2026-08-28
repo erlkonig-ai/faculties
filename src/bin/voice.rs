@@ -76,7 +76,7 @@ use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -524,7 +524,9 @@ struct VoiceStorage<'a> {
 }
 
 struct VoiceSession<'a> {
-    collection: &'a mut Collection<Pile>,
+    pile: &'a mut Pile,
+    collection: CollectionHandle,
+    signer: &'a ed25519_dalek::SigningKey,
     facts: TribleSet,
     reader: PileReader,
 }
@@ -539,13 +541,12 @@ impl VoiceSession<'_> {
         let added = fragment.facts().clone();
         fragment.describe_with(entity! { metadata::description: description });
         let commit = self
-            .collection
-            .commit(fragment)
+            .pile
+            .commit(self.collection, self.signer, fragment)
             .context("commit Voice fragment")?;
         self.facts += added;
         self.reader = self
-            .collection
-            .storage_mut()
+            .pile
             .reader()
             .context("refresh Voice attachment snapshot")?;
         Ok(commit)
@@ -558,25 +559,24 @@ impl VoiceStorage<'_> {
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, COLLECTION_SCOPE_ID, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let facts = collection
-                .materialize()
+            let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
+            let (facts, _ticket, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
                 .context("materialize Voice collection")?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .context("open Voice attachment reader")?;
             voice_model::validate_catalog(&reader, &facts)
                 .context("validate native Voice collection")?;
             operation(&mut VoiceSession {
-                collection: &mut collection,
+                pile: &mut pile,
+                collection,
+                signer: &signer,
                 facts,
                 reader,
             })
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 }
 
