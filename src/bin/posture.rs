@@ -53,7 +53,7 @@ use faculties::schemas::posture::{
 };
 #[cfg(any(feature = "local-embed", test))]
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
-use faculties::storage::{discover_target, load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
 use regex::Regex;
@@ -62,7 +62,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -1889,18 +1889,16 @@ impl PostureStorage<'_> {
         // Authority is loaded before storage is touched. Ordinary reads and
         // writes never mint an identity or substitute an ephemeral signer.
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let author = signer.verifying_key().to_bytes();
-        let mut collection = open_scope(pile, scope, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let (facts, _) = materialize_stable(&mut collection, scope, author, label)?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .with_context(|| format!("open Posture {label} blob reader"))?;
+            let collection = open_scope(&mut pile, scope, &signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
+                .with_context(|| format!("materialize authored Posture {label} collection"))?;
             Ok(CollectionView { facts, reader })
         })();
-        finish_pile(collection.into_storage(), result)
+        finish_pile(pile, result)
     }
 
     /// The signed COMMITs this key authored in `scope`. Tests use it to check
@@ -1908,11 +1906,21 @@ impl PostureStorage<'_> {
     #[cfg(test)]
     fn authored_commits(&self, scope: Id, label: &str) -> Result<Vec<CollectionCommit>> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
+        let mut pile = open_pile_strict(self.pile)?;
         let author = signer.verifying_key().to_bytes();
-        let mut collection = open_scope(pile, scope, signer);
-        let result = (|| Ok(materialize_stable(&mut collection, scope, author, label)?.1))();
-        finish_pile(collection.into_storage(), result)
+        let result = (|| {
+            let collection = open_scope(&mut pile, scope, &signer)?;
+            let ticket = pile
+                .ticket(collection, &[])
+                .with_context(|| format!("discover authored Posture {label} commits"))?;
+            Ok(ticket
+                .commits()
+                .iter()
+                .copied()
+                .filter(|commit| commit.public_key().raw == author)
+                .collect())
+        })();
+        finish_pile(pile, result)
     }
 
     fn policy_view(&self) -> Result<CollectionView> {
@@ -1938,26 +1946,25 @@ impl PostureStorage<'_> {
         mut fragment: Fragment,
         description: &str,
     ) -> Result<CollectionCommit> {
-        self.with_collection(
+        self.with_store(
             DEFAULT_POLICY_SCOPE_ID,
             "policy",
-            |collection, current, reader, _| {
+            |pile, collection, signer, current, reader, _| {
                 faculties::posture_policy::validate_policy_catalog_union(
                     reader, current, &fragment,
                 )?;
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Posture policy fragment")
             },
         )
     }
 
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
-        self.with_collection(
+        self.with_store(
             DEFAULT_SCAN_SCOPE_ID,
             "scan",
-            |collection, _current, reader, commits| {
+            |pile, collection, signer, _current, reader, commits| {
                 let scan = validate_scan_commit_fragment(fragment.facts())?;
                 validate_scan_commits(reader, commits, scan)?;
                 let mut staged_blobs = fragment.blobs().clone();
@@ -1968,80 +1975,43 @@ impl PostureStorage<'_> {
                 // past is not re-judged against today's schema.
                 validate_scan_catalog_with(reader, Some(&staged), fragment.facts())?;
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                collection
-                    .commit(fragment)
+                pile.commit(collection, signer, fragment)
                     .context("commit authored Posture scan fragment")
             },
         )
     }
 
-    fn with_collection<T>(
+    fn with_store<T>(
         &self,
         scope: Id,
         label: &str,
         operation: impl FnOnce(
-            &mut Collection<Pile>,
+            &mut Pile,
+            CollectionHandle,
+            &ed25519_dalek::SigningKey,
             &TribleSet,
             &PileReader,
             &[CollectionCommit],
         ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let pile = open_pile_strict(self.pile)?;
-        let author = signer.verifying_key().to_bytes();
-        let mut collection = open_scope(pile, scope, signer);
+        let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let (facts, commits) = materialize_stable(&mut collection, scope, author, label)?;
-            let reader = collection
-                .storage_mut()
-                .reader()
-                .with_context(|| format!("open Posture {label} blob reader"))?;
-            operation(&mut collection, &facts, &reader, &commits)
+            let collection = open_scope(&mut pile, scope, &signer)?;
+            let (facts, ticket, reader) = pile
+                .snapshot(collection, &[])
+                .map(|snapshot| snapshot.into_parts())
+                .with_context(|| format!("materialize authored Posture {label} collection"))?;
+            operation(
+                &mut pile,
+                collection,
+                &signer,
+                &facts,
+                &reader,
+                ticket.commits(),
+            )
         })();
-        finish_pile(collection.into_storage(), result)
-    }
-}
-
-/// The namespace an already-open collection belongs to.
-fn collection_namespace(collection: &Collection<Pile>) -> Result<ed25519_dalek::VerifyingKey> {
-    triblespace::core::collection::descriptor::namespace(collection.descriptor().facts())
-        .ok_or_else(|| anyhow!("a Posture root descriptor names its namespace"))?
-        .map_err(|error| anyhow!("decode the namespace on the Posture root descriptor: {error}"))
-}
-
-fn materialize_stable(
-    collection: &mut Collection<Pile>,
-    scope: Id,
-    author: [u8; 32],
-    label: &str,
-) -> Result<(TribleSet, Vec<CollectionCommit>)> {
-    // The namespace is read back off the collection we already hold rather
-    // than passed in beside it: it is a property of that collection, and a
-    // second copy travelling alongside is a second thing that can disagree.
-    let namespace = collection_namespace(collection)?;
-    loop {
-        let before = discover_target(collection.storage_mut(), scope, namespace)
-            .with_context(|| format!("discover fixed Posture {label} descriptor"))?;
-        let before = before
-            .commits()
-            .iter()
-            .copied()
-            .filter(|commit| commit.public_key().raw == author)
-            .collect::<Vec<_>>();
-        let facts = collection
-            .materialize()
-            .with_context(|| format!("materialize authored Posture {label} collection"))?;
-        let after = discover_target(collection.storage_mut(), scope, namespace)
-            .with_context(|| format!("rediscover fixed Posture {label} descriptor"))?;
-        let after = after
-            .commits()
-            .iter()
-            .copied()
-            .filter(|commit| commit.public_key().raw == author)
-            .collect::<Vec<_>>();
-        if before == after {
-            return Ok((facts, after));
-        }
+        finish_pile(pile, result)
     }
 }
 
@@ -6078,7 +6048,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_policy_write_is_idempotent_and_reads_are_pure() {
+    fn canonical_policy_write_and_registered_reads_are_idempotent() {
         let store = TestStore::new();
         let storage = store.storage();
 
@@ -6106,7 +6076,11 @@ mod tests {
         );
         drop(view);
 
-        let after_first_write = std::fs::metadata(&store.pile).unwrap().len();
+        // Opening a never-seen scope registers and offers its descriptor
+        // closure. That one store operation is distinct from materialization;
+        // once registered, repeated snapshots are pure.
+        storage.scan_view().unwrap();
+        let after_registration = std::fs::metadata(&store.pile).unwrap().len();
         cmd_vocab_add(
             storage,
             "PROJECT-SUNRISE",
@@ -6116,7 +6090,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::metadata(&store.pile).unwrap().len(),
-            after_first_write,
+            after_registration,
             "an idempotent policy write must not append another COMMIT"
         );
 
@@ -6124,8 +6098,8 @@ mod tests {
         storage.scan_view().unwrap();
         assert_eq!(
             std::fs::metadata(&store.pile).unwrap().len(),
-            after_first_write,
-            "materializing either collection must not mutate the pile"
+            after_registration,
+            "materializing either registered collection must not mutate the pile"
         );
 
         let missing_key = store._directory.path().join("missing.key");
@@ -6137,7 +6111,7 @@ mod tests {
         assert!(!missing_key.exists(), "a read must never mint a signer");
         assert_eq!(
             std::fs::metadata(&store.pile).unwrap().len(),
-            after_first_write
+            after_registration
         );
     }
 
@@ -6851,7 +6825,7 @@ mod tests {
     }
 
     #[test]
-    fn open_scan_collection_materializes_foreign_commits_without_claiming_authorship() {
+    fn foreign_scan_commits_are_stored_but_inert_without_descriptor_authority() {
         let store = TestStore::new();
         let (files, omissions) = sample_scan_inputs();
         let (fragment, _) = build_scan_fragment(
@@ -6862,30 +6836,18 @@ mod tests {
             None,
             IMPLEMENTED.iter().copied().collect(),
         );
-        let expected = fragment.facts().clone();
         let mut pile = open_pile_strict(&store.pile).unwrap();
-        // Ordinary faculty collections are deliberately Open: their private
-        // reach and the local store boundary, not an ambient authority ledger,
-        // determine who can deliver bytes. A foreign signer therefore joins
-        // the same namespaced collection, but local-authorship queries must not
-        // mistake that commit for one of ours.
-        let namespace = faculties::storage::load_signer(&store.pile, Some(&store.key))
-            .unwrap()
-            .verifying_key();
-        let descriptor =
-            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, namespace);
+        let local = faculties::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCAN_SCOPE_ID, &local).unwrap();
         let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
-        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &descriptor,
-            fragment,
-            &foreign,
-        )
-        .unwrap();
+        // Publication is an unconditional local ledger append. Admission is a
+        // separate read concern rooted in the authority carried by this exact
+        // descriptor handle.
+        let foreign_commit = pile.commit(collection, &foreign, fragment).unwrap();
         pile.close().unwrap();
 
         let view = store.storage().scan_view().unwrap();
-        assert_eq!(view.facts, expected);
+        assert!(view.facts.is_empty());
         assert!(store
             .storage()
             .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
@@ -6893,12 +6855,15 @@ mod tests {
             .is_empty());
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
-        let target = discover_target(&mut pile, DEFAULT_SCAN_SCOPE_ID, namespace).unwrap();
-        assert_eq!(
-            target.descriptor().facts(),
-            faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, namespace).facts()
-        );
-        assert_eq!(target.commits().len(), 1);
+        let records =
+            triblespace::core::collection::discover_collection_records(&mut pile).unwrap();
+        let stored = records
+            .commits()
+            .iter()
+            .copied()
+            .filter(|commit| commit.collection() == collection)
+            .collect::<Vec<_>>();
+        assert_eq!(stored, vec![foreign_commit]);
         pile.close().unwrap();
     }
 
