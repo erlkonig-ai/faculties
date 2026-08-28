@@ -285,14 +285,11 @@ impl WikiStorage<'_> {
         })
     }
 
-    fn publish(&self, current: &WikiView, fragment: Fragment) -> Result<CollectionCommit> {
+    fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            let (_, author) = wiki_model::author_record(&signer.verifying_key());
-            wiki_model::validate_candidate(&current.reader, &current.facts, &fragment, author)
-                .context("preflight authored Wiki union")?;
             open_scope(pile, schema::DEFAULT_SCOPE_ID, signer.clone())
                 .commit(fragment)
-                .context("publish authored Wiki fragment")
+                .context("publish Wiki fragment")
         })
     }
 
@@ -705,7 +702,7 @@ fn cmd_create(
     let mut fragment = Fragment::empty();
     let tags = resolve_tags(&catalog, &view.reader, &tags, &mut fragment)?;
     let revision = stage_revision(storage, &mut fragment, None, title, content, tags)?;
-    storage.publish(&view, fragment)?;
+    storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
 }
@@ -751,7 +748,7 @@ fn cmd_edit(
         resolve_tags(&catalog, &view.reader, &tag_names, &mut fragment)?
     };
     let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
-    storage.publish(&view, fragment)?;
+    storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
 }
@@ -934,7 +931,7 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
     let title = read_string(&view.reader, agreed(entry, |head| head.title, "title")?)?;
     let content = read_string(&view.reader, agreed(entry, |head| head.content, "content")?)?;
     let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
-    storage.publish(&view, fragment)?;
+    storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
 }
@@ -952,7 +949,7 @@ fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<()> {
     let tags = chosen.tags.iter().copied().collect();
     let mut fragment = Fragment::empty();
     let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
-    storage.publish(&view, fragment)?;
+    storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
 }
@@ -1424,7 +1421,7 @@ fn cmd_tag_mint(storage: WikiStorage<'_>, name: String) -> Result<()> {
         return Ok(());
     }
     let (fragment, id, normalized) = wiki_model::tag_record(&name)?;
-    storage.publish(&view, fragment)?;
+    storage.publish(fragment)?;
     println!("{id:x}  {normalized}");
     Ok(())
 }
@@ -1472,7 +1469,7 @@ fn cmd_import(storage: WikiStorage<'_>, path: PathBuf, tags: Vec<String>) -> Res
         println!("{revision:x}  {}", path.display());
     }
     if !fragment.facts().is_empty() {
-        storage.publish(&view, fragment)?;
+        storage.publish(fragment)?;
     }
     Ok(())
 }
@@ -1664,7 +1661,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool) -> Result<()> {
         }
     }
     if fix && !fragment.facts().is_empty() {
-        storage.publish(&view, fragment)?;
+        storage.publish(fragment)?;
     }
     println!("{changed} revision(s) need lint fixes");
     if check && changed > 0 {
@@ -1722,7 +1719,7 @@ fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
         )?;
     }
     if !fragment.facts().is_empty() {
-        storage.publish(&view, fragment)?;
+        storage.publish(fragment)?;
     }
     Ok(())
 }
@@ -1944,7 +1941,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
         let catalog = &current.catalog;
@@ -1968,7 +1965,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&current, forks).unwrap();
+        storage.publish(forks).unwrap();
 
         cmd_edit(
             storage,
@@ -1999,7 +1996,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         cmd_edit(
             storage,
@@ -2107,7 +2104,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
         let catalog = &current.catalog;
@@ -2131,7 +2128,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&current, forks).unwrap();
+        storage.publish(forks).unwrap();
 
         let view = storage.view().unwrap();
         let catalog = &view.catalog;
@@ -2168,7 +2165,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, fragment).unwrap();
+        storage.publish(fragment).unwrap();
         let after = storage.view().unwrap();
         let catalog = &after.catalog;
         assert_eq!(
@@ -2194,7 +2191,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, fragment).unwrap();
+        storage.publish(fragment).unwrap();
         let after = storage.view().unwrap();
         let catalog = &after.catalog;
         let short = &format!("{revision:x}")[..8];
@@ -2242,7 +2239,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         // A2: same page, citation removed.
         let current = storage.view().unwrap();
@@ -2258,7 +2255,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&current, edit).unwrap();
+        storage.publish(edit).unwrap();
 
         let after = storage.view().unwrap();
         let catalog = &after.catalog;
@@ -2317,7 +2314,7 @@ mod tests {
             BTreeSet::from([citing_tag]),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
         let catalog = &current.catalog;
@@ -2332,7 +2329,7 @@ mod tests {
             BTreeSet::from([later_tag]),
         )
         .unwrap();
-        storage.publish(&current, edit).unwrap();
+        storage.publish(edit).unwrap();
 
         let after = storage.view().unwrap();
         let catalog = &after.catalog;
@@ -2369,7 +2366,7 @@ mod tests {
             BTreeSet::from([source_tag]),
         )
         .unwrap();
-        storage.publish(&before, fragment).unwrap();
+        storage.publish(fragment).unwrap();
 
         let after = storage.view().unwrap();
         let catalog = &after.catalog;
@@ -2486,7 +2483,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&before, genesis).unwrap();
+        storage.publish(genesis).unwrap();
 
         let truncated = format!("{target:x}")[..12].to_owned();
         let current = storage.view().unwrap();
@@ -2500,7 +2497,7 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage.publish(&current, fragment).unwrap();
+        storage.publish(fragment).unwrap();
 
         cmd_lint(storage, true, false).unwrap();
 

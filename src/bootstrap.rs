@@ -499,36 +499,32 @@ pub fn generation() -> [u8; 32] {
 
 /// Import one locally authored Wiki root and one locally authored Compass root.
 ///
-/// The pile and durable key must already exist. Both candidate unions and all
-/// staged text attachments are validated before either content COMMIT is
-/// appended. Replaying with the same key is content-addressed and yields the
-/// same two content COMMIT ids.
+/// The pile and durable key must already exist. Both fragments are constructed
+/// completely before publication. Replaying with the same key is
+/// content-addressed and yields the same two content COMMIT ids.
 pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        // This preflight deliberately stays on the live/JIT resolver. Ensuring
-        // a durable derived index can append cache evidence; bootstrap must
-        // validate both staged candidates before it writes anything at all.
-        let (wiki_before, wiki_reader) = wiki_model::materialize_collection(&mut pile, &signer)
+        let wiki_before = wiki_model::materialize_indexed_collection(&mut pile, &signer)
             .context("materialize Wiki before bootstrap import")?;
         let (compass_before, compass_reader) = compass::materialize_collection(&mut pile, &signer)
             .context("materialize Compass before bootstrap import")?;
-        let (_, author) = wiki_model::author_record(&signer.verifying_key());
-        let wiki_catalog = wiki_model::load_catalog(&wiki_before)
-            .context("load current Wiki topology before bootstrap import")?;
-        let (wiki, wiki_roots) =
-            wiki_fragment(&signer.verifying_key(), Some((&wiki_catalog, &wiki_reader)))?;
+        let (wiki, wiki_roots) = wiki_fragment(
+            &signer.verifying_key(),
+            Some((wiki_before.catalog(), wiki_before.reader())),
+        )?;
         let seed = PortableSeed {
             wiki,
             compass: compass_fragment()?,
             wiki_roots,
         };
 
-        wiki_model::validate_candidate(&wiki_reader, &wiki_before, &seed.wiki, author)
-            .context("validate portable Wiki seed and attachment closure")?;
+        // Compass seed identities are fixed anchors rather than intrinsic
+        // artifacts. Reject an existing, divergent use of one of those ids
+        // before publishing either half of the seed.
         compass::validate_candidate(&compass_reader, &compass_before, &seed.compass)
-            .context("validate portable Compass seed and attachment closure")?;
+            .context("validate portable Compass anchor compatibility")?;
 
         let expected_wiki = seed.wiki.facts().clone();
         let expected_compass = seed.compass.facts().clone();

@@ -834,93 +834,6 @@ where
     Ok(catalog)
 }
 
-/// Validate the exact additive state a native publication would create.
-///
-/// Newly introduced revision identities and authorship observations must name
-/// the current collection signer as author. Existing facts are never rewritten
-/// or removed.
-pub fn validate_candidate(
-    reader: &PileReader,
-    current: &TribleSet,
-    fragment: &Fragment,
-    expected_author: Id,
-) -> Result<WikiCatalog> {
-    let before = ids_of_kind(current, KIND_REVISION);
-    let before_authorships = ids_of_kind(current, KIND_AUTHORSHIP);
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let catalog = load_catalog(&union)?;
-    let fact_index = entity_fact_index(&union);
-    let native_ids = ids_of_kind(&union, KIND_REVISION);
-    let authorship_ids = ids_of_kind(&union, KIND_AUTHORSHIP);
-    let existing_entities: BTreeSet<Id> = current.iter().map(|fact| *fact.e()).collect();
-    for fact in fragment.facts() {
-        let entity = *fact.e();
-        if native_ids.contains(&entity) || authorship_ids.contains(&entity) {
-            // load_catalog already checked the complete entity against its
-            // intrinsic constructor, including every fact added here.
-            continue;
-        }
-        if let Some(key) = catalog.author_keys.get(&entity) {
-            if fact.a() != &attestation::signed_by.id() {
-                bail!("Wiki publication adds a non-author fact to author {entity:x}");
-            }
-            let expected = entity! { attestation::signed_by: *key };
-            check_exact_entity(&fact_index, entity, &expected, "author")?;
-            continue;
-        }
-        if let Some(handle) = catalog.tag_names.get(&entity) {
-            if fact.a() != &metadata::name.id() {
-                bail!("Wiki publication adds a non-vocabulary fact to tag {entity:x}");
-            }
-            if !existing_entities.contains(&entity) {
-                let expected = if TAG_SPECS.iter().any(|(known, _)| *known == entity) {
-                    entity! { ExclusiveId::force_ref(&entity) @ metadata::name: *handle }
-                } else {
-                    entity! { metadata::name: *handle }
-                };
-                let canonical = expected.root().expect("tag vocabulary root");
-                if canonical != entity {
-                    bail!(
-                        "Wiki tag {entity:x} is non-canonical; canonical identity is {canonical:x}"
-                    );
-                }
-                check_exact_entity(&fact_index, entity, &expected, "tag vocabulary")?;
-            }
-            continue;
-        }
-        bail!("Wiki publication contains an unrecognized fact on entity {entity:x}");
-    }
-    for revision in catalog.revisions.revision_records() {
-        if revision.is_native()
-            && !before.contains(&revision.id)
-            && revision.author != Some(expected_author)
-        {
-            bail!(
-                "Wiki revision {:x} author is not the publishing signer",
-                revision.id
-            );
-        }
-        for authorship in &revision.authorships {
-            if !before_authorships.contains(&authorship.id)
-                && authorship.author != Some(expected_author)
-            {
-                bail!(
-                    "Wiki authorship {:x} author is not the publishing signer",
-                    authorship.id
-                );
-            }
-        }
-    }
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .reader()
-        .context("snapshot staged Wiki attachments")?;
-    validate_payloads(reader, Some(&overlay), &catalog)?;
-    Ok(catalog)
-}
-
 pub fn author_record(key: &VerifyingKey) -> (Fragment, Id) {
     let key: PublicKeyValue = (*key).to_inline();
     let fragment = entity! { attestation::signed_by: key };
@@ -1600,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_snapshot_index_does_not_advance_authority_or_stage_state() {
+    fn exact_snapshot_index_does_not_advance_authority() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
@@ -1620,25 +1533,6 @@ mod tests {
         assert_eq!(ticket_after_index, ticket_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 
-        let (successor_fragment, successor) =
-            revision_record(draft(author, "successor", [root])).unwrap();
-        let staged = validate_candidate(
-            snapshot.reader(),
-            snapshot.facts(),
-            &successor_fragment,
-            author,
-        )
-        .unwrap();
-        assert_eq!(staged.revisions.all_entries()[0].frontier[0].id, successor);
-        assert_eq!(
-            resolve(snapshot.observed(), [root]),
-            BTreeSet::from([root]),
-            "staged validation must not mutate the attached durable order"
-        );
-        let ticket_after_stage = open_scope(&mut pile, DEFAULT_SCOPE_ID, signer.clone())
-            .ticket()
-            .unwrap();
-        assert_eq!(ticket_after_stage, ticket_before);
         pile.close().unwrap();
     }
 
@@ -1700,33 +1594,33 @@ mod tests {
     }
 
     #[test]
-    fn native_authorship_is_bound_to_its_publishing_signer() {
+    fn curator_can_publish_another_authors_revision() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
+
+        let author_key = SigningKey::from_bytes(&[13; 32]);
+        let curator_key = SigningKey::from_bytes(&[14; 32]);
+        let (author_fragment, author) = author_record(&author_key.verifying_key());
+        let (revision_fragment, revision) = revision_record(draft(author, "shared", [])).unwrap();
+
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        let reader = pile.reader().unwrap();
-        pile.close().unwrap();
-
-        let owner = SigningKey::from_bytes(&[13; 32]);
-        let (author_fragment, author) = author_record(&owner.verifying_key());
-        let (revision_fragment, revision) = revision_record(draft(author, "owned", [])).unwrap();
-        let mut current = author_fragment.facts().clone();
-        current += revision_fragment.facts().clone();
-
-        let impostor = SigningKey::from_bytes(&[14; 32]);
-        let (_, impostor_author) = author_record(&impostor.verifying_key());
-        let claimed = authorship_fragment(revision, Some(author), Some(at(2.0))).unwrap();
-        assert!(
-            validate_candidate(&reader, &current, &claimed, impostor_author)
-                .unwrap_err()
-                .to_string()
-                .contains("author is not the publishing signer")
+        commit_collection(&mut pile, &curator_key, author_fragment + revision_fragment).unwrap();
+        let snapshot = materialize_indexed_collection(&mut pile, &curator_key).unwrap();
+        assert_eq!(
+            snapshot
+                .catalog()
+                .revisions
+                .revision(revision)
+                .unwrap()
+                .author,
+            Some(author)
         );
+        pile.close().unwrap();
     }
 
     #[test]
-    fn native_admission_rejects_unrecognized_facts_and_unnormalized_tags() {
+    fn read_model_ignores_unrelated_facts_but_rejects_unnormalized_tags() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
         File::create(&path).unwrap();
@@ -1739,12 +1633,7 @@ mod tests {
         let (revision_fragment, _) = revision_record(draft(author, "strict", [])).unwrap();
         let mut unexpected = author_fragment + revision_fragment;
         unexpected += entity! { metadata::description: "not Wiki state" };
-        assert!(
-            validate_candidate(&reader, &TribleSet::new(), &unexpected, author)
-                .unwrap_err()
-                .to_string()
-                .contains("unrecognized fact")
-        );
+        assert!(load_catalog(unexpected.facts()).is_ok());
 
         let mut bad_tag = Fragment::empty();
         let handle = bad_tag.put::<blobencodings::UTF8String, _>(" Mixed ".to_owned());
@@ -1755,12 +1644,13 @@ mod tests {
         let (revision, _) = revision_record(tagged).unwrap();
         bad_tag += author_record(&signer.verifying_key()).0;
         bad_tag += revision;
-        assert!(
-            validate_candidate(&reader, &TribleSet::new(), &bad_tag, author)
-                .unwrap_err()
-                .to_string()
-                .contains("not normalized")
-        );
+        let catalog = load_catalog(bad_tag.facts()).unwrap();
+        let mut staged = bad_tag.clone();
+        let overlay = staged.blobs_mut().reader().unwrap();
+        assert!(validate_payloads(&reader, Some(&overlay), &catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("not normalized"));
     }
 
     /// The legacy anchor is nothing at all now — not an edge, not a selector.

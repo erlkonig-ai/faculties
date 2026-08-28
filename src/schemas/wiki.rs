@@ -111,14 +111,14 @@ pub mod attrs {
 /// same author converges, which makes re-import idempotent without any token to
 /// remember; different authors never collapse.
 ///
-/// The signed COMMIT remains the publication OCCURRENCE, so genuinely repeated
-/// publications stay distinguishable there without disturbing artifact
-/// identity.
-///
-/// `author` must be CRYPTOGRAPHICALLY BOUND, never a claimed value carried in
-/// content: native admission derives it from the publishing key and requires
-/// agreement. Preserved legacy versions remain their original entities and do
-/// not synthesize a persona id from an Ed25519 commit key.
+/// The signed COMMIT remains the CURATION occurrence: its signer chose to
+/// include this artifact in a collection, but need not be its author. This is
+/// what lets one Wiki faithfully republish another person's unchanged work.
+/// `author` is attribution carried by the artifact; cryptographically proving
+/// that attribution, when required, is a separate author attestation rather
+/// than an inference from the enclosing collection signature. Preserved legacy
+/// versions remain their original entities and do not synthesize a persona id
+/// from an Ed25519 commit key.
 ///
 /// Tags participate: they are mutable, and their ids are content-derived from
 /// their normalized names, so identical state still mints an identical revision
