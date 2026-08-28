@@ -1023,6 +1023,7 @@ fn comb_advance(
         stream: stream.to_owned(),
         persona: persona.to_owned(),
         position,
+        anchor: None,
         grain: grain.map(str::to_owned),
         predecessors,
         observed_at: BTreeSet::from([observed_at]),

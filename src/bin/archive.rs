@@ -13,6 +13,7 @@ use faculties::archive_codex::{self, ProjectionSummary as CodexProjectionSummary
 use faculties::archive_collection::{
     self as archive_collection, ArchiveBlock, ArchiveImportWriter, ArchivePart, ArchivePayload,
     ArchiveProjection, ArchiveSearchSnapshot, ArchiveSnapshot, ArchiveTimelineBlock,
+    ArchiveTimelineCursor,
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
@@ -94,7 +95,7 @@ enum Command {
         /// `start <from-ts>`, `stop`, or nothing for the next batch.
         #[arg(value_name = "ACTION")]
         action: Vec<String>,
-        /// Blocks per batch. An equal-timestamp run is never split.
+        /// Blocks per batch. The exact block cursor makes every boundary safe.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Include tool, thinking, event, and media-only blocks.
@@ -469,6 +470,7 @@ fn interval_bounds(interval: Inline<NsTAIInterval>) -> Result<(Epoch, Epoch)> {
         .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))
 }
 
+#[cfg(test)]
 fn interval_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
     let (lower, _upper): (i128, i128) = interval
         .try_from_inline()
@@ -831,9 +833,10 @@ fn parse_tai_timestamp(value: &str) -> Result<Epoch> {
     ))
 }
 
-fn cursor_state(position: Option<Epoch>) -> CursorState {
+fn cursor_state(position: Option<Epoch>, anchor: Option<Id>) -> CursorState {
     CursorState {
         position: position.map(|epoch| (epoch, epoch).try_to_inline().unwrap()),
+        anchor,
         grain: None,
     }
 }
@@ -843,8 +846,9 @@ fn plan_cursor_update(
     stream: &str,
     persona: &str,
     position: Option<Epoch>,
+    anchor: Option<Id>,
 ) -> Result<Option<Fragment>> {
-    let state = cursor_state(position);
+    let state = cursor_state(position, anchor);
     let predecessors = match catalog.resolution(stream, persona) {
         None => BTreeSet::new(),
         Some(resolution) => {
@@ -859,6 +863,7 @@ fn plan_cursor_update(
         stream: stream.to_owned(),
         persona: persona.to_owned(),
         position: state.position,
+        anchor: state.anchor,
         grain: state.grain,
         predecessors,
         observed_at: BTreeSet::new(),
@@ -866,7 +871,11 @@ fn plan_cursor_update(
     Ok(Some(fragment))
 }
 
-fn active_cursor_position(catalog: &CombCatalog, stream: &str, persona: &str) -> Result<i128> {
+fn active_archive_cursor(
+    catalog: &CombCatalog,
+    stream: &str,
+    persona: &str,
+) -> Result<ArchiveTimelineCursor> {
     let resolution = catalog.resolution(stream, persona).ok_or_else(|| {
         anyhow!("no active replay for persona {persona}: use `archive replay start <from>`")
     })?;
@@ -880,7 +889,10 @@ fn active_cursor_position(catalog: &CombCatalog, stream: &str, persona: &str) ->
     if lower != upper {
         bail!("archive replay cursor is not a point interval");
     }
-    Ok(lower)
+    Ok(state.anchor.map_or(
+        ArchiveTimelineCursor::AfterTime(lower),
+        ArchiveTimelineCursor::AfterBlock,
+    ))
 }
 
 fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()> {
@@ -914,17 +926,8 @@ fn split_replay_batch(
     timeline: Vec<ArchiveTimelineBlock>,
     limit: usize,
 ) -> (Vec<ArchiveTimelineBlock>, usize) {
-    let mut selected = Vec::new();
-    let mut remaining = 0usize;
-    let mut cutoff = None;
-    for item in timeline {
-        if selected.len() < limit || cutoff == Some(item.key) {
-            cutoff = Some(item.key);
-            selected.push(item);
-        } else {
-            remaining += 1;
-        }
-    }
+    let remaining = timeline.len().saturating_sub(limit);
+    let selected = timeline.into_iter().take(limit).collect();
     (selected, remaining)
 }
 
@@ -954,7 +957,7 @@ fn run_replay(
             let position = from - hifitime::Duration::from_total_nanoseconds(1);
             let (facts, catalog) = storage.load_comb()?;
             if let Some(fragment) =
-                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position))?
+                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position), None)?
             {
                 validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
@@ -967,7 +970,9 @@ fn run_replay(
                 bail!("usage: archive replay stop");
             }
             let (facts, catalog) = storage.load_comb()?;
-            if let Some(fragment) = plan_cursor_update(&catalog, REPLAY_STREAM, persona, None)? {
+            if let Some(fragment) =
+                plan_cursor_update(&catalog, REPLAY_STREAM, persona, None, None)?
+            {
                 validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
             }
@@ -979,9 +984,9 @@ fn run_replay(
     }
 
     let replay = storage.load_replay()?;
-    let position = active_cursor_position(&replay.comb_catalog, REPLAY_STREAM, persona)?;
+    let cursor = active_archive_cursor(&replay.comb_catalog, REPLAY_STREAM, persona)?;
     let (selected, remaining) = split_replay_batch(
-        replay.archive.timeline_after(position, |block| {
+        replay.archive.timeline_after(cursor, |block| {
             with_tools || block.has_modality(archive_schema::content_fact::modality::TEXT)
         })?,
         limit,
@@ -998,13 +1003,15 @@ fn run_replay(
         );
         println!("---");
     }
-    let last_key = selected.last().expect("selected is nonempty").key;
-    let last_epoch = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
+    let last = selected.last().expect("selected is nonempty");
+    let last_epoch =
+        Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last.position));
     let fragment = plan_cursor_update(
         &replay.comb_catalog,
         REPLAY_STREAM,
         persona,
         Some(last_epoch),
+        Some(last.block.semantic.block),
     )?
     .ok_or_else(|| anyhow!("replay emitted blocks without advancing its cursor"))?;
     validate_cursor_update(&replay.comb_facts, &fragment)?;
@@ -1330,12 +1337,12 @@ mod tests {
             .contains("<untimed>"));
 
         let timeline = archive
-            .timeline_after(i128::MIN, |block| {
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
                 block.has_modality(archive_schema::content_fact::modality::TEXT)
             })
             .unwrap();
         assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].key, earliest_receipt_key);
+        assert_eq!(timeline[0].position, earliest_receipt_key);
     }
 
     #[test]
@@ -1456,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_rejects_zero_limit_and_never_splits_equal_timestamps() {
+    fn replay_rejects_zero_limit_and_exact_cursor_can_split_equal_timestamps() {
         let fixture = fixture();
         let source = fixture._directory.path().join("replay.jsonl");
         fs::write(
@@ -1474,15 +1481,23 @@ mod tests {
 
         let archive = storage(&fixture).load().unwrap();
         let timeline = archive
-            .timeline_after(i128::MIN, |block| {
+            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
                 block.has_modality(archive_schema::content_fact::modality::TEXT)
             })
             .unwrap();
         assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline[0].position, timeline[1].position);
+        let first_cursor = timeline[0].cursor();
         let (selected, remaining) = split_replay_batch(timeline, 1);
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].key, selected[1].key);
-        assert_eq!(remaining, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(remaining, 2);
+
+        let resumed = archive
+            .timeline_after(first_cursor, |block| {
+                block.has_modality(archive_schema::content_fact::modality::TEXT)
+            })
+            .unwrap();
+        assert_eq!(resumed.len(), 2, "the equal-time peer is not skipped");
 
         let error = run_replay(storage(&fixture), &[], 0, false, Some("replay-test")).unwrap_err();
         assert_eq!(error.to_string(), "replay limit must be at least 1");
