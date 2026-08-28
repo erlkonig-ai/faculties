@@ -14,6 +14,7 @@ use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -189,12 +190,11 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let facts = open_scope(&mut *pile, scope, self.signer.clone())
-            .materialize()
-            .with_context(|| format!("materialize {label} collection"))?;
-        let reader = pile
-            .reader()
-            .with_context(|| format!("open {label} attachment reader"))?;
+        let collection = open_scope(pile, scope, &self.signer)?;
+        let (facts, _, reader) = pile
+            .snapshot(collection, &[])
+            .with_context(|| format!("materialize {label} collection"))?
+            .into_parts();
         Ok(CollectionView { facts, reader })
     }
 
@@ -246,8 +246,8 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        open_scope(&mut *pile, scope, self.signer.clone())
-            .commit(fragment)
+        let collection = open_scope(pile, scope, &self.signer)?;
+        pile.commit(collection, &self.signer, fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())
     }

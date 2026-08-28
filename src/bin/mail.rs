@@ -25,6 +25,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -191,12 +192,11 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let facts = open_scope(&mut *pile, scope, self.signer.clone())
-            .materialize()
-            .with_context(|| format!("materialize {label} collection"))?;
-        let reader = pile
-            .reader()
-            .with_context(|| format!("open {label} blob reader"))?;
+        let collection = open_scope(pile, scope, &self.signer)?;
+        let (facts, _, reader) = pile
+            .snapshot(collection, &[])
+            .with_context(|| format!("materialize {label} collection"))?
+            .into_parts();
         Ok(CollectionView { facts, reader })
     }
 
@@ -262,8 +262,8 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        open_scope(&mut *pile, scope, self.signer.clone())
-            .commit(fragment)
+        let collection = open_scope(pile, scope, &self.signer)?;
+        pile.commit(collection, &self.signer, fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())
     }

@@ -34,6 +34,7 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
@@ -161,12 +162,11 @@ impl TriageSnapshot {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
-        let facts = open_scope(&mut *pile, scope, self.signer.clone())
-            .materialize()
-            .with_context(|| format!("materialize {label} collection"))?;
-        let reader = pile
-            .reader()
-            .with_context(|| format!("open {label} attachment reader"))?;
+        let collection = open_scope(pile, scope, &self.signer)?;
+        let (facts, _, reader) = pile
+            .snapshot(collection, &[])
+            .with_context(|| format!("materialize {label} collection"))?
+            .into_parts();
         Ok(CollectionView { facts, reader })
     }
 

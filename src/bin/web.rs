@@ -15,6 +15,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -278,12 +279,11 @@ impl WebStorage<'_> {
         scope: Id,
         label: &str,
     ) -> Result<CollectionView> {
-        let facts = open_scope(&mut *pile, scope, signer.clone())
-            .materialize()
-            .with_context(|| format!("materialize {label} collection"))?;
-        let reader = pile
-            .reader()
-            .with_context(|| format!("open {label} attachment reader"))?;
+        let collection = open_scope(pile, scope, signer)?;
+        let (facts, _, reader) = pile
+            .snapshot(collection, &[])
+            .with_context(|| format!("materialize {label} collection"))?
+            .into_parts();
         Ok(CollectionView { facts, reader })
     }
 
@@ -319,13 +319,13 @@ impl WebStorage<'_> {
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         fragment.describe_with(entity! { metadata::description: description });
-        let pile = open_pile_strict(self.pile)?;
-        let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
-        let result = collection
-            .commit(fragment)
+        let mut pile = open_pile_strict(self.pile)?;
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+        let result = pile
+            .commit(collection, &signer, fragment)
             .context("commit Web observation")
             .map(|_| ());
-        finish_pile(collection.into_storage(), result, "observation write")
+        finish_pile(pile, result, "observation write")
     }
 }
 
@@ -764,9 +764,11 @@ mod tests {
         .unwrap();
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let pile = open_pile_strict(&pile_path).unwrap();
-        let mut collection = faculties::collection_names::open(pile, DEFAULT_SCOPE_ID, signer);
-        let facts = collection.materialize().unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let collection =
+            faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let facts = pile.snapshot(collection, &[]).unwrap().into_facts();
         assert_eq!(
             find!(
                 (entity: Id),
@@ -775,6 +777,6 @@ mod tests {
             .count(),
             1
         );
-        collection.into_storage().close().unwrap();
+        pile.close().unwrap();
     }
 }
