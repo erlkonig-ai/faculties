@@ -140,6 +140,7 @@ struct RetiredVaultDiscovery {
 
 #[derive(Clone)]
 struct AccessCandidate {
+    inbox_commit: CollectionCommit,
     vault: CollectionHandle,
     custody: SigningKey,
     read_issuer: VerifyingKey,
@@ -157,6 +158,7 @@ struct PreparedVault {
     current_record_ids: BTreeSet<Id>,
     current_ids: BTreeSet<Id>,
     presentation: Vec<CapabilityPresentation>,
+    successor_inbox_commits: Vec<CollectionCommit>,
     successor_proofs: Vec<CapabilityProofBundle>,
     custody: SigningKey,
     founder_access: Option<(CapabilityProofBundle, CapabilityProofBundle)>,
@@ -442,6 +444,7 @@ fn inbox_rows(
                 continue;
             }
             local.push(AccessCandidate {
+                inbox_commit: *commit,
                 vault: load_access_envelope(&facts, id)
                     .expect("the row was validated above")
                     .vault,
@@ -663,6 +666,19 @@ fn successor_proofs(
             ]
         })
         .map(|bundle| (bundle.proof().id(), bundle))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+fn successor_inbox_commits(
+    candidates: &[AccessCandidate],
+    collection: CollectionHandle,
+) -> Vec<CollectionCommit> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.vault == collection)
+        .map(|candidate| (candidate.inbox_commit.id(), candidate.inbox_commit))
         .collect::<BTreeMap<_, _>>()
         .into_values()
         .collect()
@@ -929,6 +945,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             current_record_ids,
             current_ids,
             presentation,
+            successor_inbox_commits: successor_inbox_commits(&current_candidates, new),
             successor_proofs: successor_proofs(&current_candidates, new),
             custody,
             founder_access,
@@ -1047,12 +1064,26 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
     let mut appended_commits = 0;
     let mut published_envelopes = 0;
 
-    // A legacy proof record can already be discoverable even though its claim
-    // blobs predate Artifact OFFERs. Repair every successor proof this plan
-    // relies on before publishing any target COMMIT. Founder proofs are also
-    // staged here so a newly published envelope cannot race ahead of its DHT
-    // providers; publish_access_envelope's repeat is deliberately idempotent.
+    // A reused successor envelope or proof can already be discoverable even
+    // though its descriptor, payload closure, or claim blobs predate Artifact
+    // OFFERs. Repair every exact access path this plan relies on before
+    // publishing any target COMMIT. Founder proofs are also staged here so a
+    // newly published envelope cannot race ahead of its DHT providers;
+    // publish_access_envelope's repeat is deliberately idempotent.
     for vault in &before.vaults {
+        if !vault.successor_inbox_commits.is_empty() {
+            crate::offer_backfill::offer_reused_commit_closure(
+                pile,
+                current_inbox,
+                &vault.successor_inbox_commits,
+            )
+            .with_context(|| {
+                format!(
+                    "offer existing successor access envelope closure for vault {:X}",
+                    vault.summary.vault
+                )
+            })?;
+        }
         for proof in &vault.successor_proofs {
             persist_proof_bundle(pile, proof).with_context(|| {
                 format!(
@@ -1620,14 +1651,27 @@ mod tests {
             triblespace::core::clock::epoch_now(),
         )
         .unwrap();
-        commit_fragment(
+        let envelope_id = envelope.root().unwrap();
+        let sealed_seed = load_access_envelope(envelope.facts(), envelope_id)
+            .unwrap()
+            .sealed_seed;
+        let inbox_commit = commit_fragment(
             &mut pile,
             &fixture.signer,
             access_inbox_handle(fixture.signer.verifying_key()),
             envelope,
         );
+        let inbox_artifacts = [
+            access_inbox_handle(fixture.signer.verifying_key()).transmute(),
+            Handle::<UnknownBlob>::from_hash(inbox_commit.data()),
+            inbox_commit.metadata().transmute(),
+            sealed_seed.transmute(),
+        ];
         let offers = pile.offers_snapshot().unwrap();
         assert!(claims.iter().all(|claim| !offers.contains(*claim)));
+        assert!(inbox_artifacts
+            .iter()
+            .all(|artifact| !offers.contains(*artifact)));
         pile.close().unwrap();
 
         let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
@@ -1638,6 +1682,9 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let offers = pile.offers_snapshot().unwrap();
         assert!(claims.iter().all(|claim| offers.contains(*claim)));
+        assert!(inbox_artifacts
+            .iter()
+            .all(|artifact| offers.contains(*artifact)));
         pile.close().unwrap();
     }
 
