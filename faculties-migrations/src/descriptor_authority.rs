@@ -19,6 +19,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use faculties::schemas::posture::DEFAULT_SCAN_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
@@ -30,7 +31,7 @@ use triblespace::core::collection::simplearchive_union::{self, TribleSetUnionV1}
 use triblespace::core::collection::{
     discover_collection_records, CollectionRecord, CollectionStore, CollectionStoreExt,
 };
-use triblespace::core::id::{ExclusiveId, Id};
+use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -69,6 +70,10 @@ pub struct RootReseat {
 pub enum ResidueKind {
     Derived,
     SecretsDeferred,
+    /// An ordinary retired root under another authority (or otherwise not the
+    /// exact descriptor selected by this signer). Valid in concatenated
+    /// multi-authority piles; only blocking when no local epoch evidence exists.
+    ForeignOrdinaryRoot,
     RetiredNamedRoot,
     PreNamingRoot,
     Unknown,
@@ -87,6 +92,25 @@ pub struct DescriptorAuthorityPlan {
     pub roots: Vec<RootReseat>,
     pub residues: Vec<Residue>,
     pub invalid_records: usize,
+    /// At least one retired or current ordinary root belongs to the selected
+    /// signer. This distinguishes an empty/current-only pile from choosing a
+    /// third-party key for a pile which contains only foreign ordinary roots.
+    pub selected_epoch_evidence: bool,
+    /// Strictly verified COMMIT records observed across all collections.
+    /// Without selected-signer epoch evidence, any nonzero value makes a
+    /// successful no-op ambiguous rather than proving that nothing applies.
+    pub collection_commits: usize,
+    /// Bridgeable legacy Posture findings still present in the frozen retired
+    /// leaves. These must be bridged before any successor COMMIT is written.
+    pub posture_pending_bridges: usize,
+    /// Legacy Posture findings whose content identity can no longer be
+    /// recovered. Publication requires one explicit acceptance while the
+    /// retired leaf set is frozen.
+    pub posture_unbridged: usize,
+    /// Every deterministic successor COMMIT for the retired Posture leaves is
+    /// already present. This exact boundary, rather than an ambient marker,
+    /// makes replay independent of repositories used by the historical scan.
+    pub posture_reseat_complete: bool,
 }
 
 impl DescriptorAuthorityPlan {
@@ -96,7 +120,34 @@ impl DescriptorAuthorityPlan {
 
     pub fn settled(&self) -> bool {
         self.missing_commits() == 0
+            && !self.authority_ambiguous()
+            && self.posture_pending_bridges == 0
+            && self.posture_unbridged == 0
     }
+
+    pub fn foreign_ordinary_roots(&self) -> usize {
+        self.residues
+            .iter()
+            .filter(|residue| residue.kind == ResidueKind::ForeignOrdinaryRoot)
+            .count()
+    }
+
+    /// Whether this key has no evidence of owning the epoch while the pile is
+    /// nonempty. This conservative Faculties-specific boundary catches wrong
+    /// keys even when a foreign descriptor blob has not arrived yet. If a
+    /// legitimate external-/Secrets-only pile ever needs this migration, it
+    /// should gain an explicit override rather than silently guessing now.
+    pub fn authority_ambiguous(&self) -> bool {
+        !self.selected_epoch_evidence && self.collection_commits != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DescriptorAuthorityOptions {
+    /// Accept genuinely unrecoverable legacy Posture findings for this frozen
+    /// retired epoch. The resulting exact Posture successor COMMITs embody the
+    /// decision, so replay never needs the flag again.
+    pub accept_unbridged_posture: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,11 +279,30 @@ fn retired_descriptor(
     }
 }
 
-fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
+/// Reconstruct the exact descriptor one ordinary root had in the retired
+/// name/namespace epoch.
+///
+/// Migration code must use this rather than the live collection facade: once
+/// authority became mandatory, opening a faculty scope computes a different
+/// handle. In particular, migrations which must precede this re-seat need to
+/// append their final legacy leaf under this descriptor so it is carried
+/// across with every other source leaf.
+pub(crate) fn retired_root_descriptor(scope: Id, namespace: VerifyingKey) -> Result<Fragment> {
+    let (_, name, reach) = faculties::collection_names::table()
+        .into_iter()
+        .find(|(candidate, _, _)| *candidate == scope)
+        .ok_or_else(|| anyhow!("scope {scope:X} is absent from the ordinary-root registry"))?;
+    Ok(retired_descriptor(name, namespace, None, reach))
+}
+
+pub(crate) fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
     IntoBlob::<SimpleArchive>::to_blob(fragment.facts().clone()).get_handle()
 }
 
-fn descriptor_facts(reader: &PileReader, collection: CollectionHandle) -> Result<TribleSet> {
+pub(crate) fn descriptor_facts(
+    reader: &PileReader,
+    collection: CollectionHandle,
+) -> Result<TribleSet> {
     let blob: Blob<SimpleArchive> = reader
         .get(collection)
         .with_context(|| format!("read descriptor {}", hex::encode_upper(collection.raw)))?;
@@ -278,7 +348,11 @@ fn has_attribute(facts: &TribleSet, attribute: Id) -> bool {
     facts.iter().any(|fact| fact.a() == &attribute)
 }
 
-fn classify_residue(reader: &PileReader, collection: CollectionHandle) -> (ResidueKind, String) {
+fn classify_residue(
+    reader: &PileReader,
+    collection: CollectionHandle,
+    expected_namespace: VerifyingKey,
+) -> (ResidueKind, String) {
     let Ok(facts) = descriptor_facts(reader, collection) else {
         return (
             ResidueKind::Unknown,
@@ -311,6 +385,22 @@ fn classify_residue(reader: &PileReader, collection: CollectionHandle) -> (Resid
                 ),
             )
         }
+        Ok(root)
+            if root.authority.is_none()
+                && faculties::collection_names::table()
+                    .iter()
+                    .any(|(_, name, _)| *name == root.name.as_str()) =>
+        {
+            (
+                ResidueKind::ForeignOrdinaryRoot,
+                format!(
+                    "ordinary root '{}' belongs to namespace {} rather than the exact descriptor under {}",
+                    root.name,
+                    hex::encode_upper(root.namespace.to_bytes()),
+                    hex::encode_upper(expected_namespace.to_bytes()),
+                ),
+            )
+        }
         Ok(root) => (
             ResidueKind::RetiredNamedRoot,
             format!("retired or external named root '{}'", root.name),
@@ -335,6 +425,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
     let authority = signer.verifying_key();
     let mut roots = Vec::new();
     let mut recognized = BTreeSet::new();
+    let mut selected_epoch_evidence = false;
 
     for (scope, name, reach) in faculties::collection_names::table() {
         let old_descriptor = retired_descriptor(name, authority, None, reach.clone());
@@ -349,6 +440,14 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
             .copied()
             .filter(|commit| commit.collection() == old)
             .collect::<Vec<_>>();
+        // This is the no-presentation admission rule used by `ticket`: the
+        // descriptor authority itself is admitted, arbitrary strictly signed
+        // COMMITs on a publicly computable handle are inert. Counting the
+        // latter would let a foreign writer spoof local epoch ownership.
+        selected_epoch_evidence |= !source.is_empty()
+            || commits.iter().any(|commit| {
+                commit.collection() == new && commit.public_key().raw == authority.to_bytes()
+            });
         // This is a transform of retired leaves, not a registry audit. A
         // current-epoch-only root has nothing to migrate and must not make a
         // clean pile depend on retaining the retired descriptor forever.
@@ -395,7 +494,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
         .into_iter()
         .filter(|(collection, _)| !recognized.contains(collection))
         .map(|(collection, records)| {
-            let (kind, detail) = classify_residue(&reader, collection);
+            let (kind, detail) = classify_residue(&reader, collection, authority);
             Residue {
                 collection,
                 kind,
@@ -406,10 +505,30 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
         .collect::<Vec<_>>();
     roots.sort_by(|left, right| left.name.cmp(&right.name));
     residues.sort_by_key(|residue| (residue.kind, residue.collection));
+
+    let posture_reseat_complete = roots
+        .iter()
+        .find(|root| root.scope == DEFAULT_SCAN_SCOPE_ID)
+        .is_none_or(|root| root.missing_commits == 0);
+    let (posture_pending_bridges, posture_unbridged) = if posture_reseat_complete {
+        (0, 0)
+    } else {
+        // Only the exact target COMMIT set may close this epoch. Until that
+        // exists, inspect the frozen retired source; unrelated or foreign
+        // current-handle COMMITs cannot spoof either a bridge or acceptance.
+        let audit = crate::posture_findings::audit_retired_for_descriptor(pile, signer)
+            .context("audit retired Posture findings before descriptor re-seat")?;
+        (audit.bridged().len(), audit.unbridged().len())
+    };
     Ok(DescriptorAuthorityPlan {
         roots,
         residues,
         invalid_records,
+        selected_epoch_evidence,
+        collection_commits: commits.len(),
+        posture_pending_bridges,
+        posture_unbridged,
+        posture_reseat_complete,
     })
 }
 
@@ -446,8 +565,56 @@ fn validate_resident_commit_inputs(
     Ok(())
 }
 
-fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthorityReport> {
+fn frozen_sources(
+    plan: &DescriptorAuthorityPlan,
+    commits: &[CollectionCommit],
+) -> Result<BTreeMap<CollectionHandle, Vec<CollectionCommit>>> {
+    plan.roots
+        .iter()
+        .map(|root| {
+            let source = commits
+                .iter()
+                .copied()
+                .filter(|commit| commit.collection() == root.old)
+                .collect::<Vec<_>>();
+            if source.len() != root.source_commits {
+                bail!(
+                    "retired {} source changed after the final plan (planned {}, now {} COMMITs); re-plan before publication",
+                    root.name,
+                    root.source_commits,
+                    source.len(),
+                );
+            }
+            Ok((root.old, source))
+        })
+        .collect()
+}
+
+fn publish_open(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    options: DescriptorAuthorityOptions,
+) -> Result<DescriptorAuthorityReport> {
     let before = plan_open(pile, signer)?;
+    if before.authority_ambiguous() {
+        bail!(
+            "descriptor-authority found {} collection COMMIT(s) but no retired or authority-admitted current ordinary-root evidence for the supplied signer; refusing an ambiguous wrong-authority no-op ({} foreign ordinary root(s) decoded)",
+            before.collection_commits,
+            before.foreign_ordinary_roots(),
+        );
+    }
+    if before.posture_pending_bridges != 0 {
+        bail!(
+            "descriptor-authority is blocked by {} bridgeable legacy Posture finding(s); run `migrations posture-findings` first",
+            before.posture_pending_bridges,
+        );
+    }
+    if before.posture_unbridged != 0 && !options.accept_unbridged_posture {
+        bail!(
+            "descriptor-authority found {} unrecoverable legacy Posture finding(s); inspect the dry-run report, then publish once with `--accept-unbridged-posture` to freeze this exact epoch",
+            before.posture_unbridged,
+        );
+    }
     let discovered = discover_collection_records(&mut *pile)
         .context("rediscover frozen source records before publication")?;
     let commits = discovered.commits().to_vec();
@@ -460,18 +627,7 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthor
         .context("open publication dependency reader")?;
     let authority = signer.verifying_key();
     let mut appended_commits = 0;
-    let sources = before
-        .roots
-        .iter()
-        .map(|root| {
-            let source = commits
-                .iter()
-                .copied()
-                .filter(|commit| commit.collection() == root.old)
-                .collect::<Vec<_>>();
-            (root.old, source)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let sources = frozen_sources(&before, &commits)?;
 
     // Validate the complete frozen source before making even the first target
     // COMMIT visible. Descriptor registration below may still be retried, but
@@ -497,6 +653,8 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthor
                 root.name
             );
         }
+        crate::offer_backfill::offer_reused_commit_closure(pile, root.new, source)
+            .with_context(|| format!("offer re-seated {} dependency closure", root.name))?;
         for commit in expected_target_commits(signer, root.new, source).into_values() {
             if existing.contains(&commit.id()) {
                 continue;
@@ -518,7 +676,10 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthor
     })
 }
 
-fn materialize_source(reader: &PileReader, commits: &[CollectionCommit]) -> Result<TribleSet> {
+pub(crate) fn materialize_source(
+    reader: &PileReader,
+    commits: &[CollectionCommit],
+) -> Result<TribleSet> {
     let mut facts = TribleSet::new();
     let mut seen = BTreeSet::new();
     for commit in commits {
@@ -600,9 +761,17 @@ pub fn plan_path(pile: &Path, key: Option<&Path>) -> Result<DescriptorAuthorityP
 /// Stop old-epoch writers before publication. The transform is additive and
 /// replayable, but a concurrent old writer could append after the source census.
 pub fn publish_path(pile: &Path, key: Option<&Path>) -> Result<DescriptorAuthorityReport> {
+    publish_path_with_options(pile, key, DescriptorAuthorityOptions::default())
+}
+
+pub fn publish_path_with_options(
+    pile: &Path,
+    key: Option<&Path>,
+    options: DescriptorAuthorityOptions,
+) -> Result<DescriptorAuthorityReport> {
     let signer = load_signer(pile, key).context("load durable descriptor authority")?;
     let mut store = open_pile_strict(pile)?;
-    let result = publish_open(&mut store, &signer);
+    let result = publish_open(&mut store, &signer, options);
     finish_pile(store, result, "descriptor-authority publication")
 }
 
@@ -628,9 +797,11 @@ mod tests {
 
     use super::*;
     use faculties::storage::initialize_signer;
+    use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{CollectionMerge, CollectionRecord};
-    use triblespace::core::repo::BlobStorePut;
+    use triblespace::core::id::ExclusiveId;
+    use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut, RetentionRoots};
 
     fn store_fragment(pile: &mut Pile, fragment: Fragment) -> CollectionHandle {
         let (_, facts, _, mut blobs) = fragment.into_parts();
@@ -779,6 +950,153 @@ mod tests {
     }
 
     #[test]
+    fn wrong_signer_reports_the_real_ordinary_root_and_refuses_a_noop() {
+        let (directory, path, _key, signer) = fixture();
+        let (_scope, name, reach) = faculties::collection_names::table()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        let old = store_fragment(
+            &mut pile,
+            retired_descriptor(name, signer.verifying_key(), None, reach.clone()),
+        );
+        let data = pile.put::<SimpleArchive, _>(one_fact(0x6a)).unwrap();
+        let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            old,
+            data.transmute(),
+            metadata,
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let wrong_key_path = directory.path().join("wrong.key");
+        let wrong = initialize_signer(&path, Some(&wrong_key_path)).unwrap();
+        assert_ne!(wrong.verifying_key(), signer.verifying_key());
+
+        // A handle is public information. Merely signing a COMMIT for the
+        // descriptor computed under `wrong` cannot spoof evidence that this
+        // key owns an epoch; without a proof, only the descriptor authority is
+        // admitted by an empty-presentation ticket.
+        let mut pile = open_pile_strict(&path).unwrap();
+        let wrong_current = pile
+            .collection(simplearchive_union::descriptor(
+                name,
+                wrong.verifying_key(),
+                reach,
+            ))
+            .unwrap();
+        pile.commit(wrong_current, &signer, Fragment::from(one_fact(0x6b)))
+            .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&path, Some(&wrong_key_path)).unwrap();
+        assert!(plan.roots.is_empty());
+        assert!(plan.authority_ambiguous());
+        assert_eq!(plan.foreign_ordinary_roots(), 1);
+        assert!(!plan.settled());
+        assert_eq!(
+            plan.residues
+                .iter()
+                .find(|residue| residue.collection == old)
+                .unwrap()
+                .kind,
+            ResidueKind::ForeignOrdinaryRoot
+        );
+
+        let error = publish_path(&path, Some(&wrong_key_path))
+            .expect_err("a wrong durable signer must never become a successful no-op");
+        assert!(error.to_string().contains("wrong-authority no-op"));
+
+        let mut pile = open_pile_strict(&path).unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        assert_eq!(records.commits().len(), 2);
+        assert_eq!(
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == old)
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == wrong_current)
+                .count(),
+            1
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn concatenated_authorities_migrate_independently_but_a_third_key_fails() {
+        let (directory, path, key_a, signer_a) = fixture();
+        let key_b = directory.path().join("b.key");
+        let signer_b = initialize_signer(&path, Some(&key_b)).unwrap();
+        let (_scope, name, reach) = faculties::collection_names::table()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        for (index, signer) in [&signer_a, &signer_b].into_iter().enumerate() {
+            let old = store_fragment(
+                &mut pile,
+                retired_descriptor(name, signer.verifying_key(), None, reach.clone()),
+            );
+            let data = pile
+                .put::<SimpleArchive, _>(one_fact(0x71 + index as u8))
+                .unwrap();
+            let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                signer,
+                old,
+                data.transmute(),
+                metadata,
+            )))
+            .unwrap();
+        }
+        pile.close().unwrap();
+
+        let plan_a = plan_path(&path, Some(&key_a)).unwrap();
+        assert!(plan_a.selected_epoch_evidence);
+        assert!(!plan_a.authority_ambiguous());
+        assert_eq!(
+            plan_a
+                .residues
+                .iter()
+                .filter(|residue| residue.kind == ResidueKind::ForeignOrdinaryRoot)
+                .count(),
+            1
+        );
+        assert!(publish_path(&path, Some(&key_a)).unwrap().plan.settled());
+
+        let plan_b = plan_path(&path, Some(&key_b)).unwrap();
+        assert!(plan_b.selected_epoch_evidence);
+        assert!(!plan_b.authority_ambiguous());
+        assert!(publish_path(&path, Some(&key_b)).unwrap().plan.settled());
+
+        let replay_a = publish_path(&path, Some(&key_a)).unwrap();
+        assert_eq!(replay_a.appended_commits, 0);
+        assert!(replay_a.plan.settled());
+        assert!(!replay_a.plan.authority_ambiguous());
+
+        let key_c = directory.path().join("c.key");
+        initialize_signer(&path, Some(&key_c)).unwrap();
+        let plan_c = plan_path(&path, Some(&key_c)).unwrap();
+        assert!(!plan_c.selected_epoch_evidence);
+        assert!(plan_c.authority_ambiguous());
+        assert_eq!(plan_c.foreign_ordinary_roots(), 2);
+        assert!(publish_path(&path, Some(&key_c))
+            .unwrap_err()
+            .to_string()
+            .contains("wrong-authority no-op"));
+    }
+
+    #[test]
     fn publication_reuses_handles_collapses_duplicate_open_leaves_and_skips_merges() {
         let (_directory, path, key, signer) = fixture();
         let foreign = SigningKey::from_bytes(&[0x52; 32]);
@@ -839,6 +1157,112 @@ mod tests {
             .merges()
             .iter()
             .all(|merge| merge.collection() != root.new));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_a_retired_leaf_appended_after_its_plan() {
+        let (_directory, path, _key, signer) = fixture();
+        let (_scope, name, reach) = faculties::collection_names::table()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        let old = store_fragment(
+            &mut pile,
+            retired_descriptor(name, signer.verifying_key(), None, reach),
+        );
+        let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let first = pile.put::<SimpleArchive, _>(one_fact(0x31)).unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            old,
+            first.transmute(),
+            metadata,
+        )))
+        .unwrap();
+        let plan = plan_open(&mut pile, &signer).unwrap();
+
+        let late = pile.put::<SimpleArchive, _>(one_fact(0x32)).unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            old,
+            late.transmute(),
+            metadata,
+        )))
+        .unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        let error = frozen_sources(&plan, records.commits()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("source changed after the final plan"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn reseat_backfills_offers_for_reused_archives_and_nested_attachments() {
+        let (_directory, path, key, signer) = fixture();
+        let (scope, name, reach) = faculties::collection_names::table()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        let old = store_fragment(
+            &mut pile,
+            retired_descriptor(name, signer.verifying_key(), None, reach),
+        );
+
+        let mut data_fragment = Fragment::empty();
+        let data_attachment: Inline<Handle<UTF8String>> =
+            data_fragment.put("nested data attachment".to_owned());
+        data_fragment += entity! { metadata::description: data_attachment };
+        let data = store_fragment(&mut pile, data_fragment);
+
+        let mut metadata_fragment = Fragment::empty();
+        let metadata_attachment: Inline<Handle<UTF8String>> =
+            metadata_fragment.put("nested metadata attachment".to_owned());
+        metadata_fragment += entity! { metadata::description: metadata_attachment };
+        let commit_metadata = store_fragment(&mut pile, metadata_fragment);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            old,
+            data.transmute(),
+            commit_metadata,
+        )))
+        .unwrap();
+        assert!(pile.offers_snapshot().unwrap().is_empty());
+        pile.close().unwrap();
+
+        let report = publish_path(&path, Some(&key)).unwrap();
+        let root = report
+            .plan
+            .roots
+            .iter()
+            .find(|root| root.scope == scope)
+            .unwrap();
+        let mut pile = open_pile_strict(&path).unwrap();
+        let offers = pile.offers_snapshot().unwrap();
+        for handle in [
+            root.new.transmute(),
+            data.transmute(),
+            commit_metadata.transmute(),
+            data_attachment.transmute(),
+            metadata_attachment.transmute(),
+        ] {
+            assert!(offers.contains(handle), "missing OFFER for {handle:?}");
+        }
+
+        let reader = pile.reader().unwrap();
+        let mut roots = RetentionRoots::new();
+        roots.retain_recursive(root.new);
+        roots.retain_recursive(data);
+        roots.retain_recursive(commit_metadata);
+        for handle in roots.expanded(&reader) {
+            assert!(
+                offers.contains(handle),
+                "missing OFFER for a conservatively reachable artifact {handle:?}"
+            );
+        }
         pile.close().unwrap();
     }
 

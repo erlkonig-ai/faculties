@@ -36,27 +36,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anybytes::View;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::SigningKey;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::Blob;
+use triblespace::core::collection::{
+    discover_collection_records, CollectionCommit, CollectionRecord, CollectionStore,
+};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut, OfferCapture};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::entity;
 use triblespace::prelude::{exists, find, pattern};
 
-use faculties::legacy_hint::open_scope;
 use faculties::posture_finding::{
     commit_message_location, finding_id, git_bytes, git_probe, Carrier, GitObjects, Location,
 };
 use faculties::schemas::posture::{
     modality, posture, DEFAULT_SCAN_SCOPE_ID, KIND_FINDING, KIND_LEGACY_BRIDGE,
 };
-use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
+use faculties::storage::{load_signer, open_pile_strict};
+
+use crate::descriptor_authority::{
+    descriptor_facts, descriptor_handle, materialize_source, retired_root_descriptor,
+};
 
 type TextHandle = Inline<Handle<UTF8String>>;
 
@@ -108,27 +117,9 @@ impl FindingBridgePlan {
 /// Pure: it opens repositories read-only and writes nothing.
 pub fn plan(pile: &Path, key: Option<&Path>) -> Result<FindingBridgePlan> {
     let signer = load_signer(pile, key)?;
-    let store = open_pile_strict(pile)?;
-    let mut collection = open_scope(store, DEFAULT_SCAN_SCOPE_ID, signer);
-    let result = (|| {
-        let facts = collection
-            .materialize()
-            .context("materialize the Posture scan collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Posture scan blob reader")?;
-        build(&facts, &reader)
-    })();
-    let close = collection
-        .into_storage()
-        .close()
-        .map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(plan), Ok(())) => Ok(plan),
-        (Ok(_), Err(error)) => Err(error.context("close Posture pile")),
-        (Err(error), _) => Err(error),
-    }
+    let mut store = open_pile_strict(pile)?;
+    let result = plan_open(&mut store, &signer);
+    finish_pile(store, result, "Posture bridge planning")
 }
 
 /// Write the bridges. Exact replay is idempotent, because both the blobs and
@@ -137,17 +128,186 @@ pub fn publish(
     pile: &Path,
     key: Option<&Path>,
 ) -> Result<(FindingBridgePlan, Option<CollectionCommit>)> {
-    let plan = plan(pile, key)?;
-    if plan.bridged.is_empty() {
-        return Ok((plan, None));
+    let signer = load_signer(pile, key)?;
+    let mut store = open_pile_strict(pile)?;
+    let result = (|| {
+        let plan = plan_open(&mut store, &signer)?;
+        if plan.bridged.is_empty() {
+            return Ok((plan, None));
+        }
+
+        let descriptor = retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key())?;
+        let mut fragment = plan.fragment.clone();
+        fragment.describe_with(entity! {
+            metadata::description: "posture legacy finding identity bridges".to_owned(),
+        });
+        let commit = publish_retired_fragment(&mut store, &signer, descriptor, fragment)
+            .context("publish Posture finding bridges under the retired descriptor")?;
+
+        let after = plan_open(&mut store, &signer)?;
+        if !after.bridged.is_empty() {
+            bail!("Posture bridge publication left pending bridge rows");
+        }
+        Ok((plan, Some(commit)))
+    })();
+    finish_pile(store, result, "Posture bridge publication")
+}
+
+/// Plan against the exact retired Posture descriptor.
+///
+/// The bridge deliberately runs before descriptor-authority. Publishing it to
+/// the current mandatory-authority descriptor would strand it outside the
+/// frozen retired leaf set and the subsequent re-seat would not carry it.
+fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<FindingBridgePlan> {
+    let retired = retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key())?;
+    let retired_handle = descriptor_handle(&retired);
+    let current =
+        faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key());
+    let current_handle = descriptor_handle(&current);
+    let discovered = discover_collection_records(&mut *pile)
+        .context("discover Posture records for finding bridge")?;
+
+    if discovered.commits().iter().any(|commit| {
+        commit.collection() == current_handle
+            && commit.public_key().raw == signer.verifying_key().to_bytes()
+    }) {
+        bail!(
+            "Posture already has mandatory-authority COMMITs; the finding bridge must be settled before `migrations descriptor-authority`"
+        );
     }
-    let mut fragment = plan.fragment.clone();
-    fragment.describe_with(entity! {
-        metadata::description: "posture legacy finding identity bridges".to_owned(),
-    });
-    let commit = publish_fragment(pile, key, DEFAULT_SCAN_SCOPE_ID, fragment)
-        .context("publish Posture finding bridges")?;
-    Ok((plan, Some(commit)))
+
+    let source = discovered
+        .commits()
+        .iter()
+        .copied()
+        .filter(|commit| commit.collection() == retired_handle)
+        .collect::<Vec<_>>();
+    let reader = pile.reader().context("open Posture bridge reader")?;
+    if !source.is_empty() {
+        let resident =
+            descriptor_facts(&reader, retired_handle).context("read retired Posture descriptor")?;
+        if resident != *retired.facts() {
+            bail!("retired Posture descriptor is not the exact registered epoch");
+        }
+    }
+    let facts =
+        materialize_source(&reader, &source).context("materialize retired Posture scan leaves")?;
+    build(&facts, &reader)
+}
+
+/// Inspect only the frozen retired Posture leaves before descriptor re-seat.
+///
+/// The caller first checks whether every deterministic successor COMMIT for
+/// those leaves is already present. Once that exact epoch boundary exists,
+/// replay must not depend on repositories which may since have moved or been
+/// collected. Until then this is the authoritative pre-publication audit:
+/// bridgeable rows must be settled, while genuinely unrecoverable rows require
+/// the descriptor migration's explicit one-shot acceptance.
+pub(crate) fn audit_retired_for_descriptor(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<FindingBridgePlan> {
+    let retired = retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key())?;
+    let retired_handle = descriptor_handle(&retired);
+    let discovered = discover_collection_records(&mut *pile)
+        .context("discover Posture records for descriptor prerequisite")?;
+    let retired_source = discovered
+        .commits()
+        .iter()
+        .copied()
+        .filter(|commit| commit.collection() == retired_handle)
+        .collect::<Vec<_>>();
+    let reader = pile
+        .reader()
+        .context("open Posture descriptor-prerequisite reader")?;
+
+    if !retired_source.is_empty() {
+        let resident =
+            descriptor_facts(&reader, retired_handle).context("read retired Posture descriptor")?;
+        if resident != *retired.facts() {
+            bail!("retired Posture descriptor is not the exact registered epoch");
+        }
+    }
+    let facts = materialize_source(&reader, &retired_source)
+        .context("materialize retired Posture facts for descriptor prerequisite")?;
+    build(&facts, &reader)
+}
+
+/// Publish one fragment under a deliberately retired descriptor.
+///
+/// The live publication API correctly rejects that descriptor because it has
+/// no mandatory authority. This migration-local seam mirrors the normal
+/// dependency ordering without weakening the current API: descriptor and
+/// fragment attachments, descriptor/data/metadata archives, OFFERs, then the
+/// signed COMMIT.
+fn publish_retired_fragment(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    descriptor: Fragment,
+    fragment: Fragment,
+) -> Result<CollectionCommit> {
+    let expected = descriptor_handle(&descriptor);
+    let (_, descriptor_facts, _, descriptor_blobs) = descriptor.into_parts();
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    let mut capture = OfferCapture::new(pile);
+
+    for blob in sorted_blobs(descriptor_blobs)? {
+        capture
+            .put::<UnknownBlob, _>(blob)
+            .context("store retired Posture descriptor attachment")?;
+    }
+    let collection = capture
+        .put::<SimpleArchive, _>(descriptor_facts)
+        .context("store retired Posture descriptor")?;
+    if collection != expected {
+        bail!("stored retired Posture descriptor changed content identity");
+    }
+    for blob in sorted_blobs(blobs)? {
+        capture
+            .put::<UnknownBlob, _>(blob)
+            .context("store Posture bridge attachment")?;
+    }
+    let data = capture
+        .put::<SimpleArchive, _>(facts)
+        .context("store Posture bridge facts")?;
+    let metadata = capture
+        .put::<SimpleArchive, _>(metafacts)
+        .context("store Posture bridge metadata")?;
+    let commit = CollectionCommit::sign(
+        signer,
+        collection,
+        Handle::<SimpleArchive>::to_hash(data),
+        metadata,
+    );
+    capture
+        .insert(CollectionRecord::Commit(commit))
+        .map_err(|error| anyhow!("append retired Posture bridge COMMIT: {error}"))?;
+    Ok(commit)
+}
+
+fn sorted_blobs(
+    mut blobs: triblespace::core::blob::MemoryBlobStore,
+) -> Result<Vec<Blob<UnknownBlob>>> {
+    let mut blobs = blobs
+        .reader()
+        .expect("MemoryBlobStore::reader is infallible")
+        .into_iter()
+        .map(|(_, blob)| blob)
+        .collect::<Vec<_>>();
+    blobs.sort_unstable_by_key(|blob| blob.get_handle().raw);
+    Ok(blobs)
+}
+
+fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.context(format!("close pile after {operation}"))),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => Err(error.context(format!(
+            "closing after {operation} also failed: {close_error}"
+        ))),
+    }
 }
 
 fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
@@ -389,7 +549,12 @@ fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use super::*;
+    use faculties::storage::initialize_signer;
+    use triblespace::core::collection::CollectionStoreExt;
+    use triblespace::core::id::ExclusiveId;
 
     #[test]
     fn a_literal_pin_bridges_without_a_repository() {
@@ -418,5 +583,164 @@ mod tests {
     fn a_malformed_legacy_locator_is_reported_not_guessed() {
         assert!(unsafe_attribute_location("rust-attribute-added src/schema.rs#1").is_err());
         assert!(unsafe_attribute_location("patch abc:1  x").is_err());
+    }
+
+    #[test]
+    fn descriptor_authority_reseats_the_bridge_leaf_written_to_the_retired_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("posture.pile");
+        let key_path = directory.path().join("posture.key");
+        File::create(&pile_path).unwrap();
+        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+
+        let occurrence = Id::new([0x41; 16]).unwrap();
+        let finding = Id::new([0x42; 16]).unwrap();
+        let mut legacy = Fragment::empty();
+        let locator = legacy.put(
+            "rust-attribute-added src/schema.rs#1  \"AAAA\" unsafe as legacy: ShortString;"
+                .to_owned(),
+        );
+        let value = legacy.put("legacy declaration".to_owned());
+        legacy += entity! {
+            ExclusiveId::force_ref(&finding) @
+            metadata::tag: KIND_FINDING,
+            metadata::tag: modality::UNSAFE_ATTRIBUTE_ID,
+            posture::occurrence: occurrence,
+            posture::locator: locator,
+            posture::value: value,
+        };
+
+        let retired =
+            retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key()).unwrap();
+        let retired_handle = descriptor_handle(&retired);
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source = publish_retired_fragment(&mut pile, &signer, retired, legacy).unwrap();
+        assert_eq!(source.collection(), retired_handle);
+
+        // A foreign writer can compute the mandatory-authority handle and
+        // publish a strictly signed COMMIT on it, but that COMMIT is inert
+        // without a WRITE presentation. It may neither fake this occurrence's
+        // bridge nor prevent the real retired bridge from being published.
+        let foreign = SigningKey::from_bytes(&[0x73; 32]);
+        let current_descriptor = faculties::collection_names::root_descriptor(
+            DEFAULT_SCAN_SCOPE_ID,
+            signer.verifying_key(),
+        );
+        let current_handle = pile.collection(current_descriptor).unwrap();
+        let fake_bridge = entity! {
+            metadata::tag: KIND_LEGACY_BRIDGE,
+            posture::occurrence: occurrence,
+            posture::sighting_of: Id::new([0x55; 16]).unwrap(),
+        };
+        pile.commit(current_handle, &foreign, fake_bridge).unwrap();
+        pile.close().unwrap();
+
+        let error = crate::descriptor_authority::publish_path(&pile_path, Some(&key_path))
+            .expect_err("descriptor-first must not strand a bridgeable finding");
+        assert!(error.to_string().contains("bridgeable legacy Posture"));
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        assert_eq!(records.commits().len(), 2);
+        assert_eq!(
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == retired_handle)
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == current_handle)
+                .count(),
+            1
+        );
+        pile.close().unwrap();
+
+        let (planned, bridge) = publish(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(planned.bridged().len(), 1);
+        let bridge = bridge.expect("one bridge COMMIT");
+        assert_eq!(bridge.collection(), retired_handle);
+
+        let report = crate::descriptor_authority::publish_path(&pile_path, Some(&key_path))
+            .expect("re-seat retired Posture leaves");
+        let root = report
+            .plan
+            .roots
+            .iter()
+            .find(|root| root.scope == DEFAULT_SCAN_SCOPE_ID)
+            .expect("Posture root was planned");
+        assert_eq!(root.source_commits, 2);
+        assert_eq!(root.target_commits, 2);
+        assert_eq!(root.missing_commits, 0);
+
+        let expected_bridge =
+            CollectionCommit::sign(&signer, root.new, bridge.data(), bridge.metadata());
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        assert!(records
+            .commits()
+            .iter()
+            .any(|commit| commit.id() == expected_bridge.id()));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn unrecoverable_findings_require_one_explicit_epoch_acceptance() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("posture.pile");
+        let key_path = directory.path().join("posture.key");
+        File::create(&pile_path).unwrap();
+        let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+
+        let occurrence = Id::new([0x61; 16]).unwrap();
+        let finding = Id::new([0x62; 16]).unwrap();
+        let mut legacy = Fragment::empty();
+        let locator = legacy.put("docProps/core.xml creator".to_owned());
+        let value = legacy.put("legacy author".to_owned());
+        legacy += entity! {
+            ExclusiveId::force_ref(&finding) @
+            metadata::tag: KIND_FINDING,
+            metadata::tag: modality::OOXML_CORE_PROPS,
+            posture::occurrence: occurrence,
+            posture::locator: locator,
+            posture::value: value,
+        };
+
+        let retired =
+            retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key()).unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        publish_retired_fragment(&mut pile, &signer, retired, legacy).unwrap();
+        pile.close().unwrap();
+
+        let plan = crate::descriptor_authority::plan_path(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(plan.posture_pending_bridges, 0);
+        assert_eq!(plan.posture_unbridged, 1);
+        assert!(!plan.posture_reseat_complete);
+        let before = std::fs::read(&pile_path).unwrap();
+        let error = crate::descriptor_authority::publish_path(&pile_path, Some(&key_path))
+            .expect_err("unrecoverable Posture rows need explicit acceptance");
+        assert!(error.to_string().contains("--accept-unbridged-posture"));
+        assert_eq!(std::fs::read(&pile_path).unwrap(), before);
+
+        let accepted = crate::descriptor_authority::publish_path_with_options(
+            &pile_path,
+            Some(&key_path),
+            crate::descriptor_authority::DescriptorAuthorityOptions {
+                accept_unbridged_posture: true,
+            },
+        )
+        .unwrap();
+        assert!(accepted.plan.posture_reseat_complete);
+        assert_eq!(accepted.plan.posture_unbridged, 0);
+
+        // Exact deterministic target leaves embody the one-shot acceptance;
+        // replay does not consult the old environment or need the flag again.
+        let replay =
+            crate::descriptor_authority::publish_path(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(replay.appended_commits, 0);
+        assert!(replay.plan.posture_reseat_complete);
     }
 }

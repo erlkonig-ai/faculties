@@ -46,8 +46,8 @@ use triblespace::core::collection::records::{
 };
 use triblespace::core::collection::simplearchive_union::{self, TribleSetUnionV1};
 use triblespace::core::collection::{
-    discover_collection_records, CollectionRecord, CollectionStore, CollectionStoreExt,
-    ACTION_WRITE,
+    discover_collection_records, CapabilityPresentation, CollectionRecord, CollectionStore,
+    CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
@@ -73,6 +73,7 @@ mod retired {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultReseat {
     pub vault: Id,
+    pub authority: VerifyingKey,
     pub old: CollectionHandle,
     pub new: CollectionHandle,
     pub source_commits: usize,
@@ -132,10 +133,17 @@ struct RetiredRoot {
     authority: Option<VerifyingKey>,
 }
 
+struct RetiredVaultDiscovery {
+    vaults: BTreeMap<CollectionHandle, (Id, RetiredRoot)>,
+    unreadable: BTreeMap<CollectionHandle, String>,
+}
+
 #[derive(Clone)]
 struct AccessCandidate {
     vault: CollectionHandle,
     custody: SigningKey,
+    read_issuer: VerifyingKey,
+    read_bundle: CapabilityProofBundle,
     writer: VerifyingKey,
     write_bundle: CapabilityProofBundle,
 }
@@ -143,15 +151,21 @@ struct AccessCandidate {
 struct PreparedVault {
     summary: VaultReseat,
     source_facts: TribleSet,
+    source: Vec<CollectionCommit>,
     expected: Vec<CollectionCommit>,
+    source_ids: BTreeSet<Id>,
+    current_record_ids: BTreeSet<Id>,
+    current_ids: BTreeSet<Id>,
+    presentation: Vec<CapabilityPresentation>,
     custody: SigningKey,
-    read: CapabilityProofBundle,
-    write: CapabilityProofBundle,
+    founder_access: Option<(CapabilityProofBundle, CapabilityProofBundle)>,
 }
 
 struct PreparedPlan {
     public: SecretsDescriptorAuthorityPlan,
     vaults: Vec<PreparedVault>,
+    old_inbox_ids: BTreeSet<Id>,
+    current_inbox_ids: BTreeSet<Id>,
 }
 
 fn one_attribute<'a>(
@@ -298,23 +312,38 @@ fn has_attribute(facts: &TribleSet, attribute: Id) -> bool {
 fn discover_retired_vaults(
     reader: &PileReader,
     commits: &[CollectionCommit],
-) -> Result<BTreeMap<CollectionHandle, (Id, RetiredRoot)>> {
+) -> Result<RetiredVaultDiscovery> {
     let mut vaults = BTreeMap::new();
+    let mut unreadable = BTreeMap::new();
     let collections = commits
         .iter()
         .map(CollectionCommit::collection)
         .collect::<BTreeSet<_>>();
     for collection in collections {
-        let Ok(facts) = descriptor_facts(reader, collection) else {
-            continue;
+        let facts = match descriptor_facts(reader, collection) {
+            Ok(facts) => facts,
+            Err(error) => {
+                unreadable.insert(
+                    collection,
+                    format!(
+                        "read descriptor referenced by COMMITs for {}: {error:#}",
+                        hex::encode_upper(collection.raw)
+                    ),
+                );
+                continue;
+            }
         };
         if !has_attribute(&facts, retired::collection_name.id()) {
             continue;
         }
         let root = decode_retired_root(&facts)
             .with_context(|| format!("strictly decode retired descriptor {collection:?}"))?;
-        let Ok(vault) = secrets::parse_vault_name(&root.name) else {
-            continue;
+        let vault = match secrets::parse_vault_name(&root.name) {
+            Ok(vault) => vault,
+            Err(error) if root.name.starts_with(secrets::VAULT_NAME_PREFIX) => {
+                return Err(error).context("decode recognizable retired Secrets vault name")
+            }
+            Err(_) => continue,
         };
         let authority = root
             .authority
@@ -325,7 +354,7 @@ fn discover_retired_vaults(
         }
         vaults.insert(collection, (vault, root));
     }
-    Ok(vaults)
+    Ok(RetiredVaultDiscovery { vaults, unreadable })
 }
 
 fn load_proof_bundle(
@@ -416,6 +445,8 @@ fn inbox_rows(
                     .expect("the row was validated above")
                     .vault,
                 custody: opened.custody,
+                read_issuer: opened.read_issuer,
+                read_bundle: opened.read_bundle,
                 writer: opened.writer,
                 write_bundle: opened.write_bundle,
             });
@@ -499,9 +530,15 @@ fn expected_target_commits(
     signer: &SigningKey,
     target: CollectionHandle,
     source: &[CollectionCommit],
+    current: &[CollectionCommit],
 ) -> Vec<CollectionCommit> {
+    let current_pairs = current
+        .iter()
+        .map(|commit| (commit.data(), commit.metadata()))
+        .collect::<BTreeSet<_>>();
     source
         .iter()
+        .filter(|commit| !current_pairs.contains(&(commit.data(), commit.metadata())))
         .map(|commit| {
             let target = CollectionCommit::sign(signer, target, commit.data(), commit.metadata());
             (target.id(), target)
@@ -517,7 +554,7 @@ fn matching_custody(
     current: &[AccessCandidate],
     old_handle: CollectionHandle,
     new_handle: CollectionHandle,
-) -> Result<(SigningKey, bool)> {
+) -> Result<SigningKey> {
     let old = old
         .iter()
         .filter(|candidate| {
@@ -548,7 +585,87 @@ fn matching_custody(
     {
         bail!("valid access envelopes disagree on the custody seed");
     }
-    Ok((first, !current_matches.is_empty()))
+    Ok(first)
+}
+
+fn exact_founder_access(
+    candidates: &[AccessCandidate],
+    collection: CollectionHandle,
+    authority: VerifyingKey,
+    custody_public: [u8; 32],
+    read: &CapabilityProofBundle,
+    write: &CapabilityProofBundle,
+) -> bool {
+    candidates.iter().any(|candidate| {
+        candidate.vault == collection
+            && candidate.custody.verifying_key().to_bytes() == custody_public
+            && candidate.read_issuer == authority
+            && candidate.read_bundle.proof().id() == read.proof().id()
+            && candidate.writer == authority
+            && candidate.write_bundle.proof().id() == write.proof().id()
+    })
+}
+
+fn unbounded_write_presentation(
+    candidate: &AccessCandidate,
+    authority: VerifyingKey,
+    subject: VerifyingKey,
+    collection: CollectionHandle,
+    custody_public: [u8; 32],
+) -> bool {
+    candidate.vault == collection
+        && candidate.custody.verifying_key().to_bytes() == custody_public
+        && candidate.writer == subject
+        && candidate
+            .write_bundle
+            .verify(
+                authority,
+                triblespace::core::clock::epoch_now(),
+                subject,
+                write_request(collection),
+            )
+            .is_ok_and(|verified| verified.effective_validity().is_none())
+}
+
+fn current_presentations(
+    candidates: &[AccessCandidate],
+    collection: CollectionHandle,
+) -> Vec<CapabilityPresentation> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.vault == collection)
+        .map(|candidate| {
+            (
+                (
+                    candidate.writer.to_bytes(),
+                    candidate.write_bundle.proof().id().raw,
+                ),
+                CapabilityPresentation::new(candidate.writer, candidate.write_bundle.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+fn potentially_admitted_current_record(
+    commits: &[CollectionCommit],
+    collection: CollectionHandle,
+    authority: VerifyingKey,
+    candidates: &[AccessCandidate],
+) -> bool {
+    let authority = authority.to_bytes();
+    let delegated = candidates
+        .iter()
+        .filter(|candidate| candidate.vault == collection)
+        .map(|candidate| candidate.writer.to_bytes())
+        .collect::<BTreeSet<_>>();
+    commits
+        .iter()
+        .filter(|commit| commit.collection() == collection)
+        .any(|commit| {
+            commit.public_key().raw == authority || delegated.contains(&commit.public_key().raw)
+        })
 }
 
 fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
@@ -561,8 +678,9 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         .collect::<BTreeSet<_>>();
     let invalid_records = discovered.diagnostics().len();
     let reader = pile.reader().context("open Secrets migration reader")?;
-    let retired_vaults = discover_retired_vaults(&reader, &commits)?;
-    let authority_map = retired_vaults
+    let discovery = discover_retired_vaults(&reader, &commits)?;
+    let authority_map = discovery
+        .vaults
         .iter()
         .map(|(handle, (_, root))| {
             (
@@ -574,36 +692,24 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
 
     let old_inbox_descriptor = retired_inbox_descriptor(signer.verifying_key());
     let old_inbox = descriptor_handle(&old_inbox_descriptor);
-    if commits
-        .iter()
-        .any(|commit| commit.collection() == old_inbox)
-    {
+    let old_candidates = inbox_rows(pile, &reader, &commits, old_inbox, signer, &authority_map);
+    if !old_candidates.is_empty() {
         let resident = descriptor_facts(&reader, old_inbox)
             .context("read retired local Secrets access-inbox descriptor")?;
         if resident != *old_inbox_descriptor.facts() {
             bail!("retired local Secrets access inbox is not the exact supported epoch");
         }
     }
-    let old_candidates = inbox_rows(pile, &reader, &commits, old_inbox, signer, &authority_map);
 
     let current_inbox = access_inbox_handle(signer.verifying_key());
-    let current_authorities = retired_vaults
+    let current_authorities = discovery
+        .vaults
         .values()
         .map(|(vault, root)| {
             let authority = root.authority.expect("vault discovery requires authority");
             (secrets::vault_handle(*vault, authority), authority)
         })
         .collect::<BTreeMap<_, _>>();
-    if commits
-        .iter()
-        .any(|commit| commit.collection() == current_inbox)
-    {
-        let resident = descriptor_facts(&reader, current_inbox)
-            .context("read current local Secrets access-inbox descriptor")?;
-        if resident != *access_inbox_descriptor(signer.verifying_key()).facts() {
-            bail!("current local Secrets access inbox has a noncanonical descriptor");
-        }
-    }
     let current_candidates = inbox_rows(
         pile,
         &reader,
@@ -612,6 +718,31 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         signer,
         &current_authorities,
     );
+    if !current_candidates.is_empty() {
+        let resident = descriptor_facts(&reader, current_inbox)
+            .context("read current local Secrets access-inbox descriptor")?;
+        if resident != *access_inbox_descriptor(signer.verifying_key()).facts() {
+            bail!("current local Secrets access inbox has a noncanonical descriptor");
+        }
+    }
+
+    for (collection, error) in &discovery.unreadable {
+        let inert_inbox = (*collection == old_inbox && old_candidates.is_empty())
+            || (*collection == current_inbox && current_candidates.is_empty());
+        let inert_successor = current_authorities
+            .get(collection)
+            .is_some_and(|authority| {
+                !potentially_admitted_current_record(
+                    &commits,
+                    *collection,
+                    *authority,
+                    &current_candidates,
+                )
+            });
+        if !inert_inbox && !inert_successor {
+            bail!("{error}");
+        }
+    }
 
     let mut public = SecretsDescriptorAuthorityPlan {
         vaults: Vec::new(),
@@ -619,7 +750,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         invalid_records,
     };
     let mut prepared = Vec::new();
-    for (old, (vault, root)) in retired_vaults {
+    for (old, (vault, root)) in discovery.vaults {
         let source_count = commits
             .iter()
             .filter(|commit| commit.collection() == old)
@@ -628,44 +759,139 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             continue;
         }
         let authority = root.authority.expect("vault discovery requires authority");
-        if authority != signer.verifying_key() {
-            public.delegated.push(DelegatedVault {
-                vault,
-                old,
-                authority,
-                reason: "vault authority is not the durable local signer; obtain a successor-handle regrant from the founder".to_owned(),
-            });
-            continue;
+        if root.namespace != authority {
+            bail!(
+                "retired vault {vault:X} uses namespace {} but authority {}; refusing a many-to-one descriptor collapse",
+                hex::encode_upper(root.namespace.to_bytes()),
+                hex::encode_upper(authority.to_bytes()),
+            );
         }
-
         let source = authorized_source_commits(&commits, old, authority, &old_candidates)?;
         let source_facts = materialize_source(&reader, &source)?;
-        let catalog = validate_catalog(&reader, vault, &source_facts)
-            .with_context(|| format!("validate retired vault {vault:X}"))?;
+        let new = secrets::vault_handle(vault, authority);
+        let presentation = current_presentations(&current_candidates, new);
+        let current_record_ids = commits
+            .iter()
+            .filter(|commit| commit.collection() == new)
+            .map(CollectionCommit::id)
+            .collect::<BTreeSet<_>>();
+        let mut prospective_facts = source_facts.clone();
+        let current = if !potentially_admitted_current_record(
+            &commits,
+            new,
+            authority,
+            &current_candidates,
+        ) {
+            Vec::new()
+        } else {
+            let expected_descriptor = secrets::vault_descriptor(vault, authority);
+            let resident = descriptor_facts(&reader, new)
+                .with_context(|| format!("read current vault descriptor for {vault:X}"))?;
+            if resident != *expected_descriptor.facts() {
+                bail!("current vault descriptor for {vault:X} is not canonical");
+            }
+            let ticket = pile
+                .ticket(new, &presentation)
+                .map_err(|error| anyhow!("admit current vault {vault:X}: {error}"))?;
+            prospective_facts += pile
+                .materialize(&ticket)
+                .map_err(|error| anyhow!("materialize current vault {vault:X}: {error}"))?;
+            ticket.commits().to_vec()
+        };
+        let current_ids = current
+            .iter()
+            .map(CollectionCommit::id)
+            .collect::<BTreeSet<_>>();
+        // Namespace removal is many-to-one in principle. The historical
+        // namespace==authority invariant above makes the old source unique;
+        // validating its union with every admitted current leaf here proves
+        // the target catalog cannot be poisoned before the first append.
+        let catalog = validate_catalog(&reader, vault, &prospective_facts)
+            .with_context(|| format!("validate prospective successor vault {vault:X}"))?;
         let custody_public = catalog
             .custody
             .context("retired capability-native vault has no custody declaration")?
             .public_key;
-        let new = secrets::vault_handle(vault, authority);
-        let (custody, access_ready) = matching_custody(
+        let location = VaultLocation::new(vault, authority);
+        if location.collection() != new {
+            bail!("current vault location changed identity while planning");
+        }
+        // A founder's own assertions are the durable basis of its collection.
+        // A currently admitted delegated writer may later expire, and the new
+        // deterministic founder envelope does not preserve that writer's
+        // grant. Only a delegated replica may treat its admitted target pairs
+        // as the surviving basis and avoid re-signing them locally.
+        let coverage = if authority == signer.verifying_key() {
+            current
+                .iter()
+                .copied()
+                .filter(|commit| commit.public_key().raw == authority.to_bytes())
+                .collect::<Vec<_>>()
+        } else {
+            current.clone()
+        };
+        let expected = expected_target_commits(signer, new, &source, &coverage);
+        let successor_read_ready = current_candidates.iter().any(|candidate| {
+            candidate.vault == new && candidate.custody.verifying_key().to_bytes() == custody_public
+        });
+        let delegated_successor_grant = authority != signer.verifying_key()
+            && current_candidates.iter().any(|candidate| {
+                unbounded_write_presentation(
+                    candidate,
+                    authority,
+                    signer.verifying_key(),
+                    new,
+                    custody_public,
+                )
+            });
+        if authority != signer.verifying_key()
+            && (!successor_read_ready || (!expected.is_empty() && !delegated_successor_grant))
+        {
+            let reason = if !successor_read_ready {
+                "obtain a valid successor-handle READ/custody envelope"
+            } else {
+                "some retired leaves are absent from the admitted successor; obtain an unbounded successor WRITE grant for the local signer or have an authorized writer publish those exact data/metadata pairs"
+            };
+            public.delegated.push(DelegatedVault {
+                vault,
+                old,
+                authority,
+                reason: reason.to_owned(),
+            });
+            continue;
+        }
+        let custody = matching_custody(
             custody_public,
             &old_candidates,
             &current_candidates,
             old,
             new,
         )?;
-        let location = VaultLocation::new(vault, authority);
-        if location.collection() != new {
-            bail!("current vault location changed identity while planning");
-        }
-        let (read, write) = founder_proofs(signer, location);
-        let expected = expected_target_commits(signer, new, &source);
+        let (access_ready, founder_access) = if authority == signer.verifying_key() {
+            let (read, write) = founder_proofs(signer, location);
+            (
+                exact_founder_access(
+                    &current_candidates,
+                    new,
+                    authority,
+                    custody_public,
+                    &read,
+                    &write,
+                ),
+                Some((read, write)),
+            )
+        } else {
+            debug_assert!(successor_read_ready);
+            debug_assert!(expected.is_empty() || delegated_successor_grant);
+            (true, None)
+        };
         let missing_commits = expected
             .iter()
             .filter(|commit| !existing_ids.contains(&commit.id()))
             .count();
         let summary = VaultReseat {
             vault,
+            authority,
             old,
             new,
             source_commits: source_count,
@@ -677,10 +903,14 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         prepared.push(PreparedVault {
             summary,
             source_facts,
+            source: source.clone(),
             expected,
+            source_ids: source.iter().map(CollectionCommit::id).collect(),
+            current_record_ids,
+            current_ids,
+            presentation,
             custody,
-            read,
-            write,
+            founder_access,
         });
     }
     public.vaults.sort_by_key(|vault| (vault.vault, vault.old));
@@ -688,9 +918,21 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         .delegated
         .sort_by_key(|vault| (vault.vault, vault.old));
     prepared.sort_by_key(|vault| (vault.summary.vault, vault.summary.old));
+    let old_inbox_ids = commits
+        .iter()
+        .filter(|commit| commit.collection() == old_inbox)
+        .map(CollectionCommit::id)
+        .collect();
+    let current_inbox_ids = commits
+        .iter()
+        .filter(|commit| commit.collection() == current_inbox)
+        .map(CollectionCommit::id)
+        .collect();
     Ok(PreparedPlan {
         public,
         vaults: prepared,
+        old_inbox_ids,
+        current_inbox_ids,
     })
 }
 
@@ -719,9 +961,64 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
             "Secrets descriptor-authority activation requires fresh grants for delegated vaults: {blocked}"
         );
     }
-    let existing = discover_collection_records(&mut *pile)
-        .context("rediscover target records before Secrets publication")?
-        .commits()
+    let discovered = discover_collection_records(&mut *pile)
+        .context("rediscover frozen records before Secrets publication")?;
+    let commits = discovered.commits().to_vec();
+    let old_inbox = descriptor_handle(&retired_inbox_descriptor(signer.verifying_key()));
+    let current_inbox = access_inbox_handle(signer.verifying_key());
+    let old_inbox_ids = commits
+        .iter()
+        .filter(|commit| commit.collection() == old_inbox)
+        .map(CollectionCommit::id)
+        .collect::<BTreeSet<_>>();
+    let current_inbox_ids = commits
+        .iter()
+        .filter(|commit| commit.collection() == current_inbox)
+        .map(CollectionCommit::id)
+        .collect::<BTreeSet<_>>();
+    if old_inbox_ids != before.old_inbox_ids || current_inbox_ids != before.current_inbox_ids {
+        bail!("Secrets access inbox changed after the final plan; re-plan before publication");
+    }
+    for vault in &before.vaults {
+        let source_ids = commits
+            .iter()
+            .filter(|commit| commit.collection() == vault.summary.old)
+            .map(CollectionCommit::id)
+            .collect::<BTreeSet<_>>();
+        let current_record_ids = commits
+            .iter()
+            .filter(|commit| commit.collection() == vault.summary.new)
+            .map(CollectionCommit::id)
+            .collect::<BTreeSet<_>>();
+        if source_ids != vault.source_ids || current_record_ids != vault.current_record_ids {
+            bail!(
+                "Secrets vault {:X} changed after the final plan; re-plan before publication",
+                vault.summary.vault,
+            );
+        }
+        let current_ids = if vault.current_ids.is_empty() {
+            BTreeSet::new()
+        } else {
+            pile.ticket(vault.summary.new, &vault.presentation)
+                .map_err(|error| {
+                    anyhow!(
+                        "re-admit frozen successor vault {:X}: {error}",
+                        vault.summary.vault
+                    )
+                })?
+                .commits()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect()
+        };
+        if current_ids != vault.current_ids {
+            bail!(
+                "Secrets vault {:X} admission changed after the final plan; re-plan before publication",
+                vault.summary.vault,
+            );
+        }
+    }
+    let existing = commits
         .iter()
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
@@ -730,23 +1027,34 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
     let mut published_envelopes = 0;
 
     for vault in &before.vaults {
-        let descriptor = secrets::vault_descriptor(vault.summary.vault, signer.verifying_key());
+        let descriptor = secrets::vault_descriptor(vault.summary.vault, vault.summary.authority);
         let registered = pile
             .collection(descriptor)
             .map_err(|error| anyhow!("register current vault descriptor: {error}"))?;
         if registered != vault.summary.new {
             bail!("registered current vault descriptor changed identity");
         }
+        crate::offer_backfill::offer_reused_commit_closure(pile, vault.summary.new, &vault.source)
+            .with_context(|| {
+                format!(
+                    "offer re-seated Secrets vault {:X} dependency closure",
+                    vault.summary.vault
+                )
+            })?;
         if !vault.summary.access_ready {
+            let (read, write) = vault
+                .founder_access
+                .as_ref()
+                .context("only a local founder may synthesize a successor envelope")?;
             publish_access_envelope(
                 pile,
                 signer,
-                VaultLocation::new(vault.summary.vault, signer.verifying_key()),
+                VaultLocation::new(vault.summary.vault, vault.summary.authority),
                 &vault.custody,
                 signer.verifying_key(),
-                &vault.read,
+                read,
                 signer.verifying_key(),
-                &vault.write,
+                write,
                 triblespace::core::clock::epoch_now(),
             )
             .with_context(|| {
@@ -801,10 +1109,13 @@ fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &PreparedPlan) -> Res
                 vault.summary.vault
             );
         }
+        let ticket = pile
+            .ticket(vault.summary.new, &vault.presentation)
+            .map_err(|error| anyhow!("admit migrated vault: {error}"))?;
         let snapshot = pile
-            .snapshot(vault.summary.new, &[])
-            .map_err(|error| anyhow!("snapshot migrated vault: {error}"))?;
-        if !vault.source_facts.difference(snapshot.facts()).is_empty() {
+            .materialize(&ticket)
+            .map_err(|error| anyhow!("materialize migrated vault: {error}"))?;
+        if !vault.source_facts.difference(&snapshot).is_empty() {
             bail!(
                 "current vault {:X} does not contain the retired fact union",
                 vault.summary.vault
@@ -942,6 +1253,15 @@ mod tests {
         collection: CollectionHandle,
         action: Id,
     ) -> CapabilityProofBundle {
+        root_bundle_for(root, root.verifying_key(), collection, action)
+    }
+
+    fn root_bundle_for(
+        root: &SigningKey,
+        subject: VerifyingKey,
+        collection: CollectionHandle,
+        action: Id,
+    ) -> CapabilityProofBundle {
         let atom = CapabilityAtom::new(
             CapabilityAction::new(action),
             CapabilityResource::from(collection),
@@ -949,7 +1269,7 @@ mod tests {
         CapabilityProofBundle::issue_root(
             root,
             CapabilityClaim::root(atom, CapabilityMode::InvokeAndDelegate, None),
-            root.verifying_key(),
+            subject,
         )
         .unwrap()
     }
@@ -1136,6 +1456,394 @@ mod tests {
             1
         );
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn alternate_current_access_does_not_stand_in_for_the_exact_founder_envelope() {
+        let fixture = founder_fixture();
+        let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
+        let read_atom = CapabilityAtom::new(
+            CapabilityAction::new(secrets::ACTION_READ),
+            CapabilityResource::from(location.collection()),
+        );
+        let alternate_read = CapabilityProofBundle::issue_root(
+            &fixture.signer,
+            CapabilityClaim::root(read_atom, CapabilityMode::Invoke, None),
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (_, founder_write) = founder_proofs(&fixture.signer, location);
+
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        publish_access_envelope(
+            &mut pile,
+            &fixture.signer,
+            location,
+            &fixture.custody,
+            fixture.signer.verifying_key(),
+            &alternate_read,
+            fixture.signer.verifying_key(),
+            &founder_write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.pending_envelopes(), 1);
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.published_envelopes, 1);
+        assert_eq!(report.plan.pending_envelopes(), 0);
+    }
+
+    #[test]
+    fn exact_founder_proofs_with_the_wrong_custody_do_not_count_ready() {
+        let fixture = founder_fixture();
+        let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
+        let (read, write) = founder_proofs(&fixture.signer, location);
+        let wrong_custody = key(0x7a);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        publish_access_envelope(
+            &mut pile,
+            &fixture.signer,
+            location,
+            &wrong_custody,
+            fixture.signer.verifying_key(),
+            &read,
+            fixture.signer.verifying_key(),
+            &write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.pending_envelopes(), 1);
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.published_envelopes, 1);
+        assert!(report.plan.settled());
+    }
+
+    #[test]
+    fn foreign_inert_exact_pair_does_not_suppress_the_authority_reseat() {
+        let fixture = founder_fixture();
+        let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
+        let foreign = key(0x7b);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
+        );
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &foreign,
+            target,
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.vaults[0].target_commits, fixture.source.len());
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.appended_commits, fixture.source.len());
+        assert!(report.plan.settled());
+    }
+
+    #[test]
+    fn foreign_inert_target_commit_without_a_descriptor_cannot_block_reseat() {
+        let fixture = founder_fixture();
+        let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
+        let foreign = key(0x7d);
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &foreign,
+            target,
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.vaults[0].target_commits, fixture.source.len());
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.appended_commits, fixture.source.len());
+        assert!(report.plan.settled());
+    }
+
+    #[test]
+    fn delegated_current_pair_does_not_replace_the_founders_durable_reseat() {
+        let fixture = founder_fixture();
+        let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
+        let writer = key(0x7c);
+        let (read, _) = founder_proofs(&fixture.signer, location);
+        let write = root_bundle_for(
+            &fixture.signer,
+            writer.verifying_key(),
+            location.collection(),
+            ACTION_WRITE,
+        );
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
+        );
+        publish_access_envelope(
+            &mut pile,
+            &fixture.signer,
+            location,
+            &fixture.custody,
+            fixture.signer.verifying_key(),
+            &read,
+            writer.verifying_key(),
+            &write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &writer,
+            location.collection(),
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.vaults[0].target_commits, fixture.source.len());
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.appended_commits, fixture.source.len());
+        assert!(report.plan.settled());
+    }
+
+    #[test]
+    fn conflicting_current_catalog_is_rejected_before_publication() {
+        let fixture = founder_fixture();
+        let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
+        let conflicting = secrets::vault_header_fragment(
+            fixture.vault,
+            "conflicting epoch",
+            at(9),
+            fixture.custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
+        );
+        commit_fragment(&mut pile, &fixture.signer, target, conflicting);
+        pile.close().unwrap();
+        let before = fs::read(&fixture.pile).unwrap();
+
+        assert!(plan_path(&fixture.pile, Some(&fixture.key)).is_err());
+        assert!(publish_path(&fixture.pile, Some(&fixture.key)).is_err());
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn namespace_collapse_is_rejected_before_publication() {
+        let fixture = founder_fixture();
+        let alternate_namespace = key(0x79).verifying_key();
+        let descriptor = retired_vault_descriptor(
+            fixture.vault,
+            alternate_namespace,
+            fixture.signer.verifying_key(),
+        );
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let alternate = store_fragment(&mut pile, descriptor);
+        let header = secrets::vault_header_fragment(
+            fixture.vault,
+            "alternate namespace",
+            at(11),
+            fixture.custody.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        commit_fragment(&mut pile, &fixture.signer, alternate, header);
+        pile.close().unwrap();
+        let before = fs::read(&fixture.pile).unwrap();
+
+        let error = plan_path(&fixture.pile, Some(&fixture.key)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("many-to-one descriptor collapse"));
+        assert!(publish_path(&fixture.pile, Some(&fixture.key)).is_err());
+        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+    }
+
+    #[test]
+    fn successor_grant_settles_a_delegated_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("test.pile");
+        let key_path = directory.path().join("test.key");
+        File::create(&pile_path).unwrap();
+        let local = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let founder = key(0x81);
+        let custody = key(0x82);
+        let vault = id(0x83);
+        let old_descriptor =
+            retired_vault_descriptor(vault, founder.verifying_key(), founder.verifying_key());
+        let old = descriptor_handle(&old_descriptor);
+        let old_inbox_descriptor = retired_inbox_descriptor(local.verifying_key());
+        let old_inbox = descriptor_handle(&old_inbox_descriptor);
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        store_fragment(&mut pile, old_descriptor);
+        store_fragment(&mut pile, old_inbox_descriptor);
+        let source = commit_fragment(
+            &mut pile,
+            &founder,
+            old,
+            secrets::vault_header_fragment(
+                vault,
+                "delegated",
+                at(1),
+                custody.verifying_key().to_bytes(),
+            )
+            .unwrap(),
+        );
+
+        let old_read = root_bundle_for(&founder, local.verifying_key(), old, secrets::ACTION_READ);
+        let old_write = root_bundle(&founder, old, ACTION_WRITE);
+        persist_proof_bundle(&mut pile, &old_read).unwrap();
+        persist_proof_bundle(&mut pile, &old_write).unwrap();
+        let old_envelope = build_access_envelope(
+            old,
+            &custody,
+            local.verifying_key(),
+            &old_read,
+            founder.verifying_key(),
+            &old_write,
+            founder.verifying_key(),
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        commit_fragment(&mut pile, &founder, old_inbox, old_envelope);
+
+        let location = VaultLocation::new(vault, founder.verifying_key());
+        let current_read = root_bundle_for(
+            &founder,
+            local.verifying_key(),
+            location.collection(),
+            secrets::ACTION_READ,
+        );
+        let current_write = root_bundle_for(
+            &founder,
+            local.verifying_key(),
+            location.collection(),
+            ACTION_WRITE,
+        );
+        publish_access_envelope(
+            &mut pile,
+            &founder,
+            location,
+            &custody,
+            local.verifying_key(),
+            &current_read,
+            local.verifying_key(),
+            &current_write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&pile_path, Some(&key_path)).unwrap();
+        assert!(plan.delegated.is_empty());
+        assert_eq!(plan.vaults.len(), 1);
+        assert!(plan.vaults[0].access_ready);
+        let report = publish_path(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(report.appended_commits, 1);
+        assert_eq!(report.published_envelopes, 0);
+        assert!(report.plan.settled());
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let records = discover_collection_records(&mut pile).unwrap();
+        let target = records
+            .commits()
+            .iter()
+            .find(|commit| commit.collection() == location.collection())
+            .unwrap();
+        assert_eq!(
+            (target.data(), target.metadata()),
+            (source.data(), source.metadata())
+        );
+        assert_eq!(target.public_key().raw, local.verifying_key().to_bytes());
+        pile.close().unwrap();
+
+        let replay = publish_path(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(replay.appended_commits, 0);
+        assert!(replay.plan.settled());
+    }
+
+    #[test]
+    fn admitted_successor_pair_needs_no_local_write_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("test.pile");
+        let key_path = directory.path().join("test.key");
+        File::create(&pile_path).unwrap();
+        let local = initialize_signer(&pile_path, Some(&key_path)).unwrap();
+        let founder = key(0x91);
+        let custody = key(0x92);
+        let vault = id(0x93);
+        let old_descriptor =
+            retired_vault_descriptor(vault, founder.verifying_key(), founder.verifying_key());
+        let old = descriptor_handle(&old_descriptor);
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        store_fragment(&mut pile, old_descriptor);
+        let source = commit_fragment(
+            &mut pile,
+            &founder,
+            old,
+            secrets::vault_header_fragment(
+                vault,
+                "already moved",
+                at(1),
+                custody.verifying_key().to_bytes(),
+            )
+            .unwrap(),
+        );
+
+        let location = VaultLocation::new(vault, founder.verifying_key());
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(vault, founder.verifying_key()),
+        );
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &founder,
+            location.collection(),
+            source.data(),
+            source.metadata(),
+        )))
+        .unwrap();
+        let current_read = root_bundle_for(
+            &founder,
+            local.verifying_key(),
+            location.collection(),
+            secrets::ACTION_READ,
+        );
+        let founder_write = root_bundle(&founder, location.collection(), ACTION_WRITE);
+        publish_access_envelope(
+            &mut pile,
+            &founder,
+            location,
+            &custody,
+            local.verifying_key(),
+            &current_read,
+            founder.verifying_key(),
+            &founder_write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&pile_path, Some(&key_path)).unwrap();
+        assert!(plan.delegated.is_empty());
+        assert_eq!(plan.missing_commits(), 0);
+        assert!(plan.settled());
+        let report = publish_path(&pile_path, Some(&key_path)).unwrap();
+        assert_eq!(report.appended_commits, 0);
+        assert_eq!(report.published_envelopes, 0);
+        assert!(report.plan.settled());
     }
 
     #[test]

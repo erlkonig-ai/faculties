@@ -1,70 +1,22 @@
-//! Explicit migrations between Faculties storage generations.
+//! The still-live one-shot migrations for the current Faculties storage epoch.
 //!
-//! This crate exists so the faculties do not carry it. Every faculty reads
-//! native `Collection`s now; the transforms that got a pile there are needed
-//! exactly once per pile, by one binary, and are dead weight in every command
-//! that runs afterwards. Keeping them here means the library the faculties
-//! depend on has no migration surface at all, while the migrations themselves
-//! stay in the repository forever — an existing user's legacy pile has no other
-//! path forward, and deleting that path would make their data invisible the day
-//! they upgrade.
+//! Historical cutovers are intentionally absent. They have already been
+//! consumed by the deployed pile, never shipped as a public compatibility
+//! surface, and remain recoverable from Git history. Keeping only the active
+//! epoch makes it possible to tell which transformations may still be run:
 //!
-//! Layout:
+//! 1. [`posture_findings`] publishes legacy finding bridges into Posture's
+//!    retired descriptor.
+//! 2. [`descriptor_authority`] re-seats ordinary faculty roots under mandatory
+//!    authority and carries that bridge leaf with the rest of Posture.
+//! 3. [`secrets_descriptor_authority`] performs the handle-aware Secrets
+//!    re-seat after ordinary roots have moved.
 //!
-//! - [`collection_cutover`] freezes immutable legacy sources and captures
-//!   append-stable native collection prefixes for additive migrations.
-//! - One `*_cutover` module per faculty holds that faculty's typed transform:
-//!   `plan(&FrozenSource)` builds a plan whose `verify_conservation` proves the
-//!   produced fragments re-union to exactly the original `TribleSet`, and
-//!   `publish` writes them into the faculty's native scope.
-//! - [`activation_cutover`] erases every typed plan into one aggregate plan and
-//!   proves complete legacy-source coverage.
-//! - [`disposable_cutover`] builds that aggregate plan into a disposable
-//!   sibling pile and atomically replaces an unchanged live pile.
-//! - [`secrets_direct_proofs`] is the additive, migration-local bridge from
-//!   unpublished subject-bearing access rows to current direct proof records.
-//! - [`descriptor_authority`] is the one-shot additive re-seat from retired
-//!   name/namespace roots to UTF-8 names under mandatory authority.
-//!
-//! The `migrations` binary is the only consumer.
+//! The `migrations` binary is the only consumer. Each migration is additive,
+//! content-addressed, replayable, and checks the epoch ordering before it
+//! writes.
 
-pub mod activation_cutover;
-pub mod archive_cutover;
-pub mod atlas_cutover;
-pub mod body_cutover;
-pub mod cognition_cutover;
-pub mod collection_cutover;
-pub mod collection_naming;
-pub mod comb_cutover;
-pub mod compass_cutover;
-pub mod decide_cutover;
 pub mod descriptor_authority;
-pub mod discord_cutover;
-pub mod disposable_cutover;
-pub mod files_cutover;
-pub mod habit_cutover;
-pub mod headspace_cutover;
-pub mod legacy_password;
-pub(crate) mod legacy_secrets_v1;
-pub mod mail_credentials;
-pub mod mail_cutover;
-pub mod memory_cutover;
-pub mod memory_journal;
-pub mod message_cutover;
-pub mod orient_cutover;
-pub mod planner_cutover;
-pub mod posture_cutover;
+mod offer_backfill;
 pub mod posture_findings;
-pub mod relations_cutover;
-pub mod secrets_cutover;
-pub mod secrets_direct_proofs;
-pub mod secrets_vault_cutover;
-pub mod status_cutover;
-pub mod status_register;
-pub mod teams_credentials;
-pub mod teams_cutover;
-pub mod voice_cutover;
-pub mod web_cutover;
-pub mod wiki_cutover;
-
-pub mod per_faculty;
+pub mod secrets_descriptor_authority;
