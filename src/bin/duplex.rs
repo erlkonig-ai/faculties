@@ -1604,6 +1604,7 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     use faculties::legacy_hint::open_scope;
     use faculties::schemas::voice::{CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
     use faculties::storage::{load_signer, open_pile_strict};
+    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::metadata;
     use triblespace::prelude::*;
 
@@ -1611,25 +1612,20 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let fragment = faculties::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
     let signer = load_signer(pile_path, key)?;
-    let pile = open_pile_strict(pile_path)?;
-    let mut collection = open_scope(pile, COLLECTION_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
     let result = (|| -> Result<()> {
-        let facts = collection
-            .materialize()
+        let snapshot = pile
+            .snapshot(collection, &[])
             .context("materialize the Voice collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open the Voice attachment reader")?;
+        let (facts, _, reader) = snapshot.into_parts();
         faculties::voice::validate_candidate(&reader, &facts, &fragment)?;
         let mut described = fragment.clone();
         described.describe_with(entity! { metadata::description: "duplex spoke" });
-        collection
-            .commit(described)
+        pile.commit(collection, &signer, described)
             .context("commit the utterance")?;
         Ok(())
     })();
-    let pile = collection.into_storage();
     let close = pile.close().map_err(anyhow::Error::from);
     match (result, close) {
         (Ok(()), Ok(())) => Ok(()),

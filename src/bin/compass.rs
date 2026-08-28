@@ -13,6 +13,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -255,12 +256,18 @@ impl CompassStorage<'_> {
             let facts = view.facts();
             let reader = view.reader();
             let by = if let Some(persona) = persona {
-                let relation_facts = open_scope(&mut *pile, RELATIONS_SCOPE_ID, signer.clone())
-                    .materialize()
-                    .context("materialize Relations collection for Compass persona")?;
-                relations::validate_catalog(reader, &relation_facts)
+                let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+                let (relation_facts, _, relation_reader) = pile
+                    .snapshot(collection, &[])
+                    .context("materialize Relations collection for Compass persona")?
+                    .into_parts();
+                relations::validate_catalog(&relation_reader, &relation_facts)
                     .context("validate Relations collection for Compass persona")?;
-                Some(resolve_persona_id(&relation_facts, reader, persona)?)
+                Some(resolve_persona_id(
+                    &relation_facts,
+                    &relation_reader,
+                    persona,
+                )?)
             } else {
                 None
             };

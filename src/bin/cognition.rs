@@ -12,7 +12,7 @@ use faculties::cognition;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::repo::BlobStore;
+use triblespace::core::collection::CollectionStoreExt;
 
 #[derive(Parser)]
 #[command(
@@ -39,16 +39,13 @@ enum Command {
 
 fn check(cli: &Cli) -> Result<()> {
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
-    let pile = open_pile_strict(&cli.pile)?;
-    let mut collection = open_scope(pile, DEFAULT_SCOPE_ID, signer);
+    let mut pile = open_pile_strict(&cli.pile)?;
+    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let facts = collection
-            .materialize()
+        let snapshot = pile
+            .snapshot(collection, &[])
             .context("materialize native Cognition collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Cognition attachment reader")?;
+        let (facts, _, reader) = snapshot.into_parts();
         cognition::validate_catalog(&reader, &facts)?;
         println!(
             "Cognition scope {DEFAULT_SCOPE_ID:X}: {} facts validated",
@@ -56,7 +53,7 @@ fn check(cli: &Cli) -> Result<()> {
         );
         Ok(())
     })();
-    finish(collection.into_storage(), result)
+    finish(pile, result)
 }
 
 fn finish<T>(pile: triblespace::core::repo::pile::Pile, result: Result<T>) -> Result<T> {

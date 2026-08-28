@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileReader;
 use triblespace::macros::{find, pattern};
@@ -251,8 +252,9 @@ fn materialize_scope(
     scope: Id,
     label: &str,
 ) -> Result<TribleSet> {
-    open_scope(&mut *pile, scope, signer.clone())
-        .materialize()
+    let collection = open_scope(pile, scope, signer)?;
+    pile.snapshot(collection, &[])
+        .map(|snapshot| snapshot.into_facts())
         .map_err(|error| anyhow!("materialize {label} collection: {error}"))
 }
 
@@ -1223,13 +1225,9 @@ fn save_checkpoint(
 ) -> Result<()> {
     let (mut fragment, _) = orient_model::checkpoint_fragment(persona, view, clock::point_now()?)?;
     fragment += orient_model::seen_notes_fragment(persona, newly_observed);
-    open_scope(
-        pile,
-        faculties::schemas::orient::DEFAULT_SCOPE_ID,
-        signer.clone(),
-    )
-    .commit(fragment)
-    .map_err(|error| anyhow!("commit Orient semantic checkpoint: {error}"))?;
+    let collection = open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
+        .map_err(|error| anyhow!("commit Orient semantic checkpoint: {error}"))?;
     Ok(())
 }
 
@@ -1288,13 +1286,9 @@ fn migrate_note_frontier(
     // appended after this commit are absent from Seen and wake normally.
     let selected = universe;
     let fragment = orient_model::seen_notes_fragment(persona, selected.iter().copied());
-    open_scope(
-        pile,
-        faculties::schemas::orient::DEFAULT_SCOPE_ID,
-        signer.clone(),
-    )
-    .commit(fragment)
-    .map_err(|error| anyhow!("commit Orient note-frontier migration: {error}"))?;
+    let collection = open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
+        .map_err(|error| anyhow!("commit Orient note-frontier migration: {error}"))?;
     Ok(MigrationOutcome {
         checkpoint: checkpoint.event,
         observed: selected.len(),
@@ -2002,9 +1996,9 @@ mod tests {
     }
 
     fn commit_scope(pile: &mut Pile, signer: &SigningKey, scope: Id, fragment: Fragment) {
-        faculties::collection_names::open(pile, scope, signer.clone())
-            .commit(fragment)
-            .unwrap();
+        let collection =
+            faculties::collection_names::open(pile, scope, signer.verifying_key()).unwrap();
+        pile.commit(collection, signer, fragment).unwrap();
     }
 
     fn profile(label: &str) -> relations::ProfileInput {

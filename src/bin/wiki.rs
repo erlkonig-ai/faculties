@@ -18,7 +18,7 @@ use faculties::wiki::{
 };
 #[cfg(test)]
 use hifitime::Epoch;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
 
@@ -253,12 +253,11 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn scope_view(&self, scope: Id, label: &str) -> Result<CollectionView> {
         self.with_pile(|pile, signer| {
-            let facts = open_scope(&mut *pile, scope, signer.clone())
-                .materialize()
-                .with_context(|| format!("materialize {label} collection"))?;
-            let reader = pile
-                .reader()
-                .with_context(|| format!("open {label} attachment reader"))?;
+            let collection = open_scope(pile, scope, signer)?;
+            let (facts, _, reader) = pile
+                .snapshot(collection, &[])
+                .with_context(|| format!("materialize {label} collection"))?
+                .into_parts();
             Ok(CollectionView { facts, reader })
         })
     }
@@ -279,16 +278,16 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            open_scope(pile, scope, signer.clone())
-                .commit(fragment)
+            let collection = open_scope(pile, scope, signer)?;
+            pile.commit(collection, signer, fragment)
                 .context("publish native collection fragment")
         })
     }
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            open_scope(pile, schema::DEFAULT_SCOPE_ID, signer.clone())
-                .commit(fragment)
+            let collection = open_scope(pile, schema::DEFAULT_SCOPE_ID, signer)?;
+            pile.commit(collection, signer, fragment)
                 .context("publish Wiki fragment")
         })
     }
@@ -511,10 +510,10 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
 
 fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
     storage.with_pile(|pile, signer| {
-        let facts = open_scope(&mut *pile, FILES_SCOPE_ID, signer.clone())
-            .materialize()
-            .context("materialize Files collection")?;
-        Ok(facts)
+        let collection = open_scope(pile, FILES_SCOPE_ID, signer)?;
+        pile.snapshot(collection, &[])
+            .map(|snapshot| snapshot.into_facts())
+            .context("materialize Files collection")
     })
 }
 
@@ -2523,8 +2522,13 @@ mod tests {
         let (author_fragment, _) = wiki_model::author_record(&signer.verifying_key());
         let (legacy, anchor, _v1, _v2) = legacy_anchor_pair();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        faculties::collection_names::open(&mut pile, schema::DEFAULT_SCOPE_ID, signer)
-            .commit(author_fragment + legacy)
+        let collection = faculties::collection_names::open(
+            &mut pile,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        pile.commit(collection, &signer, author_fragment + legacy)
             .unwrap();
         pile.close().unwrap();
 

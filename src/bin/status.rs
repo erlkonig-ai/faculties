@@ -17,7 +17,7 @@ use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
 use triblespace::prelude::*;
@@ -107,9 +107,9 @@ fn materialize_scope(
     scope: Id,
     label: &str,
 ) -> Result<TribleSet> {
-    let mut collection = open_scope(&mut *pile, scope, signer.clone());
-    collection
-        .materialize()
+    let collection = open_scope(pile, scope, signer)?;
+    pile.snapshot(collection, &[])
+        .map(|snapshot| snapshot.into_facts())
         .with_context(|| format!("materialize authored {label} collection"))
 }
 
@@ -132,9 +132,8 @@ fn commit_status(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let mut collection = open_scope(&mut *pile, DEFAULT_SCOPE_ID, signer.clone());
-    collection
-        .commit(fragment)
+    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    pile.commit(collection, signer, fragment)
         .context("commit authored Status event")
 }
 

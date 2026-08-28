@@ -8,8 +8,8 @@ use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::{CliRequest, Faculty, Invocation, Param, Spec, Verb};
 use faculties::storage::{load_signer, open_pile_strict};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::BlobStore;
 use triblespace::prelude::Id;
 
 const SHARED: &[Param] = &[
@@ -61,14 +61,12 @@ impl AtlasContext {
     }
 
     fn with_catalog<T>(&mut self, operation: impl FnOnce(&AtlasCatalog) -> Result<T>) -> Result<T> {
-        let mut collection = open_scope(&mut self.pile, DEFAULT_SCOPE_ID, self.signer.clone());
-        let facts = collection
-            .materialize()
+        let collection = open_scope(&mut self.pile, DEFAULT_SCOPE_ID, &self.signer)?;
+        let snapshot = self
+            .pile
+            .snapshot(collection, &[])
             .context("materialize native Atlas collection")?;
-        let reader = collection
-            .storage_mut()
-            .reader()
-            .context("open Atlas attachment reader")?;
+        let (facts, _, reader) = snapshot.into_parts();
         let catalog =
             atlas::load_catalog(&reader, &facts).context("validate native Atlas catalog")?;
         operation(&catalog)
