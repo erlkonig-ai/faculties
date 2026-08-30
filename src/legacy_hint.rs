@@ -221,20 +221,19 @@ pub fn legacy_migration_hint(
     // TWO ways a collection can read as empty, and they want opposite advice.
     //
     // A pile that never cut over has its history in a legacy branch. A pile
-    // that cut over but predates NAMING has its history in real native
-    // collections that this build cannot address: they are anchored by the
-    // retired scope, so a lookup by name finds nothing and the emptiness above
-    // is an addressing failure rather than an absence. Such a pile usually
-    // still carries the legacy branch as residue, so checking the branch first
-    // confidently names a migration that already ran.
+    // that cut over under a retired descriptor epoch has its history in real
+    // native collections that this build cannot address. Old scope-anchored
+    // descriptors remain as additive residue even after later re-seats, so a
+    // lookup by the current descriptor can find nothing while all source data
+    // is still present.
     //
-    // Naming is named first when both hold: it is what makes the collections
-    // readable at all.
+    // Descriptor re-seat is named first when both hold: it is what makes the
+    // current collections readable without replaying legacy branches.
     if any_scope_anchored_collection(pile)? {
         return Some(format!(
-            "note: this pile's native `{branch_name}` collection cannot be found by name, but the pile holds collections anchored by the retired scope id.\n\
-             note: a root collection is now named within a namespace, which changed its descriptor and so its identity; current faculties therefore look for a collection this pile does not have yet. Nothing has been lost — the existing collections are intact and the migration only adds beside them.\n\
-             note: run `migrations --pile <this pile> collection-naming --dry-run` to see exactly what would move, and `migrations --pile <this pile> collection-naming` to migrate."
+            "note: this pile's native `{branch_name}` collection is absent under the current descriptor, but the pile holds retired collection epochs.\n\
+             note: descriptor evolution changes a collection's content identity; current faculties therefore look for a collection this pile does not have yet. Nothing has been lost — the existing collections are intact and re-seat only adds beside them.\n\
+             note: run `migrations --pile <this pile> posture-findings --dry-run` first, then `migrations --pile <this pile> descriptor-authority --dry-run` to inspect the additive re-seat."
         ));
     }
     let (commits, capped) = legacy_authored_commits(pile, branch_name)?;
@@ -553,7 +552,7 @@ mod tests {
     /// cutover again. Its collections are real and full; they are simply not
     /// reachable by name, and the legacy branch it still carries is residue.
     #[test]
-    fn a_pre_naming_pile_is_told_to_name_its_collections_not_to_cut_over_again() {
+    fn a_retired_descriptor_pile_is_told_to_reseat_not_cut_over_again() {
         let directory = TempDir::new().unwrap();
         let path = new_pile(&directory);
         // Residue: the branch a pre-naming pile still has lying around.
@@ -574,17 +573,14 @@ mod tests {
             .expect("a pile whose collections cannot be found by name must say so");
         pile.close().unwrap();
 
-        assert!(
-            hint.contains("collection-naming"),
-            "the naming migration is the one that applies: {hint}"
-        );
+        assert!(hint.contains("descriptor-authority"), "{hint}");
         assert!(
             !hint.contains("legacy-branches activate"),
-            "this pile already cut over; naming it again is not cutting it over: {hint}"
+            "this pile already cut over; re-seating is not cutting it over: {hint}"
         );
         assert!(
             hint.contains("Nothing has been lost"),
-            "naming is additive too, and the reader needs to know it: {hint}"
+            "re-seat is additive too, and the reader needs to know it: {hint}"
         );
     }
 
@@ -603,7 +599,7 @@ mod tests {
         pile.close().unwrap();
 
         assert!(hint.contains("legacy-branches activate"), "{hint}");
-        assert!(!hint.contains("collection-naming"), "{hint}");
+        assert!(!hint.contains("descriptor-authority"), "{hint}");
     }
 
     #[test]
