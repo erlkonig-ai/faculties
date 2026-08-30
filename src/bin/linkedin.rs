@@ -280,7 +280,7 @@ impl RelationsStorage<'_> {
             let store_snapshot = pile.snapshot()?;
             let cover = collection.admitted(&store_snapshot)?;
             Ok(cover
-                .claims(&store_snapshot)?
+                .commits(&store_snapshot)?
                 .iter()
                 .filter(|commit| commit.public_key().raw == author)
                 .count())

@@ -19,16 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{bail, Result};
 
-use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::reach;
-use triblespace::core::collection::records::{
-    collection_authority, collection_mapping, collection_reach, collection_representation,
-    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
-    KIND_COLLECTION_MAPPING,
-};
+use triblespace::core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace::core::collection::{CollectionMapping, CollectionOperationError};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
@@ -44,8 +38,6 @@ use triblespace::core::trible::{build_intrinsic_entity, IntrinsicEntityRow, Trib
 use triblespace::macros::entity;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::{hash_tokens, WordHash};
-
-use crate::schemas::blockdag as schema;
 
 /// Archive-block-text BM25 member mapping, version 1.
 ///
@@ -96,13 +88,21 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
-impl CollectionMapping<SimpleArchive, PortableBM25Blob> for ArchiveBlockTextBm25Mapping {
+impl CollectionMapping for ArchiveBlockTextBm25Mapping {
+    type Source = SimpleArchive;
+    type Target = PortableBM25Blob;
+
+    fn fragment(&self) -> Fragment {
+        mapping_fragment()
+    }
+
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = triblespace::core::collection::descriptor::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         if actual != Some(ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1) {
             return Err(CollectionOperationError::Fatal(format!(
-                "Archive BM25 mapping algorithm {:?} does not match archive-block-text-v1 {ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1:X}",
+                "Archive BM25 mapping algorithm {:?} does not match archive-block-text-v1 \
+                 {ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1:X}",
                 actual.map(|id| format!("{id:X}")),
             )));
         }
@@ -127,39 +127,6 @@ fn mapping_fragment() -> Fragment {
         metadata::tag: KIND_COLLECTION_MAPPING,
         mapping_algorithm*: <ArchiveBlockTextBm25MappingV1 as MetaDescribe>::describe(),
     }
-}
-
-/// Exact descriptor for the derived Archive BM25 collection.
-///
-/// This collection is a derivation of the archive's canonical SimpleArchive
-/// union, so it names that collection as its SOURCE and carries no independent
-/// name. Authority is descriptor-local rather than inherited through the
-/// source relation, and is therefore stated explicitly here.
-pub fn descriptor(authority: VerifyingKey) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_authority: authority,
-        collection_source: source_collection(authority),
-        collection_representation*: <PortableBM25Blob as MetaDescribe>::describe(),
-        collection_mapping*: mapping_fragment(),
-        collection_reach*: reach::private(),
-    }
-}
-
-/// The archive's canonical SimpleArchive union, which this collection derives
-/// from.
-///
-/// Written out rather than reached for: core deliberately offers no helper for
-/// hashing a descriptor it did not store, because a handle computed beside a
-/// store instead of by it can name a collection whose descriptor is absent.
-/// Naming a source is exactly a place where that has to be conspicuous.
-pub fn source_collection(authority: VerifyingKey) -> CollectionHandle {
-    IntoBlob::<SimpleArchive>::to_blob(
-        crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority)
-            .facts()
-            .clone(),
-    )
-    .get_handle()
 }
 
 /// Build one exact portable Archive BM25 element.

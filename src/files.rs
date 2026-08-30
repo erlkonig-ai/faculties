@@ -1502,12 +1502,12 @@ mod tests {
     fn complete_fragment_survives_native_collection_commit_and_materialization() {
         let signer = SigningKey::generate(&mut OsRng);
         let mut store = MemoryRepo::default();
-        let collection = store
-            .collection::<SimpleArchive>(crate::collection_names::root_descriptor(
-                crate::schemas::files::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            ))
-            .unwrap();
+        let collection = crate::collection_names::open(
+            &mut store,
+            crate::schemas::files::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
         let file = stage(
             b"slides".to_vec(),
             "deck.pptx",

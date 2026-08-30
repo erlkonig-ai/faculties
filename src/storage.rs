@@ -25,11 +25,10 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-#[cfg(test)]
-use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
-    discover_collection_records, Collection, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRead, CollectionRecordDiagnostic, CollectionStoreExt, FactCover, TryFromCover,
+    Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
+    CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
+    CollectionRecordSelector, CollectionStoreExt, FactCover, TryFromCover,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
@@ -46,7 +45,6 @@ use triblespace::core::trible::{Fragment, TribleSet};
 /// representation-specific validation before they become usable equations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetDiscovery {
-    descriptor: Fragment,
     commits: Vec<CollectionCommit>,
     merges: Vec<CollectionMerge>,
     derives: Vec<CollectionDerive>,
@@ -54,15 +52,6 @@ pub struct TargetDiscovery {
 }
 
 impl TargetDiscovery {
-    /// Canonical `SimpleArchive`-union descriptor for the requested scope.
-    ///
-    /// A `Fragment` rather than a bare `TribleSet`: this one was BUILT here, so
-    /// it still carries its root and metafacts, and throwing those away only to
-    /// scan for them again later would be paying to lose information.
-    pub fn descriptor(&self) -> &Fragment {
-        &self.descriptor
-    }
-
     /// Valid self-signed commits targeting this collection, ordered by id.
     pub fn commits(&self) -> &[CollectionCommit] {
         &self.commits
@@ -108,40 +97,40 @@ where
     S: CollectionStoreExt,
     <S as SnapshotSource>::Snapshot: CollectionRead,
 {
-    let descriptor = crate::collection_names::root_descriptor(scope, authority);
-    let collection = store
-        .collection::<SimpleArchive>(descriptor.clone())
+    let collection = crate::collection_names::open(store, scope, authority)
         .context("register target collection descriptor")?;
     let snapshot = store
         .snapshot()
         .context("freeze target collection store snapshot")?;
-    let records =
-        discover_collection_records(&snapshot).context("discover native collection records")?;
-    let commits = records
-        .commits()
-        .iter()
-        .copied()
-        .filter(|commit| commit.collection() == collection.handle())
-        .collect();
-    let merges = records
-        .merges()
-        .iter()
-        .copied()
-        .filter(|merge| merge.collection() == collection.handle())
-        .collect();
-    let derives = records
-        .derives()
-        .iter()
-        .copied()
-        .filter(|derive| derive.collection() == collection.handle())
-        .collect();
+    let selectors = std::collections::BTreeSet::from([CollectionRecordSelector::Collection(
+        collection.handle(),
+    )]);
+    let records = snapshot
+        .select_records(&selectors)
+        .context("discover native collection records")?;
+    let mut commits = Vec::new();
+    let mut merges = Vec::new();
+    let mut derives = Vec::new();
+    let mut diagnostics = Vec::new();
+    for record in records {
+        match record {
+            CollectionRecord::Commit(commit) => match commit.verify_strict() {
+                Ok(()) => commits.push(commit),
+                Err(error) => diagnostics.push(CollectionRecordDiagnostic {
+                    id: commit.id(),
+                    error: CollectionRecordDiagnosticError::InvalidCommit(error),
+                }),
+            },
+            CollectionRecord::Merge(merge) => merges.push(merge),
+            CollectionRecord::Derive(derive) => derives.push(derive),
+        }
+    }
 
     Ok(TargetDiscovery {
-        descriptor,
         commits,
         merges,
         derives,
-        diagnostics: records.diagnostics().to_vec(),
+        diagnostics,
     })
 }
 
@@ -167,22 +156,22 @@ where
 
 /// Read one authorized SimpleArchive union and retain the exact provenance
 /// claims selected by the same admission decision.
-pub fn read_fact_collection_with_claims<S>(
+pub fn read_fact_collection_with_commits<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
 ) -> Result<(TribleSet, FactCover, Vec<CollectionCommit>)>
 where
     S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
 {
-    let (cover, claims) = collection
-        .admitted_with_claims(snapshot)
-        .context("discover authorized collection cover and claims")?;
+    let (cover, commits) = collection
+        .admitted_with_commits(snapshot)
+        .context("discover authorized collection cover and commits")?;
     let physical = cover
         .resolve(snapshot)
         .context("resolve authorized collection cover")?;
     let facts = TribleSet::try_from_cover(&physical, snapshot)
         .context("read authorized collection facts")?;
-    Ok((facts, cover, claims))
+    Ok((facts, cover, commits))
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.
@@ -316,11 +305,6 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    /// Content identity of a descriptor these tests built but have not stored.
-    fn collection_of(descriptor: &Fragment) -> CollectionHandle {
-        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
-    }
-
     use std::fs::{self, File};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -329,7 +313,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
-    use triblespace::core::blob::IntoBlob;
     use triblespace::core::collection::{empty_metadata_handle, CollectionRecord, CollectionStore};
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
@@ -418,10 +401,13 @@ mod tests {
         let team = signer.verifying_key();
         let target_scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
         let other_scope = crate::schemas::compass::DEFAULT_SCOPE_ID;
-        let target_descriptor = crate::collection_names::root_descriptor(target_scope, team);
-        let other_descriptor = crate::collection_names::root_descriptor(other_scope, team);
-        let target = collection_of(&target_descriptor);
-        let other = collection_of(&other_descriptor);
+        let mut store = MemoryRepo::default();
+        let target = crate::collection_names::open(&mut store, target_scope, team)
+            .unwrap()
+            .handle();
+        let other = crate::collection_names::open(&mut store, other_scope, team)
+            .unwrap()
+            .handle();
 
         let target_commit = CollectionCommit::sign(
             &signer,
@@ -452,7 +438,6 @@ mod tests {
         let derive_from_target =
             CollectionDerive::new(other, Inline::new([11; 32]), Inline::new([12; 32]));
 
-        let mut store = MemoryRepo::default();
         for record in [
             CollectionRecord::Commit(target_commit),
             CollectionRecord::Commit(other_commit),
@@ -465,7 +450,6 @@ mod tests {
         }
 
         let discovered = discover_target(&mut store, target_scope, team).unwrap();
-        assert_eq!(discovered.descriptor().facts(), target_descriptor.facts());
         assert_eq!(discovered.commits(), &[target_commit]);
         assert_eq!(discovered.merges(), &[target_merge]);
         assert_eq!(discovered.derives(), &[derive_to_target]);
@@ -517,21 +501,16 @@ mod tests {
         assert_eq!(after_replay, before_replay);
 
         let mut pile = open_pile_strict(&files.pile).unwrap();
+        let target_collection =
+            crate::collection_names::open(&mut pile, target_scope, team).unwrap();
         let target = discover_target(&mut pile, target_scope, team).unwrap();
-        assert_eq!(
-            target.descriptor().facts(),
-            crate::collection_names::root_descriptor(target_scope, team).facts()
-        );
         assert_eq!(target.commits(), &[first]);
+        assert_eq!(target.commits()[0].collection(), target_collection.handle());
         assert!(target.merges().is_empty());
         assert!(target.derives().is_empty());
         assert!(target.diagnostics().is_empty());
 
         let unrelated_target = discover_target(&mut pile, other_scope, team).unwrap();
-        assert_eq!(
-            unrelated_target.descriptor().facts(),
-            crate::collection_names::root_descriptor(other_scope, team).facts()
-        );
         assert_eq!(unrelated_target.commits().len(), 1);
 
         let reader = pile.snapshot().unwrap();

@@ -1918,7 +1918,7 @@ impl PostureStorage<'_> {
                 .snapshot()
                 .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
             let (_, _, commits) =
-                faculties::storage::read_fact_collection_with_claims(collection, &store_snapshot)
+                faculties::storage::read_fact_collection_with_commits(collection, &store_snapshot)
                     .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
             Ok(commits
                 .iter()
@@ -2008,7 +2008,7 @@ impl PostureStorage<'_> {
                 .snapshot()
                 .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
             let (facts, _, commits) =
-                faculties::storage::read_fact_collection_with_claims(collection, &reader)
+                faculties::storage::read_fact_collection_with_commits(collection, &reader)
                     .with_context(|| format!("materialize authored Posture {label} collection"))?;
             operation(&mut pile, collection, &signer, &facts, &reader, &commits)
         })();
@@ -6826,7 +6826,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_scan_commits_are_stored_but_inert_without_descriptor_authority() {
+    fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
         let store = TestStore::new();
         let (files, omissions) = sample_scan_inputs();
         let (fragment, _) = build_scan_fragment(
@@ -6842,8 +6842,8 @@ mod tests {
         let collection = open_scope(&mut pile, DEFAULT_SCAN_SCOPE_ID, &local).unwrap();
         let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
         // Publication is an unconditional local ledger append. Admission is a
-        // separate read concern rooted in the authority carried by this exact
-        // descriptor handle.
+        // separate read concern rooted in this collection's immutable WRITE
+        // admission policy.
         let foreign_commit = pile.commit(collection, &foreign, fragment).unwrap();
         pile.close().unwrap();
 

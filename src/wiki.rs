@@ -14,7 +14,9 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
-use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetCollection};
+use triblespace::core::collection::observed_union::{
+    ObserveStatesMapping, ObservedIndex, ObservedSetCollection,
+};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
@@ -217,15 +219,20 @@ impl WikiSnapshot {
 }
 
 /// Exact maintained dominated-set projection used for Wiki frontiers.
-pub fn observed_collection(authority: VerifyingKey) -> ObservedSetCollection {
-    ObservedSetCollection::new(
-        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        authority,
-        metadata::supersedes.id(),
-        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        authority,
-        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-    )
+pub fn observed_collection<S>(
+    store: &mut S,
+    authority: VerifyingKey,
+) -> Result<ObservedSetCollection>
+where
+    S: CollectionStoreExt,
+{
+    let source = crate::collection_names::open(store, DEFAULT_SCOPE_ID, authority)?;
+    let target = store.derive(
+        source,
+        ObserveStatesMapping::new(metadata::supersedes.id()),
+        crate::collection_names::private_policy(authority),
+    )?;
+    Ok(ObservedSetCollection::new(source, target))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1305,7 +1312,7 @@ pub fn materialize_indexed_collection(
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
-    let observed = observed_collection(signer.verifying_key())
+    let observed = observed_collection(pile, signer.verifying_key())?
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let catalog = validate_catalog_with_order(&store_snapshot, &facts, &observed)?;

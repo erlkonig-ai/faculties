@@ -22,7 +22,7 @@ use triblespace::core::capability::{
     CapabilityResource,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, Collection, CollectionHandle, ACTION_WRITE,
+    AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, ACTION_WRITE,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
@@ -106,23 +106,12 @@ pub fn parse_vault_name(name: &str) -> Result<Id> {
     Ok(id)
 }
 
-/// Canonical private `SimpleArchive`-union descriptor of one vault epoch.
-pub fn vault_descriptor(vault: Id, authority: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(&vault_name(vault), authority, reach::private())
-}
-
-/// Typed private `SimpleArchive`-union collection of one vault epoch.
-pub(crate) fn vault_collection(
-    vault: Id,
-    authority: VerifyingKey,
-) -> Collection<blobencodings::SimpleArchive> {
-    Collection::from_descriptor(&vault_descriptor(vault, authority))
-        .expect("vault_descriptor constructs a typed SimpleArchive collection")
-}
-
-/// Exact collection resource governed by `WRITE` and `READ` authority.
-pub fn vault_handle(vault: Id, authority: VerifyingKey) -> CollectionHandle {
-    vault_collection(vault, authority).handle()
+/// Immutable collection policy for one private vault epoch.
+pub fn vault_policy(authority: VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +207,7 @@ impl VaultAccess {
     pub(crate) fn new(
         vault: Id,
         trust_root: VerifyingKey,
+        collection: Collection<blobencodings::SimpleArchive>,
         subject: VerifyingKey,
         custody: SigningKey,
         read_bundles: Vec<CapabilityProofBundle>,
@@ -229,7 +219,6 @@ impl VaultAccess {
         if write_bundles.is_empty() {
             bail!("vault access requires at least one exact WRITE proof bundle");
         }
-        let collection = vault_collection(vault, trust_root);
         let access = Self {
             vault,
             trust_root,
@@ -1255,34 +1244,35 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_is_exact_private_union_with_authority() {
+    fn store_created_vault_descriptor_has_exact_private_policy() {
         let vault = id(7);
         let authority = key(2).verifying_key();
-        let descriptor = vault_descriptor(vault, authority);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(&vault_name(vault), vault_policy(authority))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: TribleSet = snapshot.get(collection.handle()).unwrap();
 
         assert_eq!(
-            descriptor_facts::name(descriptor.facts()).unwrap().unwrap(),
+            descriptor_facts::name(&descriptor).unwrap().unwrap(),
             vault_name(vault).to_blob().get_handle()
         );
         assert_eq!(
-            descriptor_facts::authority(descriptor.facts()).unwrap(),
-            authority
+            descriptor_facts::policy(&descriptor).unwrap(),
+            vault_policy(authority)
         );
         assert_eq!(
-            descriptor_facts::representation(descriptor.facts()).unwrap(),
+            descriptor_facts::representation(&descriptor).unwrap(),
             <blobencodings::SimpleArchive as MetaDescribe>::id()
         );
-        assert_eq!(descriptor_facts::source(descriptor.facts()).unwrap(), None);
-        assert_eq!(descriptor_facts::mapping(descriptor.facts()).unwrap(), None);
-        assert!(!reach::travels(descriptor.facts()));
-        assert_eq!(
-            vault_handle(vault, authority),
-            descriptor.into_facts().to_blob().get_handle()
-        );
-        assert_ne!(
-            vault_handle(vault, authority),
-            vault_handle(vault, key(3).verifying_key())
-        );
+        assert_eq!(descriptor_facts::source(&descriptor).unwrap(), None);
+        assert_eq!(descriptor_facts::mapping(&descriptor).unwrap(), None);
+        drop(snapshot);
+        let foreign = store
+            .collection(&vault_name(vault), vault_policy(key(3).verifying_key()))
+            .unwrap();
+        assert_ne!(collection.handle(), foreign.handle());
     }
 
     #[test]
@@ -1524,7 +1514,14 @@ mod tests {
         let subject = key(3);
         let outsider = key(4);
         let custody = SigningKey::generate(&mut OsRng);
-        let collection = vault_collection(vault, root.verifying_key());
+        let mut authorized = MemoryRepo::default();
+        let collection = authorized
+            .collection(&vault_name(vault), vault_policy(root.verifying_key()))
+            .unwrap();
+        let wrong_resource = authorized
+            .collection(&vault_name(id(41)), vault_policy(root.verifying_key()))
+            .unwrap()
+            .handle();
         let collection_handle = collection.handle();
         let read = root_bundle(
             &root,
@@ -1555,6 +1552,7 @@ mod tests {
         let access = VaultAccess::new(
             vault,
             root.verifying_key(),
+            collection,
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![read.clone()],
@@ -1580,14 +1578,6 @@ mod tests {
         fragment += sealed.fragment;
         let facts = fragment.facts().clone();
 
-        let mut authorized = MemoryRepo::default();
-        let registered = authorized
-            .collection::<blobencodings::SimpleArchive>(vault_descriptor(
-                vault,
-                root.verifying_key(),
-            ))
-            .unwrap();
-        assert_eq!(registered, collection);
         crate::storage::persist_proof_bundle(&mut authorized, &write).unwrap();
         authorized
             .commit(collection, &subject, fragment.clone())
@@ -1603,7 +1593,6 @@ mod tests {
         assert_eq!(snapshot.open(secret, &subject).unwrap(), b"hunter2");
         assert!(snapshot.open(secret, &outsider).is_err());
 
-        let wrong_resource = vault_handle(id(41), root.verifying_key());
         let wrong_read = root_bundle(
             &root,
             subject.verifying_key(),
@@ -1614,6 +1603,7 @@ mod tests {
         assert!(VaultAccess::new(
             vault,
             root.verifying_key(),
+            collection,
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![wrong_read],
@@ -1631,6 +1621,7 @@ mod tests {
         assert!(VaultAccess::new(
             vault,
             root.verifying_key(),
+            collection,
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![wrong_subject_read],
@@ -1642,6 +1633,7 @@ mod tests {
         let wrong_custody_access = VaultAccess::new(
             vault,
             root.verifying_key(),
+            collection,
             subject.verifying_key(),
             wrong_custody,
             vec![read.clone()],
@@ -1664,6 +1656,7 @@ mod tests {
         assert!(VaultAccess::new(
             vault,
             root.verifying_key(),
+            collection,
             subject.verifying_key(),
             custody,
             vec![read],

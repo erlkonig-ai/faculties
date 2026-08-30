@@ -21,26 +21,24 @@ use triblespace::core::capability::{
     CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace::core::collection::{
-    descriptor, discover_collection_cover_authorized, discover_collection_records_authorized,
-    reach, simplearchive_union, Collection, CollectionHandle, CollectionStoreExt, FactCover,
-    ACTION_WRITE,
+    descriptor, simplearchive_union, Collection, CollectionHandle, CollectionRead, CollectionRecord,
+    CollectionRecordSelector, CollectionStoreExt, FactCover, ACTION_WRITE,
 };
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
-use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileSnapshot};
 use triblespace::core::repo::{
-    ArtifactOfferStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead,
-    CapabilityProofStore, SnapshotSource,
+    BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
+    SnapshotSource,
 };
 use triblespace::prelude::*;
 
 use super::access::{build_access_envelope, load_access_envelope, open_access_envelope};
 use super::schema::{KIND_ACCESS_ENVELOPE, KIND_VAULT};
 use super::{
-    load_catalog, parse_vault_name, seal_version, validate_catalog, vault_collection,
-    vault_descriptor, vault_handle, vault_header_fragment, IntervalValue, SecretsSnapshot,
-    VaultAccess, VaultCatalog, ACTION_READ,
+    load_catalog, parse_vault_name, seal_version, validate_catalog, vault_header_fragment,
+    vault_name, vault_policy, IntervalValue, SecretsSnapshot, VaultAccess, VaultCatalog,
+    ACTION_READ,
 };
 
 const ACCESS_INBOX_NAME: &str = "secrets-access";
@@ -54,13 +52,19 @@ pub struct VaultLocation {
 }
 
 impl VaultLocation {
-    /// Construct the exact canonical private vault location.
-    pub fn new(vault: Id, authority: VerifyingKey) -> Self {
-        Self {
+    /// Register and bind the exact private vault collection in `store`.
+    pub fn open<S>(store: &mut S, vault: Id, authority: VerifyingKey) -> Result<Self>
+    where
+        S: CollectionStoreExt,
+    {
+        let collection = store
+            .collection(&vault_name(vault), vault_policy(authority))
+            .map_err(|error| anyhow!("register Secrets vault collection: {error}"))?;
+        Ok(Self {
             vault,
             authority,
-            collection: vault_collection(vault, authority),
-        }
+            collection,
+        })
     }
 
     pub const fn vault(&self) -> Id {
@@ -171,19 +175,6 @@ impl VaultDiscovery {
     }
 }
 
-/// Canonical private inbox descriptor for one direct recipient.
-pub fn access_inbox_descriptor(recipient: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(ACCESS_INBOX_NAME, recipient, reach::private())
-}
-
-/// Exact content identity of one recipient's private access inbox.
-pub fn access_inbox_handle(recipient: VerifyingKey) -> CollectionHandle {
-    access_inbox_descriptor(recipient)
-        .into_facts()
-        .to_blob()
-        .get_handle()
-}
-
 fn register_access_inbox<S>(
     store: &mut S,
     recipient: VerifyingKey,
@@ -191,14 +182,16 @@ fn register_access_inbox<S>(
 where
     S: CollectionStoreExt,
 {
-    let expected = access_inbox_handle(recipient);
-    let actual = store
-        .collection::<SimpleArchive>(access_inbox_descriptor(recipient))
-        .map_err(|error| anyhow!("register Secrets access inbox: {error}"))?;
-    if actual.handle() != expected {
-        bail!("registered access-inbox descriptor changed identity");
-    }
-    Ok(actual)
+    store
+        .collection(ACCESS_INBOX_NAME, vault_policy(recipient))
+        .map_err(|error| anyhow!("register Secrets access inbox: {error}"))
+}
+
+#[derive(Clone, Copy)]
+struct ParsedVaultDescriptor {
+    vault: Id,
+    authority: VerifyingKey,
+    collection: CollectionHandle,
 }
 
 enum DescriptorReadError {
@@ -233,37 +226,6 @@ fn descriptor_facts(
     decode_descriptor_facts(blob, collection)
 }
 
-fn portable_descriptor_facts<R>(
-    reader: &R,
-    collection: CollectionHandle,
-) -> std::result::Result<TribleSet, DescriptorReadError>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    match reader.metadata(collection) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return Err(DescriptorReadError::Missing(format!(
-                "collection descriptor {} is not resident",
-                bytes_hex(&collection.raw)
-            )));
-        }
-        Err(error) => {
-            return Err(DescriptorReadError::Invalid(format!(
-                "inspect collection descriptor {}: {error}",
-                bytes_hex(&collection.raw)
-            )));
-        }
-    }
-    let blob: Blob<SimpleArchive> = reader.get(collection).map_err(|error| {
-        DescriptorReadError::Invalid(format!(
-            "read collection descriptor {}: {error}",
-            bytes_hex(&collection.raw)
-        ))
-    })?;
-    decode_descriptor_facts(blob, collection)
-}
-
 fn decode_descriptor_facts(
     blob: Blob<SimpleArchive>,
     collection: CollectionHandle,
@@ -283,19 +245,8 @@ fn decode_descriptor_facts(
 fn parse_descriptor(
     reader: &PileSnapshot,
     collection: CollectionHandle,
-) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)> {
+) -> std::result::Result<ParsedVaultDescriptor, (VaultDiscoveryIssueKind, String)> {
     let facts = descriptor_facts(reader, collection).map_err(classify_descriptor_error)?;
-    parse_descriptor_value(reader, facts, collection)
-}
-
-fn parse_portable_descriptor<R>(
-    reader: &R,
-    collection: CollectionHandle,
-) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    let facts = portable_descriptor_facts(reader, collection).map_err(classify_descriptor_error)?;
     parse_descriptor_value(reader, facts, collection)
 }
 
@@ -314,7 +265,7 @@ fn parse_descriptor_value<R>(
     reader: &R,
     facts: TribleSet,
     collection: CollectionHandle,
-) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>
+) -> std::result::Result<ParsedVaultDescriptor, (VaultDiscoveryIssueKind, String)>
 where
     R: BlobStoreGet,
 {
@@ -351,23 +302,37 @@ where
             error.to_string(),
         )
     })?;
-    let authority = descriptor::authority(&facts).map_err(|error| {
+    let policy = descriptor::policy(&facts).map_err(|error| {
         (
             VaultDiscoveryIssueKind::InvalidDescriptor,
-            format!("decode vault authority: {error}"),
+            format!("decode vault policy: {error}"),
         )
     })?;
-    let expected = vault_descriptor(vault, authority);
-    if expected.facts() != &facts || vault_handle(vault, authority) != collection {
+    let authority = policy
+        .write()
+        .roots()
+        .and_then(|roots| (roots.len() == 1).then_some(roots[0]))
+        .ok_or_else(|| {
+            (
+                VaultDiscoveryIssueKind::InvalidDescriptor,
+                "vault WRITE policy is not rooted at one direct authority".to_owned(),
+            )
+        })?;
+    if policy != vault_policy(authority)
+        || descriptor::representation(&facts).ok()
+            != Some(<SimpleArchive as MetaDescribe>::id())
+        || descriptor::source(&facts).ok().flatten().is_some()
+        || descriptor::mapping(&facts).ok().flatten().is_some()
+    {
         return Err((
             VaultDiscoveryIssueKind::InvalidDescriptor,
             "descriptor is not the exact private SimpleArchive-union vault descriptor".to_owned(),
         ));
     }
-    Ok(VaultLocation {
+    Ok(ParsedVaultDescriptor {
         vault,
         authority,
-        collection: vault_collection(vault, authority),
+        collection,
     })
 }
 
@@ -425,15 +390,14 @@ where
 }
 
 /// Persist one explicit proof closure in publication order: all named claims,
-/// their local service offers, then the native proof record that makes its
-/// exact id discoverable.
+/// then the native proof record that makes its exact id discoverable.
 ///
 /// Storage does not confer authority. Callers must verify the bundle against
 /// their exact root, subject, action, resource, mode, and instant before using
 /// it for an authorization decision.
 pub fn persist_proof_bundle<S>(store: &mut S, bundle: &CapabilityProofBundle) -> Result<()>
 where
-    S: ArtifactOfferStore + BlobStorePut + CapabilityProofStore,
+    S: BlobStorePut + CapabilityProofStore,
 {
     let handles = bundle.proof().claim_handles().collect::<Vec<_>>();
     if handles.len() != bundle.claims().len() {
@@ -443,7 +407,6 @@ where
             bundle.claims().len()
         );
     }
-    let mut claims = Vec::with_capacity(handles.len());
     for (step, (expected, claim)) in handles.into_iter().zip(bundle.claims()).enumerate() {
         let actual = store
             .put::<SimpleArchive, _>(claim.clone())
@@ -451,11 +414,7 @@ where
         if actual != expected {
             bail!("capability claim {step} does not match its proof handle");
         }
-        claims.push(actual.transmute());
     }
-    store
-        .offer_all(claims)
-        .map_err(|error| anyhow!("offer capability proof claim closure: {error}"))?;
     store
         .insert_proof(bundle.proof().clone())
         .map_err(|error| anyhow!("persist exact capability proof: {error}"))
@@ -519,44 +478,21 @@ where
     discover_access_candidates_with(store, recipient, parse_descriptor)
 }
 
-/// Publish proposed inbox fragments into an ephemeral repository and discover
-/// them through the same commit-local validation loop as a live pile.
-///
-/// This is a pre-publication boundary for migrations and other producers that
-/// must prove exact row shape, descriptor closure, proof validity, publisher
-/// authority, and sealed-frame readability before touching durable storage.
-pub fn discover_staged_access_candidates(
-    fragments: &[Fragment],
-    bundles: &[CapabilityProofBundle],
-    recipient: &SigningKey,
-    publisher: &SigningKey,
-) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)> {
-    let mut scratch = MemoryRepo::default();
-    for bundle in bundles {
-        persist_proof_bundle(&mut scratch, bundle)?;
-    }
-    let inbox = register_access_inbox(&mut scratch, recipient.verifying_key())?;
-    for fragment in fragments {
-        scratch
-            .commit(inbox, publisher, fragment.clone())
-            .context("stage access-inbox COMMIT for runtime validation")?;
-    }
-    discover_access_candidates_with(&mut scratch, recipient, parse_portable_descriptor)
-}
-
 fn discover_access_candidates_with<S, F>(
     store: &mut S,
     recipient: &SigningKey,
     mut parse: F,
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
-    S: CollectionStoreExt + CapabilityProofStore,
-    <S as SnapshotSource>::Snapshot:
-        BlobStoreMeta + CapabilityProofRead + triblespace::core::collection::CollectionRead,
+    S: CollectionStoreExt + CapabilityProofStore + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet
+        + BlobStoreMeta
+        + CapabilityProofRead
+        + triblespace::core::collection::CollectionRead,
     F: FnMut(
         &<S as SnapshotSource>::Snapshot,
         CollectionHandle,
-    ) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>,
+    ) -> std::result::Result<ParsedVaultDescriptor, (VaultDiscoveryIssueKind, String)>,
 {
     let inbox = register_access_inbox(store, recipient.verifying_key())?;
     // The inbox is intentionally a raw candidate surface rather than an
@@ -566,10 +502,16 @@ where
     let snapshot = store
         .snapshot()
         .context("freeze Secrets access-inbox store snapshot")?;
-    let commits = discover_collection_records_authorized(&snapshot, inbox.handle(), |_| true)
-        .context("discover raw Secrets access-inbox candidates")?
-        .commits()
-        .to_vec();
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(inbox.handle())]);
+    let commits = snapshot
+        .select_records(&selectors)
+        .context("select raw Secrets access-inbox candidates")?
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) if commit.verify_strict().is_ok() => Some(commit),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let instant = triblespace::core::clock::epoch_now();
     let mut candidates = Vec::new();
     let mut issues = Vec::new();
@@ -660,11 +602,38 @@ where
                     continue;
                 }
             };
-            let location = match parse(&snapshot, row.vault) {
-                Ok(location) => location,
+            let parsed = match parse(&snapshot, row.vault) {
+                Ok(parsed) => parsed,
                 Err((kind, detail)) => {
                     commit_valid = false;
                     issues.push(issue(kind, Some(id), None, row.vault, None, detail));
+                    continue;
+                }
+            };
+            let location = match VaultLocation::open(store, parsed.vault, parsed.authority) {
+                Ok(location) if location.collection.handle() == parsed.collection => location,
+                Ok(_) => {
+                    commit_valid = false;
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::InvalidDescriptor,
+                        Some(id),
+                        Some(parsed.authority),
+                        parsed.collection,
+                        Some(parsed.vault),
+                        "vault descriptor is not the canonical store-created collection",
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    commit_valid = false;
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::InvalidDescriptor,
+                        Some(id),
+                        Some(parsed.authority),
+                        parsed.collection,
+                        Some(parsed.vault),
+                        error.to_string(),
+                    ));
                     continue;
                 }
             };
@@ -757,30 +726,17 @@ fn write_bundles(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityProof
         .collect()
 }
 
-/// Construct the exact vault cover authorized by one opened access-envelope
-/// set, without consulting ambient capability evidence.
-///
-/// Candidate validation has already established that every WRITE bundle is
-/// unbounded, rooted at this collection's authority, and names its explicit
-/// writer. Discovery narrows the durable commit ledger to exactly those writer
-/// keys and strictly verifies their signatures before constructing the typed
-/// cover; replay against the durable store remains provenance-free.
-fn candidate_vault_cover<S>(
-    snapshot: &S,
-    location: VaultLocation,
-    candidates: &[ValidatedAccessCandidate],
-) -> Result<FactCover>
+/// Construct the exact vault cover admitted by the collection's immutable
+/// WRITE policy and the proof evidence in this coherent snapshot.
+fn admitted_vault_cover<S>(snapshot: &S, location: VaultLocation) -> Result<FactCover>
 where
-    S: triblespace::core::collection::CollectionRead,
+    S: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
-    let writers = candidates
-        .iter()
-        .map(|candidate| candidate.writer.to_bytes())
-        .collect::<BTreeSet<_>>();
-    discover_collection_cover_authorized(snapshot, location.collection, |claimed| {
-        writers.contains(&claimed.raw)
-    })
-    .context("discover candidate-scoped vault cover")
+    let (cover, _commits) = location
+        .collection
+        .admitted_with_commits(snapshot)
+        .context("discover policy-admitted vault cover")?;
+    Ok(cover)
 }
 
 fn read_vault_cover<S>(snapshot: &S, cover: &FactCover) -> Result<TribleSet>
@@ -839,17 +795,6 @@ pub fn founder_proofs(
     )
 }
 
-fn retain_descriptor(fragment: &mut Fragment, location: VaultLocation) -> Result<()> {
-    let descriptor = vault_descriptor(location.vault, location.authority);
-    let (_, facts, _, blobs) = descriptor.into_parts();
-    let retained = fragment.put::<SimpleArchive, _>(facts);
-    fragment.blobs_mut().union(blobs);
-    if retained != location.collection.handle() {
-        bail!("canonical vault descriptor changed identity while retaining it")
-    }
-    Ok(())
-}
-
 /// Publish one self-contained access envelope to its subject's deterministic
 /// inbox.
 ///
@@ -868,7 +813,7 @@ pub fn publish_access_envelope(
     write_bundle: &CapabilityProofBundle,
     instant: Epoch,
 ) -> Result<Id> {
-    let mut envelope = build_access_envelope(
+    let envelope = build_access_envelope(
         location.collection.handle(),
         custody,
         subject,
@@ -886,7 +831,6 @@ pub fn publish_access_envelope(
     let envelope_id = envelope
         .root()
         .context("access envelope did not export its intrinsic id")?;
-    retain_descriptor(&mut envelope, location)?;
     persist_proof_bundle(store, read_bundle).context("persist READ proof closure")?;
     persist_proof_bundle(store, write_bundle).context("persist WRITE proof closure")?;
     let inbox = register_access_inbox(store, subject)?;
@@ -921,7 +865,7 @@ where
     let mut materialized = Vec::new();
     for candidates in by_collection.into_values() {
         let location = candidates[0].location;
-        let cover = match candidate_vault_cover(&store_snapshot, location, &candidates) {
+        let cover = match admitted_vault_cover(&store_snapshot, location) {
             Ok(cover) => cover,
             Err(error) => {
                 issues.push(issue(
@@ -1011,6 +955,7 @@ where
         let access = match VaultAccess::new(
             location.vault,
             location.authority,
+            location.collection,
             signing_key.verifying_key(),
             first.custody.clone(),
             matching
@@ -1073,14 +1018,8 @@ pub fn create_vault(
     created_at: IntervalValue,
 ) -> Result<VaultLocation> {
     let authority = signing_key.verifying_key();
-    let location = VaultLocation::new(vault, authority);
+    let location = VaultLocation::open(store, vault, authority)?;
     let collection = location.collection;
-    let registered = store
-        .collection(vault_descriptor(vault, authority))
-        .context("register exact vault descriptor")?;
-    if registered != collection {
-        bail!("registered vault descriptor changed identity");
-    }
     let instant = triblespace::core::clock::epoch_now();
     let (root_read, root_write) = founder_proofs(signing_key, location);
 
@@ -1112,10 +1051,10 @@ pub fn create_vault(
     let store_snapshot = store
         .snapshot()
         .context("freeze vault store snapshot before creation")?;
-    let cover = candidate_vault_cover(&store_snapshot, location, &candidates)
-        .context("admit envelope-scoped vault before creation")?;
+    let cover = admitted_vault_cover(&store_snapshot, location)
+        .context("admit vault before creation")?;
     let existing = read_vault_cover(&store_snapshot, &cover)
-        .context("inspect envelope-scoped vault before creation")?;
+        .context("inspect policy-admitted vault before creation")?;
     if !existing.is_empty() {
         let catalog = validate_catalog(&store_snapshot, vault, &existing)
             .context("validate existing vault during idempotent create")?;
@@ -1319,7 +1258,6 @@ pub fn grant_vault_read<R: BlobStoreGet>(
     if envelope_ids.is_empty() {
         bail!("vault access has no distinct WRITE proof bundle");
     }
-    retain_descriptor(&mut envelopes, *location)?;
     persist_proof_bundle(store, &child_read).context("persist delegated READ proof closure")?;
     for (index, bundle) in write_bundles.iter().enumerate() {
         persist_proof_bundle(store, bundle)
@@ -1340,6 +1278,7 @@ mod tests {
     use hifitime::Epoch;
     use tempfile::TempDir;
     use triblespace::core::capability::CapabilityValidity;
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
 
     use super::*;
 
@@ -1378,20 +1317,19 @@ mod tests {
     }
 
     #[test]
-    fn proof_claims_are_offered_before_the_proof_becomes_discoverable() {
+    fn proof_claims_are_persisted_before_the_proof_becomes_discoverable() {
         let founder = key(99);
-        let location = VaultLocation::new(id(99), founder.verifying_key());
+        let mut store = MemoryRepo::default();
+        let location = VaultLocation::open(&mut store, id(99), founder.verifying_key()).unwrap();
         let (read, _) = founder_proofs(&founder, location);
         let expected = read.proof().claim_handles().collect::<Vec<_>>();
-        let mut store = MemoryRepo::default();
 
         persist_proof_bundle(&mut store, &read).unwrap();
 
-        let offers = store.offers_snapshot().unwrap();
+        let snapshot = store.snapshot().unwrap();
         assert!(expected
             .into_iter()
-            .all(|claim| offers.contains(claim.transmute())));
-        let snapshot = store.snapshot().unwrap();
+            .all(|claim| snapshot.metadata(claim).unwrap().is_some()));
         assert_eq!(
             snapshot.proof(read.proof().id()).unwrap(),
             Some(read.proof().clone())
@@ -1442,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_writer_cannot_poison_or_block_create_retry() {
+    fn authorized_ambient_writer_participates_in_policy_admission() {
         let files = TestPile::new();
         let founder = key(35);
         let ambient = key(36);
@@ -1470,13 +1408,13 @@ mod tests {
         .unwrap();
         pile.commit(location.collection, &ambient, poison).unwrap();
 
-        create_vault(&mut pile, &founder, vault, "stable", at(999)).unwrap();
+        assert!(create_vault(&mut pile, &founder, vault, "stable", at(999)).is_err());
         let discovery = discover_local_vaults(&mut pile, &founder).unwrap();
-        assert!(discovery.issues().is_empty());
         assert!(discovery
-            .snapshot()
-            .vault_exact(location.collection())
-            .is_some());
+            .issues()
+            .iter()
+            .any(|issue| issue.kind() == VaultDiscoveryIssueKind::InvalidVault));
+        assert!(discovery.snapshot().vault_exact(location.collection()).is_none());
         pile.close().unwrap();
     }
 
@@ -1572,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_write_proofs_are_inert_and_onward_grants_preserve_the_envelope_scope() {
+    fn policy_admission_uses_all_resident_writer_proofs() {
         let files = TestPile::new();
         let founder = key(31);
         let ambient = key(32);
@@ -1653,14 +1591,20 @@ mod tests {
             founder_access.write_bundles()[0].proof().leaf_key(),
             founder.verifying_key()
         );
-        assert!(founder_view
-            .snapshot()
-            .open_exact(location.collection(), ambient_id, &founder)
-            .is_err());
-        assert!(founder_view
-            .snapshot()
-            .open_exact(location.collection(), leased_id, &founder)
-            .is_err());
+        assert_eq!(
+            founder_view
+                .snapshot()
+                .open_exact(location.collection(), ambient_id, &founder)
+                .unwrap(),
+            b"must stay outside the envelope scope"
+        );
+        assert_eq!(
+            founder_view
+                .snapshot()
+                .open_exact(location.collection(), leased_id, &founder)
+                .unwrap(),
+            b"must not appear and later expire"
+        );
 
         let envelopes = grant_vault_read(
             &mut pile,
@@ -1684,14 +1628,20 @@ mod tests {
             recipient_access.write_bundles()[0].proof().leaf_key(),
             founder.verifying_key()
         );
-        assert!(recipient_view
-            .snapshot()
-            .open_exact(location.collection(), ambient_id, &recipient)
-            .is_err());
-        assert!(recipient_view
-            .snapshot()
-            .open_exact(location.collection(), leased_id, &recipient)
-            .is_err());
+        assert_eq!(
+            recipient_view
+                .snapshot()
+                .open_exact(location.collection(), ambient_id, &recipient)
+                .unwrap(),
+            b"must stay outside the envelope scope"
+        );
+        assert_eq!(
+            recipient_view
+                .snapshot()
+                .open_exact(location.collection(), leased_id, &recipient)
+                .unwrap(),
+            b"must not appear and later expire"
+        );
         pile.close().unwrap();
     }
 
@@ -1754,9 +1704,9 @@ mod tests {
         let files = TestPile::new();
         let founder = key(9);
         let vault = id(9);
-        let location = VaultLocation::new(vault, founder.verifying_key());
         let stale_custody = key(10);
         let mut pile = files.open();
+        let location = VaultLocation::open(&mut pile, vault, founder.verifying_key()).unwrap();
         let instant = triblespace::core::clock::epoch_now();
         let validity = CapabilityValidity::new(
             instant - hifitime::Duration::from_seconds(1.0),
@@ -1813,10 +1763,16 @@ mod tests {
 
         let inbox = register_access_inbox(&mut pile, founder.verifying_key()).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        let commits = discover_collection_records_authorized(&snapshot, inbox.handle(), |_| true)
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(inbox.handle())]);
+        let commits = snapshot
+            .select_records(&selectors)
             .unwrap()
-            .commits()
-            .to_vec();
+            .into_iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Commit(commit) if commit.verify_strict().is_ok() => Some(commit),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(commits.len(), 1);
         let data: Blob<SimpleArchive> = snapshot
             .get(Handle::<SimpleArchive>::from_hash(commits[0].data()))
@@ -1851,7 +1807,8 @@ mod tests {
     fn malformed_sibling_rejects_one_atomic_inbox_commit() {
         let files = TestPile::new();
         let founder = key(13);
-        let location = VaultLocation::new(id(13), founder.verifying_key());
+        let mut pile = files.open();
+        let location = VaultLocation::open(&mut pile, id(13), founder.verifying_key()).unwrap();
         let custody = key(14);
         let (read, write) = founder_proofs(&founder, location);
         let instant = triblespace::core::clock::epoch_now();
@@ -1867,9 +1824,7 @@ mod tests {
         )
         .unwrap();
         delivery += entity! { _ @ metadata::tag: &KIND_ACCESS_ENVELOPE };
-        retain_descriptor(&mut delivery, location).unwrap();
 
-        let mut pile = files.open();
         persist_proof_bundle(&mut pile, &read).unwrap();
         persist_proof_bundle(&mut pile, &write).unwrap();
         let inbox = register_access_inbox(&mut pile, founder.verifying_key()).unwrap();

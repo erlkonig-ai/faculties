@@ -142,6 +142,7 @@ struct TriageSnapshot {
     pile: RefCell<Option<Pile>>,
     signer: SigningKey,
     store_snapshot: PileSnapshot,
+    collections: std::collections::BTreeMap<Id, Collection<SimpleArchive>>,
 }
 
 impl TriageSnapshot {
@@ -150,6 +151,24 @@ impl TriageSnapshot {
         // new identity, create a pile, or admit somebody else's COMMITs.
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
         let mut pile = open_pile_strict(&cli.pile)?;
+        let mut collections = std::collections::BTreeMap::new();
+        for scope in [
+            COGNITION_SCOPE_ID,
+            HEADSPACE_SCOPE_ID,
+            MEMORY_SCOPE_ID,
+            RELATIONS_SCOPE_ID,
+            MESSAGE_SCOPE_ID,
+        ] {
+            let collection =
+                faculties::collection_names::open(&mut pile, scope, signer.verifying_key())
+                    .with_context(|| {
+                        format!(
+                            "register {} collection",
+                            faculties::collection_names::require_name(scope)
+                        )
+                    })?;
+            collections.insert(scope, collection);
+        }
         let store_snapshot = pile
             .snapshot()
             .context("freeze Triage native store snapshot")?;
@@ -158,26 +177,19 @@ impl TriageSnapshot {
             pile: RefCell::new(Some(pile)),
             signer,
             store_snapshot,
+            collections,
         })
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
-        let descriptor =
-            faculties::collection_names::root_descriptor(scope, self.signer.verifying_key());
-        let collection = Collection::<SimpleArchive>::from_descriptor(&descriptor)
-            .with_context(|| format!("type {label} collection descriptor"))?;
-        let facts = if self
-            .store_snapshot
-            .metadata(collection.handle())
-            .with_context(|| format!("inspect {label} collection descriptor"))?
-            .is_some()
-        {
-            faculties::storage::read_fact_collection(collection, &self.store_snapshot)
-                .map(|(facts, _)| facts)
-                .with_context(|| format!("materialize {label} collection"))?
-        } else {
-            TribleSet::new()
-        };
+        let collection = self
+            .collections
+            .get(&scope)
+            .copied()
+            .with_context(|| format!("{label} collection was not registered in snapshot"))?;
+        let facts = faculties::storage::read_fact_collection(collection, &self.store_snapshot)
+            .map(|(facts, _)| facts)
+            .with_context(|| format!("materialize {label} collection"))?;
         Ok(CollectionView {
             facts,
             reader: self.store_snapshot.clone(),

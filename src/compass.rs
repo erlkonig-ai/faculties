@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
+use triblespace::core::collection::lww_register::{
+    LwwIndex, LwwRegisterCollection, RegisterCoordinatesMapping,
+};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -63,16 +65,20 @@ impl CompassSnapshot {
 }
 
 /// The exact maintained LWW projection used for current Compass status.
-pub fn status_register_collection(authority: VerifyingKey) -> LwwRegisterCollection {
-    LwwRegisterCollection::new(
-        crate::collection_names::require_name(DEFAULT_SCOPE_ID),
-        authority,
-        board::status_of.id(),
-        metadata::created_at.id(),
-        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-        authority,
-        crate::collection_names::require_reach(DEFAULT_SCOPE_ID),
-    )
+pub fn status_register_collection<S>(
+    store: &mut S,
+    authority: VerifyingKey,
+) -> Result<LwwRegisterCollection>
+where
+    S: CollectionStoreExt,
+{
+    let source = crate::collection_names::open(store, DEFAULT_SCOPE_ID, authority)?;
+    let target = store.derive(
+        source,
+        RegisterCoordinatesMapping::new(board::status_of.id(), metadata::created_at.id()),
+        crate::collection_names::private_policy(authority),
+    )?;
+    Ok(LwwRegisterCollection::new(source, target))
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -1044,7 +1050,7 @@ pub fn materialize_indexed_collection(
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
-    let status = status_register_collection(signer.verifying_key())
+    let status = status_register_collection(pile, signer.verifying_key())?
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     Ok(CompassSnapshot {

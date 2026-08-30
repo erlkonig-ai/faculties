@@ -11,7 +11,7 @@ use std::process::Command;
 
 use faculties::schemas::compass::{board, KIND_GOAL_ID};
 use faculties::storage::{initialize_signer, open_pile_strict};
-use triblespace::core::collection::simplearchive_union;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
@@ -99,16 +99,14 @@ fn open_admission_native_history_is_immediately_visible() {
 
     let signer = faculties::storage::load_signer(&pile_path, None).unwrap();
     let mut pile = open_pile_strict(&pile_path).unwrap();
-    simplearchive_union::publish_fragment_commit(
+    let collection = faculties::collection_names::open(
         &mut pile,
-        &faculties::collection_names::root_descriptor(
-            faculties::schemas::compass::DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-        ),
-        goal_fragment("a native goal"),
-        &signer,
+        faculties::schemas::compass::DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
     )
     .unwrap();
+    pile.commit(collection, &signer, goal_fragment("a native goal"))
+        .unwrap();
     pile.close().unwrap();
 
     let output = compass_list(&pile_path);

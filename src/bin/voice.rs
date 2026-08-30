@@ -1375,15 +1375,19 @@ mod tests {
             .unwrap();
 
         let mut pile_storage = open_pile_strict(&pile).unwrap();
-        let team = faculties::storage::load_signer(&pile, Some(&key))
-            .unwrap()
-            .verifying_key();
-        let discovery = discover_target(&mut pile_storage, COLLECTION_SCOPE_ID, team).unwrap();
-        assert_eq!(
-            discovery.descriptor().facts(),
-            faculties::collection_names::root_descriptor(COLLECTION_SCOPE_ID, team).facts()
-        );
+        let signer = faculties::storage::load_signer(&pile, Some(&key)).unwrap();
+        let collection = open_scope(&mut pile_storage, COLLECTION_SCOPE_ID, &signer).unwrap();
+        let discovery = discover_target(
+            &mut pile_storage,
+            COLLECTION_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
         assert_eq!(discovery.commits().len(), 2);
+        assert!(discovery
+            .commits()
+            .iter()
+            .all(|commit| commit.collection() == collection.handle()));
         pile_storage.close().unwrap();
     }
 

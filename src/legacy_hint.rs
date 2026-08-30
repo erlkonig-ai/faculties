@@ -34,8 +34,8 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::{Collection, CollectionRead, CollectionRecord};
+use triblespace::core::blob::{IntoBlob, TryFromBlob};
+use triblespace::core::collection::{Collection, CollectionRead};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
@@ -218,24 +218,6 @@ pub fn legacy_migration_hint(
         return None;
     }
 
-    // TWO ways a collection can read as empty, and they want opposite advice.
-    //
-    // A pile that never cut over has its history in a legacy branch. A pile
-    // that cut over under a retired descriptor epoch has its history in real
-    // native collections that this build cannot address. Old scope-anchored
-    // descriptors remain as additive residue even after later re-seats, so a
-    // lookup by the current descriptor can find nothing while all source data
-    // is still present.
-    //
-    // Descriptor re-seat is named first when both hold: it is what makes the
-    // current collections readable without replaying legacy branches.
-    if any_scope_anchored_collection(pile)? {
-        return Some(format!(
-            "note: this pile's native `{branch_name}` collection is absent under the current descriptor, but the pile holds retired collection epochs.\n\
-             note: descriptor evolution changes a collection's content identity; current faculties therefore look for a collection this pile does not have yet. Nothing has been lost — the existing collections are intact and re-seat only adds beside them.\n\
-             note: run `migrations --pile <this pile> posture-findings --dry-run` first, then `migrations --pile <this pile> descriptor-authority --dry-run` to inspect the additive re-seat."
-        ));
-    }
     let (commits, capped) = legacy_authored_commits(pile, branch_name)?;
     if commits == 0 {
         return None;
@@ -253,55 +235,6 @@ pub fn legacy_migration_hint(
          note: current faculties read only native collections, so that history stays invisible until it is migrated. Nothing has been lost — the legacy branch is intact and migration only adds to it.\n\
          note: stop every writer on this pile, then run `migrations --pile <this pile> legacy-branches plan` to see exactly what would move, and `migrations --pile <this pile> legacy-branches activate` to migrate."
     ))
-}
-
-/// The anchor a root collection carried before it was named within a namespace.
-///
-/// A bare PROBE id, deliberately not a schema declaration: this crate no longer
-/// knows what a scope MEANS, only that a descriptor still carrying one predates
-/// naming. The transform that understands it lives in `faculties-migrations`,
-/// and rebuilding scope-anchored descriptors from a name table here would drag
-/// that migration surface back into the library it was moved out of.
-///
-/// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
-const RETIRED_COLLECTION_SCOPE: Id =
-    triblespace::macros::id_hex!("D3418873C70392E3ADAA05C00E11A583");
-
-/// Whether any collection in this pile is still anchored by a scope.
-///
-/// Generic on purpose: the question is "does any descriptor here carry a
-/// scope", never "is THIS faculty's old descriptor present". A name table would
-/// answer only for collections this build happens to know, and would go stale
-/// against a pile older or stranger than itself.
-///
-/// This runs only once a collection has already read as empty, so its cost
-/// lands on a pile that is broken for the reader anyway; being able to say what
-/// is wrong is worth more there than the scan it takes to find out.
-fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
-    let snapshot = pile.snapshot().ok()?;
-    let mut collections = BTreeSet::new();
-    for record in snapshot.records().ok()? {
-        if let Ok(CollectionRecord::Commit(commit)) = record {
-            collections.insert(commit.collection());
-        }
-    }
-    for collection in collections {
-        // A descriptor that is absent or does not decode says nothing either
-        // way, so it is skipped rather than treated as an answer.
-        let Ok(blob) = snapshot.get::<Blob<SimpleArchive>, _>(collection.transmute()) else {
-            continue;
-        };
-        let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
-            continue;
-        };
-        if facts
-            .iter()
-            .any(|fact| *fact.a() == RETIRED_COLLECTION_SCOPE)
-        {
-            return Some(true);
-        }
-    }
-    Some(false)
 }
 
 /// Whether one collection has no authority-admitted commits, or `None` if its
@@ -417,7 +350,6 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
-    use triblespace::core::collection::simplearchive_union;
     use triblespace::macros::entity;
     use triblespace::prelude::*;
 
@@ -529,67 +461,9 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// A descriptor as a pile written before naming carries one: the current
-    /// shape plus the retired scope anchor.
-    ///
-    /// Built from the raw retired attribute id rather than a declaration, for
-    /// exactly the reason the probe is: this crate no longer knows what a scope
-    /// means, and declaring it would pull a migration surface back into the
-    /// library it was moved out of.
-    fn scope_anchored_descriptor(scope: Id) -> Fragment {
-        use triblespace::core::inline::encodings::genid::GenId;
-        use triblespace::core::inline::IntoInline;
-        use triblespace::core::trible::Trible;
-
-        let current = crate::collection_names::root_descriptor(scope, test_authority());
-        let root = ExclusiveId::force(current.root().expect("a descriptor has one root"));
-        let mut facts = current.into_facts();
-        facts.insert(&Trible::new(
-            &root,
-            &RETIRED_COLLECTION_SCOPE,
-            &IntoInline::<GenId>::to_inline(scope),
-        ));
-        Fragment::rooted(*root, facts)
-    }
-
-    /// A pile that DID cut over but predates naming must not be told to run the
-    /// cutover again. Its collections are real and full; they are simply not
-    /// reachable by name, and the legacy branch it still carries is residue.
-    #[test]
-    fn a_retired_descriptor_pile_is_told_to_reseat_not_cut_over_again() {
-        let directory = TempDir::new().unwrap();
-        let path = new_pile(&directory);
-        // Residue: the branch a pre-naming pile still has lying around.
-        write_legacy_branch(&path);
-
-        let mut pile = Pile::open(&path).unwrap();
-        // Real history, under the anchor that build used.
-        simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &scope_anchored_descriptor(DEFAULT_SCOPE_ID),
-            goal_fragment("a goal published before naming"),
-            &signer(),
-        )
-        .unwrap();
-
-        let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
-        let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection)
-            .expect("a pile whose collections cannot be found by name must say so");
-        pile.close().unwrap();
-
-        assert!(hint.contains("descriptor-authority"), "{hint}");
-        assert!(
-            !hint.contains("legacy-branches activate"),
-            "this pile already cut over; re-seating is not cutting it over: {hint}"
-        );
-        assert!(
-            hint.contains("Nothing has been lost"),
-            "re-seat is additive too, and the reader needs to know it: {hint}"
-        );
-    }
-
-    /// The two arms are distinct: a genuinely pre-cutover pile still gets the
-    /// cutover advice, because nothing in it is anchored by a scope.
+    /// A genuinely pre-cutover pile gets the one remaining branch-cutover
+    /// advice. Descriptor-policy re-seating belongs to the active migration,
+    /// not to this runtime hint.
     #[test]
     fn a_pre_cutover_pile_still_gets_the_cutover_advice() {
         let directory = TempDir::new().unwrap();
@@ -597,13 +471,11 @@ mod tests {
         write_legacy_branch(&path);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(any_scope_anchored_collection(&mut pile), Some(false));
         let collection = current_collection(&mut pile, DEFAULT_SCOPE_ID);
         let hint = legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection).unwrap();
         pile.close().unwrap();
 
         assert!(hint.contains("legacy-branches activate"), "{hint}");
-        assert!(!hint.contains("descriptor-authority"), "{hint}");
     }
 
     #[test]

@@ -31,31 +31,26 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
-/// Canonical descriptor for the one supported Habit collection.
-///
-/// Named `"habit"` within `team`, which is the team's ROOT key rather than the
-/// key that signs commits. It is a parameter because they coincide only for a
-/// team of one, and defaulting would root this collection at whichever key
-/// happened to be writing.
-pub fn descriptor(team: VerifyingKey) -> Fragment {
-    crate::collection_names::root_descriptor(DEFAULT_SCOPE_ID, team)
-}
-
 /// Content identity of the Habit collection this pile roots.
-///
-/// Written out rather than reached for: core deliberately offers no helper for
-/// hashing a descriptor it did not store, because a handle computed beside a
-/// store instead of by it can name a collection whose descriptor is absent.
-/// This one is only ever printed.
 pub fn collection_handle(
     pile: &Path,
     key: Option<&Path>,
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
     let signer = load_signer(pile, key)?;
-    Ok(triblespace::core::blob::IntoBlob::<
-        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
-    >::to_blob(descriptor(signer.verifying_key()).facts().clone())
-    .get_handle())
+    let mut store = open_pile_strict(pile)?;
+    let result =
+        crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key())
+            .map(|collection| collection.handle())
+            .context("register Habit collection");
+    let close = store.close().context("close Habit pile");
+    match (result, close) {
+        (Ok(handle), Ok(())) => Ok(handle),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(close)) => {
+            Err(error.context(format!("closing pile also failed: {close}")))
+        }
+    }
 }
 
 /// One pile-resident executable carried by a standing intention.
@@ -1514,10 +1509,13 @@ mod tests {
         );
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-        let team = signer.verifying_key();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-        assert_eq!(collection, pile.collection(descriptor(team)).unwrap());
+        assert_eq!(
+            collection,
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key(),)
+                .unwrap()
+        );
         pile.close().unwrap();
     }
 

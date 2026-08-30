@@ -301,12 +301,13 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
         .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
 
-    let compass_status = compass::status_register_collection(signer.verifying_key())
+    let compass_status = compass::status_register_collection(pile, signer.verifying_key())?
         .ensure_exact(pile, &compass_cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
-    let checkpoint_register = orient_model::checkpoint_register_collection(signer.verifying_key())
-        .ensure_exact(pile, &checkpoint_cover)
-        .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
+    let checkpoint_register =
+        orient_model::checkpoint_register_collection(pile, signer.verifying_key())?
+            .ensure_exact(pile, &checkpoint_cover)
+            .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
 
     Ok(NativeCatalogs {
         messages: message_facts,

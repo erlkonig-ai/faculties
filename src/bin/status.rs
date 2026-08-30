@@ -424,16 +424,13 @@ mod tests {
         let fixture = fixture();
         let window = Id::new([0x83; 16]).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let namespace = load_signer(&fixture.pile, Some(&fixture.key))
-            .unwrap()
-            .verifying_key();
-        let descriptor = faculties::collection_names::root_descriptor(DEFAULT_SCOPE_ID, namespace);
+        let local = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let foreign = SigningKey::from_bytes(&[0x84; 32]);
-        triblespace::core::collection::simplearchive_union::publish_fragment_commit(
-            &mut pile,
-            &descriptor,
-            status::status_fragment(window, "foreign", at(30.0)).unwrap(),
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &local).unwrap();
+        pile.commit(
+            collection,
             &foreign,
+            status::status_fragment(window, "foreign", at(30.0)).unwrap(),
         )
         .unwrap();
         pile.close().unwrap();

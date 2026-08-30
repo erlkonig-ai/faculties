@@ -672,9 +672,11 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         }
 
         if let Some((_, _, cover)) = by_scope.get(&COMPASS_SCOPE_ID) {
-            let index = crate::compass::status_register_collection(signer.verifying_key())
-                .ensure_exact(&mut pile, cover)
-                .map_err(|error| format!("maintain Compass status register: {error}"))?;
+            let index =
+                crate::compass::status_register_collection(&mut pile, signer.verifying_key())
+                    .map_err(|error| format!("register Compass status collection: {error:#}"))?
+                    .ensure_exact(&mut pile, cover)
+                    .map_err(|error| format!("maintain Compass status register: {error}"))?;
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -685,7 +687,8 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         }
 
         if let Some((_, _, cover)) = by_scope.get(&WIKI_SCOPE_ID) {
-            let index = crate::wiki::observed_collection(signer.verifying_key())
+            let index = crate::wiki::observed_collection(&mut pile, signer.verifying_key())
+                .map_err(|error| format!("register Wiki observation collection: {error:#}"))?
                 .ensure_exact(&mut pile, cover)
                 .map_err(|error| format!("maintain Wiki supersession index: {error}"))?;
             observed_by_scope
