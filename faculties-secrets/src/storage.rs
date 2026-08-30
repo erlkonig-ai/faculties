@@ -21,8 +21,8 @@ use triblespace::core::capability::{
     CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace::core::collection::{
-    descriptor, simplearchive_union, Collection, CollectionHandle, CollectionRead, CollectionRecord,
-    CollectionRecordSelector, CollectionStoreExt, FactCover, ACTION_WRITE,
+    descriptor, simplearchive_union, Collection, CollectionHandle, CollectionRead,
+    CollectionRecord, CollectionRecordSelector, CollectionStoreExt, FactCover, ACTION_WRITE,
 };
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
@@ -319,8 +319,7 @@ where
             )
         })?;
     if policy != vault_policy(authority)
-        || descriptor::representation(&facts).ok()
-            != Some(<SimpleArchive as MetaDescribe>::id())
+        || descriptor::representation(&facts).ok() != Some(<SimpleArchive as MetaDescribe>::id())
         || descriptor::source(&facts).ok().flatten().is_some()
         || descriptor::mapping(&facts).ok().flatten().is_some()
     {
@@ -1051,8 +1050,8 @@ pub fn create_vault(
     let store_snapshot = store
         .snapshot()
         .context("freeze vault store snapshot before creation")?;
-    let cover = admitted_vault_cover(&store_snapshot, location)
-        .context("admit vault before creation")?;
+    let cover =
+        admitted_vault_cover(&store_snapshot, location).context("admit vault before creation")?;
     let existing = read_vault_cover(&store_snapshot, &cover)
         .context("inspect policy-admitted vault before creation")?;
     if !existing.is_empty() {
@@ -1414,7 +1413,10 @@ mod tests {
             .issues()
             .iter()
             .any(|issue| issue.kind() == VaultDiscoveryIssueKind::InvalidVault));
-        assert!(discovery.snapshot().vault_exact(location.collection()).is_none());
+        assert!(discovery
+            .snapshot()
+            .vault_exact(location.collection())
+            .is_none());
         pile.close().unwrap();
     }
 
