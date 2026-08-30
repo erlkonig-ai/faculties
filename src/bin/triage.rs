@@ -33,8 +33,9 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
@@ -151,6 +152,7 @@ impl TriageSnapshot {
         // new identity, create a pile, or admit somebody else's COMMITs.
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
         let mut pile = open_pile_strict(&cli.pile)?;
+        let mut registry = MemoryRepo::default();
         let mut collections = std::collections::BTreeMap::new();
         for scope in [
             COGNITION_SCOPE_ID,
@@ -160,7 +162,7 @@ impl TriageSnapshot {
             MESSAGE_SCOPE_ID,
         ] {
             let collection =
-                faculties::collection_names::open(&mut pile, scope, signer.verifying_key())
+                faculties::collection_names::open(&mut registry, scope, signer.verifying_key())
                     .with_context(|| {
                         format!(
                             "register {} collection",
@@ -187,9 +189,18 @@ impl TriageSnapshot {
             .get(&scope)
             .copied()
             .with_context(|| format!("{label} collection was not registered in snapshot"))?;
-        let facts = faculties::storage::read_fact_collection(collection, &self.store_snapshot)
-            .map(|(facts, _)| facts)
-            .with_context(|| format!("materialize {label} collection"))?;
+        let facts = if self
+            .store_snapshot
+            .metadata(collection.handle())
+            .with_context(|| format!("inspect {label} collection descriptor"))?
+            .is_some()
+        {
+            faculties::storage::read_fact_collection(collection, &self.store_snapshot)
+                .map(|(facts, _)| facts)
+                .with_context(|| format!("materialize {label} collection"))?
+        } else {
+            TribleSet::new()
+        };
         Ok(CollectionView {
             facts,
             reader: self.store_snapshot.clone(),
