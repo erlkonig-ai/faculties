@@ -32,7 +32,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use GORBIE::prelude::CardCtx;
@@ -119,7 +119,7 @@ impl WikiLive {
         })
     }
 
-    fn text(&self, reader: &PileReader, h: TextHandle) -> String {
+    fn text(&self, reader: &PileSnapshot, h: TextHandle) -> String {
         crate::wiki::read_text(reader, h).unwrap_or_default()
     }
 
@@ -136,13 +136,13 @@ impl WikiLive {
         self.catalog.revisions.revision(revision)
     }
 
-    fn title(&self, wiki_reader: &PileReader, revision: Id) -> String {
+    fn title(&self, wiki_reader: &PileSnapshot, revision: Id) -> String {
         self.revision(revision)
             .map(|row| self.text(wiki_reader, row.title))
             .unwrap_or_default()
     }
 
-    fn content(&self, wiki_reader: &PileReader, revision: Id) -> String {
+    fn content(&self, wiki_reader: &PileSnapshot, revision: Id) -> String {
         self.revision(revision)
             .map(|row| self.text(wiki_reader, row.content))
             .unwrap_or_default()
@@ -170,7 +170,7 @@ impl WikiLive {
         heads
     }
 
-    fn visible_heads(&self, wiki_reader: &PileReader) -> Vec<VisibleHead> {
+    fn visible_heads(&self, wiki_reader: &PileSnapshot) -> Vec<VisibleHead> {
         let mut heads = Self::projected_heads(&self.catalog);
         heads.sort_by(|left, right| {
             self.title(wiki_reader, left.revision_id)
@@ -243,7 +243,7 @@ impl WikiLive {
     }
 
     /// Resolve links parsed from immutable revision content.
-    fn links(&self, wiki_reader: &PileReader, revision: Id) -> Vec<Id> {
+    fn links(&self, wiki_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
         let mut links = BTreeSet::new();
         for raw in extract_link_targets(&self.content(wiki_reader, revision)) {
             if let Some(selector) = Id::from_hex(&raw) {
@@ -256,7 +256,7 @@ impl WikiLive {
     /// Convert a link's exact revision targets into the current entry
     /// frontiers used by the graph. This changes only graph topology; opening
     /// the link still shows every exact set-valued target.
-    fn graph_link_targets(&self, wiki_reader: &PileReader, revision: Id) -> Vec<Id> {
+    fn graph_link_targets(&self, wiki_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
         let mut heads = BTreeSet::new();
         for target in self.links(wiki_reader, revision) {
             if let Some(entry) = self.catalog.revisions.entry_containing(target) {
@@ -287,7 +287,7 @@ impl WikiLive {
     /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&self, files_reader: Option<&PileReader>, hex: &str) {
+    fn open_file(&self, files_reader: Option<&PileSnapshot>, hex: &str) {
         let Some(reader) = files_reader else {
             eprintln!("[files] no files dataset available");
             return;
@@ -583,7 +583,7 @@ struct GraphNode {
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &WikiLive, wiki_reader: &PileReader) -> Self {
+    fn from_wiki(live: &WikiLive, wiki_reader: &PileSnapshot) -> Self {
         let heads = live.visible_heads(wiki_reader);
         let mut revision_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
@@ -1751,7 +1751,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::metadata;
-    use triblespace::core::repo::BlobStore;
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::*;
 
@@ -1910,7 +1909,7 @@ mod tests {
         let mut fragment = first;
         fragment += second;
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let catalog = crate::files::load_catalog(&reader, fragment.facts()).unwrap();
         let resolved = catalog
             .resolve_file(&crate::files::content_hash_hex(content))

@@ -28,9 +28,10 @@ use triblespace::core::collection::{
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::pile::{GetBlobError, Pile, PileReader};
+use triblespace::core::repo::pile::{GetBlobError, Pile, PileSnapshot};
 use triblespace::core::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofStore,
+    ArtifactOfferStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead,
+    CapabilityProofStore, SnapshotSource,
 };
 use triblespace::prelude::*;
 
@@ -126,13 +127,13 @@ impl VaultDiscoveryIssue {
 
 /// Ready local vaults plus independently rejected access candidates.
 pub struct VaultDiscovery {
-    snapshot: SecretsSnapshot<PileReader>,
+    snapshot: SecretsSnapshot<PileSnapshot>,
     locations: BTreeMap<CollectionHandle, VaultLocation>,
     issues: Vec<VaultDiscoveryIssue>,
 }
 
 impl VaultDiscovery {
-    pub fn snapshot(&self) -> &SecretsSnapshot<PileReader> {
+    pub fn snapshot(&self) -> &SecretsSnapshot<PileSnapshot> {
         &self.snapshot
     }
 
@@ -162,7 +163,7 @@ impl VaultDiscovery {
     pub fn into_parts(
         self,
     ) -> (
-        SecretsSnapshot<PileReader>,
+        SecretsSnapshot<PileSnapshot>,
         BTreeMap<CollectionHandle, VaultLocation>,
         Vec<VaultDiscoveryIssue>,
     ) {
@@ -210,7 +211,7 @@ fn bytes_hex(bytes: &[u8]) -> String {
 }
 
 fn descriptor_facts(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     collection: CollectionHandle,
 ) -> std::result::Result<TribleSet, DescriptorReadError> {
     let blob: Blob<SimpleArchive> = match reader.get(collection) {
@@ -280,7 +281,7 @@ fn decode_descriptor_facts(
 }
 
 fn parse_descriptor(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     collection: CollectionHandle,
 ) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)> {
     let facts = descriptor_facts(reader, collection).map_err(classify_descriptor_error)?;
@@ -396,17 +397,15 @@ fn header_count(facts: &TribleSet) -> usize {
     .count()
 }
 
-fn load_proof_bundle<S, R>(
-    store: &mut S,
-    reader: &R,
+fn load_proof_bundle<R>(
+    snapshot: &R,
     id: CapabilityProofId,
     label: &str,
 ) -> Result<CapabilityProofBundle>
 where
-    S: CapabilityProofStore,
-    R: BlobStoreGet,
+    R: BlobStoreGet + CapabilityProofRead,
 {
-    let proof = store
+    let proof = snapshot
         .proof(id)
         .map_err(|error| anyhow!("look up exact {label} proof: {error}"))?
         .ok_or_else(|| anyhow!("exact {label} proof is not resident"))?;
@@ -417,7 +416,7 @@ where
         .claim_handles()
         .enumerate()
         .map(|(step, handle)| {
-            reader
+            snapshot
                 .get::<Blob<SimpleArchive>, _>(handle)
                 .map_err(|error| anyhow!("read {label} claim {step}: {error}"))
         })
@@ -515,7 +514,7 @@ pub fn discover_access_candidates<S>(
     recipient: &SigningKey,
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
-    S: CollectionStoreExt<Reader = PileReader> + CapabilityProofStore,
+    S: CollectionStoreExt + CapabilityProofStore + SnapshotSource<Snapshot = PileSnapshot>,
 {
     discover_access_candidates_with(store, recipient, parse_descriptor)
 }
@@ -552,9 +551,10 @@ fn discover_access_candidates_with<S, F>(
 ) -> Result<(Vec<ValidatedAccessCandidate>, Vec<VaultDiscoveryIssue>)>
 where
     S: CollectionStoreExt + CapabilityProofStore,
-    S::Reader: BlobStoreMeta,
+    <S as SnapshotSource>::Snapshot:
+        BlobStoreMeta + CapabilityProofRead + triblespace::core::collection::CollectionRead,
     F: FnMut(
-        &S::Reader,
+        &<S as SnapshotSource>::Snapshot,
         CollectionHandle,
     ) -> std::result::Result<VaultLocation, (VaultDiscoveryIssueKind, String)>,
 {
@@ -563,11 +563,13 @@ where
     // authorized collection view. Any signer may deliver a candidate; the
     // envelope, proof closure, publisher, and target descriptor below decide
     // whether that candidate contributes access.
-    let commits = discover_collection_records_authorized(store, inbox.handle(), |_| true)
+    let snapshot = store
+        .snapshot()
+        .context("freeze Secrets access-inbox store snapshot")?;
+    let commits = discover_collection_records_authorized(&snapshot, inbox.handle(), |_| true)
         .context("discover raw Secrets access-inbox candidates")?
         .commits()
         .to_vec();
-    let reader = store.reader().context("open Secrets access-inbox view")?;
     let instant = triblespace::core::clock::epoch_now();
     let mut candidates = Vec::new();
     let mut issues = Vec::new();
@@ -580,7 +582,7 @@ where
     for commit in commits {
         let publisher = VerifyingKey::from_bytes(&commit.public_key().raw)
             .expect("collection discovery strictly verifies commit signer keys");
-        let metadata: std::result::Result<Blob<SimpleArchive>, _> = reader.get(commit.metadata());
+        let metadata: std::result::Result<Blob<SimpleArchive>, _> = snapshot.get(commit.metadata());
         let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -607,7 +609,7 @@ where
             continue;
         }
         let data_handle = Handle::<SimpleArchive>::from_hash(commit.data());
-        let blob: Blob<SimpleArchive> = match reader.get(data_handle) {
+        let blob: Blob<SimpleArchive> = match snapshot.get(data_handle) {
             Ok(blob) => blob,
             Err(error) => {
                 issues.push(issue(
@@ -658,7 +660,7 @@ where
                     continue;
                 }
             };
-            let location = match parse(&reader, row.vault) {
+            let location = match parse(&snapshot, row.vault) {
                 Ok(location) => location,
                 Err((kind, detail)) => {
                     commit_valid = false;
@@ -666,7 +668,7 @@ where
                     continue;
                 }
             };
-            let read_bundle = match load_proof_bundle(store, &reader, row.read_proof, "READ") {
+            let read_bundle = match load_proof_bundle(&snapshot, row.read_proof, "READ") {
                 Ok(bundle) => bundle,
                 Err(error) => {
                     commit_valid = false;
@@ -681,7 +683,7 @@ where
                     continue;
                 }
             };
-            let write_bundle = match load_proof_bundle(store, &reader, row.write_proof, "WRITE") {
+            let write_bundle = match load_proof_bundle(&snapshot, row.write_proof, "WRITE") {
                 Ok(bundle) => bundle,
                 Err(error) => {
                     commit_valid = false;
@@ -697,7 +699,7 @@ where
                 }
             };
             let opened = match open_access_envelope(
-                &reader,
+                &snapshot,
                 &row,
                 recipient,
                 location.authority,
@@ -764,21 +766,31 @@ fn write_bundles(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityProof
 /// keys and strictly verifies their signatures before constructing the typed
 /// cover; replay against the durable store remains provenance-free.
 fn candidate_vault_cover<S>(
-    store: &mut S,
+    snapshot: &S,
     location: VaultLocation,
     candidates: &[ValidatedAccessCandidate],
 ) -> Result<FactCover>
 where
-    S: CollectionStoreExt,
+    S: triblespace::core::collection::CollectionRead,
 {
     let writers = candidates
         .iter()
         .map(|candidate| candidate.writer.to_bytes())
         .collect::<BTreeSet<_>>();
-    discover_collection_cover_authorized(store, location.collection, |claimed| {
+    discover_collection_cover_authorized(snapshot, location.collection, |claimed| {
         writers.contains(&claimed.raw)
     })
     .context("discover candidate-scoped vault cover")
+}
+
+fn read_vault_cover<S>(snapshot: &S, cover: &FactCover) -> Result<TribleSet>
+where
+    S: BlobStoreGet + BlobStoreMeta + triblespace::core::collection::CollectionRead,
+{
+    let physical = cover
+        .resolve(snapshot)
+        .context("resolve candidate-scoped vault cover")?;
+    TribleSet::try_from_cover(&physical, snapshot).context("read candidate-scoped vault cover")
 }
 
 fn read_atom(collection: CollectionHandle) -> CapabilityAtom {
@@ -892,7 +904,7 @@ pub fn publish_access_envelope(
 /// custody key are discarded only after the real vault catalog is known.
 pub fn discover_local_vaults<S>(store: &mut S, signing_key: &SigningKey) -> Result<VaultDiscovery>
 where
-    S: CollectionStoreExt<Reader = PileReader> + CapabilityProofStore,
+    S: CollectionStoreExt + CapabilityProofStore + SnapshotSource<Snapshot = PileSnapshot>,
 {
     let (candidates, mut issues) = discover_access_candidates(store, signing_key)?;
     let mut by_collection = BTreeMap::<CollectionHandle, Vec<ValidatedAccessCandidate>>::new();
@@ -903,10 +915,13 @@ where
             .push(candidate);
     }
 
+    let store_snapshot = store
+        .snapshot()
+        .context("freeze shared vault store snapshot")?;
     let mut materialized = Vec::new();
     for candidates in by_collection.into_values() {
         let location = candidates[0].location;
-        let cover = match candidate_vault_cover(store, location, &candidates) {
+        let cover = match candidate_vault_cover(&store_snapshot, location, &candidates) {
             Ok(cover) => cover,
             Err(error) => {
                 issues.push(issue(
@@ -920,7 +935,7 @@ where
                 continue;
             }
         };
-        let facts = match store.materialize::<TribleSet, _>(&cover) {
+        let facts = match read_vault_cover(&store_snapshot, &cover) {
             Ok(facts) => facts,
             Err(error) => {
                 issues.push(issue(
@@ -948,12 +963,9 @@ where
         materialized.push((location, facts, candidates));
     }
 
-    let reader = store
-        .reader()
-        .context("open shared vault attachment view")?;
     let mut ready = Vec::<(VaultLocation, TribleSet, VaultAccess)>::new();
     for (location, facts, candidates) in materialized {
-        let catalog = match validate_catalog(&reader, location.vault, &facts) {
+        let catalog = match validate_catalog(&store_snapshot, location.vault, &facts) {
             Ok(catalog) => catalog,
             Err(error) => {
                 issues.push(issue(
@@ -1031,7 +1043,7 @@ where
             (location.vault, facts, access)
         })
         .collect::<Vec<_>>();
-    let snapshot = SecretsSnapshot::new_accessible(reader, ready)
+    let snapshot = SecretsSnapshot::new_accessible(store_snapshot, ready)
         .context("construct aggregate from independently validated vaults")?;
     issues.sort_by_key(|issue| (issue.vault, issue.collection, issue.candidate, issue.kind));
     Ok(VaultDiscovery {
@@ -1097,14 +1109,15 @@ pub fn create_vault(
         .cloned()
         .collect::<Vec<_>>();
 
-    let cover = candidate_vault_cover(store, location, &candidates)
+    let store_snapshot = store
+        .snapshot()
+        .context("freeze vault store snapshot before creation")?;
+    let cover = candidate_vault_cover(&store_snapshot, location, &candidates)
         .context("admit envelope-scoped vault before creation")?;
-    let existing = store
-        .materialize::<TribleSet, _>(&cover)
+    let existing = read_vault_cover(&store_snapshot, &cover)
         .context("inspect envelope-scoped vault before creation")?;
     if !existing.is_empty() {
-        let reader = store.reader().context("open existing vault attachments")?;
-        let catalog = validate_catalog(&reader, vault, &existing)
+        let catalog = validate_catalog(&store_snapshot, vault, &existing)
             .context("validate existing vault during idempotent create")?;
         let custody = catalog
             .custody
@@ -1378,8 +1391,9 @@ mod tests {
         assert!(expected
             .into_iter()
             .all(|claim| offers.contains(claim.transmute())));
+        let snapshot = store.snapshot().unwrap();
         assert_eq!(
-            store.proof(read.proof().id()).unwrap(),
+            snapshot.proof(read.proof().id()).unwrap(),
             Some(read.proof().clone())
         );
     }
@@ -1798,17 +1812,17 @@ mod tests {
         let location = create_vault(&mut pile, &founder, id(11), "isolated", at(1)).unwrap();
 
         let inbox = register_access_inbox(&mut pile, founder.verifying_key()).unwrap();
-        let commits = discover_collection_records_authorized(&mut pile, inbox.handle(), |_| true)
+        let snapshot = pile.snapshot().unwrap();
+        let commits = discover_collection_records_authorized(&snapshot, inbox.handle(), |_| true)
             .unwrap()
             .commits()
             .to_vec();
         assert_eq!(commits.len(), 1);
-        let reader = pile.reader().unwrap();
-        let data: Blob<SimpleArchive> = reader
+        let data: Blob<SimpleArchive> = snapshot
             .get(Handle::<SimpleArchive>::from_hash(commits[0].data()))
             .unwrap();
         let copied_facts = TribleSet::try_from_blob(data).unwrap();
-        drop(reader);
+        drop(snapshot);
 
         pile.commit(
             inbox,

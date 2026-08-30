@@ -201,7 +201,6 @@ mod tests {
     use faculties::schemas::reason::{reason_schema, KIND_REASON_ID};
     use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
     use std::fs::File;
-    use triblespace::core::collection::CollectionStoreExt;
 
     type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
@@ -274,7 +273,8 @@ mod tests {
         let collection =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
+        let reader = pile.snapshot().unwrap();
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &reader).unwrap();
         assert_eq!(facts, expected.into_facts());
         cognition::validate_catalog(&reader, &facts).unwrap();
 

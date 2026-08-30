@@ -25,7 +25,7 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::trible::TribleSet;
 
 use crate::relations::{self as native_relations, Head};
@@ -123,7 +123,7 @@ impl StatusLive {
     }
 }
 
-fn native_window_label(reader: &PileReader, facts: &TribleSet, window: Id) -> String {
+fn native_window_label(reader: &PileSnapshot, facts: &TribleSet, window: Id) -> String {
     if !native_relations::person_anchors(facts).contains(&window) {
         return id_hex(window);
     }

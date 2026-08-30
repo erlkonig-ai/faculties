@@ -16,7 +16,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
@@ -38,14 +38,14 @@ pub type Interval = Inline<inlineencodings::NsTAIInterval>;
 #[derive(Clone, Copy, Debug)]
 pub struct SourceView<'a> {
     pub facts: &'a TribleSet,
-    pub reader: &'a PileReader,
+    pub reader: &'a PileSnapshot,
 }
 
 #[derive(Clone, Copy)]
 pub struct ScanSources<'a> {
     pub cognition: SourceView<'a>,
     pub headspace: SourceView<'a>,
-    pub secrets: &'a SecretsSnapshot<PileReader>,
+    pub secrets: &'a SecretsSnapshot<PileSnapshot>,
     pub relations: SourceView<'a>,
     pub messages: SourceView<'a>,
 }
@@ -1066,7 +1066,7 @@ pub fn project_triage_headspace(catalog: &Catalog) -> TriageHeadspace {
 
 pub fn project_headspace(
     headspace_view: SourceView<'_>,
-    secrets: &SecretsSnapshot<PileReader>,
+    secrets: &SecretsSnapshot<PileSnapshot>,
 ) -> Result<TriageHeadspace> {
     let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
         .context("validate Headspace collection")?;
@@ -1308,7 +1308,6 @@ pub fn project_scan(sources: ScanSources<'_>, options: ScanOptions) -> Result<Sc
 mod tests {
     use super::*;
 
-    use triblespace::core::repo::BlobStore;
     use triblespace::macros::entity;
 
     fn id(byte: u8) -> Id {
@@ -1568,7 +1567,7 @@ mod tests {
         let exit_code: Inline<inlineencodings::U256BE> = 7u64.to_inline();
         let mut fragment = native_exec_fragment(exit_code);
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
 
         let state = collect_exec_state(&reader, &facts).unwrap();
         assert_eq!(
@@ -1586,7 +1585,7 @@ mod tests {
         raw[0] = 1;
         let mut fragment = native_exec_fragment(Inline::<inlineencodings::U256BE>::new(raw));
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
 
         let error = collect_exec_state(&reader, &facts).unwrap_err();
         assert!(format!("{error:#}").contains("exec::exit_code value larger than u64"));

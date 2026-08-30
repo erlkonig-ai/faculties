@@ -13,10 +13,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -37,7 +36,7 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 /// no authority beyond that source cover.
 pub struct OrientSnapshot {
     facts: TribleSet,
-    reader: PileReader,
+    store_snapshot: PileSnapshot,
     checkpoints: LwwIndex,
 }
 
@@ -47,9 +46,9 @@ impl OrientSnapshot {
         &self.facts
     }
 
-    /// Blob reader captured with the same immutable pile observation.
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
+    /// Store snapshot captured with the same immutable pile observation.
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
     }
 
     /// Maintained checkpoint order attached for this exact cover.
@@ -57,9 +56,9 @@ impl OrientSnapshot {
         &self.checkpoints
     }
 
-    /// Consume the coherent snapshot into facts, reader, and checkpoint index.
-    pub fn into_parts(self) -> (TribleSet, PileReader, LwwIndex) {
-        (self.facts, self.reader, self.checkpoints)
+    /// Consume the coherent snapshot into facts, store snapshot, and checkpoint index.
+    pub fn into_parts(self) -> (TribleSet, PileSnapshot, LwwIndex) {
+        (self.facts, self.store_snapshot, self.checkpoints)
     }
 }
 
@@ -516,17 +515,17 @@ pub fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<OrientSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let snapshot = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("snapshot Orient collection: {error}"))?;
-    let (facts, cover, reader) = snapshot.into_parts();
-    load_checkpoint_events(&reader, &facts).context("validate Orient checkpoint collection")?;
+    let store_snapshot = pile.snapshot().context("freeze Orient store snapshot")?;
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Orient collection")?;
+    load_checkpoint_events(&store_snapshot, &facts)
+        .context("validate Orient checkpoint collection")?;
     let checkpoints = checkpoint_register_collection(signer.verifying_key())
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
     Ok(OrientSnapshot {
         facts,
-        reader,
+        store_snapshot,
         checkpoints,
     })
 }
@@ -538,7 +537,6 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::collection::lww_register::derive_element;
-    use triblespace::core::repo::BlobStore;
 
     fn at(seconds: f64) -> IntervalValue {
         let at = Epoch::from_unix_seconds(seconds);
@@ -626,7 +624,7 @@ mod tests {
         all += left;
         all += right;
         let mut staged = all.clone();
-        let reader = staged.blobs_mut().reader().unwrap();
+        let reader = staged.blobs_mut().snapshot().unwrap();
         let events = load_checkpoint_events(&reader, all.facts()).unwrap();
         let latest = latest_checkpoint(events, &checkpoint_index(all.facts()), persona)
             .unwrap()
@@ -663,7 +661,7 @@ mod tests {
     fn validate_fragments(orient: &Fragment, compass: &Fragment) -> Result<()> {
         let mut blobs = orient.clone();
         blobs.blobs_mut().union(compass.blobs().clone());
-        let reader = blobs.blobs_mut().reader().unwrap();
+        let reader = blobs.blobs_mut().snapshot().unwrap();
         validate_catalog(&reader, orient.facts(), compass.facts())
     }
 

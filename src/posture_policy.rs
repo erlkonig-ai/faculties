@@ -22,8 +22,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::entity;
 use triblespace::prelude::{blobencodings, inlineencodings};
@@ -36,8 +36,8 @@ use crate::schemas::posture::{
 
 type TextHandle = Inline<Handle<UTF8String>>;
 
-pub fn validate_policy_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    validate_policy_catalog_with::<PileReader>(reader, None, facts)
+pub fn validate_policy_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+    validate_policy_catalog_with::<PileSnapshot>(reader, None, facts)
 }
 
 /// Validate the exact additive policy union a native publication would create.
@@ -46,7 +46,7 @@ pub fn validate_policy_catalog(reader: &PileReader, facts: &TribleSet) -> Result
 /// canonical policy state. Payloads introduced by `fragment` are read through
 /// its in-memory blob overlay before any bytes reach the pile.
 pub fn validate_policy_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<TribleSet> {
@@ -55,14 +55,14 @@ pub fn validate_policy_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot staged Posture policy payloads")?;
     validate_policy_catalog_with(reader, Some(&overlay), &union)?;
     Ok(union)
 }
 
 pub fn validate_policy_catalog_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     facts: &TribleSet,
 ) -> Result<()>
@@ -514,7 +514,7 @@ pub fn at_most_one<T>(mut values: Vec<T>, entity: Id, field: &str) -> Result<Opt
     Ok(values.pop())
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Posture {field} {}", hex::encode_upper(handle.raw)))?;
@@ -522,7 +522,7 @@ pub fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result
 }
 
 pub fn read_text_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     handle: TextHandle,
     field: &str,
@@ -546,7 +546,7 @@ where
 }
 
 pub fn validate_known_payloads_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     facts: &TribleSet,
 ) -> Result<()>

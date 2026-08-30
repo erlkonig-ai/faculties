@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
@@ -363,7 +363,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<MemoryCatalog> {
 }
 
 fn read_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String>
@@ -381,7 +381,7 @@ where
 }
 
 fn read_image_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: ImageHandle,
 ) -> Result<anybytes::Bytes>
@@ -397,7 +397,7 @@ where
 }
 
 fn validate_payloads<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     catalog: &MemoryCatalog,
 ) -> Result<()>
@@ -432,16 +432,16 @@ where
     Ok(())
 }
 
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<MemoryCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<MemoryCatalog> {
     let catalog = load_catalog(facts)?;
-    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    validate_payloads(reader, None::<&PileSnapshot>, &catalog)?;
     Ok(catalog)
 }
 
 /// Validate the exact union a publication would create, including blobs still
 /// staged only inside `fragment`, before a signed root is written.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<MemoryCatalog> {
@@ -459,18 +459,18 @@ pub fn validate_candidate(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot staged Memory attachments")?;
     validate_payloads(reader, Some(&overlay), &catalog)?;
     Ok(catalog)
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
-    read_text_overlay(reader, None::<&PileReader>, handle)
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+    read_text_overlay(reader, None::<&PileSnapshot>, handle)
 }
 
-pub fn read_image(reader: &PileReader, handle: ImageHandle) -> Result<anybytes::Bytes> {
-    read_image_overlay(reader, None::<&PileReader>, handle)
+pub fn read_image(reader: &PileSnapshot, handle: ImageHandle) -> Result<anybytes::Bytes> {
+    read_image_overlay(reader, None::<&PileSnapshot>, handle)
 }
 
 #[cfg(test)]
@@ -629,7 +629,7 @@ mod tests {
         let pile = directory.path().join("memory.pile");
         File::create(&pile).unwrap();
         let mut pile_store = open_pile_strict(&pile).unwrap();
-        let reader = pile_store.reader().unwrap();
+        let reader = pile_store.snapshot().unwrap();
 
         // The handle is intentionally not inserted into the pile. Exact
         // historical rows are durable evidence, but only intrinsic Memory
@@ -659,8 +659,8 @@ mod tests {
         let signer = initialize_open_collection_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let collection = collection(&mut pile_store, &signer);
-        let before = pile_store.snapshot(collection).unwrap().into_facts();
-        let reader = pile_store.reader().unwrap();
+        let reader = pile_store.snapshot().unwrap();
+        let (before, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
         let fragment = chunk_fragment(draft("resident only in fragment"))
             .unwrap()
             .0;
@@ -668,8 +668,8 @@ mod tests {
         assert_eq!(catalog.chunks.len(), 1);
 
         pile_store.commit(collection, &signer, fragment).unwrap();
-        let after = pile_store.snapshot(collection).unwrap().into_facts();
-        let reader = pile_store.reader().unwrap();
+        let reader = pile_store.snapshot().unwrap();
+        let (after, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
         let catalog = validate_catalog(&reader, &after).unwrap();
         assert_eq!(catalog.chunks.len(), 1);
         pile_store.close().unwrap();
@@ -689,8 +689,8 @@ mod tests {
         initial += right;
         let collection = collection(&mut pile_store, &signer);
         pile_store.commit(collection, &signer, initial).unwrap();
-        let current = pile_store.snapshot(collection).unwrap().into_facts();
-        let reader = pile_store.reader().unwrap();
+        let reader = pile_store.snapshot().unwrap();
+        let (current, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
 
         for mutation in [
             entity! { ExclusiveId::force_ref(&left_id) @ ctx::reference: right_id },

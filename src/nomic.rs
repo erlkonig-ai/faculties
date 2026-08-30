@@ -14,9 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use mary::model_collection::ModelPileSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
-use triblespace::core::collection::FactSnapshot;
-use triblespace::core::repo::pile::PileReader;
 
 /// Hugging Face model ids are provenance only; runtime never fetches them.
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
@@ -43,7 +42,7 @@ pub fn vision_pile() -> PathBuf {
     }
 }
 
-fn load_model_snapshot(path: &Path, model: &str) -> Result<FactSnapshot<PileReader>> {
+fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
     // Discover the sole authority and freeze its exact cover from one observed
     // prefix. A second scan could otherwise hide a concurrently appended team.
     let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(path)
@@ -66,7 +65,7 @@ pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::b
     let snapshot = load_model_snapshot(&pile, NOMIC_TEXT_MODEL)?;
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: NOMIC_TEXT_MODEL,
             quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -75,7 +74,7 @@ pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::b
     .with_context(|| format!("select native Nomic text weights from {}", pile.display()))?;
     let tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         TokenizerSelector::Name(NOMIC_TEXT_MODEL),
     )
     .with_context(|| format!("select native Nomic text tokenizer from {}", pile.display()))?;
@@ -95,7 +94,7 @@ pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::n
     let snapshot = load_model_snapshot(&pile, NOMIC_VISION_MODEL)?;
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         ModelSelector::Source {
             source: NOMIC_VISION_MODEL,
             quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -225,7 +224,7 @@ mod tests {
         );
         let text_keymap = mary::selection::load_keymap_from_graph(
             text.facts(),
-            text.reader(),
+            text.store(),
             ModelSelector::Source {
                 source: NOMIC_TEXT_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -235,7 +234,7 @@ mod tests {
         assert_eq!(text_keymap["text.weight"], (vec![1.25], vec![1]));
         let tokenizer = mary::selection::load_tokenizer_from_graph(
             text.facts(),
-            text.reader(),
+            text.store(),
             TokenizerSelector::Name(NOMIC_TEXT_MODEL),
         )
         .expect("select tokenizer from the same frozen snapshot");
@@ -245,7 +244,7 @@ mod tests {
             .expect("load later widened text snapshot");
         let collision = mary::selection::load_keymap_from_graph(
             widened.facts(),
-            widened.reader(),
+            widened.store(),
             ModelSelector::Source {
                 source: NOMIC_TEXT_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -267,7 +266,7 @@ mod tests {
         assert_eq!(vision.cover().len(), 1);
         let vision_keymap = mary::selection::load_keymap_from_graph(
             vision.facts(),
-            vision.reader(),
+            vision.store(),
             ModelSelector::Source {
                 source: NOMIC_VISION_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,

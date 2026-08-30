@@ -20,8 +20,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
@@ -382,14 +382,14 @@ struct TeamsStorage<'a> {
 #[derive(Clone)]
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
     secrets: secrets_vaults::VaultDiscovery,
 }
@@ -423,7 +423,7 @@ impl TeamsSession<'_> {
         self.facts += added;
         self.reader = self
             .pile
-            .reader()
+            .snapshot()
             .context("refresh Teams attachment snapshot")?;
         Ok(Some(commit))
     }
@@ -471,22 +471,21 @@ impl TeamsStorage<'_> {
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
-            .context("discover Secrets vaults for Teams")?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .context("materialize Teams collection")?
-                .into_parts();
-            validate_catalog(&reader, &facts).context("validate Teams collection")?;
+            let store_snapshot = pile.snapshot().context("freeze Teams store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .context("materialize Teams collection")?;
+            validate_catalog(&store_snapshot, &facts).context("validate Teams collection")?;
+            let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
+                .context("discover Secrets vaults for Teams")?;
             teams_core::validate_auth_secret_references(&facts, secrets.snapshot())
                 .context("validate Teams auth-profile Secrets references")?;
             operation(&mut TeamsSession {
                 pile: &mut pile,
                 collection,
                 facts,
-                reader,
+                reader: store_snapshot,
                 signer,
                 secrets,
             })
@@ -1159,7 +1158,7 @@ fn get_delegated_token(
         .snapshot()
         .lookup(secret)
         .ok_or_else(|| anyhow::anyhow!("exact delegated-token Secrets version disappeared"))?;
-    let name = secrets_model::read_text(session.secrets.snapshot().reader(), row.name)
+    let name = secrets_model::read_text(session.secrets.snapshot().store_snapshot(), row.name)
         .context("read delegated-token secret name")?;
     let encoded =
         serde_json::to_vec(&next_bundle).context("encode refreshed Teams token bundle")?;
@@ -1232,7 +1231,7 @@ fn now_epoch_secs() -> Result<i64> {
 }
 
 fn load_context(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
 ) -> Result<TeamsPresentationContext> {
@@ -1464,7 +1463,7 @@ fn current_context_head_ids(catalog: &TribleSet, source_id: Id) -> BTreeSet<Id> 
 }
 
 fn load_chat_map(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
 ) -> Result<HashMap<Id, String>> {
@@ -1485,7 +1484,7 @@ fn load_chat_map(
 }
 
 fn load_message_external_map(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
 ) -> Result<HashMap<Id, String>> {
@@ -1513,7 +1512,7 @@ fn load_message_external_map(
 }
 
 fn load_known_messages(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
 ) -> Result<Vec<KnownMessage>> {
@@ -1551,7 +1550,7 @@ fn load_known_messages(
 }
 
 fn read_utf8string(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
@@ -2637,7 +2636,7 @@ fn list_attachments(
 }
 
 fn attachment_rows(
-    _reader: &PileReader,
+    _reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
     chat_filter: Option<&HashSet<Id>>,
@@ -3142,7 +3141,7 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
 }
 
 fn coverage_head(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source_id: Id,
 ) -> Result<Option<CoverageHead>> {
@@ -3484,7 +3483,11 @@ fn build_attachment_fragment(
 /// signed COMMIT byte reaches the pile. This is deliberately stronger than
 /// validating the isolated fragment: append-only storage cannot repair a
 /// singular-field conflict or stale coverage fork after it has been signed.
-fn validate_candidate(reader: &PileReader, catalog: &TribleSet, fragment: &Fragment) -> Result<()> {
+fn validate_candidate(
+    reader: &PileSnapshot,
+    catalog: &TribleSet,
+    fragment: &Fragment,
+) -> Result<()> {
     teams_core::validate_candidate(reader, catalog, fragment)
 }
 
@@ -3493,7 +3496,7 @@ fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
     teams_core::validate_commit_fragment(facts)
 }
 
-fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> {
+fn validate_catalog(reader: &PileSnapshot, catalog: &TribleSet) -> Result<()> {
     teams_core::validate_catalog(reader, catalog)
 }
 
@@ -3992,8 +3995,9 @@ mod tests {
         // Registering a collection may append its descriptor closure, but a
         // rejected publication must not make any collection commit visible.
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
         let records =
-            triblespace::core::collection::discover_collection_records(&mut pile).unwrap();
+            triblespace::core::collection::discover_collection_records(&store_snapshot).unwrap();
         assert!(records.commits().is_empty());
     }
 

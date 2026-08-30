@@ -276,7 +276,7 @@ fn cmd_vault_list(storage: SecretsStorage<'_>) -> Result<()> {
                 .vault_exact(*collection)
                 .expect("every ready location has one aggregate snapshot");
             let name = secrets::read_text(
-                discovery.snapshot().reader(),
+                discovery.snapshot().store_snapshot(),
                 snapshot.catalog().header.name,
             )?;
             println!(
@@ -378,7 +378,7 @@ fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
                 .collection()
                 .expect("every discovered vault snapshot retains its exact collection");
             for secret in snapshot.catalog().secrets.values() {
-                let name = secrets::read_text(discovery.snapshot().reader(), secret.name)?;
+                let name = secrets::read_text(discovery.snapshot().store_snapshot(), secret.name)?;
                 println!(
                     "{}  vault {}  collection {}  {name}",
                     fmt_id(secret.id),

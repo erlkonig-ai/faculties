@@ -12,8 +12,8 @@ use anybytes::View;
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -65,7 +65,7 @@ pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle, label: &str) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle, label: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read {label} blob {}", hex::encode_upper(handle.raw)))?;
@@ -107,7 +107,7 @@ pub fn validate_catalog<Store>(reader: &Store, facts: &TribleSet) -> Result<()>
 where
     Store: BlobStoreGet + ?Sized,
 {
-    validate_catalog_with(reader, None::<&PileReader>, facts)
+    validate_catalog_with(reader, None::<&PileSnapshot>, facts)
 }
 
 /// Validate the exact union which would result from one new signed COMMIT.
@@ -126,7 +126,7 @@ where
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     validate_catalog_with(reader, Some(&overlay), &union)
 }
@@ -489,7 +489,7 @@ pub fn select_messages(
 /// Discord's REST message object does not version profile fields. If several
 /// names have been observed, all distinct names are shown rather than making a
 /// false latest-name claim.
-pub fn user_labels(facts: &TribleSet, reader: &PileReader) -> Result<BTreeMap<Id, String>> {
+pub fn user_labels(facts: &TribleSet, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>> {
     let mut names: BTreeMap<Id, BTreeSet<String>> = BTreeMap::new();
     for (user, handle) in find!(
         (user: Id, handle: TextHandle),
@@ -549,7 +549,7 @@ pub fn user_labels(facts: &TribleSet, reader: &PileReader) -> Result<BTreeMap<Id
     Ok(labels)
 }
 
-pub fn channel_labels(facts: &TribleSet, reader: &PileReader) -> Result<BTreeMap<Id, String>> {
+pub fn channel_labels(facts: &TribleSet, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>> {
     let mut values: BTreeMap<Id, BTreeSet<String>> = BTreeMap::new();
     for (channel, handle) in find!(
         (channel: Id, handle: TextHandle),

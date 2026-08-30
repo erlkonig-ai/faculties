@@ -14,7 +14,7 @@ use hifitime::Epoch;
 use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::Message;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
@@ -454,7 +454,7 @@ pub fn legacy_import_direction(facts: &TribleSet, legacy_entity: Id) -> Result<I
 }
 
 fn imported_payload_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     legacy_entity: Id,
@@ -614,11 +614,11 @@ fn imported_payload_union<Overlay: BlobStoreGet>(
 
 /// Strictly decode one exact historical payload from a resident pile.
 pub fn imported_payload(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     legacy_entity: Id,
 ) -> Result<ImportedPayloadRecord> {
-    imported_payload_union(reader, None::<&PileReader>, facts, legacy_entity)
+    imported_payload_union(reader, None::<&PileSnapshot>, facts, legacy_entity)
 }
 
 // ── accounts ──────────────────────────────────────────────────────────────
@@ -1382,20 +1382,20 @@ fn read_local_text(fragment: &Fragment, handle: TextHandle) -> Result<String> {
     let mut local = fragment.clone();
     let reader = local
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("memory blob reader creation is infallible");
     let value: View<str> = reader.get(handle).context("read staged Mail text")?;
     Ok(value.to_string())
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Mail text blob {}", hex::encode(handle.raw)))?;
     Ok(value.to_string())
 }
 
-pub fn read_bytes(reader: &PileReader, handle: BytesHandle) -> Result<Vec<u8>> {
+pub fn read_bytes(reader: &PileSnapshot, handle: BytesHandle) -> Result<Vec<u8>> {
     let value: anybytes::Bytes = reader
         .get(handle)
         .with_context(|| format!("read Mail byte blob {}", hex::encode(handle.raw)))?;
@@ -1403,7 +1403,7 @@ pub fn read_bytes(reader: &PileReader, handle: BytesHandle) -> Result<Vec<u8>> {
 }
 
 fn text_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String> {
@@ -1420,7 +1420,7 @@ fn text_union<Overlay: BlobStoreGet>(
 }
 
 fn bytes_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: BytesHandle,
 ) -> Result<Vec<u8>> {
@@ -1437,7 +1437,7 @@ fn bytes_union<Overlay: BlobStoreGet>(
 }
 
 fn archive_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: ArchiveHandle,
 ) -> Result<TribleSet> {
@@ -1455,7 +1455,7 @@ fn archive_union<Overlay: BlobStoreGet>(
 /// Decode and prove one exact canonical Files record through the same blob
 /// overlay used for an unpublished cross-collection candidate.
 fn file_attachment_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     file: Id,
@@ -1509,7 +1509,7 @@ fn file_attachment_union<Overlay: BlobStoreGet>(
 }
 
 fn validate_source_text_payloads<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     source_facts: &TribleSet,
 ) -> Result<()> {
@@ -1649,7 +1649,7 @@ pub fn acceptances_for_attempt(facts: &TribleSet, attempt_id: Id) -> Vec<Id> {
 
 /// Resolve the exact Decide frontier which authorizes a send.
 pub fn authorized_send(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     decide_facts: &TribleSet,
     draft_id: Id,
 ) -> Result<(Id, Vec<Id>)> {
@@ -1687,7 +1687,7 @@ pub fn authorized_send(
 /// The account schema stores one immutable secret id, so this path performs no
 /// name or “latest version” arbitration and has no password-identity fallback.
 pub fn open_account<R: BlobStoreGet>(
-    mail_reader: &PileReader,
+    mail_reader: &PileSnapshot,
     mail_facts: &TribleSet,
     secrets: &SecretsSnapshot<R>,
     anchor: Id,
@@ -1723,7 +1723,7 @@ fn config_owner_map(facts: &TribleSet) -> Result<HashMap<Id, AccountConfigRecord
 }
 
 fn validate_send_heads<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     decide_facts: &TribleSet,
     decision: Id,
@@ -1802,7 +1802,7 @@ fn normalized_mailboxes(
 }
 
 fn validate_attempt_rendering(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&impl BlobStoreGet>,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
@@ -1900,7 +1900,7 @@ fn validate_attempt_rendering(
 
 /// Exact structural and cross-collection validation for one Mail materialization.
 pub fn validate_catalog<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
@@ -1909,7 +1909,7 @@ pub fn validate_catalog<R>(
 ) -> Result<()> {
     validate_catalog_inner(
         reader,
-        None::<&PileReader>,
+        None::<&PileSnapshot>,
         facts,
         files_facts,
         decide_facts,
@@ -1939,10 +1939,10 @@ pub fn validate_secret_references<R>(
 /// The stopped-world cutover uses this while each target collection is being
 /// materialized independently; [`validate_catalog`] remains the required
 /// final candidate predicate once Files, Decide, and Relations are available.
-pub fn validate_local_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_local_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     validate_catalog_inner(
         reader,
-        None::<&PileReader>,
+        None::<&PileSnapshot>,
         facts,
         &TribleSet::new(),
         &TribleSet::new(),
@@ -1954,7 +1954,7 @@ pub fn validate_local_catalog(reader: &PileReader, facts: &TribleSet) -> Result<
 /// Local preflight counterpart of [`validate_catalog_union`], used by the
 /// cutover planner before cross-collection candidate materialization exists.
 pub fn validate_local_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<TribleSet> {
@@ -1963,7 +1963,7 @@ pub fn validate_local_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("memory blob reader creation is infallible");
     validate_catalog_inner(
         reader,
@@ -1980,7 +1980,7 @@ pub fn validate_local_catalog_union(
 /// Preflight the exact set union a Mail publication would create, including
 /// the new fragment's in-memory blobs, without writing pile bytes.
 pub fn validate_catalog_union<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
     files_facts: &TribleSet,
@@ -2006,7 +2006,7 @@ pub fn validate_catalog_union<R>(
 /// that have not reached the pile yet.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_catalog_union_with_blobs<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     mail_fragment: &Fragment,
     blob_overlay: &Fragment,
@@ -2020,7 +2020,7 @@ pub fn validate_catalog_union_with_blobs<R>(
     let mut staged = blob_overlay.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("memory blob reader creation is infallible");
     validate_catalog_inner(
         reader,
@@ -2037,7 +2037,7 @@ pub fn validate_catalog_union_with_blobs<R>(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_catalog_inner<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     files_facts: &TribleSet,
@@ -2512,7 +2512,7 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
 /// cutover. They remain inert evidence: native commands never create or query
 /// these kinds, while their canonical shadows use the current ontology.
 fn validate_legacy_evidence<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
 ) -> Result<TribleSet> {
@@ -2656,7 +2656,7 @@ pub fn inbox_projection(
 }
 
 fn text_values(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     id: Id,
     attribute: Id,
@@ -2673,7 +2673,7 @@ fn text_values(
 }
 
 pub fn projection_view(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     projection_id: Id,
 ) -> Result<ProjectionView> {
@@ -2765,7 +2765,7 @@ pub fn projection_direction(facts: &TribleSet, source: Id) -> Result<ProjectionD
 }
 
 fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     wire_id: Id,
@@ -2790,27 +2790,27 @@ fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
 }
 
 pub fn wire_claimed_message_id(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     wire_id: Id,
 ) -> Result<Option<String>> {
     if !ids_of_kind(facts, KIND_WIRE_MESSAGE).contains(&wire_id) {
         bail!("unknown wire message {wire_id:x}");
     }
-    wire_claimed_message_id_union(reader, None::<&PileReader>, facts, wire_id)
+    wire_claimed_message_id_union(reader, None::<&PileSnapshot>, facts, wire_id)
 }
 
 pub fn materialize_draft(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
     id: Id,
 ) -> Result<MaterializedDraft> {
-    materialize_draft_union(reader, None::<&PileReader>, mail_facts, files_facts, id)
+    materialize_draft_union(reader, None::<&PileSnapshot>, mail_facts, files_facts, id)
 }
 
 fn materialize_draft_union<Overlay: BlobStoreGet>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
@@ -3099,8 +3099,8 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// serialize per account rather than running concurrently on replicas.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_send<R>(
-    mail_reader: &PileReader,
-    decide_reader: &PileReader,
+    mail_reader: &PileSnapshot,
+    decide_reader: &PileSnapshot,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
@@ -3205,8 +3205,7 @@ mod tests {
     use crate::secrets::storage as vaults;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_open_collection_fixture;
-    use triblespace::core::collection::CollectionStoreExt;
-    use triblespace::core::repo::pile::{Pile, PileReader};
+    use triblespace::core::repo::pile::{Pile, PileSnapshot};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -3217,12 +3216,12 @@ mod tests {
         (epoch, epoch).try_to_inline().unwrap()
     }
 
-    fn empty_reader() -> (tempfile::TempDir, PileReader) {
+    fn empty_reader() -> (tempfile::TempDir, PileSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.pile");
         File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         pile.close().unwrap();
         (directory, reader)
     }
@@ -3236,7 +3235,7 @@ mod tests {
 
     struct CollectionView {
         facts: TribleSet,
-        reader: PileReader,
+        reader: PileSnapshot,
     }
 
     struct Views {
@@ -3244,7 +3243,7 @@ mod tests {
         files: CollectionView,
         decide: CollectionView,
         relations: CollectionView,
-        secrets: SecretsSnapshot<PileReader>,
+        secrets: SecretsSnapshot<PileSnapshot>,
     }
 
     impl Fixture {
@@ -3278,19 +3277,27 @@ mod tests {
                 .unwrap()
                 .into_parts()
                 .0;
-            let mut materialize = |scope| {
-                let collection = open_scope(&mut pile, scope, &signer).unwrap();
-                let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
-                CollectionView { facts, reader }
+            let mail = open_scope(&mut pile, mail_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+            let files = open_scope(&mut pile, files_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+            let decide = open_scope(&mut pile, decide_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+            let relations =
+                open_scope(&mut pile, relations_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+            let store_snapshot = pile.snapshot().unwrap();
+            let materialize = |collection| {
+                let (facts, _) =
+                    crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
+                CollectionView {
+                    facts,
+                    reader: store_snapshot.clone(),
+                }
             };
             let views = Views {
-                mail: materialize(mail_schema::DEFAULT_SCOPE_ID),
-                files: materialize(files_schema::DEFAULT_SCOPE_ID),
-                decide: materialize(decide_schema::DEFAULT_SCOPE_ID),
-                relations: materialize(relations_schema::DEFAULT_SCOPE_ID),
+                mail: materialize(mail),
+                files: materialize(files),
+                decide: materialize(decide),
+                relations: materialize(relations),
                 secrets,
             };
-            drop(materialize);
             pile.close().unwrap();
             views
         }
@@ -3377,7 +3384,7 @@ mod tests {
         let snapshot = decide::resolution_snapshot(&facts, head).unwrap();
         assert!(decide::read_text(&reader, snapshot.outcome).is_err());
 
-        let overlay = resolution.blobs_mut().reader().unwrap();
+        let overlay = resolution.blobs_mut().snapshot().unwrap();
         validate_send_heads(&reader, Some(&overlay), &facts, decision, &[head]).unwrap();
     }
 
@@ -3410,7 +3417,7 @@ mod tests {
 
         let mut staged = staged_mail;
         staged += file;
-        let overlay = staged.blobs_mut().reader().unwrap();
+        let overlay = staged.blobs_mut().snapshot().unwrap();
         let materialized = materialize_draft_union(
             &reader,
             Some(&overlay),
@@ -3489,7 +3496,7 @@ mod tests {
         let SourcePublication { mail, files, .. } = publication;
         let (facts, mut blobs) = mail.into_facts_and_blobs();
         let survivors: Vec<_> = blobs
-            .reader()
+            .snapshot()
             .unwrap()
             .into_iter()
             .map(|(handle, _)| handle)

@@ -19,7 +19,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -95,27 +95,24 @@ impl MessageStorage<'_> {
             Collection<SimpleArchive>,
             &TribleSet,
             &TribleSet,
-            &PileReader,
+            &PileSnapshot,
         ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let relations_collection = open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(relations_collection)
-                .context("materialize authored Relations collection")?
-                .into_parts();
-            relations::validate_catalog(&reader, &facts)
-                .context("validate authored Relations collection")?;
-            let relations_facts = facts;
-
             let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (message_facts, _, reader) = pile
-                .snapshot(messages)
-                .context("materialize authored Message collection")?
-                .into_parts();
-            message::validate_catalog(&reader, &message_facts, &relations_facts)
+            let store_snapshot = pile.snapshot().context("freeze Message store snapshot")?;
+            let (relations_facts, _) =
+                faculties::storage::read_fact_collection(relations_collection, &store_snapshot)
+                    .context("materialize authored Relations collection")?;
+            relations::validate_catalog(&store_snapshot, &relations_facts)
+                .context("validate authored Relations collection")?;
+            let (message_facts, _) =
+                faculties::storage::read_fact_collection(messages, &store_snapshot)
+                    .context("materialize authored Message collection")?;
+            message::validate_catalog(&store_snapshot, &message_facts, &relations_facts)
                 .context("validate authored Message collection")?;
             operation(
                 &mut pile,
@@ -123,7 +120,7 @@ impl MessageStorage<'_> {
                 messages,
                 &message_facts,
                 &relations_facts,
-                &reader,
+                &store_snapshot,
             )
         })();
         finish_pile(pile, result)
@@ -131,7 +128,7 @@ impl MessageStorage<'_> {
 
     fn with_view<T>(
         &self,
-        operation: impl FnOnce(&TribleSet, &TribleSet, &PileReader) -> Result<T>,
+        operation: impl FnOnce(&TribleSet, &TribleSet, &PileSnapshot) -> Result<T>,
     ) -> Result<T> {
         self.with_views(|_, _, _, messages, relations, reader| {
             operation(messages, relations, reader)
@@ -142,7 +139,7 @@ impl MessageStorage<'_> {
     fn update<T>(
         &self,
         description: &'static str,
-        operation: impl FnOnce(&TribleSet, &TribleSet, &PileReader) -> Result<(Option<Fragment>, T)>,
+        operation: impl FnOnce(&TribleSet, &TribleSet, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_views(|pile, signer, collection, messages, relations, reader| {
             let (fragment, value) = operation(messages, relations, reader)?;
@@ -214,12 +211,12 @@ fn render_list_body(text: &str) -> String {
     text.replace('\r', "").replace('\n', "\\n")
 }
 
-fn person_label(reader: &PileReader, facts: &TribleSet, person: Id) -> Result<String> {
+fn person_label(reader: &PileSnapshot, facts: &TribleSet, person: Id) -> Result<String> {
     let profile = relations::current_profile(facts, person)?;
     Ok(relations::profile_input(reader, &profile)?.label)
 }
 
-fn recipient_label(reader: &PileReader, facts: &TribleSet, row: &MessageRow) -> Result<String> {
+fn recipient_label(reader: &PileSnapshot, facts: &TribleSet, row: &MessageRow) -> Result<String> {
     match row.group_snapshot {
         None => person_label(reader, facts, row.to),
         Some(snapshot) => {

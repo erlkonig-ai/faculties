@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -737,7 +737,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, TextRule)>> 
     Ok(texts)
 }
 
-fn load_text_from(reader: &PileReader, handle: TextHandle) -> Result<String> {
+fn load_text_from(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Decide text payload {}", hex::encode(handle.raw)))?;
@@ -745,7 +745,7 @@ fn load_text_from(reader: &PileReader, handle: TextHandle) -> Result<String> {
 }
 
 fn load_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String>
@@ -771,7 +771,7 @@ where
 }
 
 fn validate_texts<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handles: Vec<(TextHandle, TextRule)>,
 ) -> Result<()>
@@ -793,15 +793,15 @@ where
 
 /// Validate one complete materialized authored Decide collection. Forks and
 /// uncited concurrent late factors are valid; malformed records are not.
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     let texts = validate_structure(facts)?;
-    validate_texts(reader, None::<&PileReader>, texts)
+    validate_texts(reader, None::<&PileSnapshot>, texts)
 }
 
 /// Preflight the exact set union publication would create, including staged
 /// attachments, without writing any pile bytes.
 pub fn validate_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<TribleSet> {
@@ -811,13 +811,13 @@ pub fn validate_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     validate_texts(reader, Some(&overlay), texts)?;
     Ok(expected)
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     load_text_from(reader, handle)
 }
 
@@ -832,7 +832,6 @@ mod tests {
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
-    use triblespace::core::collection::CollectionStoreExt;
 
     fn at(second: u8) -> IntervalValue {
         let epoch = Epoch::from_gregorian_utc(2026, 8, 8, 0, 0, second, 0);
@@ -847,7 +846,7 @@ mod tests {
 
     struct TestView {
         facts: TribleSet,
-        reader: PileReader,
+        reader: PileSnapshot,
     }
 
     impl Fixture {
@@ -872,7 +871,8 @@ mod tests {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-            let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
+            let reader = pile.snapshot().unwrap();
+            let (facts, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
             pile.close().unwrap();
             TestView { facts, reader }
         }

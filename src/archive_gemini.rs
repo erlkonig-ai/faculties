@@ -980,7 +980,7 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::prelude::blobencodings::RawBytes;
     use triblespace::prelude::inlineencodings::Handle;
     use triblespace::prelude::*;
@@ -1153,7 +1153,7 @@ mod tests {
         .expect("source receipt retains its raw card");
         let reader = emitted[0]
             .blobs_mut()
-            .reader()
+            .snapshot()
             .expect("MemoryBlobStore reader construction is infallible");
         let recovered: Bytes = reader.get(raw).unwrap();
         assert_eq!(recovered.as_ref(), drifted.as_bytes());
@@ -1201,7 +1201,7 @@ mod tests {
         .expect("source receipt retains its raw card");
         let reader = emitted[0]
             .blobs_mut()
-            .reader()
+            .snapshot()
             .expect("MemoryBlobStore reader construction is infallible");
         let recovered: Bytes = reader.get(raw).unwrap();
         assert_eq!(recovered.as_ref(), malformed.as_bytes());

@@ -54,7 +54,7 @@ use triblespace::core::collection::records::{
 use triblespace::core::collection::simplearchive_union;
 use triblespace::core::collection::{
     discover_collection_cover_authorized_with_admission, discover_collection_records, Collection,
-    CollectionRecord, CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    CollectionRecord, CollectionStore, CollectionStoreExt, TryFromCover, ACTION_WRITE,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
@@ -63,8 +63,8 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::{Inline, IntoInline};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, CapabilityProofStore};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::core::trible::{Fragment, Trible, TribleSet};
 use triblespace::macros::{attributes, find, pattern};
 
@@ -313,7 +313,7 @@ fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
     fragment.facts().clone().to_blob().get_handle()
 }
 
-fn descriptor_facts(reader: &PileReader, collection: CollectionHandle) -> Result<TribleSet> {
+fn descriptor_facts(reader: &PileSnapshot, collection: CollectionHandle) -> Result<TribleSet> {
     let blob: Blob<SimpleArchive> = reader
         .get(collection)
         .with_context(|| format!("read descriptor {}", hex::encode_upper(collection.raw)))?;
@@ -328,7 +328,7 @@ fn has_attribute(facts: &TribleSet, attribute: Id) -> bool {
 }
 
 fn discover_retired_vaults(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     commits: &[CollectionCommit],
 ) -> Result<RetiredVaultDiscovery> {
     let mut vaults = BTreeMap::new();
@@ -385,12 +385,11 @@ fn discover_retired_vaults(
 }
 
 fn load_proof_bundle(
-    pile: &mut Pile,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     id: CapabilityProofId,
     label: &str,
 ) -> Result<CapabilityProofBundle> {
-    let proof = pile
+    let proof = reader
         .proof(id)
         .map_err(|error| anyhow!("look up exact {label} proof: {error}"))?
         .ok_or_else(|| anyhow!("exact {label} proof is not resident"))?;
@@ -410,8 +409,7 @@ fn load_proof_bundle(
 }
 
 fn inbox_rows(
-    pile: &mut Pile,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     commits: &[CollectionCommit],
     inbox: CollectionHandle,
     recipient: &SigningKey,
@@ -450,8 +448,8 @@ fn inbox_rows(
                     .get(&row.vault)
                     .copied()
                     .context("access envelope names an unrecognized vault descriptor")?;
-                let read = load_proof_bundle(pile, reader, row.read_proof, "READ")?;
-                let write = load_proof_bundle(pile, reader, row.write_proof, "WRITE")?;
+                let read = load_proof_bundle(reader, row.read_proof, "READ")?;
+                let write = load_proof_bundle(reader, row.write_proof, "WRITE")?;
                 let opened =
                     open_access_envelope(reader, &row, recipient, authority, instant, read, write);
                 opened
@@ -594,7 +592,7 @@ fn pair_direct_predecessors(
     Ok(paired)
 }
 
-fn materialize_source(reader: &PileReader, commits: &[CollectionCommit]) -> Result<TribleSet> {
+fn materialize_source(reader: &PileSnapshot, commits: &[CollectionCommit]) -> Result<TribleSet> {
     let mut facts = TribleSet::new();
     let mut seen = BTreeSet::new();
     for commit in commits {
@@ -730,20 +728,22 @@ struct AdmittedCurrent {
 /// over an admitted payload cannot retroactively become a root of this
 /// migration observation.
 fn admitted_current(
-    pile: &mut Pile,
+    snapshot: &PileSnapshot,
     descriptor: &Fragment,
     writers: &BTreeSet<[u8; 32]>,
 ) -> Result<AdmittedCurrent> {
     let collection = Collection::<SimpleArchive>::from_descriptor(descriptor)
         .map_err(|error| anyhow!("type current Secrets collection: {error}"))?;
     let (cover, commits) =
-        discover_collection_cover_authorized_with_admission(pile, collection, |subject| {
+        discover_collection_cover_authorized_with_admission(snapshot, collection, |subject| {
             writers.contains(&subject.raw)
         })
         .map_err(|error| anyhow!("discover envelope-scoped current Secrets roots: {error}"))?;
-    let facts = pile
-        .materialize::<TribleSet, _>(&cover)
-        .map_err(|error| anyhow!("materialize envelope-scoped current Secrets cover: {error}"))?;
+    let physical = cover
+        .resolve(snapshot)
+        .map_err(|error| anyhow!("resolve envelope-scoped current Secrets cover: {error}"))?;
+    let facts = TribleSet::try_from_cover(&physical, snapshot)
+        .map_err(|error| anyhow!("read envelope-scoped current Secrets cover: {error}"))?;
     Ok(AdmittedCurrent { facts, commits })
 }
 
@@ -802,7 +802,10 @@ fn potentially_admitted_current_record(
 }
 
 fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
-    let discovered = discover_collection_records(&mut *pile)
+    let reader = pile
+        .snapshot()
+        .context("freeze Secrets migration store snapshot")?;
+    let discovered = discover_collection_records(&reader)
         .context("discover records for Secrets descriptor-authority migration")?;
     let commits = discovered.commits().to_vec();
     let existing_ids = commits
@@ -810,7 +813,6 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
     let invalid_records = discovered.diagnostics().len();
-    let reader = pile.reader().context("open Secrets migration reader")?;
     let discovery = discover_retired_vaults(&reader, &commits)?;
     let mut predecessor_by_successor = pair_direct_predecessors(&discovery)?;
     let authority_map = discovery
@@ -826,7 +828,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
 
     let old_inbox_descriptor = retired_inbox_descriptor(signer.verifying_key());
     let old_inbox = descriptor_handle(&old_inbox_descriptor);
-    let old_candidates = inbox_rows(pile, &reader, &commits, old_inbox, signer, &authority_map);
+    let old_candidates = inbox_rows(&reader, &commits, old_inbox, signer, &authority_map);
     if !old_candidates.is_empty() {
         let resident = descriptor_facts(&reader, old_inbox)
             .context("read retired local Secrets access-inbox descriptor")?;
@@ -845,7 +847,6 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         })
         .collect::<BTreeMap<_, _>>();
     let current_candidates = inbox_rows(
-        pile,
         &reader,
         &commits,
         current_inbox,
@@ -932,7 +933,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             if resident != *expected_descriptor.facts() {
                 bail!("current vault descriptor for {vault:X} is not canonical");
             }
-            let admitted = admitted_current(pile, &expected_descriptor, &current_writers)
+            let admitted = admitted_current(&reader, &expected_descriptor, &current_writers)
                 .with_context(|| format!("admit current vault {vault:X}"))?;
             prospective_facts += admitted.facts;
             admitted.commits
@@ -1079,8 +1080,9 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
     })
 }
 
-fn proof_ids(pile: &mut Pile) -> Result<BTreeSet<CapabilityProofId>> {
-    pile.proofs()
+fn proof_ids(snapshot: &PileSnapshot) -> Result<BTreeSet<CapabilityProofId>> {
+    snapshot
+        .proofs()
         .map_err(|error| anyhow!("enumerate capability proofs: {error}"))?
         .map(|proof| {
             proof
@@ -1124,7 +1126,10 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
             "Secrets descriptor-authority activation requires fresh grants for delegated vaults: {blocked}"
         );
     }
-    let discovered = discover_collection_records(&mut *pile)
+    let frozen = pile
+        .snapshot()
+        .context("freeze Secrets pre-publication store snapshot")?;
+    let discovered = discover_collection_records(&frozen)
         .context("rediscover frozen records before Secrets publication")?;
     let commits = discovered.commits().to_vec();
     let old_inbox = descriptor_handle(&retired_inbox_descriptor(signer.verifying_key()));
@@ -1165,7 +1170,7 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
         } else {
             let descriptor =
                 secrets::vault_descriptor(vault.summary.vault, vault.summary.authority);
-            admitted_current(pile, &descriptor, &vault.current_writers)
+            admitted_current(&frozen, &descriptor, &vault.current_writers)
                 .with_context(|| {
                     format!("re-admit frozen successor vault {:X}", vault.summary.vault)
                 })?
@@ -1185,7 +1190,8 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
         .iter()
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
-    let proofs_before = proof_ids(pile)?;
+    let proofs_before = proof_ids(&frozen)?;
+    drop(frozen);
     let mut appended_commits = 0;
     let mut published_envelopes = 0;
 
@@ -1282,7 +1288,11 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
         }
     }
 
-    let proofs_after = proof_ids(pile)?;
+    let proof_snapshot = pile
+        .snapshot()
+        .context("freeze Secrets post-publication proof snapshot")?;
+    let proofs_after = proof_ids(&proof_snapshot)?;
+    drop(proof_snapshot);
     let persisted_proofs = proofs_after.difference(&proofs_before).count();
     let after = plan_open(pile, signer)?;
     verify_open(pile, signer, &after)?;
@@ -1298,7 +1308,10 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
 }
 
 fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &PreparedPlan) -> Result<()> {
-    let records = discover_collection_records(&mut *pile)
+    let snapshot = pile
+        .snapshot()
+        .context("freeze Secrets verification store snapshot")?;
+    let records = discover_collection_records(&snapshot)
         .context("discover records for Secrets migration verification")?;
     let ids = records
         .commits()
@@ -1385,7 +1398,7 @@ mod tests {
     use faculties::storage::initialize_signer;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::capability::{CapabilityAtom, CapabilityClaim};
-    use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
+    use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut, CapabilityProofStore};
     use triblespace::macros::entity;
     use triblespace::prelude::TryToInline;
 
@@ -1416,7 +1429,7 @@ mod tests {
     fn store_fragment(pile: &mut Pile, fragment: Fragment) -> CollectionHandle {
         let (_, facts, _, mut blobs) = fragment.into_parts();
         let embedded = blobs
-            .reader()
+            .snapshot()
             .unwrap()
             .into_iter()
             .map(|(_, blob)| blob)
@@ -1435,7 +1448,7 @@ mod tests {
     ) -> CollectionCommit {
         let (_, facts, metafacts, mut blobs) = fragment.into_parts();
         let embedded = blobs
-            .reader()
+            .snapshot()
             .unwrap()
             .into_iter()
             .map(|(_, blob)| blob)
@@ -1575,7 +1588,8 @@ mod tests {
         assert!(report.plan.settled());
 
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
         let source_pairs = fixture
             .source
@@ -1624,7 +1638,7 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         assert_eq!(store_fragment(&mut pile, direct_descriptor), direct);
         let subset = {
-            let reader = pile.reader().unwrap();
+            let reader = pile.snapshot().unwrap();
             let data: Inline<Handle<SimpleArchive>> = fixture.source[0].data().transmute();
             let blob: Blob<SimpleArchive> = reader.get(data).unwrap();
             let facts = TribleSet::try_from_blob(blob).unwrap();
@@ -1682,7 +1696,8 @@ mod tests {
             direct,
             entity! { _ @ metadata::tag: KIND_ACCESS_ENVELOPE },
         );
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         let error = verify_frozen_predecessors(&plan, records.commits()).unwrap_err();
         assert!(error.to_string().contains("changed after the final plan"));
         pile.close().unwrap();
@@ -1779,7 +1794,8 @@ mod tests {
         assert!(report.plan.settled());
 
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         assert_eq!(
             records
                 .commits()
@@ -2207,7 +2223,8 @@ mod tests {
         assert!(report.plan.settled());
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         let target = records
             .commits()
             .iter()

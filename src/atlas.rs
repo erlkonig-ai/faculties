@@ -223,7 +223,7 @@ mod tests {
         fragment += entity! { ExclusiveId::force_ref(&member) @ metadata::tag: &id };
 
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let catalog = load_catalog(&reader, fragment.facts()).unwrap();
         let entry = catalog.entry(id).unwrap();
 

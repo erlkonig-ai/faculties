@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -700,7 +700,7 @@ fn validate_structure(facts: &TribleSet, relation_facts: &TribleSet) -> Result<V
 }
 
 fn load_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String>
@@ -726,7 +726,7 @@ where
 }
 
 fn validate_bodies<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     bodies: Vec<TextHandle>,
 ) -> Result<()>
@@ -743,25 +743,25 @@ where
 }
 
 /// Read one validated message body.
-pub fn read_body(reader: &PileReader, handle: TextHandle) -> Result<String> {
-    load_text_overlay(reader, None::<&PileReader>, handle)
+pub fn read_body(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+    load_text_overlay(reader, None::<&PileSnapshot>, handle)
 }
 
 /// Validate the native Message view inside a complete materialized collection
 /// against the exact Relations catalog from the same immutable pile snapshot.
 pub fn validate_catalog(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     relation_facts: &TribleSet,
 ) -> Result<()> {
     let bodies = validate_structure(facts, relation_facts)?;
-    validate_bodies(reader, None::<&PileReader>, bodies)
+    validate_bodies(reader, None::<&PileSnapshot>, bodies)
 }
 
 /// Validate the native Message view of the exact would-be generic union before
 /// any staged body or signed COMMIT byte is appended.
 pub fn validate_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
     relation_facts: &TribleSet,
@@ -772,7 +772,7 @@ pub fn validate_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     validate_bodies(reader, Some(&overlay), bodies)?;
     Ok(union)
@@ -961,7 +961,7 @@ mod tests {
         .unwrap();
         fragment += relations::group_create_fragment(group, "shared").unwrap().0;
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert_eq!(
             resolve_recipient(&reader, &facts, "shared").unwrap(),
@@ -1003,7 +1003,7 @@ mod tests {
         fragment += relations::group_create_fragment(group, "shared").unwrap().0;
 
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert!(matches!(
             relations::profile_head(&facts, legacy).unwrap(),
@@ -1052,7 +1052,7 @@ mod tests {
         fragment += relations::group_create_fragment(group, "crew").unwrap().0;
 
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
 
         assert_eq!(
@@ -1348,7 +1348,7 @@ mod tests {
             metadata::created_at: at_unix(15.5),
         };
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         validate_catalog_union(&reader, &TribleSet::new(), &fragment, &relation_facts).unwrap();
 
         let invalid_native =
@@ -1405,7 +1405,7 @@ mod tests {
             "one immutable envelope",
             at_unix(15.0),
         );
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         validate_catalog_union(&reader, &TribleSet::new(), &fragment, &relation_facts).unwrap();
         drop(reader);
 
@@ -1419,13 +1419,12 @@ mod tests {
                 .len(),
             1
         );
-        let snapshot = pile.snapshot(messages).unwrap();
-        validate_catalog(snapshot.reader(), snapshot.facts(), &relation_facts).unwrap();
-        assert_eq!(
-            load_message_rows(snapshot.facts()).unwrap()[0].id,
-            message_id
-        );
-        drop(snapshot);
+        let store_snapshot = pile.snapshot().unwrap();
+        let (message_facts, _) =
+            crate::storage::read_fact_collection(messages, &store_snapshot).unwrap();
+        validate_catalog(&store_snapshot, &message_facts, &relation_facts).unwrap();
+        assert_eq!(load_message_rows(&message_facts).unwrap()[0].id, message_id);
+        drop(store_snapshot);
         pile.close().unwrap();
     }
 

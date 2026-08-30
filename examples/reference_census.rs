@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::wiki as wiki_model;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
 
 #[derive(Default)]
@@ -96,7 +96,7 @@ impl Bucket {
     }
 }
 
-fn read_content(reader: &PileReader, revision: &wiki_model::RevisionRecord) -> Result<String> {
+fn read_content(reader: &PileSnapshot, revision: &wiki_model::RevisionRecord) -> Result<String> {
     wiki_model::read_text(reader, revision.content)
 }
 
@@ -110,10 +110,9 @@ fn main() -> Result<()> {
         signer.verifying_key(),
     )
     .context("register Wiki collection descriptor")?;
-    let (facts, _, reader) = store
-        .snapshot(collection)
-        .context("snapshot Wiki collection")?
-        .into_parts();
+    let reader = store.snapshot().context("freeze Wiki store snapshot")?;
+    let (facts, _) = faculties::storage::read_fact_collection(collection, &reader)
+        .context("snapshot Wiki collection")?;
     let catalog = wiki_model::load_catalog(&facts)?;
     let model = &catalog.revisions;
 

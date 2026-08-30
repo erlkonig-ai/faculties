@@ -13,8 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(test)]
+use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::metadata;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreList};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -1055,13 +1057,13 @@ where
     let mut expected = current.clone();
     expected += fragment.facts().clone();
     let handles = validate_structure(&expected)?;
-    // `BlobStore::reader` freezes a snapshot through `&mut self`.  Cloning a
+    // `SnapshotSource::snapshot` freezes an observation through `&mut self`. Cloning a
     // Fragment is O(1) over its PATCH-backed stores, so preflight can do that
     // without mutating the caller's candidate.
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     validate_texts(handles, |handle| {
         load_text_overlay(reader, &overlay, handle)
@@ -1706,7 +1708,7 @@ mod tests {
 
     struct FixtureView {
         facts: TribleSet,
-        reader: <MemoryBlobStore as BlobStore>::Reader,
+        reader: MemoryBlobStoreSnapshot,
     }
 
     impl Fixture {
@@ -1726,7 +1728,7 @@ mod tests {
         fn view(&self) -> FixtureView {
             FixtureView {
                 facts: self.facts.borrow().clone(),
-                reader: self.blobs.borrow_mut().reader().unwrap(),
+                reader: self.blobs.borrow_mut().snapshot().unwrap(),
             }
         }
     }

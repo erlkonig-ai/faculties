@@ -42,8 +42,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
@@ -126,7 +125,7 @@ struct DiscordStorage<'a> {
 #[derive(Clone)]
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct DiscordSession<'a> {
@@ -134,7 +133,7 @@ struct DiscordSession<'a> {
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl DiscordSession<'_> {
@@ -157,7 +156,7 @@ impl DiscordSession<'_> {
         self.facts += added;
         self.reader = self
             .pile
-            .reader()
+            .snapshot()
             .context("refresh Discord attachment snapshot")?;
         Ok(commit)
     }
@@ -172,18 +171,17 @@ impl DiscordStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .context("materialize Discord collection")?
-                .into_parts();
-            discord_model::validate_catalog(&reader, &facts)
+            let store_snapshot = pile.snapshot().context("freeze Discord store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .context("materialize Discord collection")?;
+            discord_model::validate_catalog(&store_snapshot, &facts)
                 .context("validate Discord collection")?;
             operation(&mut DiscordSession {
                 pile: &mut pile,
                 collection,
                 signer,
                 facts,
-                reader,
+                reader: store_snapshot,
             })
         })();
         finish_pile(pile, result)

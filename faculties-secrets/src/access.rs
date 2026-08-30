@@ -411,7 +411,6 @@ pub fn open_access_envelope<R: BlobStoreGet>(
 mod tests {
     use super::*;
     use triblespace::core::capability::CapabilityClaim;
-    use triblespace::core::repo::BlobStore;
 
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
@@ -455,7 +454,7 @@ mod tests {
         let id = fragment.root().expect("intrinsic row root");
         let (_, facts, _, mut blobs) = fragment.into_parts();
         let row = load_access_envelope(&facts, id).expect("strict row");
-        let reader = blobs.reader().expect("blob snapshot");
+        let reader = blobs.snapshot().expect("blob snapshot");
         let opened = open_access_envelope(
             &reader,
             &row,
@@ -519,7 +518,7 @@ mod tests {
         let id = fragment.root().expect("intrinsic row root");
         let (_, facts, _, mut blobs) = fragment.into_parts();
         let row = load_access_envelope(&facts, id).expect("strict row");
-        let reader = blobs.reader().expect("blob snapshot");
+        let reader = blobs.snapshot().expect("blob snapshot");
 
         assert!(open_access_envelope(
             &reader,

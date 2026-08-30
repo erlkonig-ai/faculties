@@ -14,8 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -121,18 +121,20 @@ pub fn publish_events(
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let snapshot = pile
-            .snapshot(collection)
-            .context("materialize native Cognition collection")?;
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze native Cognition store snapshot")?;
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+            .context("read native Cognition collection")?;
         let staged = fragments
             .iter()
             .fold(Fragment::empty(), |mut all, fragment| {
                 all += fragment.clone();
                 all
             });
-        validate_candidate(snapshot.reader(), snapshot.facts(), &staged)
+        validate_candidate(&store_snapshot, &facts, &staged)
             .context("preflight authored Cognition events")?;
-        drop(snapshot);
+        drop(store_snapshot);
         fragments
             .into_iter()
             .map(|fragment| {
@@ -155,7 +157,7 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
     let mut local = fragment.clone();
     let reader = local
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot self-contained Cognition event attachments")?;
     validate_payloads_in_store(&reader, &facts)?;
     validate_payloads_in_store(&reader, &metafacts)?;
@@ -165,15 +167,15 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
 /// Validate the known invariants and directly typed attachments of a complete
 /// Cognition value. Unknown facts remain legal: Cognition is intentionally a
 /// shared event ledger, and independent producers may extend its ontology.
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     validate_singleton_fields(facts)?;
-    validate_payloads(reader, None::<&PileReader>, facts)
+    validate_payloads(reader, None::<&PileSnapshot>, facts)
 }
 
 /// Validate the union which a publication would create, including payloads
 /// carried only by the staged fragment.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<()> {
@@ -183,7 +185,7 @@ pub fn validate_candidate(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot staged Cognition attachments")?;
     validate_payloads(reader, Some(&overlay), &union)
 }
@@ -191,8 +193,8 @@ pub fn validate_candidate(
 /// Strict payload validation used while projecting each frozen legacy delta.
 /// This is crate-visible so the stopped-world migration can fail on a missing
 /// typed attachment rather than silently relying on conservative reachability.
-pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    validate_payloads(reader, None::<&PileReader>, facts)
+pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+    validate_payloads(reader, None::<&PileSnapshot>, facts)
 }
 
 /// Exec results whose completion point lies in the inclusive interval,
@@ -382,7 +384,7 @@ fn raw_blob_field(attribute: Id) -> Option<&'static str> {
 }
 
 fn validate_payloads<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
 ) -> Result<()>
@@ -434,7 +436,7 @@ where
 }
 
 fn read_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<View<str>>
@@ -450,7 +452,7 @@ where
 }
 
 fn read_raw_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: RawHandle,
 ) -> Result<anybytes::Bytes>
@@ -519,11 +521,12 @@ mod tests {
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
-        validate_catalog(&reader, &facts).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
+        validate_catalog(&store_snapshot, &facts).unwrap();
         assert_eq!(facts, event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));
-        drop(reader);
+        drop(store_snapshot);
         pile.close().unwrap();
     }
 

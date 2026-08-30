@@ -28,13 +28,14 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 #[cfg(test)]
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
-    discover_collection_records, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionRecordDiagnostic, CollectionStoreExt,
+    discover_collection_records, Collection, CollectionCommit, CollectionDerive, CollectionMerge,
+    CollectionRead, CollectionRecordDiagnostic, CollectionStoreExt, FactCover, TryFromCover,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
 use triblespace::core::signing_key_file;
-use triblespace::core::trible::Fragment;
+use triblespace::core::trible::{Fragment, TribleSet};
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -105,13 +106,17 @@ pub fn discover_target<S>(
 ) -> Result<TargetDiscovery>
 where
     S: CollectionStoreExt,
+    <S as SnapshotSource>::Snapshot: CollectionRead,
 {
     let descriptor = crate::collection_names::root_descriptor(scope, authority);
     let collection = store
         .collection::<SimpleArchive>(descriptor.clone())
         .context("register target collection descriptor")?;
+    let snapshot = store
+        .snapshot()
+        .context("freeze target collection store snapshot")?;
     let records =
-        discover_collection_records(store).context("discover native collection records")?;
+        discover_collection_records(&snapshot).context("discover native collection records")?;
     let commits = records
         .commits()
         .iter()
@@ -138,6 +143,46 @@ where
         derives,
         diagnostics: records.diagnostics().to_vec(),
     })
+}
+
+/// Read one authorized SimpleArchive union through a caller-supplied coherent
+/// store snapshot, returning the semantic cover used for maintained indexes.
+pub fn read_fact_collection<S>(
+    collection: Collection<SimpleArchive>,
+    snapshot: &S,
+) -> Result<(TribleSet, FactCover)>
+where
+    S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+{
+    let cover = collection
+        .admitted(snapshot)
+        .context("discover authorized collection cover")?;
+    let physical = cover
+        .resolve(snapshot)
+        .context("resolve authorized collection cover")?;
+    let facts = TribleSet::try_from_cover(&physical, snapshot)
+        .context("read authorized collection facts")?;
+    Ok((facts, cover))
+}
+
+/// Read one authorized SimpleArchive union and retain the exact provenance
+/// claims selected by the same admission decision.
+pub fn read_fact_collection_with_claims<S>(
+    collection: Collection<SimpleArchive>,
+    snapshot: &S,
+) -> Result<(TribleSet, FactCover, Vec<CollectionCommit>)>
+where
+    S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+{
+    let (cover, claims) = collection
+        .admitted_with_claims(snapshot)
+        .context("discover authorized collection cover and claims")?;
+    let physical = cover
+        .resolve(snapshot)
+        .context("resolve authorized collection cover")?;
+    let facts = TribleSet::try_from_cover(&physical, snapshot)
+        .context("read authorized collection facts")?;
+    Ok((facts, cover, claims))
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.
@@ -290,7 +335,7 @@ mod tests {
     use triblespace::core::inline::Inline;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
     use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
@@ -489,7 +534,7 @@ mod tests {
         );
         assert_eq!(unrelated_target.commits().len(), 1);
 
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let data_handle = Handle::<SimpleArchive>::from_hash(first.data());
         let actual_facts: TribleSet = reader.get(data_handle).unwrap();
         let actual_metafacts: TribleSet = reader.get(first.metadata()).unwrap();

@@ -38,8 +38,8 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::{Inline, IntoInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::{Fragment, Trible, TribleSet};
 use triblespace::macros::{attributes, entity};
 
@@ -323,7 +323,7 @@ pub(crate) fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
 }
 
 pub(crate) fn descriptor_facts(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     collection: CollectionHandle,
 ) -> Result<TribleSet> {
     let blob: Blob<SimpleArchive> = reader
@@ -372,7 +372,7 @@ fn has_attribute(facts: &TribleSet, attribute: Id) -> bool {
 }
 
 fn classify_residue(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     collection: CollectionHandle,
     expected_namespace: VerifyingKey,
 ) -> (ResidueKind, String) {
@@ -433,7 +433,10 @@ fn classify_residue(
 }
 
 fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthorityPlan> {
-    let discovered = discover_collection_records(&mut *pile)
+    let store_snapshot = pile
+        .snapshot()
+        .context("freeze descriptor-authority planning store snapshot")?;
+    let discovered = discover_collection_records(&store_snapshot)
         .context("discover records for descriptor-authority cutover")?;
     let commits = discovered.commits().to_vec();
     let merges = discovered.merges().to_vec();
@@ -444,7 +447,6 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
         .iter()
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
-    let reader = pile.reader().context("open descriptor cutover reader")?;
     let authority = signer.verifying_key();
     let mut roots = Vec::new();
     let mut recognized = BTreeSet::new();
@@ -479,7 +481,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
             continue;
         }
 
-        let old_facts = descriptor_facts(&reader, old)
+        let old_facts = descriptor_facts(&store_snapshot, old)
             .with_context(|| format!("read retired descriptor for {name}"))?;
         if old_facts != *old_descriptor.facts() {
             bail!("retired descriptor for {name} is not the exact registered epoch");
@@ -518,7 +520,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
         .into_iter()
         .filter(|(collection, _)| !recognized.contains(collection))
         .map(|(collection, records)| {
-            let (kind, detail) = classify_residue(&reader, collection, authority);
+            let (kind, detail) = classify_residue(&store_snapshot, collection, authority);
             Residue {
                 collection,
                 kind,
@@ -557,7 +559,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
 }
 
 fn validate_resident_commit_inputs(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     root: &RootReseat,
     source: &[CollectionCommit],
 ) -> Result<()> {
@@ -639,16 +641,16 @@ fn publish_open(
             before.posture_unbridged,
         );
     }
-    let discovered = discover_collection_records(&mut *pile)
+    let store_snapshot = pile
+        .snapshot()
+        .context("freeze descriptor-authority publication store snapshot")?;
+    let discovered = discover_collection_records(&store_snapshot)
         .context("rediscover frozen source records before publication")?;
     let commits = discovered.commits().to_vec();
     let existing = commits
         .iter()
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
-    let reader = pile
-        .reader()
-        .context("open publication dependency reader")?;
     let authority = signer.verifying_key();
     let mut appended_commits = 0;
     let sources = frozen_sources(&before, &commits)?;
@@ -657,8 +659,9 @@ fn publish_open(
     // COMMIT visible. Descriptor registration below may still be retried, but
     // malformed legacy leaves cannot leave a partially populated new epoch.
     for root in &before.roots {
-        validate_resident_commit_inputs(&reader, root, &sources[&root.old])?;
+        validate_resident_commit_inputs(&store_snapshot, root, &sources[&root.old])?;
     }
+    drop(store_snapshot);
 
     for root in &before.roots {
         let source = &sources[&root.old];
@@ -701,7 +704,7 @@ fn publish_open(
 }
 
 pub(crate) fn materialize_source(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     commits: &[CollectionCommit],
 ) -> Result<TribleSet> {
     let mut facts = TribleSet::new();
@@ -720,17 +723,18 @@ pub(crate) fn materialize_source(
 }
 
 fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &DescriptorAuthorityPlan) -> Result<()> {
-    let discovered = discover_collection_records(&mut *pile)
+    let store_snapshot = pile
+        .snapshot()
+        .context("freeze descriptor-authority verification store snapshot")?;
+    let discovered = discover_collection_records(&store_snapshot)
         .context("discover records for descriptor-authority verification")?;
     let commits = discovered.commits().to_vec();
     let ids = commits
         .iter()
         .map(CollectionCommit::id)
         .collect::<BTreeSet<_>>();
-    let reader = pile.reader().context("open verification reader")?;
-
     for root in &plan.roots {
-        let descriptor = descriptor_facts(&reader, root.new)
+        let descriptor = descriptor_facts(&store_snapshot, root.new)
             .with_context(|| format!("read new {} descriptor", root.name))?;
         let parsed_authority = triblespace::core::collection::descriptor::authority(&descriptor)
             .with_context(|| format!("decode new {} authority", root.name))?;
@@ -746,13 +750,12 @@ fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &DescriptorAuthorityP
         if let Some(missing) = expected.keys().find(|id| !ids.contains(*id)) {
             bail!("new {} collection is missing COMMIT {missing}", root.name);
         }
-        let old_facts = materialize_source(&reader, &source)?;
+        let old_facts = materialize_source(&store_snapshot, &source)?;
         let collection = Collection::<SimpleArchive>::from_descriptor(&Fragment::from(descriptor))
             .map_err(|error| anyhow!("type new {} collection: {error}", root.name))?;
-        let snapshot = pile
-            .snapshot::<TribleSet, _>(collection)
-            .map_err(|error| anyhow!("snapshot new {} collection: {error}", root.name))?;
-        if !old_facts.difference(snapshot.facts()).is_empty() {
+        let (new_facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+            .with_context(|| format!("read new {} collection", root.name))?;
+        if !old_facts.difference(&new_facts).is_empty() {
             bail!(
                 "new {} collection does not contain the retired open union",
                 root.name
@@ -829,8 +832,8 @@ mod tests {
     fn store_fragment(pile: &mut Pile, fragment: Fragment) -> CollectionHandle {
         let (_, facts, _, mut blobs) = fragment.into_parts();
         let embedded = blobs
-            .reader()
-            .expect("memory blob reader")
+            .snapshot()
+            .expect("memory blob snapshot")
             .into_iter()
             .map(|(_, blob)| blob)
             .collect::<Vec<Blob<UnknownBlob>>>();
@@ -1034,7 +1037,8 @@ mod tests {
         assert!(error.to_string().contains("wrong-authority no-op"));
 
         let mut pile = open_pile_strict(&path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&store_snapshot).unwrap();
         assert_eq!(records.commits().len(), 2);
         assert_eq!(
             records
@@ -1167,7 +1171,8 @@ mod tests {
         assert_eq!(report.appended_commits, 1);
 
         let mut pile = open_pile_strict(&path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&store_snapshot).unwrap();
         let target = records
             .commits()
             .iter()
@@ -1214,7 +1219,8 @@ mod tests {
             metadata,
         )))
         .unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&store_snapshot).unwrap();
         let error = frozen_sources(&plan, records.commits()).unwrap_err();
         assert!(error
             .to_string()
@@ -1275,12 +1281,12 @@ mod tests {
             assert!(offers.contains(handle), "missing OFFER for {handle:?}");
         }
 
-        let reader = pile.reader().unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
         let mut roots = RetentionRoots::new();
         roots.retain_recursive(root.new);
         roots.retain_recursive(data);
         roots.retain_recursive(commit_metadata);
-        for handle in roots.expanded(&reader) {
+        for handle in roots.expanded(&store_snapshot) {
             assert!(
                 offers.contains(handle),
                 "missing OFFER for a conservatively reachable artifact {handle:?}"

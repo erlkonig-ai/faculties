@@ -15,7 +15,7 @@ use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -115,7 +115,7 @@ struct DecideStorage<'a> {
 
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl DecideStorage<'_> {
@@ -132,17 +132,19 @@ impl DecideStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (facts, _ticket, reader) = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_parts())
+            let store_snapshot = pile.snapshot().context("freeze Decide store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Decide collection")?;
-            decide::validate_catalog(&reader, &facts)
+            decide::validate_catalog(&store_snapshot, &facts)
                 .context("validate authored Decide collection")?;
             operation(
                 &mut pile,
                 collection,
                 &signer,
-                &CollectionView { facts, reader },
+                &CollectionView {
+                    facts,
+                    reader: store_snapshot,
+                },
             )
         })();
         finish_pile(pile, result)

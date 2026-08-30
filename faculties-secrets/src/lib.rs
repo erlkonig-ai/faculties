@@ -354,15 +354,15 @@ impl VaultSnapshot {
 /// uniqueness checks. This type performs no name, timestamp, or “latest”
 /// arbitration.
 pub struct SecretsSnapshot<R> {
-    reader: R,
+    store_snapshot: R,
     vaults: Vec<VaultSnapshot>,
     access: BTreeMap<CollectionHandle, VaultAccess>,
 }
 
 impl<R> SecretsSnapshot<R> {
-    /// Shared blob reader used to validate and open every retained vault.
-    pub fn reader(&self) -> &R {
-        &self.reader
+    /// Shared store snapshot used to validate and open every retained vault.
+    pub fn store_snapshot(&self) -> &R {
+        &self.store_snapshot
     }
 
     /// Every validated vault, ordered by construction input.
@@ -460,7 +460,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             });
         }
         Ok(Self {
-            reader,
+            store_snapshot: reader,
             vaults: snapshots,
             access: BTreeMap::new(),
         })
@@ -491,7 +491,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             });
         }
         Ok(Self {
-            reader,
+            store_snapshot: reader,
             vaults: snapshots,
             access: BTreeMap::new(),
         })
@@ -531,7 +531,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             });
         }
         Ok(Self {
-            reader,
+            store_snapshot: reader,
             vaults: snapshots,
             access: by_access,
         })
@@ -562,8 +562,13 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             bail!("the supplied signing key is not the access-envelope subject");
         }
         access.verify_read_at(triblespace::core::clock::epoch_now())?;
-        open_version(&self.reader, &snapshot.catalog, secret, &access.custody)
-            .with_context(|| format!("open secret {secret} from vault {}", snapshot.vault))
+        open_version(
+            &self.store_snapshot,
+            &snapshot.catalog,
+            secret,
+            &access.custody,
+        )
+        .with_context(|| format!("open secret {secret} from vault {}", snapshot.vault))
     }
 
     /// Open one immutable secret from an exact collection.
@@ -586,8 +591,13 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             bail!("the supplied signing key is not the access-envelope subject");
         }
         access.verify_read_at(triblespace::core::clock::epoch_now())?;
-        open_version(&self.reader, &snapshot.catalog, secret, &access.custody)
-            .with_context(|| format!("open secret {secret} from vault collection {collection:?}"))
+        open_version(
+            &self.store_snapshot,
+            &snapshot.catalog,
+            secret,
+            &access.custody,
+        )
+        .with_context(|| format!("open secret {secret} from vault collection {collection:?}"))
     }
 }
 
@@ -1180,7 +1190,6 @@ mod tests {
     use triblespace::core::capability::CapabilityClaim;
     use triblespace::core::collection::descriptor as descriptor_facts;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::BlobStore;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1219,7 +1228,7 @@ mod tests {
 
     fn catalog_from_fragment(vault: Id, fragment: &mut Fragment) -> VaultCatalog {
         let facts = fragment.facts().clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         validate_catalog(&reader, vault, &facts).unwrap()
     }
 
@@ -1336,7 +1345,7 @@ mod tests {
                 .len(),
             1
         );
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         assert_eq!(
             open_version(&reader, &catalog, secret, &custody).unwrap(),
             b"hunter2"
@@ -1361,7 +1370,7 @@ mod tests {
         fragment += sealed.fragment;
         let direct_catalog = catalog_from_fragment(vault, &mut fragment);
         let original_body = direct_catalog.secrets[&secret].body;
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         let custody_wrap = rewrap_version_for_migration(
             &reader,
             &direct_catalog,
@@ -1377,7 +1386,7 @@ mod tests {
         fragment += custody_wrap;
         let catalog = catalog_from_fragment(vault, &mut fragment);
         assert_eq!(catalog.secrets[&secret].body, original_body);
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         assert_eq!(
             open_version(&reader, &catalog, secret, &custody).unwrap(),
             b"unchanged ciphertext"
@@ -1486,7 +1495,7 @@ mod tests {
         let mut blobs = Fragment::empty();
         blobs += fragment_a;
         blobs += fragment_b;
-        let reader = blobs.blobs_mut().reader().unwrap();
+        let reader = blobs.blobs_mut().snapshot().unwrap();
 
         let error = SecretsSnapshot::new(
             reader.clone(),
@@ -1583,9 +1592,11 @@ mod tests {
         authorized
             .commit(collection, &subject, fragment.clone())
             .unwrap();
-        assert_eq!(authorized.snapshot(collection).unwrap().facts(), &facts);
+        let store_snapshot = authorized.snapshot().unwrap();
+        let admitted: TribleSet = collection.read(&store_snapshot).unwrap();
+        assert_eq!(admitted, facts);
 
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         let snapshot =
             SecretsSnapshot::new_accessible(reader.clone(), [(vault, facts.clone(), access)])
                 .unwrap();
@@ -1716,7 +1727,7 @@ mod tests {
 
         load_catalog(vault, malformed.facts()).unwrap();
         let facts = malformed.facts().clone();
-        let reader = malformed.blobs_mut().reader().unwrap();
+        let reader = malformed.blobs_mut().snapshot().unwrap();
         let error = validate_catalog(&reader, vault, &facts).unwrap_err();
         assert!(format!("{error:#}").contains("too short"), "{error:#}");
     }

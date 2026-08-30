@@ -21,7 +21,7 @@ use faculties::relations::{
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::collection::CollectionStoreExt;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -289,16 +289,15 @@ impl RelationsStorage<'_> {
         }
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .context("materialize authored Relations collection")?
-                .into_parts();
-            relations::validate_catalog(&reader, &facts)
+            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .context("materialize authored Relations collection")?;
+            relations::validate_catalog(&store_snapshot, &facts)
                 .context("validate authored Relations collection")?;
-            f(&facts, &reader)
+            f(&facts, &store_snapshot)
         })
     }
 
@@ -306,19 +305,18 @@ impl RelationsStorage<'_> {
     /// union. `None` is a genuine no-op and writes no collection record.
     fn update<T>(
         &self,
-        f: impl FnOnce(&TribleSet, &PileReader) -> Result<(Option<Fragment>, T)>,
+        f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .context("materialize authored Relations collection")?
-                .into_parts();
-            relations::validate_catalog(&reader, &facts)
+            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .context("materialize authored Relations collection")?;
+            relations::validate_catalog(&store_snapshot, &facts)
                 .context("validate authored Relations collection")?;
-            let (fragment, result) = f(&facts, &reader)?;
+            let (fragment, result) = f(&facts, &store_snapshot)?;
             if let Some(fragment) = fragment {
-                relations::validate_catalog_union(&reader, &facts, &fragment)
+                relations::validate_catalog_union(&store_snapshot, &facts, &fragment)
                     .context("preflight authored Relations union")?;
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
@@ -341,7 +339,7 @@ fn now_observation() -> Result<relations::ObservedAt> {
 }
 
 fn resolve_person_anchor(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     selector: &str,
     include_retired: bool,
@@ -359,7 +357,7 @@ fn resolve_person_anchor(
     }
 }
 
-fn resolve_group_anchor(reader: &PileReader, facts: &TribleSet, selector: &str) -> Result<Id> {
+fn resolve_group_anchor(reader: &PileSnapshot, facts: &TribleSet, selector: &str) -> Result<Id> {
     match relations::resolve_group(reader, facts, selector)? {
         SelectorOutcome::Unique(id) => Ok(id),
         SelectorOutcome::Forked {
@@ -965,7 +963,7 @@ fn cmd_group_reconcile(
 }
 
 fn print_group_snapshot(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     snapshot: GroupSnapshot,
 ) -> Result<()> {

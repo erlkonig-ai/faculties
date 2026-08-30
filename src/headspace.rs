@@ -21,8 +21,8 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -721,7 +721,7 @@ fn validate_config_value(value: &ConfigValue) -> Result<()> {
     Ok(())
 }
 
-fn load_text_from(reader: &PileReader, handle: TextHandle) -> Result<String> {
+fn load_text_from(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Headspace text payload {}", hex::encode(handle.raw)))?;
@@ -729,7 +729,7 @@ fn load_text_from(reader: &PileReader, handle: TextHandle) -> Result<String> {
 }
 
 fn load_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String>
@@ -755,7 +755,7 @@ where
 }
 
 fn parse_catalog<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
 ) -> Result<Catalog>
@@ -881,14 +881,14 @@ where
 /// Validate one exact materialized Headspace collection. Forks are valid;
 /// malformed records, wrong-track lineage, cycles, and missing payloads are
 /// not.
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
-    parse_catalog(reader, None::<&PileReader>, facts).map(drop)
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+    parse_catalog(reader, None::<&PileSnapshot>, facts).map(drop)
 }
 
 /// Preflight the exact set union publication would create, including staged
 /// text payloads, without writing pile bytes.
 pub fn validate_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<Catalog> {
@@ -897,19 +897,19 @@ pub fn validate_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     parse_catalog(reader, Some(&overlay), &union)
 }
 
 /// Resolve the exact catalog. Structural or payload failure is represented as
 /// `Resolution::Invalid`, never as defaults or an implicit winner.
-pub fn project(reader: &PileReader, facts: &TribleSet) -> Catalog {
+pub fn project(reader: &PileSnapshot, facts: &TribleSet) -> Catalog {
     project_result(reader, facts).unwrap_or_else(Catalog::invalid)
 }
 
-pub fn project_result(reader: &PileReader, facts: &TribleSet) -> Result<Catalog> {
-    parse_catalog(reader, None::<&PileReader>, facts)
+pub fn project_result(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
+    parse_catalog(reader, None::<&PileSnapshot>, facts)
 }
 
 /// Require every exact credential reference in every native snapshot to name
@@ -1021,7 +1021,7 @@ pub fn open_active_secrets<R: BlobStoreGet>(
 ///
 /// Generic migration additionally carries the complete resident closure, so
 /// unknown future payloads remain preserved rather than filtered out.
-pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     let text_attributes = [
         metadata::name.id(),
         metadata::description.id(),
@@ -1090,9 +1090,7 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::pile::Pile;
-    use triblespace::core::repo::BlobStore;
 
     use crate::legacy_hint::open_scope;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
@@ -1113,10 +1111,11 @@ mod tests {
         pile
     }
 
-    fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileReader) {
+    fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileSnapshot) {
         let collection = open_scope(pile, scope, signer).unwrap();
-        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
-        (facts, reader)
+        let store_snapshot = pile.snapshot().unwrap();
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
+        (facts, store_snapshot)
     }
 
     fn commit(pile: &mut Pile, scope: Id, signer: &SigningKey, fragment: Fragment) {
@@ -1328,7 +1327,7 @@ mod tests {
         let catalog = project_result(&reader, &facts).unwrap();
         let mut empty = Fragment::empty();
         let secrets = SecretsSnapshot::new(
-            empty.blobs_mut().reader().unwrap(),
+            empty.blobs_mut().snapshot().unwrap(),
             Vec::<(Id, TribleSet)>::new(),
         )
         .unwrap();

@@ -318,7 +318,11 @@ fn with_model<T>(
     let result = (|| {
         let snapshot = wiki_model::materialize_indexed_collection(&mut pile, &signer)
             .context("materialize indexed Wiki collection")?;
-        let model = GaugeModel::load(snapshot.catalog(), snapshot.reader(), snapshot.facts())?;
+        let model = GaugeModel::load(
+            snapshot.catalog(),
+            snapshot.store_snapshot(),
+            snapshot.facts(),
+        )?;
         operation(&model)
     })();
     let close = pile.close().map_err(anyhow::Error::from);

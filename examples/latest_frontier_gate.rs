@@ -43,8 +43,11 @@ fn superseded_by_subtraction(space: &TribleSet) -> HashSet<Id> {
 fn scope(pile: &mut Pile, id: Id, signer: &ed25519_dalek::SigningKey) -> Result<TribleSet> {
     let collection = faculties::collection_names::open(pile, id, signer.verifying_key())
         .with_context(|| format!("register collection {id:x} descriptor"))?;
-    pile.snapshot(collection)
-        .map(|snapshot| snapshot.into_facts())
+    let store_snapshot = pile
+        .snapshot()
+        .with_context(|| format!("freeze collection {id:x} store snapshot"))?;
+    faculties::storage::read_fact_collection(collection, &store_snapshot)
+        .map(|(facts, _)| facts)
         .with_context(|| format!("snapshot collection {id:x}"))
 }
 

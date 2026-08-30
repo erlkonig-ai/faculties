@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use crate::schemas::planner::{
@@ -709,7 +709,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
 }
 
 /// Strictly read a UTF8String attachment.
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
     Ok(text.to_string())
 }
@@ -717,7 +717,7 @@ pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
 /// Validate every selected native record and all of its referenced text
 /// payloads. Preserved legacy and unrelated generic collection facts are not
 /// part of this semantic view.
-pub fn validate_catalog(reader: &PileReader, space: &TribleSet) -> Result<PlannerCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<PlannerCatalog> {
     let catalog = load_catalog(space)?;
     for row in catalog.events.values() {
         let uid = read_text(reader, row.uid)
@@ -740,12 +740,14 @@ pub fn validate_catalog(reader: &PileReader, space: &TribleSet) -> Result<Planne
 /// published. Singular conflicts are checked against the complete current
 /// union; staged attachments are checked from the fragment's own blob store.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<PlannerCatalog> {
     let mut local = fragment.blobs().clone();
-    let local_reader = local.reader().context("snapshot staged Planner payloads")?;
+    let local_reader = local
+        .snapshot()
+        .context("snapshot staged Planner payloads")?;
     for fact in fragment.facts() {
         if fact.a() == &event::ical_uid.id()
             || fact.a() == &event::description.id()

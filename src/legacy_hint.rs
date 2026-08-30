@@ -35,15 +35,15 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::{
-    Collection, CollectionRecord, CollectionStore, CollectionStoreExt,
-};
+use triblespace::core::collection::{Collection, CollectionRead, CollectionRecord};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
+use triblespace::core::repo::{
+    self, BlobStoreGet, CommitHandle, PinSnapshotSource, SnapshotSource,
+};
 use triblespace::core::trible::TribleSet;
 
 use crate::schemas;
@@ -278,17 +278,17 @@ const RETIRED_COLLECTION_SCOPE: Id =
 /// lands on a pile that is broken for the reader anyway; being able to say what
 /// is wrong is worth more there than the scan it takes to find out.
 fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
+    let snapshot = pile.snapshot().ok()?;
     let mut collections = BTreeSet::new();
-    for record in pile.records().ok()? {
+    for record in snapshot.records().ok()? {
         if let Ok(CollectionRecord::Commit(commit)) = record {
             collections.insert(commit.collection());
         }
     }
-    let reader = pile.reader().ok()?;
     for collection in collections {
         // A descriptor that is absent or does not decode says nothing either
         // way, so it is skipped rather than treated as an answer.
-        let Ok(blob) = reader.get::<Blob<SimpleArchive>, _>(collection.transmute()) else {
+        let Ok(blob) = snapshot.get::<Blob<SimpleArchive>, _>(collection.transmute()) else {
             continue;
         };
         let Ok(facts) = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) else {
@@ -307,7 +307,11 @@ fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
 /// Whether one collection has no authority-admitted commits, or `None` if its
 /// descriptor or records cannot be observed.
 fn native_scope_is_empty(pile: &mut Pile, collection: Collection<SimpleArchive>) -> Option<bool> {
-    pile.cover(collection).ok().map(|cover| cover.is_empty())
+    let snapshot = pile.snapshot().ok()?;
+    collection
+        .admitted(&snapshot)
+        .ok()
+        .map(|cover| cover.is_empty())
 }
 
 /// Count authored commits reachable from the head of the legacy branch named
@@ -319,7 +323,7 @@ fn native_scope_is_empty(pile: &mut Pile, collection: Collection<SimpleArchive>)
 /// makes.
 fn legacy_authored_commits(pile: &mut Pile, name: &str) -> Option<(usize, bool)> {
     let head = legacy_branch_head(pile, name)?;
-    let reader = pile.reader().ok()?;
+    let snapshot = pile.snapshot().ok()?;
 
     let mut seen: HashSet<CommitHandle> = HashSet::new();
     let mut queue: VecDeque<CommitHandle> = VecDeque::new();
@@ -333,7 +337,7 @@ fn legacy_authored_commits(pile: &mut Pile, name: &str) -> Option<(usize, bool)>
         if walked > MAX_WALKED_COMMITS {
             return Some((authored, true));
         }
-        let archive: SimpleArchiveBlob = match reader.get(commit) {
+        let archive: SimpleArchiveBlob = match snapshot.get(commit) {
             Ok(archive) => archive,
             Err(_) => continue,
         };
@@ -371,11 +375,11 @@ fn legacy_branch_head(pile: &mut Pile, name: &str) -> Option<CommitHandle> {
         .iter_ordered()
         .filter_map(|raw| Some((Id::new(*raw)?, *snapshot.get(raw)?)))
         .collect();
-    let reader = pile.reader().ok()?;
+    let store_snapshot = pile.snapshot().ok()?;
 
     let mut head = None;
     for (branch, pin) in pins {
-        let Ok(facts): Result<TribleSet, _> = reader.get(pin) else {
+        let Ok(facts): Result<TribleSet, _> = store_snapshot.get(pin) else {
             continue;
         };
         let Ok(entity) = repo::branch::branch_entity(&facts, branch) else {

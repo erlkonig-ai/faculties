@@ -1793,8 +1793,8 @@ mod tests {
 
     use tempfile::TempDir;
     use triblespace::core::metadata;
-    use triblespace::core::repo::pile::{Pile, PileReader};
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::pile::{Pile, PileSnapshot};
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
@@ -1835,12 +1835,12 @@ mod tests {
         }
     }
 
-    fn empty_reader() -> (TempDir, PileReader) {
+    fn empty_reader() -> (TempDir, PileSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.pile");
         File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         pile.close().unwrap();
         (directory, reader)
     }
@@ -1855,7 +1855,7 @@ mod tests {
 
     fn block_with_payload(fragment: &Fragment, needle: &str) -> Id {
         let mut fragment = fragment.clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         for (block, payload) in find!(
             (block: Id, payload: Inline<Handle<UTF8String>>),
             pattern!(fragment.facts(), [
@@ -1903,14 +1903,14 @@ mod tests {
         .next()
         .expect("projection has one exact raw record");
         let mut fragment = fragment.clone();
-        let reader = fragment.blobs_mut().reader().unwrap();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
         let raw: anybytes::Bytes = reader.get(handle).unwrap();
         raw.as_ref().to_vec()
     }
 
     fn source_chunk_raws(fragment: &Fragment) -> Vec<(Id, u128, Bytes)> {
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         find!(
             (
                 chunk: Id,

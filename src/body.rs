@@ -10,10 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
@@ -60,7 +59,7 @@ pub struct BodyCatalog {
 /// that source cover; it is cache exhaust, never additional authority.
 pub struct BodySnapshot {
     facts: TribleSet,
-    reader: PileReader,
+    store_snapshot: PileSnapshot,
     catalog: BodyCatalog,
     intents: LwwIndex,
 }
@@ -71,9 +70,9 @@ impl BodySnapshot {
         &self.facts
     }
 
-    /// Blob reader captured while validating this exact source snapshot.
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
+    /// Store snapshot captured while validating this exact source view.
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
     }
 
     /// Strictly validated Body ontology for this snapshot.
@@ -86,9 +85,9 @@ impl BodySnapshot {
         &self.intents
     }
 
-    /// Consume the coherent snapshot into facts, reader, catalog, and index.
-    pub fn into_parts(self) -> (TribleSet, PileReader, BodyCatalog, LwwIndex) {
-        (self.facts, self.reader, self.catalog, self.intents)
+    /// Consume the coherent snapshot into facts, store snapshot, catalog, and index.
+    pub fn into_parts(self) -> (TribleSet, PileSnapshot, BodyCatalog, LwwIndex) {
+        (self.facts, self.store_snapshot, self.catalog, self.intents)
     }
 }
 
@@ -448,7 +447,7 @@ fn validate_catalog_payloads<B: BlobStoreGet>(reader: &B, catalog: &BodyCatalog)
 }
 
 /// Validate the exact Body ontology and all referenced payloads.
-pub fn validate_catalog(reader: &PileReader, space: &TribleSet) -> Result<BodyCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<BodyCatalog> {
     let catalog = load_catalog(space)?;
     validate_catalog_payloads(reader, &catalog)?;
     Ok(catalog)
@@ -458,7 +457,7 @@ pub fn validate_catalog(reader: &PileReader, space: &TribleSet) -> Result<BodyCa
 /// Staged attachments are read from the fragment first; unchanged handles may
 /// already exist in the durable reader.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<BodyCatalog> {
@@ -467,7 +466,7 @@ pub fn validate_candidate(
     let catalog = load_catalog(&union)?;
 
     let mut local = fragment.blobs().clone();
-    let local_reader = local.reader().context("snapshot staged Body payloads")?;
+    let local_reader = local.snapshot().context("snapshot staged Body payloads")?;
     for row in catalog.captures.values() {
         if let Some(frame) = row.frame {
             if local_reader.metadata(frame)?.is_some() {
@@ -524,17 +523,16 @@ pub fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let snapshot = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("snapshot Body collection: {error}"))?;
-    let (facts, cover, reader) = snapshot.into_parts();
-    let catalog = validate_catalog(&reader, &facts).context("validate Body collection")?;
+    let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Body collection")?;
+    let catalog = validate_catalog(&store_snapshot, &facts).context("validate Body collection")?;
     let intents = intent_register_collection(signer.verifying_key())
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,
-        reader,
+        store_snapshot,
         catalog,
         intents,
     })

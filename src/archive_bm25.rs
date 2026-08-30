@@ -346,6 +346,7 @@ fn validate_part(entity: Id, rows: &[Trible]) -> std::result::Result<(u64, Id), 
         schema::content_part::ordinal.id(),
         schema::content_part::fact.id(),
         schema::content_part::responds_to.id(),
+        schema::content_part::resolution.id(),
     ];
     let nonidentity = [metadata::tag.id()];
     validate_intrinsic_entity(
@@ -544,8 +545,8 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::id::ExclusiveId;
-    use triblespace::core::repo::pile::PileReader;
-    use triblespace::core::repo::{BlobStore, BlobStorePut};
+    use triblespace::core::repo::pile::PileSnapshot;
+    use triblespace::core::repo::{BlobStorePut, SnapshotSource};
     use triblespace::core::trible::Fragment;
     use triblespace::macros::entity;
 
@@ -554,7 +555,7 @@ mod tests {
 
     struct StoredBlobs {
         _directory: TempDir,
-        reader: PileReader,
+        reader: PileSnapshot,
     }
 
     impl StoredBlobs {
@@ -567,7 +568,7 @@ mod tests {
                 pile.put::<UnknownBlob, _>(blob).unwrap();
             }
             pile.flush().unwrap();
-            let reader = pile.reader().unwrap();
+            let reader = pile.snapshot().unwrap();
             pile.close().unwrap();
             Self {
                 _directory: directory,
@@ -580,7 +581,7 @@ mod tests {
         let (facts, mut blobs) = fragment.into_facts_and_blobs();
         let source: Blob<SimpleArchive> = facts.to_blob();
         let attachments = blobs
-            .reader()
+            .snapshot()
             .unwrap()
             .into_iter()
             .map(|(_, blob)| blob)
@@ -606,7 +607,7 @@ mod tests {
         ArchiveBM25Index::try_from_blob(blob).unwrap()
     }
 
-    fn derive(reader: &PileReader, source: Blob<SimpleArchive>) -> Blob<PortableBM25Blob> {
+    fn derive(reader: &PileSnapshot, source: Blob<SimpleArchive>) -> Blob<PortableBM25Blob> {
         derive_element(reader, source).unwrap()
     }
 

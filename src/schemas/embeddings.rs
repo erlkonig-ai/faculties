@@ -233,7 +233,7 @@ pub fn nearest(
         .map_err(|e| anyhow::anyhow!("stage query: {e:?}"))?;
     let idx = builder.build();
     let reader = store
-        .reader()
+        .snapshot()
         .map_err(|e| anyhow::anyhow!("blob reader: {e:?}"))?;
     let view = idx.attach(&reader);
     let candidates = view

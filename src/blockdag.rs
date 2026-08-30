@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
-use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::inline::IntoInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreList};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -61,7 +61,7 @@ type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
 type IntervalValue = Inline<NsTAIInterval>;
 type OrdinalValue = Inline<U256BE>;
-type OverlayReader = <MemoryBlobStore as BlobStore>::Reader;
+type OverlayReader = MemoryBlobStoreSnapshot;
 
 /// Result of validating one exact materialized Archive catalog.
 ///
@@ -1216,7 +1216,7 @@ pub fn validate_catalog_structure(facts: &TribleSet) -> Result<()> {
 }
 
 fn read_text_attachment(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     handle: TextHandle,
 ) -> std::result::Result<Option<String>, String> {
@@ -1250,7 +1250,7 @@ fn read_text_attachment(
 }
 
 fn text_attachment_present(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     handle: TextHandle,
 ) -> std::result::Result<bool, String> {
@@ -1274,7 +1274,7 @@ fn text_attachment_present(
 }
 
 fn raw_attachment_present(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     handle: RawHandle,
 ) -> std::result::Result<bool, String> {
@@ -1387,7 +1387,7 @@ fn validate_source_snapshots(
 }
 
 fn source_chunk_storage_lengths(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     chunks: &BTreeMap<Id, (u128, RawHandle)>,
 ) -> std::result::Result<BTreeMap<RawHandle, u128>, String> {
@@ -1433,7 +1433,7 @@ fn source_chunk_storage_lengths(
 }
 
 fn validate_attachments(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     plan: AttachmentPlan,
 ) -> CatalogValidation {
@@ -1509,7 +1509,7 @@ fn validate_attachments(
 }
 
 fn validate_catalog_with_overlay(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
     facts: &TribleSet,
 ) -> Result<CatalogValidation> {
@@ -1526,7 +1526,7 @@ fn validate_catalog_with_overlay(
 /// malformed data can never be concealed behind a missing blob. A pointer
 /// fact with no `resolved_to` edge is a valid unresolved external asset and is
 /// therefore accepted rather than reported as pending.
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<CatalogValidation> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<CatalogValidation> {
     validate_catalog_with_overlay(reader, None, facts)
 }
 
@@ -1537,7 +1537,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<Catalo
 /// stream, so validation does not rebuild the six in-memory PATCH indexes of
 /// a [`TribleSet`].
 pub fn validate_succinct_catalog(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &UnionArchive<OrderedUniverse>,
 ) -> Result<CatalogValidation> {
     let plan = match validate_succinct_structure(facts) {
@@ -1553,7 +1553,7 @@ pub fn validate_succinct_catalog(
 /// resolve through its immutable in-memory overlay. The returned facts are the
 /// exact candidate set that was validated.
 pub fn validate_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<(TribleSet, CatalogValidation)> {
@@ -1562,7 +1562,7 @@ pub fn validate_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     let validation = validate_catalog_with_overlay(reader, Some(&overlay), &union)?;
     Ok((union, validation))
@@ -1609,12 +1609,12 @@ mod tests {
         .unwrap()
     }
 
-    fn empty_reader() -> (tempfile::TempDir, PileReader) {
+    fn empty_reader() -> (tempfile::TempDir, PileSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.pile");
         File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         pile.close().unwrap();
         (directory, reader)
     }
@@ -1705,7 +1705,7 @@ mod tests {
         )
         .collect();
         let mut blobs = vocabulary.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let values: BTreeSet<String> = names
             .into_iter()
             .map(|name| {

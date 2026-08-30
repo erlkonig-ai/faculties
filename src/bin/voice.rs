@@ -79,8 +79,7 @@ use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 type U256 = Inline<inlineencodings::U256BE>;
@@ -529,7 +528,7 @@ struct VoiceSession<'a> {
     collection: Collection<SimpleArchive>,
     signer: &'a ed25519_dalek::SigningKey,
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl VoiceSession<'_> {
@@ -548,7 +547,7 @@ impl VoiceSession<'_> {
         self.facts += added;
         self.reader = self
             .pile
-            .reader()
+            .snapshot()
             .context("refresh Voice attachment snapshot")?;
         Ok(commit)
     }
@@ -563,18 +562,17 @@ impl VoiceStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
-            let (facts, _ticket, reader) = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_parts())
+            let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Voice collection")?;
-            voice_model::validate_catalog(&reader, &facts)
+            voice_model::validate_catalog(&store_snapshot, &facts)
                 .context("validate native Voice collection")?;
             operation(&mut VoiceSession {
                 pile: &mut pile,
                 collection,
                 signer: &signer,
                 facts,
-                reader,
+                reader: store_snapshot,
             })
         })();
         finish_pile(pile, result)

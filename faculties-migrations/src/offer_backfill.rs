@@ -9,9 +9,9 @@ use triblespace::core::blob::Blob;
 use triblespace::core::collection::{CollectionCommit, CollectionHandle};
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, INLINE_LEN};
-use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{
-    ArtifactHandle, ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStoreList,
+    ArtifactHandle, ArtifactOfferStore, BlobStoreGet, BlobStoreList, SnapshotSource,
 };
 
 /// Offer the complete resident closure a re-seated COMMIT can ask peers for.
@@ -26,9 +26,9 @@ pub(crate) fn offer_reused_commit_closure(
     collection: CollectionHandle,
     commits: &[CollectionCommit],
 ) -> Result<()> {
-    let reader = pile
-        .reader()
-        .context("open reused COMMIT dependency reader")?;
+    let store_snapshot = pile
+        .snapshot()
+        .context("freeze reused COMMIT dependency store snapshot")?;
 
     let mut roots = BTreeSet::from([collection.transmute()]);
     for commit in commits {
@@ -39,7 +39,7 @@ pub(crate) fn offer_reused_commit_closure(
     let mut queued = BTreeSet::new();
     let mut queue = VecDeque::new();
     for root in roots {
-        if !resident(&reader, root)? {
+        if !resident(&store_snapshot, root)? {
             bail!(
                 "reused COMMIT dependency {} is absent",
                 hex::encode_upper(root.raw)
@@ -51,7 +51,7 @@ pub(crate) fn offer_reused_commit_closure(
 
     let mut closure = BTreeSet::new();
     while let Some(handle) = queue.pop_front() {
-        let blob = validate_candidate(&reader, handle)?;
+        let blob = validate_candidate(&store_snapshot, handle)?;
         closure.insert(handle);
 
         // Match the store's canonical conservative child traversal, but keep
@@ -62,21 +62,19 @@ pub(crate) fn offer_reused_commit_closure(
             let mut raw = [0u8; INLINE_LEN];
             raw.copy_from_slice(chunk);
             let child = Inline::<Handle<UnknownBlob>>::new(raw);
-            if !queued.contains(&child) && resident(&reader, child)? {
+            if !queued.contains(&child) && resident(&store_snapshot, child)? {
                 queued.insert(child);
                 queue.push_back(child);
             }
         }
     }
 
+    drop(store_snapshot);
     pile.offer_all(closure)
         .map_err(|error| anyhow!("offer complete reused COMMIT dependency closure: {error}"))
 }
 
-fn resident(
-    reader: &triblespace::core::repo::pile::PileReader,
-    handle: ArtifactHandle,
-) -> Result<bool> {
+fn resident(reader: &PileSnapshot, handle: ArtifactHandle) -> Result<bool> {
     reader.contains_blob(handle).map_err(|error| {
         anyhow!(
             "inspect reused artifact {}: {error}",
@@ -85,10 +83,7 @@ fn resident(
     })
 }
 
-fn validate_candidate(
-    reader: &triblespace::core::repo::pile::PileReader,
-    handle: ArtifactHandle,
-) -> Result<Blob<UnknownBlob>> {
+fn validate_candidate(reader: &PileSnapshot, handle: ArtifactHandle) -> Result<Blob<UnknownBlob>> {
     reader.get(handle).map_err(|error| {
         anyhow!(
             "refusing to offer corrupt reused artifact {}: {error}",

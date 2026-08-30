@@ -8,9 +8,8 @@ use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::{CliRequest, Faculty, Invocation, Param, Spec, Verb};
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::pile::Pile;
-use triblespace::prelude::Id;
+use triblespace::prelude::{Id, SnapshotSource};
 
 const SHARED: &[Param] = &[
     Param::caller("pile", "Path to the pile file to use")
@@ -62,13 +61,14 @@ impl AtlasContext {
 
     fn with_catalog<T>(&mut self, operation: impl FnOnce(&AtlasCatalog) -> Result<T>) -> Result<T> {
         let collection = open_scope(&mut self.pile, DEFAULT_SCOPE_ID, &self.signer)?;
-        let snapshot = self
+        let store_snapshot = self
             .pile
-            .snapshot(collection)
+            .snapshot()
+            .context("freeze native Atlas store snapshot")?;
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
             .context("materialize native Atlas collection")?;
-        let (facts, _, reader) = snapshot.into_parts();
-        let catalog =
-            atlas::load_catalog(&reader, &facts).context("validate native Atlas catalog")?;
+        let catalog = atlas::load_catalog(&store_snapshot, &facts)
+            .context("validate native Atlas catalog")?;
         operation(&catalog)
     }
 

@@ -7,10 +7,8 @@ use ed25519_dalek::SigningKey;
 use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
-use faculties::schemas::compass::latest_status_event;
-#[cfg(test)]
-use faculties::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use faculties::schemas::compass::{latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID};
 use faculties::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use faculties::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
@@ -30,8 +28,9 @@ use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::macros::{find, pattern};
+use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -243,18 +242,15 @@ struct NativeCatalogs {
     habits: habits::Catalog,
     checkpoints: TribleSet,
     checkpoint_register: LwwIndex,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
-fn materialize_scope(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    scope: Id,
+fn read_collection(
+    collection: Collection<SimpleArchive>,
+    store_snapshot: &PileSnapshot,
     label: &str,
-) -> Result<TribleSet> {
-    let collection = open_scope(pile, scope, signer)?;
-    pile.snapshot(collection)
-        .map(|snapshot| snapshot.into_facts())
+) -> Result<(TribleSet, FactCover)> {
+    faculties::storage::read_fact_collection(collection, store_snapshot)
         .map_err(|error| anyhow!("materialize {label} collection: {error}"))
 }
 
@@ -262,24 +258,33 @@ fn materialize_scope(
 /// Collection history and record ordering stop at this boundary: callers see
 /// only their materialized set values.
 fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
-    let relations_facts = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
-    let mail_facts = materialize_scope(pile, signer, MAIL_SCOPE_ID, "Mail")?;
+    let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+    let mail_collection = open_scope(pile, MAIL_SCOPE_ID, signer)?;
     // Teams participates in news but is deliberately not run through
     // `teams::validate_catalog` here: that reads every text payload and every
     // attachment blob, which is far too much work for a path that re-arms
     // after every turn. Orient only reads message identity, state and
     // authorship, all of which are structural.
-    let teams_facts = materialize_scope(pile, signer, TEAMS_SCOPE_ID, "Teams")?;
-    let message_facts = materialize_scope(pile, signer, MESSAGE_SCOPE_ID, "Message")?;
-    let (compass_facts, _compass_reader, compass_status) =
-        compass::materialize_indexed_collection(pile, signer)?.into_parts();
-    let status_facts = materialize_scope(pile, signer, STATUS_SCOPE_ID, "Status")?;
-    let habit_facts = materialize_scope(pile, signer, HABIT_SCOPE_ID, "Habit")?;
-    let (checkpoint_facts, _checkpoint_reader, checkpoint_register) =
-        orient_model::materialize_indexed_collection(pile, signer)?.into_parts();
+    let teams_collection = open_scope(pile, TEAMS_SCOPE_ID, signer)?;
+    let message_collection = open_scope(pile, MESSAGE_SCOPE_ID, signer)?;
+    let compass_collection = open_scope(pile, COMPASS_SCOPE_ID, signer)?;
+    let status_collection = open_scope(pile, STATUS_SCOPE_ID, signer)?;
+    let habit_collection = open_scope(pile, HABIT_SCOPE_ID, signer)?;
+    let checkpoint_collection =
+        open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
     let reader = pile
-        .reader()
-        .map_err(|error| anyhow!("open Orient collection reader: {error}"))?;
+        .snapshot()
+        .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
+
+    let (relations_facts, _) = read_collection(relations_collection, &reader, "Relations")?;
+    let (mail_facts, _) = read_collection(mail_collection, &reader, "Mail")?;
+    let (teams_facts, _) = read_collection(teams_collection, &reader, "Teams")?;
+    let (message_facts, _) = read_collection(message_collection, &reader, "Message")?;
+    let (compass_facts, compass_cover) = read_collection(compass_collection, &reader, "Compass")?;
+    let (status_facts, _) = read_collection(status_collection, &reader, "Status")?;
+    let (habit_facts, _) = read_collection(habit_collection, &reader, "Habit")?;
+    let (checkpoint_facts, checkpoint_cover) =
+        read_collection(checkpoint_collection, &reader, "Orient")?;
 
     relations::validate_catalog(&reader, &relations_facts)
         .map_err(|error| anyhow!("validate Relations collection: {error:#}"))?;
@@ -295,6 +300,13 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
     orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
         .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
+
+    let compass_status = compass::status_register_collection(signer.verifying_key())
+        .ensure_exact(pile, &compass_cover)
+        .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
+    let checkpoint_register = orient_model::checkpoint_register_collection(signer.verifying_key())
+        .ensure_exact(pile, &checkpoint_cover)
+        .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
 
     Ok(NativeCatalogs {
         messages: message_facts,
@@ -896,7 +908,7 @@ fn resolve_native_persona(catalogs: &NativeCatalogs, input: &str) -> Result<Id> 
 }
 
 fn profile_inputs(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     person: Id,
 ) -> Result<Vec<relations::ProfileInput>> {
@@ -943,7 +955,7 @@ fn persona_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<String
 /// same-person components still participate in membership, while an exact id
 /// without a Relations person record simply belongs to no group yet.
 fn group_attention_keys(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     persona: Id,
 ) -> Result<HashSet<String>> {
@@ -1855,12 +1867,16 @@ fn cmd_wake(
     let signer = load_signer(pile, key)?;
     let mut storage = open_pile_strict(pile)?;
     let result = (|| {
-        let memory_facts = materialize_scope(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory")?;
+        let memory_collection = open_scope(&mut storage, MEMORY_SCOPE_ID, &signer)?;
+        let memory_reader = storage
+            .snapshot()
+            .map_err(|error| anyhow!("freeze Memory store snapshot: {error}"))?;
+        let (memory_facts, _) = read_collection(memory_collection, &memory_reader, "Memory")?;
         let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
             .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
         let catalogs = load_native_catalogs(&mut storage, &signer)?;
 
-        let memory_catalog = memory_model::validate_catalog(&catalogs.reader, &memory_facts)
+        let memory_catalog = memory_model::validate_catalog(&memory_reader, &memory_facts)
             .map_err(|error| anyhow!("validate Memory collection: {error:#}"))?;
         let nodes = memory_catalog.node_ids();
         let mut memory = TribleSet::new();
@@ -1870,11 +1886,11 @@ fn cmd_wake(
         let cover = render_cover(
             &memory,
             &TribleSet::new(),
-            &catalogs.reader,
+            &memory_reader,
             &CoverOpts::plain(chars),
         )?;
 
-        let beliefs = wiki_model::cover_fragments(wiki.reader(), wiki.catalog())?;
+        let beliefs = wiki_model::cover_fragments(wiki.store_snapshot(), wiki.catalog())?;
         let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
         Ok((cover, beliefs, goals))
     })();

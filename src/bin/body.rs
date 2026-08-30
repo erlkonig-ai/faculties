@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
@@ -436,13 +436,13 @@ impl BodyStorage<'_> {
         }
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileReader) -> Result<T>) -> Result<T> {
+    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-            let snapshot = pile
-                .snapshot(collection)
+            let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Body collection")?;
-            f(snapshot.facts(), snapshot.reader())
+            f(&facts, &store_snapshot)
         })
     }
 
@@ -704,7 +704,7 @@ fn latest_intent(snapshot: &body_model::BodySnapshot) -> Result<Option<(i128, Id
         return Ok(None);
     };
     let text: View<str> = snapshot
-        .reader()
+        .store_snapshot()
         .get(row.text)
         .map_err(|error| anyhow::anyhow!("read latest intent {:X}: {error}", row.id))?;
     Ok(Some((

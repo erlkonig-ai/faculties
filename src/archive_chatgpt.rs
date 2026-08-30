@@ -20,7 +20,7 @@ use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::import::scanner as sc;
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
@@ -1065,7 +1065,7 @@ fn projected_identity(fragment: &mut Fragment) -> Result<(Id, View<str>, Id)> {
     .ok_or_else(|| anyhow!("source projection {projection:x} has no projected block"))?;
     let reader = fragment
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader construction is infallible");
     let locator: View<str> = reader
         .get(locator)
@@ -1408,7 +1408,7 @@ mod tests {
                 let reader = projection
                     .fragment
                     .blobs_mut()
-                    .reader()
+                    .snapshot()
                     .expect("MemoryBlobStore reader construction is infallible");
                 let raw: Bytes = reader.get(raw).unwrap();
                 Snapshot {
@@ -1687,7 +1687,7 @@ mod tests {
                     let reader = projection
                         .fragment
                         .blobs_mut()
-                        .reader()
+                        .snapshot()
                         .expect("MemoryBlobStore reader construction is infallible");
                     let raw: Bytes = reader.get(raw).unwrap();
                     retained_exact_pointer = raw.view::<str>().is_ok_and(|raw| {

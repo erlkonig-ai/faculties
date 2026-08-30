@@ -1615,11 +1615,10 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
     let result = (|| -> Result<()> {
-        let snapshot = pile
-            .snapshot(collection)
+        let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
             .context("materialize the Voice collection")?;
-        let (facts, _, reader) = snapshot.into_parts();
-        faculties::voice::validate_candidate(&reader, &facts, &fragment)?;
+        faculties::voice::validate_candidate(&store_snapshot, &facts, &fragment)?;
         let mut described = fragment.clone();
         described.describe_with(entity! { metadata::description: "duplex spoke" });
         pile.commit(collection, &signer, described)

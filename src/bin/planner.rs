@@ -25,7 +25,7 @@ use rrule::{RRuleSet, Tz};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -123,7 +123,7 @@ struct PlannerStorage<'a> {
 
 struct LoadedPlanner {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
     catalog: PlannerCatalog,
 }
 
@@ -141,15 +141,14 @@ impl PlannerStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_parts())
+            let store_snapshot = pile.snapshot().context("freeze Planner store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Planner collection")?;
-            let catalog = planner_model::validate_catalog(&reader, &facts)
+            let catalog = planner_model::validate_catalog(&store_snapshot, &facts)
                 .context("validate Planner collection")?;
             let loaded = LoadedPlanner {
                 facts,
-                reader,
+                reader: store_snapshot,
                 catalog,
             };
             operation(&mut pile, collection, &signer, &loaded)
@@ -186,9 +185,10 @@ impl PlannerStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let cover = pile.cover(collection)?;
-            Ok(pile
-                .claims(&cover)?
+            let store_snapshot = pile.snapshot()?;
+            let cover = collection.admitted(&store_snapshot)?;
+            Ok(cover
+                .claims(&store_snapshot)?
                 .iter()
                 .filter(|commit| commit.public_key().raw == author)
                 .count())

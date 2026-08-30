@@ -21,9 +21,9 @@ use std::time::SystemTime;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::observed_union::ObservedIndex;
-use triblespace::core::collection::{Collection, CollectionHandle, CollectionStoreExt, FactCover};
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::BlobStore;
+use triblespace::core::collection::{Collection, CollectionHandle, FactCover};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
@@ -190,7 +190,7 @@ impl DatasetRevision {
 #[derive(Clone, Copy, Debug)]
 pub struct DatasetView<'a> {
     pub facts: &'a TribleSet,
-    pub reader: &'a PileReader,
+    pub reader: &'a PileSnapshot,
     pub revision: DatasetRevision,
     lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
     observed_orders: &'a BTreeMap<Id, ObservedIndex>,
@@ -241,14 +241,14 @@ impl<'a> WidgetContext<'a> {
 /// Borrowed aggregate of ready exact vault epochs plus its viewer cache token.
 #[derive(Clone, Copy)]
 pub struct SecretsView<'a> {
-    pub snapshot: &'a SecretsSnapshot<PileReader>,
+    pub snapshot: &'a SecretsSnapshot<PileSnapshot>,
     pub revision: DatasetRevision,
 }
 
 #[derive(Clone, Debug)]
 struct LoadedDataset {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
     revision: DatasetRevision,
     lww_registers: BTreeMap<(Id, Id), LwwIndex>,
     observed_orders: BTreeMap<Id, ObservedIndex>,
@@ -258,7 +258,7 @@ impl LoadedDataset {
     fn new(
         collection: CollectionHandle,
         facts: TribleSet,
-        reader: PileReader,
+        reader: PileSnapshot,
         lww_registers: BTreeMap<(Id, Id), LwwIndex>,
         observed_orders: BTreeMap<Id, ObservedIndex>,
     ) -> Self {
@@ -656,13 +656,18 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
+        let mut collections = Vec::new();
         for (scope, label) in materialization_scopes(sources) {
             let collection = open_scope(&mut pile, scope, &signer)
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
-            let snapshot = pile
-                .snapshot(collection)
-                .map_err(|error| format!("materialize {label} collection: {error}"))?;
-            let (facts, cover, _reader) = snapshot.into_parts();
+            collections.push((scope, label, collection));
+        }
+        let store_snapshot = pile
+            .snapshot()
+            .map_err(|error| format!("freeze viewer store snapshot: {error}"))?;
+        for (scope, label, collection) in collections {
+            let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+                .map_err(|error| format!("materialize {label} collection: {error:#}"))?;
             by_scope.insert(scope, (collection, facts, cover));
         }
 
@@ -698,11 +703,8 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             })
             .transpose()?;
 
-        let reader = pile
-            .reader()
-            .map_err(|error| format!("open immutable viewer blob snapshot: {error}"))?;
         validate_catalog(
-            &reader,
+            &store_snapshot,
             &by_scope,
             &observed_by_scope,
             sources,
@@ -726,7 +728,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                     LoadedDataset::new(
                         collection.handle(),
                         facts.clone(),
-                        reader.clone(),
+                        store_snapshot.clone(),
                         lww_registers,
                         observed_orders,
                     ),
@@ -746,11 +748,11 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 }
 
 fn validate_catalog(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     by_scope: &BTreeMap<Id, (Collection<SimpleArchive>, TribleSet, FactCover)>,
     observed_by_scope: &BTreeMap<Id, BTreeMap<Id, ObservedIndex>>,
     sources: &BTreeSet<SourceKey>,
-    secrets: Option<&SecretsSnapshot<PileReader>>,
+    secrets: Option<&SecretsSnapshot<PileSnapshot>>,
 ) -> Result<(), String> {
     let facts = |source: SourceKey| {
         let scope = COLLECTION_SOURCE_CATALOG
@@ -1127,7 +1129,8 @@ mod tests {
         let collection =
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let cover_before = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
 
         let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
@@ -1146,7 +1149,8 @@ mod tests {
         let collection =
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let cover_after = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(cover_after, cover_before);
     }

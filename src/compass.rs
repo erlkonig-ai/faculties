@@ -15,8 +15,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterCollection};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -36,7 +36,7 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 /// artifacts are cache exhaust, never additional semantic authority.
 pub struct CompassSnapshot {
     facts: TribleSet,
-    reader: PileReader,
+    store_snapshot: PileSnapshot,
     status: LwwIndex,
 }
 
@@ -46,9 +46,9 @@ impl CompassSnapshot {
         &self.facts
     }
 
-    /// Blob reader captured while validating this exact snapshot.
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
+    /// Store snapshot captured while validating this exact collection view.
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
     }
 
     /// Maintained LWW order attached for this snapshot's source cover.
@@ -56,9 +56,9 @@ impl CompassSnapshot {
         &self.status
     }
 
-    /// Consume the coherent snapshot into facts, blob reader, and status index.
-    pub fn into_parts(self) -> (TribleSet, PileReader, LwwIndex) {
-        (self.facts, self.reader, self.status)
+    /// Consume the coherent snapshot into facts, store snapshot, and status index.
+    pub fn into_parts(self) -> (TribleSet, PileSnapshot, LwwIndex) {
+        (self.facts, self.store_snapshot, self.status)
     }
 }
 
@@ -952,7 +952,7 @@ pub fn priority_ranks(
     ranks
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .map_err(|error| anyhow!("load Compass text: {error:?}"))?;
@@ -963,7 +963,7 @@ pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
 /// Kind names are descriptive catalog sugar and are deliberately excluded:
 /// the legacy CLI emitted some of those handles without retaining their blob,
 /// and a missing label must not make otherwise-complete board data unreadable.
-pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     validate_structure(facts)?;
     for fact in facts {
         if fact.a() == &board::title.id()
@@ -991,7 +991,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 /// are substitutable to every reader and validator. The normal constructors
 /// provide intrinsic idempotence; replay/import paths may retain old ids.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<()> {
@@ -1000,7 +1000,7 @@ pub fn validate_candidate(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot staged Compass attachments")?;
     for fact in fragment.facts() {
         if fact.a() == &board::title.id()
@@ -1024,14 +1024,13 @@ pub fn validate_candidate(
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
-) -> Result<(TribleSet, PileReader)> {
+) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let (facts, _, reader) = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("materialize Compass collection: {error}"))?
-        .into_parts();
-    validate_known_payloads(&reader, &facts)?;
-    Ok((facts, reader))
+    let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Compass collection")?;
+    validate_known_payloads(&store_snapshot, &facts)?;
+    Ok((facts, store_snapshot))
 }
 
 /// Capture Compass facts and attach the maintained status LWW index for that
@@ -1041,17 +1040,16 @@ pub fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let snapshot = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("snapshot Compass collection: {error}"))?;
-    let (facts, cover, reader) = snapshot.into_parts();
-    validate_known_payloads(&reader, &facts)?;
+    let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Compass collection")?;
+    validate_known_payloads(&store_snapshot, &facts)?;
     let status = status_register_collection(signer.verifying_key())
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     Ok(CompassSnapshot {
         facts,
-        reader,
+        store_snapshot,
         status,
     })
 }

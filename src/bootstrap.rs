@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
-use triblespace::core::repo::pile::PileReader;
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
@@ -326,7 +326,7 @@ fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
 
 fn wiki_fragment(
     key: &ed25519_dalek::VerifyingKey,
-    current: Option<(&wiki_model::WikiCatalog, &PileReader)>,
+    current: Option<(&wiki_model::WikiCatalog, &PileSnapshot)>,
 ) -> Result<(Fragment, Vec<Id>)> {
     let (mut out, author) = wiki_model::author_record(key);
 
@@ -492,7 +492,7 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
             .context("materialize Wiki before bootstrap import")?;
         let (wiki, wiki_roots) = wiki_fragment(
             &signer.verifying_key(),
-            Some((wiki_before.catalog(), wiki_before.reader())),
+            Some((wiki_before.catalog(), wiki_before.store_snapshot())),
         )?;
         let seed = PortableSeed {
             wiki,
@@ -537,7 +537,7 @@ mod tests {
     use std::fs::File;
 
     use triblespace::core::collection::discover_collection_records;
-    use triblespace::prelude::CollectionStoreExt;
+    use triblespace::prelude::SnapshotSource;
 
     use super::*;
     use crate::storage::{initialize_signer, load_signer, open_pile_strict};
@@ -641,7 +641,8 @@ mod tests {
             signer.verifying_key(),
         )
         .unwrap();
-        let cover_before = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
@@ -654,7 +655,8 @@ mod tests {
             signer.verifying_key(),
         )
         .unwrap();
-        let cover_after = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
@@ -669,7 +671,8 @@ mod tests {
         );
 
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&store_snapshot).unwrap();
         assert_eq!(records.commits().len(), 2);
         pile.close().unwrap();
     }

@@ -49,8 +49,8 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut, OfferCapture};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, OfferCapture, SnapshotSource};
 use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::entity;
 use triblespace::prelude::{exists, find, pattern};
@@ -164,7 +164,10 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<FindingBridgePlan> 
     let current =
         faculties::collection_names::root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key());
     let current_handle = descriptor_handle(&current);
-    let discovered = discover_collection_records(&mut *pile)
+    let reader = pile
+        .snapshot()
+        .context("freeze Posture bridge store snapshot")?;
+    let discovered = discover_collection_records(&reader)
         .context("discover Posture records for finding bridge")?;
 
     if discovered.commits().iter().any(|commit| {
@@ -182,7 +185,6 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<FindingBridgePlan> 
         .copied()
         .filter(|commit| commit.collection() == retired_handle)
         .collect::<Vec<_>>();
-    let reader = pile.reader().context("open Posture bridge reader")?;
     if !source.is_empty() {
         let resident =
             descriptor_facts(&reader, retired_handle).context("read retired Posture descriptor")?;
@@ -209,7 +211,10 @@ pub(crate) fn audit_retired_for_descriptor(
 ) -> Result<FindingBridgePlan> {
     let retired = retired_root_descriptor(DEFAULT_SCAN_SCOPE_ID, signer.verifying_key())?;
     let retired_handle = descriptor_handle(&retired);
-    let discovered = discover_collection_records(&mut *pile)
+    let reader = pile
+        .snapshot()
+        .context("freeze Posture descriptor-prerequisite store snapshot")?;
+    let discovered = discover_collection_records(&reader)
         .context("discover Posture records for descriptor prerequisite")?;
     let retired_source = discovered
         .commits()
@@ -217,10 +222,6 @@ pub(crate) fn audit_retired_for_descriptor(
         .copied()
         .filter(|commit| commit.collection() == retired_handle)
         .collect::<Vec<_>>();
-    let reader = pile
-        .reader()
-        .context("open Posture descriptor-prerequisite reader")?;
-
     if !retired_source.is_empty() {
         let resident =
             descriptor_facts(&reader, retired_handle).context("read retired Posture descriptor")?;
@@ -289,8 +290,8 @@ fn sorted_blobs(
     mut blobs: triblespace::core::blob::MemoryBlobStore,
 ) -> Result<Vec<Blob<UnknownBlob>>> {
     let mut blobs = blobs
-        .reader()
-        .expect("MemoryBlobStore::reader is infallible")
+        .snapshot()
+        .expect("MemoryBlobStore::snapshot is infallible")
         .into_iter()
         .map(|(_, blob)| blob)
         .collect::<Vec<_>>();
@@ -310,7 +311,7 @@ fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
     }
 }
 
-fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
+fn build(facts: &TribleSet, reader: &PileSnapshot) -> Result<FindingBridgePlan> {
     let mut objects = GitObjects::default();
     let mut fragment = Fragment::empty();
     let mut bridged = BTreeMap::new();
@@ -386,7 +387,7 @@ fn build(facts: &TribleSet, reader: &PileReader) -> Result<FindingBridgePlan> {
 }
 
 /// The repository a git audit recorded as its document, when it named one.
-fn repository_of(facts: &TribleSet, reader: &PileReader, finding: Id) -> Result<Option<PathBuf>> {
+fn repository_of(facts: &TribleSet, reader: &PileSnapshot, finding: Id) -> Result<Option<PathBuf>> {
     let Some(document) = find!(
         document: Id,
         pattern!(facts, [{ finding @ posture::document: ?document }])
@@ -540,7 +541,7 @@ fn unsafe_attribute_location(locator: &str) -> Result<Location> {
     ))
 }
 
-fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
+fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Posture {field}"))?;
@@ -642,7 +643,8 @@ mod tests {
             .expect_err("descriptor-first must not strand a bridgeable finding");
         assert!(error.to_string().contains("bridgeable legacy Posture"));
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         assert_eq!(records.commits().len(), 2);
         assert_eq!(
             records
@@ -682,7 +684,8 @@ mod tests {
         let expected_bridge =
             CollectionCommit::sign(&signer, root.new, bridge.data(), bridge.metadata());
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = discover_collection_records(&snapshot).unwrap();
         assert!(records
             .commits()
             .iter()

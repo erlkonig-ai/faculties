@@ -18,8 +18,8 @@ use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetCo
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
@@ -184,7 +184,7 @@ pub struct WikiCatalog {
 /// its unsigned artifacts are cache exhaust and never additional authority.
 pub struct WikiSnapshot {
     facts: TribleSet,
-    reader: PileReader,
+    store_snapshot: PileSnapshot,
     observed: ObservedIndex,
     catalog: WikiCatalog,
 }
@@ -196,8 +196,8 @@ impl WikiSnapshot {
     }
 
     /// Blob reader captured while validating this exact snapshot.
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
     }
 
     /// Maintained observation order attached for this snapshot's source cover.
@@ -211,8 +211,8 @@ impl WikiSnapshot {
     }
 
     /// Consume the coherent snapshot into its application-facing parts.
-    pub fn into_parts(self) -> (TribleSet, PileReader, ObservedIndex, WikiCatalog) {
-        (self.facts, self.reader, self.observed, self.catalog)
+    pub fn into_parts(self) -> (TribleSet, PileSnapshot, ObservedIndex, WikiCatalog) {
+        (self.facts, self.store_snapshot, self.observed, self.catalog)
     }
 }
 
@@ -747,7 +747,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
     load_catalog_with_order(space, &order)
 }
 
-fn validate_payloads(reader: &PileReader, catalog: &WikiCatalog) -> Result<()> {
+fn validate_payloads(reader: &PileSnapshot, catalog: &WikiCatalog) -> Result<()> {
     for revision in catalog.revisions.revision_records() {
         let title = read_text(reader, revision.title)
             .with_context(|| format!("read Wiki revision {:x} title", revision.id))?;
@@ -775,7 +775,7 @@ fn validate_payloads(reader: &PileReader, catalog: &WikiCatalog) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     for fact in facts {
         if fact.a() == &attrs::title.id()
             || fact.a() == &attrs::content.id()
@@ -794,7 +794,7 @@ pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result
 ///
 /// This is the migration/import and test-oracle boundary. Durable application
 /// reads should use [`materialize_indexed_collection`].
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<WikiCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<WikiCatalog> {
     let catalog = load_catalog(facts)?;
     validate_payloads(reader, &catalog)?;
     Ok(catalog)
@@ -803,7 +803,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<WikiCa
 /// Validate one Wiki fact snapshot using an already attached supersession
 /// order for exactly that snapshot's source cover.
 pub fn validate_catalog_with_order<O>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     order: &O,
 ) -> Result<WikiCatalog>
@@ -863,7 +863,7 @@ pub fn tag_record(name: &str) -> Result<(Fragment, Id, String)> {
     }
 }
 
-pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader.get(handle)?;
     Ok(value.to_string())
 }
@@ -875,7 +875,7 @@ pub fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
 /// erase a tagged head. Callers therefore see the authored revision DAG's
 /// actual frontier rather than a timestamp-selected legacy approximation.
 pub fn cover_fragments(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &WikiCatalog,
 ) -> Result<Vec<(String, String)>> {
     let mut cover_tags = BTreeSet::new();
@@ -922,7 +922,7 @@ pub fn cover_fragments(
 
 /// Display name for a tag id, falling back to the built-in vocabulary and
 /// then to hex, so an unnamed tag still prints something addressable.
-pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
+pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) -> Result<String> {
     match catalog.tag_names.get(&id) {
         Some(handle) => read_text(reader, *handle),
         None => Ok(TAG_SPECS
@@ -988,7 +988,7 @@ pub struct FrontierModel {
 }
 
 impl FrontierModel {
-    pub fn load(catalog: &WikiCatalog, reader: &PileReader, facts: &TribleSet) -> Result<Self> {
+    pub fn load(catalog: &WikiCatalog, reader: &PileSnapshot, facts: &TribleSet) -> Result<Self> {
         let records = catalog.revisions.all_entries();
         let mut entries = Vec::with_capacity(records.len());
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
@@ -1280,21 +1280,20 @@ impl FrontierModel {
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
-) -> Result<(TribleSet, PileReader)> {
+) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let (facts, _, reader) = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("materialize Wiki collection: {error}"))?
-        .into_parts();
-    validate_catalog(&reader, &facts)?;
-    Ok((facts, reader))
+    let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Wiki collection")?;
+    validate_catalog(&store_snapshot, &facts)?;
+    Ok((facts, store_snapshot))
 }
 
 /// Capture and validate one durable Wiki snapshot with its exact maintained
 /// supersession index.
 ///
 /// The source facts, exact cover, and attachment reader come from one
-/// [`CollectionStoreExt::snapshot`] observation. Index maintenance happens
+/// [`SnapshotSource::snapshot`] observation. Index maintenance happens
 /// only afterward and is attached to
 /// that exact cover, so it cannot change which authoritative commits this
 /// read admits even if newer commits arrive concurrently.
@@ -1303,17 +1302,16 @@ pub fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let snapshot = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("snapshot Wiki collection: {error}"))?;
-    let (facts, cover, reader) = snapshot.into_parts();
+    let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Wiki collection")?;
     let observed = observed_collection(signer.verifying_key())
         .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
-    let catalog = validate_catalog_with_order(&reader, &facts, &observed)?;
+    let catalog = validate_catalog_with_order(&store_snapshot, &facts, &observed)?;
     Ok(WikiSnapshot {
         facts,
-        reader,
+        store_snapshot,
         observed,
         catalog,
     })
@@ -1512,9 +1510,11 @@ mod tests {
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
         let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-        let cover_before = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
-        let cover_after_index = pile.cover(collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 

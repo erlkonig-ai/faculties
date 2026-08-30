@@ -18,8 +18,7 @@ use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStore;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -71,7 +70,7 @@ struct StatusStorage<'a> {
 struct Catalogs {
     status: TribleSet,
     relations: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl StatusStorage<'_> {
@@ -101,22 +100,17 @@ impl StatusStorage<'_> {
     }
 }
 
-fn materialize_scope(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    scope: Id,
-    label: &str,
-) -> Result<TribleSet> {
-    let collection = open_scope(pile, scope, signer)?;
-    pile.snapshot(collection)
-        .map(|snapshot| snapshot.into_facts())
-        .with_context(|| format!("materialize authored {label} collection"))
-}
-
 fn load_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Catalogs> {
-    let status_facts = materialize_scope(pile, signer, DEFAULT_SCOPE_ID, "Status")?;
-    let relations_facts = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
-    let reader = pile.reader().context("open Status/Relations blob reader")?;
+    let status_collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+    let reader = pile
+        .snapshot()
+        .context("freeze shared Status/Relations store snapshot")?;
+    let (status_facts, _) = faculties::storage::read_fact_collection(status_collection, &reader)
+        .context("materialize authored Status collection")?;
+    let (relations_facts, _) =
+        faculties::storage::read_fact_collection(relations_collection, &reader)
+            .context("materialize authored Relations collection")?;
     status::validate_catalog(&reader, &status_facts).context("validate Status collection")?;
     relations::validate_catalog(&reader, &relations_facts)
         .context("validate Relations collection")?;
@@ -158,7 +152,7 @@ fn format_age(now: i128, past: i128) -> String {
 /// Exact ids deliberately do not require Relations membership. Labels and
 /// aliases use the complete native Relations read model and fail closed on
 /// ambiguity or a forked profile/lifecycle track.
-fn resolve_window_id(reader: &PileReader, facts: &TribleSet, input: &str) -> Result<Id> {
+fn resolve_window_id(reader: &PileSnapshot, facts: &TribleSet, input: &str) -> Result<Id> {
     let input = input.trim();
     if let Some(id) = Id::from_hex(input) {
         return Ok(id);
@@ -171,7 +165,7 @@ fn resolve_window_id(reader: &PileReader, facts: &TribleSet, input: &str) -> Res
 
 /// Render a Relations label without hiding unsettled state. Unknown anchors
 /// remain valid Status windows and render as their exact id.
-fn window_label(reader: &PileReader, facts: &TribleSet, window: Id) -> Result<String> {
+fn window_label(reader: &PileSnapshot, facts: &TribleSet, window: Id) -> Result<String> {
     if !relations::person_anchors(facts).contains(&window) {
         return Ok(fmt_id(window));
     }
@@ -374,14 +368,10 @@ mod tests {
     fn publish_relations(fixture: &Fixture, fragment: Fragment) {
         storage(fixture)
             .with_pile(|pile, signer| {
-                let current = materialize_scope(pile, signer, RELATIONS_SCOPE_ID, "Relations")?;
-                let reader = pile.reader().unwrap();
+                let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+                let reader = pile.snapshot()?;
+                let (current, _) = faculties::storage::read_fact_collection(collection, &reader)?;
                 relations::validate_catalog_union(&reader, &current, &fragment)?;
-                let collection = faculties::collection_names::open(
-                    &mut *pile,
-                    RELATIONS_SCOPE_ID,
-                    signer.verifying_key(),
-                )?;
                 pile.commit(collection, signer, fragment)?;
                 Ok(())
             })
@@ -455,8 +445,10 @@ mod tests {
                 assert!(rows.is_empty());
 
                 let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-                assert!(pile.cover(collection)?.is_empty());
-                let discovered = triblespace::core::collection::discover_collection_records(pile)?;
+                let store_snapshot = pile.snapshot()?;
+                assert!(collection.admitted(&store_snapshot)?.is_empty());
+                let discovered =
+                    triblespace::core::collection::discover_collection_records(&store_snapshot)?;
                 let resident = discovered
                     .commits()
                     .iter()

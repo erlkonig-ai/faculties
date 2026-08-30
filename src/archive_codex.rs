@@ -806,8 +806,8 @@ mod tests {
 
     use tempfile::TempDir;
     use triblespace::core::metadata;
-    use triblespace::core::repo::pile::{Pile, PileReader};
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::pile::{Pile, PileSnapshot};
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
@@ -846,12 +846,12 @@ mod tests {
         (directory, summary, fragment)
     }
 
-    fn empty_reader() -> (TempDir, PileReader) {
+    fn empty_reader() -> (TempDir, PileSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.pile");
         File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         pile.close().unwrap();
         (directory, reader)
     }
@@ -866,7 +866,7 @@ mod tests {
 
     fn source_chunk_raws(fragment: &Fragment) -> Vec<(Id, u128, Bytes)> {
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         find!(
             (
                 chunk: Id,
@@ -1021,7 +1021,7 @@ mod tests {
         .collect();
         assert_eq!(thinking_payloads.len(), 1);
         let mut blobs = fragment.blobs().clone();
-        let blob_reader = blobs.reader().unwrap();
+        let blob_reader = blobs.snapshot().unwrap();
         let reasoning = blob_reader
             .get::<View<str>, UTF8String>(thinking_payloads[0])
             .unwrap();

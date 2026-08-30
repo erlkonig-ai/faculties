@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreList};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList};
 use triblespace::prelude::*;
 
 use crate::schemas::status::{status, KIND_STATUS_UPDATE};
@@ -283,7 +283,7 @@ where
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     for handle in handles {
         load_text_overlay(reader, &overlay, handle)?;
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn staged_attachment_validates_before_publication() {
         let mut storage = MemoryRepo::default();
-        let reader = storage.reader().unwrap();
+        let reader = storage.snapshot().unwrap();
         let fragment = status_fragment(id(2), "staged", at(20.0)).unwrap();
         let expected = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert_eq!(expected, fragment.facts().clone());
@@ -377,7 +377,7 @@ mod tests {
         let missing: TextHandle = Inline::new([0xA5; 32]);
         let missing_record = status_record(id(3), missing, at(30.0));
         let mut storage = MemoryRepo::default();
-        let reader = storage.reader().unwrap();
+        let reader = storage.snapshot().unwrap();
         assert!(format!(
             "{:#}",
             validate_catalog(&reader, missing_record.facts()).unwrap_err()
@@ -387,7 +387,7 @@ mod tests {
         let invalid = Blob::<blobencodings::UTF8String>::new(Bytes::from(vec![0xFF]));
         let invalid_handle = invalid.get_handle();
         storage.blobs.insert(invalid);
-        let reader = storage.reader().unwrap();
+        let reader = storage.snapshot().unwrap();
         let invalid_record = status_record(id(4), invalid_handle, at(31.0));
         assert!(validate_catalog(&reader, invalid_record.facts()).is_err());
     }
@@ -396,7 +396,7 @@ mod tests {
     fn catalog_ignores_legacy_and_unrelated_facts_but_rejects_malformed_canonical_events() {
         let mut storage = MemoryRepo::default();
         let text: TextHandle = storage.put("legacy".to_owned()).unwrap();
-        let reader = storage.reader().unwrap();
+        let reader = storage.snapshot().unwrap();
         let legacy = ufoid();
         let random = entity! { &legacy @
             metadata::tag: &KIND_STATUS_UPDATE,

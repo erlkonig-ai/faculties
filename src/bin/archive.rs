@@ -32,6 +32,7 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::trible::{Fragment, TribleSet};
 
 #[derive(Parser)]
@@ -142,9 +143,9 @@ impl ArchiveStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
-            let facts = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_facts())
+            let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
+            let facts = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .map(|(facts, _)| facts)
                 .context("materialize Comb cursor collection")?;
             let catalog =
                 comb_model::load_catalog(&facts).context("validate Comb cursor collection")?;
@@ -907,9 +908,9 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
     let mut pile = open_pile_strict(storage.pile)?;
     let result = (|| {
         let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
-        let current = pile
-            .snapshot(collection)
-            .map(|snapshot| snapshot.into_facts())
+        let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
+        let current = faculties::storage::read_fact_collection(collection, &store_snapshot)
+            .map(|(facts, _)| facts)
             .context("materialize Comb cursor collection before publication")?;
         validate_cursor_update(&current, &fragment)?;
         pile.commit(collection, &signer, fragment)

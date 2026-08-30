@@ -14,8 +14,8 @@ use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
@@ -631,7 +631,7 @@ pub fn coverage_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
 }
 
 pub fn coverage_head(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source: Id,
 ) -> Result<Option<CoverageHead>> {
@@ -867,7 +867,7 @@ pub fn source_ids(catalog: &TribleSet) -> BTreeSet<Id> {
 }
 
 /// Decode the exact tenant coordinate of a native source.
-pub fn source_label(reader: &PileReader, catalog: &TribleSet, source: Id) -> Result<String> {
+pub fn source_label(reader: &PileSnapshot, catalog: &TribleSet, source: Id) -> Result<String> {
     let handle = one_required(
         find!(
             value: TextHandle,
@@ -882,7 +882,7 @@ pub fn source_label(reader: &PileReader, catalog: &TribleSet, source: Id) -> Res
 /// Decode every source-scoped chat identity without choosing among conflicting
 /// values. Structural ambiguity is an error, not a display-name fallback.
 pub fn chat_labels(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     source: Id,
 ) -> Result<BTreeMap<Id, String>> {
@@ -1394,7 +1394,7 @@ fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
 }
 
 fn read_utf8string(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
@@ -1405,13 +1405,13 @@ fn read_utf8string(
 }
 
 /// Decode one Teams text attachment with field-specific context.
-pub fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
+pub fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
     read_utf8string(reader, handle, field)
 }
 
 /// Validate a prospective signed member before it reaches append-only storage.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &TribleSet,
     fragment: &Fragment,
 ) -> Result<()> {
@@ -1820,12 +1820,12 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
 }
 
 fn validate_fragment_payloads(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     fragment: &Fragment,
     catalog: &TribleSet,
 ) -> Result<()> {
     let mut local = fragment.blobs().clone();
-    let local = local.reader().context("snapshot Teams page payloads")?;
+    let local = local.snapshot().context("snapshot Teams page payloads")?;
     let text_attributes = text_attributes();
     for fact in fragment.facts() {
         if text_attributes.contains(fact.a()) {
@@ -1894,7 +1894,7 @@ fn validate_fragment_payloads(
 
 /// Validate the complete materialized Teams collection and all referenced
 /// payload bytes.
-pub fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> {
+pub fn validate_catalog(reader: &PileSnapshot, catalog: &TribleSet) -> Result<()> {
     reject_retired_oauth_evidence(catalog)?;
     // Native Teams meaning is rooted in source-scoped coverage receipts,
     // presentation contexts, and auth profiles. Historical facts copied by a
@@ -1902,7 +1902,7 @@ pub fn validate_catalog(reader: &PileReader, catalog: &TribleSet) -> Result<()> 
     let active = active_catalog(catalog);
     validate_known_payloads(reader, &active)?;
     validate_catalog_structure(&active)?;
-    validate_attachment_payload_sizes(reader, None::<&PileReader>, &active)?;
+    validate_attachment_payload_sizes(reader, None::<&PileSnapshot>, &active)?;
 
     let sources = find!(
         source: Id,
@@ -2191,7 +2191,7 @@ fn validate_catalog_structure(catalog: &TribleSet) -> Result<()> {
     Ok(())
 }
 
-fn validate_known_payloads(reader: &PileReader, catalog: &TribleSet) -> Result<()> {
+fn validate_known_payloads(reader: &PileSnapshot, catalog: &TribleSet) -> Result<()> {
     let text_attributes = text_attributes();
     for fact in catalog {
         if text_attributes.contains(fact.a()) {
@@ -2205,7 +2205,7 @@ fn validate_known_payloads(reader: &PileReader, catalog: &TribleSet) -> Result<(
 }
 
 fn validate_attachment_payload_sizes<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     catalog: &TribleSet,
 ) -> Result<()>
@@ -2928,7 +2928,7 @@ mod tests {
         let path = directory.path().join("retired-oauth.pile");
         std::fs::File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let error = validate_catalog(&reader, retired.facts()).unwrap_err();
         assert!(error
             .to_string()
@@ -3079,10 +3079,10 @@ mod tests {
                     std::fs::File::create(&path).unwrap();
                     let mut pile = Pile::open(&path).unwrap();
                     let mut blobs = forked.blobs().clone();
-                    for (_, blob) in blobs.reader().unwrap() {
+                    for (_, blob) in blobs.snapshot().unwrap() {
                         pile.put::<UnknownBlob, _>(blob).unwrap();
                     }
-                    pile.reader().unwrap()
+                    pile.snapshot().unwrap()
                 },
                 root_record.scopes,
                 "test scopes",
@@ -3112,10 +3112,10 @@ mod tests {
         std::fs::File::create(&pile_path).unwrap();
         let mut pile = Pile::open(&pile_path).unwrap();
         let mut blobs = forked.blobs().clone();
-        for (_, blob) in blobs.reader().unwrap() {
+        for (_, blob) in blobs.snapshot().unwrap() {
             pile.put::<UnknownBlob, _>(blob).unwrap();
         }
-        validate_catalog(&pile.reader().unwrap(), forked.facts()).unwrap();
+        validate_catalog(&pile.snapshot().unwrap(), forked.facts()).unwrap();
     }
 
     #[test]
@@ -3191,10 +3191,10 @@ mod tests {
         std::fs::File::create(&pile_path).unwrap();
         let mut pile = Pile::open(&pile_path).unwrap();
         let mut blobs = catalog.blobs().clone();
-        for (_, blob) in blobs.reader().unwrap() {
+        for (_, blob) in blobs.snapshot().unwrap() {
             pile.put::<UnknownBlob, _>(blob).unwrap();
         }
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         validate_catalog(&reader, catalog.facts()).unwrap();
 
         assert_eq!(

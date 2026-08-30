@@ -64,8 +64,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -1881,7 +1881,7 @@ struct PostureStorage<'a> {
 #[derive(Debug)]
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl PostureStorage<'_> {
@@ -1892,11 +1892,15 @@ impl PostureStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_parts())
+            let store_snapshot = pile
+                .snapshot()
+                .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .with_context(|| format!("materialize authored Posture {label} collection"))?;
-            Ok(CollectionView { facts, reader })
+            Ok(CollectionView {
+                facts,
+                reader: store_snapshot,
+            })
         })();
         finish_pile(pile, result)
     }
@@ -1910,9 +1914,12 @@ impl PostureStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
-            let (_, commits) = pile
-                .snapshot_with_admission::<TribleSet, _>(collection)
-                .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
+            let store_snapshot = pile
+                .snapshot()
+                .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
+            let (_, _, commits) =
+                faculties::storage::read_fact_collection_with_claims(collection, &store_snapshot)
+                    .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
             Ok(commits
                 .iter()
                 .copied()
@@ -1968,7 +1975,7 @@ impl PostureStorage<'_> {
                 validate_scan_commits(reader, commits, scan)?;
                 let mut staged_blobs = fragment.blobs().clone();
                 let staged = staged_blobs
-                    .reader()
+                    .snapshot()
                     .context("snapshot staged Posture scan payloads")?;
                 // Only the fragment being written is validated. The accumulated
                 // past is not re-judged against today's schema.
@@ -1989,7 +1996,7 @@ impl PostureStorage<'_> {
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &TribleSet,
-            &PileReader,
+            &PileSnapshot,
             &[CollectionCommit],
         ) -> Result<T>,
     ) -> Result<T> {
@@ -1997,10 +2004,12 @@ impl PostureStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
-            let (snapshot, commits) = pile
-                .snapshot_with_admission(collection)
-                .with_context(|| format!("materialize authored Posture {label} collection"))?;
-            let (facts, _, reader) = snapshot.into_parts();
+            let reader = pile
+                .snapshot()
+                .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
+            let (facts, _, commits) =
+                faculties::storage::read_fact_collection_with_claims(collection, &reader)
+                    .with_context(|| format!("materialize authored Posture {label} collection"))?;
             operation(&mut pile, collection, &signer, &facts, &reader, &commits)
         })();
         finish_pile(pile, result)
@@ -2019,7 +2028,7 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
-fn read_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
+fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Posture {field} payload"))?;
@@ -2157,7 +2166,7 @@ fn text_attribute_ids() -> HashSet<Id> {
 }
 
 fn read_text_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     handle: TextHandle,
     field: &str,
@@ -2181,7 +2190,7 @@ where
 }
 
 fn validate_known_payloads_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     facts: &TribleSet,
 ) -> Result<()>
@@ -2228,7 +2237,7 @@ fn validate_policy_view(view: &CollectionView) -> Result<()> {
 /// store the past was valid when it was written; validation belongs in
 /// migrations and at the moment of writing, never on a read path.
 fn validate_scan_commits(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     commits: &[CollectionCommit],
     writing: Id,
 ) -> Result<()> {
@@ -2306,7 +2315,7 @@ fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
 }
 
 fn validate_scan_catalog_with<R>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     staged: Option<&R>,
     facts: &TribleSet,
 ) -> Result<()>
@@ -3186,7 +3195,7 @@ fn legacy_bridges(facts: &TribleSet) -> BTreeMap<Id, BTreeSet<Id>> {
 /// the finding visible; set union therefore exposes disagreement instead of
 /// choosing a winner by time or iteration order.
 fn settled_findings(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     facts: &TribleSet,
     bridges: BTreeMap<Id, BTreeSet<Id>>,
 ) -> Result<Settled> {
@@ -3253,7 +3262,7 @@ fn settled_findings(
 }
 
 #[cfg(test)]
-fn benign_occurrences(reader: &PileReader, facts: &TribleSet) -> Result<BTreeSet<Id>> {
+fn benign_occurrences(reader: &PileSnapshot, facts: &TribleSet) -> Result<BTreeSet<Id>> {
     Ok(settled_findings(reader, facts, BTreeMap::new())?.ordinary)
 }
 
@@ -3556,7 +3565,7 @@ fn append_channel(fragment: &mut Fragment, name: &str) -> Id {
     id
 }
 
-fn channel_by_name(reader: &PileReader, space: &TribleSet, raw: &str) -> Result<Option<Id>> {
+fn channel_by_name(reader: &PileSnapshot, space: &TribleSet, raw: &str) -> Result<Option<Id>> {
     let wanted = canonical_channel(raw)?;
     let mut matches = Vec::new();
     for (channel, name) in find!(
@@ -3683,7 +3692,7 @@ fn policy_members(space: &TribleSet, channel: Id) -> Result<(Option<Id>, BTreeSe
 /// historical assertions; only the next policy snapshot chooses one role.
 #[cfg(any(feature = "local-embed", test))]
 fn take_exemplars_with_body(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     space: &TribleSet,
     members: &mut BTreeSet<Id>,
     body: &str,
@@ -3712,7 +3721,7 @@ fn take_exemplars_with_body(
 }
 
 fn channel_terms(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     space: &TribleSet,
     channel: Id,
 ) -> Result<Vec<(String, String)>> {
@@ -6847,8 +6856,9 @@ mod tests {
             .is_empty());
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
         let records =
-            triblespace::core::collection::discover_collection_records(&mut pile).unwrap();
+            triblespace::core::collection::discover_collection_records(&store_snapshot).unwrap();
         let stored = records
             .commits()
             .iter()

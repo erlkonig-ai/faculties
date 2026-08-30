@@ -12,7 +12,7 @@ use faculties::cognition;
 use faculties::legacy_hint::open_scope;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::repo::SnapshotSource;
 
 #[derive(Parser)]
 #[command(
@@ -42,11 +42,10 @@ fn check(cli: &Cli) -> Result<()> {
     let mut pile = open_pile_strict(&cli.pile)?;
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let snapshot = pile
-            .snapshot(collection)
+        let store_snapshot = pile.snapshot().context("freeze Cognition store snapshot")?;
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
             .context("materialize native Cognition collection")?;
-        let (facts, _, reader) = snapshot.into_parts();
-        cognition::validate_catalog(&reader, &facts)?;
+        cognition::validate_catalog(&store_snapshot, &facts)?;
         println!(
             "Cognition scope {DEFAULT_SCOPE_ID:X}: {} facts validated",
             facts.len()

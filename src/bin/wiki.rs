@@ -19,7 +19,7 @@ use faculties::wiki::{
 #[cfg(test)]
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[cfg(feature = "local-embed")]
@@ -222,12 +222,12 @@ struct WikiStorage<'a> {
 #[cfg(feature = "local-embed")]
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct WikiView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
     catalog: WikiCatalog,
 }
 
@@ -254,11 +254,15 @@ impl WikiStorage<'_> {
     fn scope_view(&self, scope: Id, label: &str) -> Result<CollectionView> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, scope, signer)?;
-            let (facts, _, reader) = pile
-                .snapshot(collection)
-                .with_context(|| format!("materialize {label} collection"))?
-                .into_parts();
-            Ok(CollectionView { facts, reader })
+            let store_snapshot = pile
+                .snapshot()
+                .with_context(|| format!("freeze {label} store snapshot"))?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+                .with_context(|| format!("materialize {label} collection"))?;
+            Ok(CollectionView {
+                facts,
+                reader: store_snapshot,
+            })
         })
     }
 
@@ -392,15 +396,19 @@ fn mutation_entry<'a>(model: &'a RevisionReadModel, raw: &str) -> Result<&'a Ent
     }
 }
 
-fn read_string(reader: &PileReader, handle: schema::TextHandle) -> Result<String> {
+fn read_string(reader: &PileSnapshot, handle: schema::TextHandle) -> Result<String> {
     wiki_model::read_text(reader, handle)
 }
 
-fn tag_name(catalog: &WikiCatalog, reader: &PileReader, id: Id) -> Result<String> {
+fn tag_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) -> Result<String> {
     wiki_model::tag_display_name(catalog, reader, id)
 }
 
-fn format_tags(catalog: &WikiCatalog, reader: &PileReader, tags: &BTreeSet<Id>) -> Result<String> {
+fn format_tags(
+    catalog: &WikiCatalog,
+    reader: &PileSnapshot,
+    tags: &BTreeSet<Id>,
+) -> Result<String> {
     let mut names = Vec::new();
     for tag in tags {
         names.push(tag_name(catalog, reader, *tag)?);
@@ -414,7 +422,7 @@ fn format_tags(catalog: &WikiCatalog, reader: &PileReader, tags: &BTreeSet<Id>) 
 
 fn resolve_tags(
     catalog: &WikiCatalog,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     names: &[String],
     fragment: &mut Fragment,
 ) -> Result<BTreeSet<Id>> {
@@ -511,8 +519,9 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
 fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
     storage.with_pile(|pile, signer| {
         let collection = open_scope(pile, FILES_SCOPE_ID, signer)?;
-        pile.snapshot(collection)
-            .map(|snapshot| snapshot.into_facts())
+        let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
+        faculties::storage::read_fact_collection(collection, &store_snapshot)
+            .map(|(facts, _)| facts)
             .context("materialize Files collection")
     })
 }
@@ -677,11 +686,11 @@ fn prepare_content(
     Ok(content)
 }
 
-fn revision_title(reader: &PileReader, revision: &RevisionRecord) -> Result<String> {
+fn revision_title(reader: &PileSnapshot, revision: &RevisionRecord) -> Result<String> {
     read_string(reader, revision.title)
 }
 
-fn revision_content(reader: &PileReader, revision: &RevisionRecord) -> Result<String> {
+fn revision_content(reader: &PileSnapshot, revision: &RevisionRecord) -> Result<String> {
     read_string(reader, revision.content)
 }
 
@@ -753,7 +762,7 @@ fn cmd_edit(
 }
 
 fn print_revision(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     catalog: &WikiCatalog,
     revision: &RevisionRecord,
 ) -> Result<()> {
@@ -954,7 +963,7 @@ fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<()> {
 }
 
 /// Link targets cited by one immutable revision.
-fn revision_links(reader: &PileReader, revision: &RevisionRecord) -> Result<BTreeSet<Id>> {
+fn revision_links(reader: &PileSnapshot, revision: &RevisionRecord) -> Result<BTreeSet<Id>> {
     let mut out = BTreeSet::new();
     for raw in extract_link_targets(&revision_content(reader, revision)?) {
         if let Some(id) = Id::from_hex(&raw) {
@@ -964,7 +973,7 @@ fn revision_links(reader: &PileReader, revision: &RevisionRecord) -> Result<BTre
     Ok(out)
 }
 
-fn derived_links(reader: &PileReader, entry: &EntryRecord) -> Result<BTreeSet<Id>> {
+fn derived_links(reader: &PileSnapshot, entry: &EntryRecord) -> Result<BTreeSet<Id>> {
     let mut out = BTreeSet::new();
     for head in &entry.frontier {
         out.extend(revision_links(reader, head)?);
@@ -986,7 +995,7 @@ struct BacklinkSummary {
 /// A1 cited X and A2 removed it, an entry-scoped index still reports "A cites
 /// X", which A's current text does not say.
 fn backlink_summaries(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     revisions: &RevisionReadModel,
 ) -> Result<BTreeMap<Id, BacklinkSummary>> {
     let expression = regex::Regex::new(
@@ -1217,7 +1226,7 @@ fn short(value: &str, chars: usize) -> String {
 /// exactly true — A1 did — and `wiki show <A1>`, which follows the entry
 /// forward, shows whether A's current text still does.
 fn incoming_revisions(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     revisions: &RevisionReadModel,
     entry: &EntryRecord,
 ) -> Result<Vec<Id>> {

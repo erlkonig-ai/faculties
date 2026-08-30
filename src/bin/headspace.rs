@@ -16,7 +16,7 @@ use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -157,7 +157,7 @@ struct SecretSetArgs {
 
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct Views {
@@ -191,14 +191,19 @@ impl Storage<'_> {
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
         let collection = open_scope(pile, scope, &self.signer)?;
-        let (facts, _, reader) = pile
-            .snapshot(collection)
-            .with_context(|| format!("materialize {label} collection"))?
-            .into_parts();
-        Ok(CollectionView { facts, reader })
+        let store_snapshot = pile
+            .snapshot()
+            .with_context(|| format!("freeze {label} store snapshot"))?;
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+            .with_context(|| format!("materialize {label} collection"))?;
+        Ok(CollectionView {
+            facts,
+            reader: store_snapshot,
+        })
     }
 
     fn views(&self) -> Result<Views> {
+        let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
         let secrets = {
             let mut pile = self.pile.borrow_mut();
             let pile = pile
@@ -207,7 +212,6 @@ impl Storage<'_> {
             vaults::discover_local_vaults(pile, &self.signer)
                 .context("discover readable Secrets vaults")?
         };
-        let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
         let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
             .context("validate Headspace collection")?;
         headspace::validate_secret_references(&catalog, secrets.snapshot())

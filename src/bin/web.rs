@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
@@ -267,7 +267,7 @@ struct WebStorage<'a> {
 
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl WebStorage<'_> {
@@ -279,11 +279,15 @@ impl WebStorage<'_> {
         label: &str,
     ) -> Result<CollectionView> {
         let collection = open_scope(pile, scope, signer)?;
-        let (facts, _, reader) = pile
-            .snapshot(collection)
-            .with_context(|| format!("materialize {label} collection"))?
-            .into_parts();
-        Ok(CollectionView { facts, reader })
+        let store_snapshot = pile
+            .snapshot()
+            .with_context(|| format!("freeze {label} store snapshot"))?;
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
+            .with_context(|| format!("materialize {label} collection"))?;
+        Ok(CollectionView {
+            facts,
+            reader: store_snapshot,
+        })
     }
 
     /// Resolve Headspace once and decrypt exactly the credential versions it
@@ -292,10 +296,10 @@ impl WebStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
-                .context("discover readable Secrets vaults")?;
             let headspace =
                 self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
+            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
+                .context("discover readable Secrets vaults")?;
             let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
                 .context("validate Headspace collection")?;
             headspace::validate_secret_references(&catalog, secrets.snapshot())
@@ -767,7 +771,9 @@ mod tests {
         let collection =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let facts = pile.snapshot(collection).unwrap().into_facts();
+        let store_snapshot = pile.snapshot().unwrap();
+        let (facts, _) =
+            faculties::storage::read_fact_collection(collection, &store_snapshot).unwrap();
         assert_eq!(
             find!(
                 (entity: Id),

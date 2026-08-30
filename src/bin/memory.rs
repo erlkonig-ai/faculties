@@ -32,10 +32,10 @@ use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+use triblespace::prelude::blobencodings::{RawBytes, SimpleArchive, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -86,7 +86,7 @@ struct MemoryStorage<'a> {
 
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct LoadedMemory {
@@ -111,15 +111,13 @@ struct LoadedProvenance {
 }
 
 impl MemoryStorage<'_> {
-    fn materialize_scope(
-        pile: &mut Pile,
-        signer: &ed25519_dalek::SigningKey,
-        scope: Id,
+    fn materialize_collection(
+        collection: Collection<SimpleArchive>,
+        store_snapshot: &PileSnapshot,
         label: &str,
     ) -> Result<TribleSet> {
-        let collection = open_scope(pile, scope, signer)?;
-        pile.snapshot(collection)
-            .map(|snapshot| snapshot.into_facts())
+        faculties::storage::read_fact_collection(collection, store_snapshot)
+            .map(|(facts, _)| facts)
             .with_context(|| format!("materialize authored {label} collection"))
     }
 
@@ -135,13 +133,12 @@ impl MemoryStorage<'_> {
         }
     }
 
-    fn load_memory_from_pile(
-        pile: &mut Pile,
-        signer: &ed25519_dalek::SigningKey,
+    fn load_memory_from_snapshot(
+        collection: Collection<SimpleArchive>,
+        store_snapshot: &PileSnapshot,
     ) -> Result<LoadedMemory> {
-        let materialized = Self::materialize_scope(pile, signer, MEMORY_SCOPE_ID, "Memory")?;
-        let reader = pile.reader().context("open Memory blob reader")?;
-        let catalog = memory_model::validate_catalog(&reader, &materialized)
+        let materialized = Self::materialize_collection(collection, store_snapshot, "Memory")?;
+        let catalog = memory_model::validate_catalog(store_snapshot, &materialized)
             .context("validate Memory collection")?;
         // The collection remains an exact additive ledger.  Ordinary Memory
         // commands consume its canonical projection so preserved random-id
@@ -152,7 +149,10 @@ impl MemoryStorage<'_> {
         for fact in materialized.iter().filter(|fact| nodes.contains(fact.e())) {
             facts.insert(fact);
         }
-        let memory = CollectionView { facts, reader };
+        let memory = CollectionView {
+            facts,
+            reader: store_snapshot.clone(),
+        };
         Ok(LoadedMemory { memory, catalog })
     }
 
@@ -160,7 +160,11 @@ impl MemoryStorage<'_> {
     fn load(&self) -> Result<LoadedMemory> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = Self::load_memory_from_pile(&mut pile, &signer);
+        let result = (|| {
+            let collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let store_snapshot = pile.snapshot().context("freeze Memory store snapshot")?;
+            Self::load_memory_from_snapshot(collection, &store_snapshot)
+        })();
         Self::finish_pile(pile, result)
     }
 
@@ -170,20 +174,25 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
-            let facts = if with_embeddings {
-                Self::materialize_scope(
-                    &mut pile,
-                    &signer,
-                    EMBEDDINGS_SCOPE_ID,
-                    "shared Embeddings",
-                )?
+            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let embeddings_collection = if with_embeddings {
+                Some(open_scope(&mut pile, EMBEDDINGS_SCOPE_ID, &signer)?)
             } else {
-                TribleSet::new()
+                None
             };
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze Memory/Embeddings store snapshot")?;
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let facts = embeddings_collection
+                .map(|collection| {
+                    Self::materialize_collection(collection, &store_snapshot, "shared Embeddings")
+                })
+                .transpose()?
+                .unwrap_or_default();
             let embeddings = CollectionView {
                 facts,
-                reader: memory.memory.reader.clone(),
+                reader: store_snapshot,
             };
             Ok(LoadedContext { memory, embeddings })
         })();
@@ -195,11 +204,16 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
-            let facts = Self::materialize_scope(&mut pile, &signer, DEFAULT_COMB_SCOPE_ID, "Comb")?;
+            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let comb_collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze Memory/Comb store snapshot")?;
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let facts = Self::materialize_collection(comb_collection, &store_snapshot, "Comb")?;
             let comb = CollectionView {
                 facts,
-                reader: memory.memory.reader.clone(),
+                reader: store_snapshot,
             };
             let comb_catalog =
                 comb_model::load_catalog(&comb.facts).context("validate Comb collection")?;
@@ -217,21 +231,20 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory = Self::load_memory_from_pile(&mut pile, &signer)?;
-            let cognition_facts = Self::materialize_scope(
-                &mut pile,
-                &signer,
-                cognition_schema::DEFAULT_SCOPE_ID,
-                "Cognition",
-            )?;
-            let archive_facts = Self::materialize_scope(
-                &mut pile,
-                &signer,
-                archive_schema::DEFAULT_SCOPE_ID,
-                "Archive",
-            )?;
-            let reader = memory.memory.reader.clone();
-            match blockdag::validate_catalog(&reader, &archive_facts)
+            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let cognition_collection =
+                open_scope(&mut pile, cognition_schema::DEFAULT_SCOPE_ID, &signer)?;
+            let archive_collection =
+                open_scope(&mut pile, archive_schema::DEFAULT_SCOPE_ID, &signer)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze Memory/Cognition/Archive store snapshot")?;
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let cognition_facts =
+                Self::materialize_collection(cognition_collection, &store_snapshot, "Cognition")?;
+            let archive_facts =
+                Self::materialize_collection(archive_collection, &store_snapshot, "Archive")?;
+            match blockdag::validate_catalog(&store_snapshot, &archive_facts)
                 .context("validate Archive collection for Memory provenance")?
             {
                 CatalogValidation::Accepted => {}
@@ -247,11 +260,11 @@ impl MemoryStorage<'_> {
                 memory,
                 cognition: CollectionView {
                     facts: cognition_facts,
-                    reader: reader.clone(),
+                    reader: store_snapshot.clone(),
                 },
                 archive: CollectionView {
                     facts: archive_facts,
-                    reader,
+                    reader: store_snapshot,
                 },
             })
         })();
@@ -262,11 +275,13 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let current = Self::materialize_scope(&mut pile, &signer, MEMORY_SCOPE_ID, "Memory")?;
-            let reader = pile.reader().context("open Memory mutation reader")?;
-            memory_model::validate_candidate(&reader, &current, &fragment)
-                .context("validate Memory mutation")?;
             let collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze Memory mutation store snapshot")?;
+            let current = Self::materialize_collection(collection, &store_snapshot, "Memory")?;
+            memory_model::validate_candidate(&store_snapshot, &current, &fragment)
+                .context("validate Memory mutation")?;
             pile.commit(collection, &signer, fragment)
                 .context("commit authored Memory fragment")?;
             Ok(())
@@ -291,11 +306,13 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let mut candidate =
-                Self::materialize_scope(&mut pile, &signer, DEFAULT_COMB_SCOPE_ID, "Comb")?;
+            let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze Comb mutation store snapshot")?;
+            let mut candidate = Self::materialize_collection(collection, &store_snapshot, "Comb")?;
             candidate += fragment.facts().clone();
             comb_model::load_catalog(&candidate).context("validate Comb mutation")?;
-            let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
             pile.commit(collection, &signer, fragment)
                 .context("commit authored Comb cursor")?;
             Ok(())
@@ -309,7 +326,7 @@ impl MemoryStorage<'_> {
 
 /// One-line render of a chunk for list/similar output: the summary's first
 /// line, or a wordless-image marker, or empty.
-fn chunk_oneline(reader: &PileReader, space: &TribleSet, id: Id) -> String {
+fn chunk_oneline(reader: &PileSnapshot, space: &TribleSet, id: Id) -> String {
     if let Some(h) = chunk_summary_handle(space, id) {
         return reader
             .get::<View<str>, UTF8String>(h)
@@ -2208,7 +2225,11 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn print_archive_meta(reader: &PileReader, archive: &TribleSet, archive_msg_id: Id) -> Result<()> {
+fn print_archive_meta(
+    reader: &PileSnapshot,
+    archive: &TribleSet,
+    archive_msg_id: Id,
+) -> Result<()> {
     let mut native_projection = false;
     if let Some((block,)) = find!(
         (block: Id),
@@ -2474,7 +2495,7 @@ fn cmd_provenance(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 // show / turn subcommands
 // ---------------------------------------------------------------------------
 
-fn print_chunk(reader: &PileReader, space: &TribleSet, chunk_id: Id) -> Result<()> {
+fn print_chunk(reader: &PileSnapshot, space: &TribleSet, chunk_id: Id) -> Result<()> {
     if let Some(handle) = chunk_summary_handle(space, chunk_id) {
         let summary: View<str> = reader.get(handle).context("read chunk summary")?;
         print!("{}", summary.trim_end());
@@ -2543,7 +2564,7 @@ fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     bail!("no chunk id matches prefix '{prefix}'")
 }
 
-fn print_turn_facets(reader: &PileReader, space: &TribleSet, raw: &str) -> Result<()> {
+fn print_turn_facets(reader: &PileSnapshot, space: &TribleSet, raw: &str) -> Result<()> {
     let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
     for chunk_id in all_chunk_ids(space) {
@@ -2642,7 +2663,7 @@ fn id_starts_with(id: Id, prefix: &str) -> bool {
 /// drop its bytes at `/tmp/mem_img/<hex>.<ext>` and print the path. No embedder
 /// needed; this is pure blob → disk. Extension is sniffed from the magic bytes.
 fn materialize_image(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     chunk_id: Id,
     handle: Inline<Handle<RawBytes>>,
 ) -> Result<PathBuf> {

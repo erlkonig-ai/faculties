@@ -19,12 +19,12 @@ use triblespace::core::collection::exact_target_compaction::compact_exact_target
 use triblespace::core::collection::reach;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionStoreExt, CoverAttachment, FactCover,
+    Collection, CollectionCommit, CollectionStoreExt, Cover, FactCover,
 };
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{
-    ArtifactOfferStore, BlobStore, BlobStoreGet, BlobStorePut, OfferCapture,
+    ArtifactOfferStore, BlobStoreGet, BlobStorePut, OfferCapture, SnapshotSource,
 };
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
@@ -229,15 +229,17 @@ impl ArchiveImportWriter {
         let mut pile = open_pile_strict(pile_path)?;
         let result = (|| {
             let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer)?;
-            let snapshot = pile
-                .snapshot(collection)
-                .context("snapshot authored Archive collection")?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze authored Archive store snapshot")?;
+            let (current, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+                .context("read authored Archive collection")?;
             require_accepted(
-                blockdag::validate_catalog(snapshot.reader(), snapshot.facts())
+                blockdag::validate_catalog(&store_snapshot, &current)
                     .context("validate materialized Archive collection")?,
                 "materialized Archive collection",
             )?;
-            Ok((collection, snapshot.into_facts()))
+            Ok((collection, current))
         })();
         match result {
             Ok((collection, current)) => {
@@ -308,12 +310,12 @@ impl ArchiveImportWriter {
             if self.delta.facts().is_empty() {
                 return Ok((value, None));
             }
-            // `PileReader` snapshots are immutable. Open this view only after
+            // `PileSnapshot` snapshots are immutable. Open this view only after
             // every staged blob append so catalog validation sees those
             // dependencies without retaining them in the Fragment overlay.
             let reader = self
                 .pile
-                .reader()
+                .snapshot()
                 .context("open staged Archive dependency reader")?;
             let (_, validation) =
                 blockdag::validate_catalog_union(&reader, &self.current, &self.delta)
@@ -367,7 +369,7 @@ fn validated_embedded_blobs(
     mut blobs: triblespace::core::blob::MemoryBlobStore,
 ) -> Result<Vec<Blob<UnknownBlob>>> {
     let reader = blobs
-        .reader()
+        .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
     let mut embedded: Vec<_> = reader.iter().collect();
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
@@ -488,7 +490,7 @@ pub struct Bm25IndexReport {
 
 struct EnsuredBm25 {
     report: Bm25IndexReport,
-    cover: CoverAttachment<PortableBM25Blob>,
+    cover: Cover<PortableBM25Blob>,
 }
 
 /// Ensure a portable exact-TF cover of the frozen Archive cover, then compact
@@ -561,8 +563,16 @@ impl ArchiveSearchSnapshot {
             let archive =
                 ArchiveSnapshot::from_store(&mut pile, collection, schema::DEFAULT_SCOPE_ID)?;
             let ensured = ensure_bm25_for_snapshot(&mut pile, &archive, authority)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze ensured Archive BM25 store snapshot")?;
             let mut segments = Vec::with_capacity(ensured.cover.len());
-            for (data, blob) in ensured.cover.into_members() {
+            for handle in ensured.cover.members() {
+                let data = Handle::<PortableBM25Blob>::to_hash(handle);
+                let blob: Blob<PortableBM25Blob> =
+                    store_snapshot.get(handle).with_context(|| {
+                        format!("load Archive BM25 segment {}", hex::encode_upper(data.raw))
+                    })?;
                 segments.push(ArchiveBm25::try_from_blob(blob).with_context(|| {
                     format!(
                         "attach Archive BM25 segment {}",
@@ -620,7 +630,7 @@ impl ArchiveSearchSnapshot {
 pub struct ArchiveSnapshot {
     scope: Id,
     facts: TribleSet,
-    reader: PileReader,
+    store_snapshot: PileSnapshot,
     cover: FactCover,
     commits: Vec<CollectionCommit>,
 }
@@ -648,19 +658,21 @@ impl ArchiveSnapshot {
         collection: Collection<SimpleArchive>,
         scope: Id,
     ) -> Result<Self> {
-        let (snapshot, commits) = pile
-            .snapshot_with_admission(collection)
-            .context("snapshot authored Archive collection")?;
-        let (facts, cover, reader) = snapshot.into_parts();
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze authored Archive store snapshot")?;
+        let (facts, cover, commits) =
+            crate::storage::read_fact_collection_with_claims(collection, &store_snapshot)
+                .context("read authored Archive collection")?;
         require_accepted(
-            blockdag::validate_catalog(&reader, &facts)
+            blockdag::validate_catalog(&store_snapshot, &facts)
                 .context("validate materialized Archive catalog")?,
             "materialized Archive catalog",
         )?;
         Ok(Self {
             scope,
             facts,
-            reader,
+            store_snapshot,
             cover,
             commits,
         })
@@ -684,8 +696,8 @@ impl ArchiveSnapshot {
         &self.facts
     }
 
-    pub fn reader(&self) -> &PileReader {
-        &self.reader
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
     }
 
     /// Exact admitted source members represented by this snapshot.
@@ -874,7 +886,7 @@ impl ArchiveSnapshot {
 
     /// Retrieve and hash-validate one source chunk on demand.
     pub fn source_chunk_bytes(&self, chunk: &ArchiveSourceChunk) -> Result<Bytes> {
-        self.reader
+        self.store_snapshot
             .get(chunk.bytes)
             .with_context(|| format!("read Archive source chunk {:X}", chunk.id))
     }
@@ -1522,7 +1534,10 @@ impl ArchiveSnapshot {
     }
 
     fn read_text(&self, handle: TextHandle) -> Result<String> {
-        let value: View<str> = self.reader.get(handle).context("read Archive text")?;
+        let value: View<str> = self
+            .store_snapshot
+            .get(handle)
+            .context("read Archive text")?;
         Ok(value.to_string())
     }
 }
@@ -1721,7 +1736,7 @@ mod tests {
     fn first_embedded_handle(fragment: &Fragment) -> Inline<Handle<UnknownBlob>> {
         let mut blobs = fragment.blobs().clone();
         blobs
-            .reader()
+            .snapshot()
             .unwrap()
             .iter()
             .next()
@@ -1753,7 +1768,7 @@ mod tests {
         // collection root makes its facts visible yet.
         let mut physical = open_pile_strict(&pile).unwrap();
         assert!(physical.offers_snapshot().unwrap().contains(embedded));
-        let reader = physical.reader().unwrap();
+        let reader = physical.snapshot().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
         physical.close().unwrap();
@@ -1805,7 +1820,7 @@ mod tests {
             physical.offers_snapshot().unwrap().contains(embedded),
             "an orphan OFFER is lawful: it grants neither authority nor retention"
         );
-        let reader = physical.reader().unwrap();
+        let reader = physical.snapshot().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
         physical.close().unwrap();
@@ -2000,7 +2015,8 @@ mod tests {
         drop(snapshot);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let claims = pile.claims(&cover).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let claims = cover.claims(&store_snapshot).unwrap();
         assert_eq!(claims.len(), 2);
         assert!(claims.contains(&admitted));
         assert!(claims.contains(&duplicate));
@@ -2146,7 +2162,10 @@ mod tests {
         );
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let derives: Vec<_> = records
             .derives()
             .iter()
@@ -2303,7 +2322,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let authority = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
         let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority);
         let raw_target = succinctarchive_union::descriptor(
@@ -2317,7 +2339,7 @@ mod tests {
             .find(|derive| derive.collection() == collection_of(&raw_target))
             .copied()
             .expect("stored Archive raw-Succinct DERIVE");
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let (input, output) = (derive.input(), derive.output());
         let input: Blob<SimpleArchive> = reader
             .get(Handle::<SimpleArchive>::from_hash(input))
@@ -2353,7 +2375,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
         let derives: Vec<_> = records
@@ -2371,7 +2396,8 @@ mod tests {
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
         let source_collection = Collection::<SimpleArchive>::from_descriptor(&source).unwrap();
-        let source_cover = pile.cover(source_collection).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
+        let source_cover = source_collection.admitted(&store_snapshot).unwrap();
         let exact = ExactDerivedCollection::<
             SimpleArchive,
             PortableBM25Blob,
@@ -2514,7 +2540,7 @@ mod tests {
         .unwrap();
 
         let target = test_target(&pile_path, &key);
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let output = archive_bm25::derive_element(&reader, union.clone()).unwrap();
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
@@ -2560,7 +2586,10 @@ mod tests {
         drop(frozen);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let records = discover_collection_records(&mut pile).unwrap();
+        let records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let target = test_target(&pile_path, &key);
         let inputs: BTreeSet<_> = records
             .derives()
@@ -2604,7 +2633,10 @@ mod tests {
         let first = exact.ensure_exact(&mut pile, &first_cover).unwrap();
         assert_eq!(first.len(), 1);
         drop(first);
-        let first_records = discover_collection_records(&mut pile).unwrap();
+        let first_records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let first_derives = first_records
             .derives()
             .iter()
@@ -2614,7 +2646,10 @@ mod tests {
 
         let full = exact.ensure_exact(&mut pile, &full_cover).unwrap();
         assert_eq!(full.len(), 2);
-        let full_records = discover_collection_records(&mut pile).unwrap();
+        let full_records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let full_derives = full_records
             .derives()
             .iter()
@@ -2628,7 +2663,10 @@ mod tests {
         assert_eq!(compacted.len(), 1);
         drop(compacted);
 
-        let records_before = discover_collection_records(&mut pile).unwrap();
+        let records_before = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         let counts_before = (
             records_before.derives().len(),
             records_before.merges().len(),
@@ -2636,7 +2674,10 @@ mod tests {
         let retry = exact.ensure_exact(&mut pile, &full_cover).unwrap();
         assert_eq!(retry.len(), 1, "the admitted MERGE is reused");
         drop(retry);
-        let records_after = discover_collection_records(&mut pile).unwrap();
+        let records_after = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         assert_eq!(
             (records_after.derives().len(), records_after.merges().len()),
             counts_before,
@@ -2658,19 +2699,19 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source_collection = Collection::<SimpleArchive>::from_descriptor(&source).unwrap();
-        let source_cover = pile.cover(source_collection).unwrap();
-        let reader = pile.reader().unwrap();
-        let input: Blob<SimpleArchive> = reader
+        let store_snapshot = pile.snapshot().unwrap();
+        let source_cover = source_collection.admitted(&store_snapshot).unwrap();
+        let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
-        let output = archive_bm25::derive_element(&reader, input).unwrap();
+        let output = archive_bm25::derive_element(&store_snapshot, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
         let pending = CollectionDerive::new(collection_of(&target), commit.data(), output_data);
         drop(output);
-        drop(reader);
+        drop(store_snapshot);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
         assert!(pile
-            .reader()
+            .snapshot()
             .unwrap()
             .metadata(Handle::<PortableBM25Blob>::from_hash(output_data))
             .unwrap()
@@ -2686,13 +2727,15 @@ mod tests {
         assert_eq!(
             ready
                 .members()
-                .iter()
-                .map(|(data, _)| Handle::<PortableBM25Blob>::to_hash(*data))
+                .map(Handle::<PortableBM25Blob>::to_hash)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([output_data])
         );
         drop(ready);
-        let records = discover_collection_records(&mut pile).unwrap();
+        let records = {
+            let store_snapshot = pile.snapshot().unwrap();
+            discover_collection_records(&store_snapshot).unwrap()
+        };
         assert_eq!(
             records
                 .derives()

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
@@ -372,13 +372,12 @@ fn with_files_view<T>(
         Collection<SimpleArchive>,
         &SigningKey,
         &TribleSet,
-        &PileReader,
+        &PileSnapshot,
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(pile, |store, collection, signer| {
-        let (space, _ticket, reader) = store
-            .snapshot(collection)
-            .map(|snapshot| snapshot.into_parts())
+        let reader = store.snapshot().context("freeze Files store snapshot")?;
+        let (space, _) = faculties::storage::read_fact_collection(collection, &reader)
             .context("materialize Files collection")?;
         f(store, collection, signer, &space, &reader)
     })
@@ -483,7 +482,7 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
         .context("discover and freeze the sole native Mary CLIP model collection")?;
     let keymap = mary::selection::load_keymap_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::ModelSelector::Source {
             source: CLIP_MODEL,
             quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -492,7 +491,7 @@ fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
     .context("select native CLIP weights")?;
     let tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
-        snapshot.reader(),
+        snapshot.store(),
         mary::selection::TokenizerSelector::Name(CLIP_MODEL),
     )
     .context("select native CLIP tokenizer")?;
@@ -874,7 +873,7 @@ fn cmd_fetch(
 
 fn cmd_list(
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     filter_tags: &[String],
     filter_mime: Option<&str>,
 ) -> Result<()> {
@@ -957,7 +956,7 @@ fn cmd_resolve(space: &TribleSet, input: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(space: &TribleSet, reader: &PileReader, id: &str) -> Result<()> {
+fn cmd_show(space: &TribleSet, reader: &PileSnapshot, id: &str) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
     if is_file(space, eid) {
@@ -1014,7 +1013,7 @@ fn cmd_show(space: &TribleSet, reader: &PileReader, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(space: &TribleSet, reader: &PileReader, id: &str, output: Option<&str>) -> Result<()> {
+fn cmd_get(space: &TribleSet, reader: &PileSnapshot, id: &str, output: Option<&str>) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
     // For imports, follow to root.
@@ -1115,7 +1114,7 @@ fn cmd_tag(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     id: &str,
     tag_name: &str,
 ) -> Result<()> {
@@ -1136,7 +1135,7 @@ fn cmd_tag(
     Ok(())
 }
 
-fn cmd_search(space: &TribleSet, reader: &PileReader, query: &str) -> Result<()> {
+fn cmd_search(space: &TribleSet, reader: &PileSnapshot, query: &str) -> Result<()> {
     let needle = query.to_lowercase();
     let mut hits: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
@@ -1176,7 +1175,7 @@ fn cmd_search(space: &TribleSet, reader: &PileReader, query: &str) -> Result<()>
     Ok(())
 }
 
-fn cmd_imports(space: &TribleSet, reader: &PileReader) -> Result<()> {
+fn cmd_imports(space: &TribleSet, reader: &PileSnapshot) -> Result<()> {
     let mut imports: Vec<(i128, Id, Option<String>, Vec<String>)> = Vec::new();
 
     for (eid,) in find!(
@@ -1216,7 +1215,7 @@ fn cmd_imports(space: &TribleSet, reader: &PileReader) -> Result<()> {
 
 fn cmd_tree(
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     id: &str,
     max_depth: Option<usize>,
 ) -> Result<()> {
@@ -1291,7 +1290,7 @@ fn print_tree<R: BlobStoreGet>(
     }
 }
 
-fn cmd_diff(space: &TribleSet, reader: &PileReader, left_id: &str, right_id: &str) -> Result<()> {
+fn cmd_diff(space: &TribleSet, reader: &PileSnapshot, left_id: &str, right_id: &str) -> Result<()> {
     let resolve_root = |raw: &str| -> Result<Id> {
         let eid = file_capability::resolve_selector(space, raw)?;
         if is_import(space, eid) {
@@ -1501,7 +1500,7 @@ fn cmd_embed7b(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     force: bool,
 ) -> Result<()> {
     // Gather image file entities, grouped by content hash so identical bytes are
@@ -1695,7 +1694,7 @@ fn cmd_embed7b_pdf(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     force: bool,
     dpi: u32,
     file_limit: usize,
@@ -1849,7 +1848,7 @@ fn cmd_embed7b_pdf(
 /// (`attr_mm7b::embedding`, populated by `files embed-7b`) instead of CLIP-512.
 fn cmd_similar(
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     id: Option<&str>,
     text: Option<&str>,
     floor: f32,
@@ -1948,7 +1947,7 @@ fn cmd_similar(
 /// reuses that file's stored 7b vector (image→image).
 fn cmd_similar_mm7b(
     space: &TribleSet,
-    reader: &PileReader,
+    reader: &PileSnapshot,
     id: Option<&str>,
     text: Option<&str>,
     floor: f32,
@@ -2292,7 +2291,7 @@ mod tests {
                 .unwrap();
         let selected = mary::selection::load_keymap_from_graph(
             frozen.facts(),
-            frozen.reader(),
+            frozen.store(),
             mary::selection::ModelSelector::Source {
                 source: CLIP_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -2301,7 +2300,7 @@ mod tests {
         .unwrap();
         let tokenizer = mary::selection::load_tokenizer_from_graph(
             frozen.facts(),
-            frozen.reader(),
+            frozen.store(),
             mary::selection::TokenizerSelector::Name(CLIP_MODEL),
         )
         .unwrap();
@@ -2328,7 +2327,7 @@ mod tests {
 
         let still_selected = mary::selection::load_keymap_from_graph(
             frozen.facts(),
-            frozen.reader(),
+            frozen.store(),
             mary::selection::ModelSelector::Source {
                 source: CLIP_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -2337,7 +2336,7 @@ mod tests {
         .unwrap();
         let still_tokenizer = mary::selection::load_tokenizer_from_graph(
             frozen.facts(),
-            frozen.reader(),
+            frozen.store(),
             mary::selection::TokenizerSelector::Name(CLIP_MODEL),
         )
         .unwrap();
@@ -2351,7 +2350,7 @@ mod tests {
                 .unwrap();
         let latest_selected = mary::selection::load_keymap_from_graph(
             latest.facts(),
-            latest.reader(),
+            latest.store(),
             mary::selection::ModelSelector::Source {
                 source: CLIP_MODEL,
                 quantization: mary::persist::QUANTIZATION_NATIVE,
@@ -2362,7 +2361,7 @@ mod tests {
         assert_eq!(latest_selected["later.weight"], (vec![3.0], vec![1]));
         let tokenizer_error = mary::selection::load_tokenizer_from_graph(
             latest.facts(),
-            latest.reader(),
+            latest.store(),
             mary::selection::TokenizerSelector::Name(CLIP_MODEL),
         )
         .unwrap_err();

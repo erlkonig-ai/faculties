@@ -1045,7 +1045,7 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::{exists, pattern};
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
@@ -1168,7 +1168,7 @@ mod tests {
                 let reader = projected
                     .fragment
                     .blobs_mut()
-                    .reader()
+                    .snapshot()
                     .expect("memory blob reader construction is infallible");
                 let locator: View<str> = reader.get(locator).unwrap();
                 let raw: Bytes = reader.get(raw).unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
                 )
                 .next()
                 .unwrap();
-                let reader = projected.fragment.blobs_mut().reader().unwrap();
+                let reader = projected.fragment.blobs_mut().snapshot().unwrap();
                 let locator: View<str> = reader.get(locator).unwrap();
                 if locator.as_ref() == "explicit-root/m2" {
                     second_has_predecessor = Some(exists!(pattern!(&projected.fragment, [{

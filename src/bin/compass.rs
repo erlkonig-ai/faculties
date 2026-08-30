@@ -13,9 +13,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::lww_register::LwwIndex;
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
@@ -236,11 +235,11 @@ impl CompassStorage<'_> {
 
     fn with_view<T>(
         &self,
-        f: impl FnOnce(&TribleSet, &PileReader, &LwwIndex) -> Result<T>,
+        f: impl FnOnce(&TribleSet, &PileSnapshot, &LwwIndex) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
             let view = compass::materialize_indexed_collection(pile, signer)?;
-            f(view.facts(), view.reader(), view.status_register())
+            f(view.facts(), view.store_snapshot(), view.status_register())
         })
     }
 
@@ -249,18 +248,20 @@ impl CompassStorage<'_> {
     fn update<T>(
         &self,
         persona: Option<&str>,
-        f: impl FnOnce(&TribleSet, &PileReader, Option<Id>) -> Result<(Option<Fragment>, T)>,
+        f: impl FnOnce(&TribleSet, &PileSnapshot, Option<Id>) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
             let view = compass::materialize_indexed_collection(pile, signer)?;
             let facts = view.facts();
-            let reader = view.reader();
+            let reader = view.store_snapshot();
             let by = if let Some(persona) = persona {
                 let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
-                let (relation_facts, _, relation_reader) = pile
-                    .snapshot(collection)
-                    .context("materialize Relations collection for Compass persona")?
-                    .into_parts();
+                let relation_reader = pile
+                    .snapshot()
+                    .context("freeze Relations store snapshot for Compass persona")?;
+                let (relation_facts, _) =
+                    faculties::storage::read_fact_collection(collection, &relation_reader)
+                        .context("materialize Relations collection for Compass persona")?;
                 relations::validate_catalog(&relation_reader, &relation_facts)
                     .context("validate Relations collection for Compass persona")?;
                 Some(resolve_persona_id(
@@ -282,7 +283,7 @@ impl CompassStorage<'_> {
     }
 }
 
-fn task_title(reader: &PileReader, space: &TribleSet, task_id: Id) -> String {
+fn task_title(reader: &PileSnapshot, space: &TribleSet, task_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .and_then(|h| read_text(reader, h).ok())
@@ -339,7 +340,7 @@ fn all_note_ids(space: &TribleSet) -> Vec<Id> {
     .collect()
 }
 
-fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     compass::read_text(reader, handle)
 }
 
@@ -399,7 +400,7 @@ fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
     tags
 }
 
-fn note_references(reader: &PileReader, space: &TribleSet, note_id: Id) -> Vec<String> {
+fn note_references(reader: &PileSnapshot, space: &TribleSet, note_id: Id) -> Vec<String> {
     let mut references: Vec<String> = find!(
         handle: TextHandle,
         pattern!(space, [{ note_id @ board::reference: ?handle }])
@@ -423,7 +424,7 @@ fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
 }
 
 fn render_board(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     space: &TribleSet,
     status_register: &LwwIndex,
     status_filter: &[String],
@@ -646,7 +647,7 @@ fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, 
 /// Resolve one active Relations person for attribution. The flag remains a
 /// cooperative authorship claim, but it cannot name an unknown or retired
 /// anchor.
-fn resolve_persona_id(space: &TribleSet, reader: &PileReader, input: &str) -> Result<Id> {
+fn resolve_persona_id(space: &TribleSet, reader: &PileSnapshot, input: &str) -> Result<Id> {
     relations::resolve_person(reader, space, input, false)?.require_unique("persona", input)
 }
 

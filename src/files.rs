@@ -13,14 +13,14 @@
 //! those facts to imports or source-specific occurrence entities; complete
 //! catalogs also preserve historical path/timestamp provenance on file ids.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
@@ -970,13 +970,12 @@ where
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
-) -> Result<(TribleSet, PileReader)> {
+) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_scope(pile, crate::schemas::files::DEFAULT_SCOPE_ID, signer)?;
-    let (facts, _, reader) = pile
-        .snapshot(collection)
-        .map_err(|error| anyhow!("materialize Files collection: {error}"))?
-        .into_parts();
-    Ok((facts, reader))
+    let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        .context("read Files collection")?;
+    Ok((facts, store_snapshot))
 }
 
 /// Publish one complete Files fragment through an already open pile.
@@ -1000,9 +999,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{BlobStore, BlobStoreGet};
+    use triblespace::core::repo::BlobStoreGet;
 
     fn content_of(fragment: &Fragment) -> ContentHandle {
         find!(
@@ -1053,7 +1051,7 @@ mod tests {
     fn catalog_projects_complete_imports_without_scalar_arbitration() {
         let (fragment, root, import_id) = imported_file_fragment("/tmp/report.txt");
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let catalog = load_catalog(&reader, fragment.facts()).unwrap();
         let import = catalog.import(import_id).unwrap();
 
@@ -1082,7 +1080,7 @@ mod tests {
             file::imported_at: second_time,
         };
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
 
         let catalog = load_catalog(&reader, fragment.facts()).unwrap();
 
@@ -1100,7 +1098,7 @@ mod tests {
         let interval: ImportTime = (start, end).try_to_inline().unwrap();
         fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::imported_at: interval };
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
 
         let error = load_catalog(&reader, fragment.facts()).unwrap_err();
 
@@ -1114,7 +1112,7 @@ mod tests {
         let path = with_path.put::<UTF8String, _>("unknown:path".to_owned());
         with_path += entity! { ExclusiveId::force_ref(&unknown) @ file::source_path: path };
         let mut blobs = with_path.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, with_path.facts()).unwrap_err();
         assert!(format!("{error:#}")
             .contains("source_path/imported_at provenance without KIND_FILE or KIND_IMPORT"));
@@ -1124,7 +1122,7 @@ mod tests {
         let instant: ImportTime = (instant, instant).try_to_inline().unwrap();
         with_time += entity! { ExclusiveId::force_ref(&unknown) @ file::imported_at: instant };
         let mut blobs = with_time.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, with_time.facts()).unwrap_err();
         assert!(format!("{error:#}")
             .contains("source_path/imported_at provenance without KIND_FILE or KIND_IMPORT"));
@@ -1133,7 +1131,7 @@ mod tests {
         let root = with_root.root().unwrap();
         with_root += entity! { ExclusiveId::force_ref(&unknown) @ file::root: &root };
         let mut blobs = with_root.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, with_root.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("import root without KIND_IMPORT"));
     }
@@ -1146,7 +1144,7 @@ mod tests {
         conflicting +=
             entity! { ExclusiveId::force_ref(&import_id) @ file::imported_at: alternate };
         let mut blobs = conflicting.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for imported_at"));
 
@@ -1155,7 +1153,7 @@ mod tests {
         conflicting +=
             entity! { ExclusiveId::force_ref(&import_id) @ file::source_path: alternate };
         let mut blobs = conflicting.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for source_path"));
 
@@ -1163,7 +1161,7 @@ mod tests {
         let alternate_root = Id::new([0x51; 16]).unwrap();
         conflicting += entity! { ExclusiveId::force_ref(&import_id) @ file::root: &alternate_root };
         let mut blobs = conflicting.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, conflicting.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for root"));
 
@@ -1176,7 +1174,7 @@ mod tests {
             file::root: &root,
         };
         let mut blobs = partial.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, partial.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("0 values for imported_at"));
     }
@@ -1188,7 +1186,7 @@ mod tests {
         let competing = fragment.put::<UTF8String, _>("alternate.txt".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::name: competing };
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let error = load_catalog(&reader, fragment.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for file name"));
 
@@ -1197,7 +1195,7 @@ mod tests {
         let competing = fragment.put::<RawBytes, _>(b"second".to_vec());
         fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::content: competing };
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
 
         let error = load_catalog(&reader, fragment.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for file content"));
@@ -1211,7 +1209,7 @@ mod tests {
         let mut fragment = first;
         fragment += second;
         let mut blobs = fragment.blobs().clone();
-        let reader = blobs.reader().unwrap();
+        let reader = blobs.snapshot().unwrap();
         let catalog = load_catalog(&reader, fragment.facts()).unwrap();
 
         let resolved = catalog.resolve_file(&content_hash_hex(content)).unwrap();
@@ -1486,7 +1484,7 @@ mod tests {
             .map(|(name,)| name)
         );
         let mut blobs = file.blobs().clone();
-        let reader = blobs.reader().expect("fragment blob reader");
+        let reader = blobs.snapshot().expect("fragment blob reader");
         let name: anybytes::View<str> = reader
             .get::<anybytes::View<str>, UTF8String>(name_handle)
             .expect("staged media type name");
@@ -1524,10 +1522,9 @@ mod tests {
         store
             .commit(collection, &signer, file)
             .expect("commit canonical file");
-        let (catalog, _, reader) = store
-            .snapshot::<TribleSet, _>(collection)
-            .expect("materialize files")
-            .into_parts();
+        let reader = store.snapshot().expect("freeze files store snapshot");
+        let (catalog, _) =
+            crate::storage::read_fact_collection(collection, &reader).expect("materialize files");
         let content_handle = find!(
             content: ContentHandle,
             pattern!(&catalog, [{ file_id @ file::content: ?content }])

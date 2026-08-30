@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::intrinsic_entity_id_v1;
 use triblespace::prelude::*;
 
@@ -381,7 +381,10 @@ fn validate_legacy_identity(
 
 /// Strictly load the marker-free historical Voice ontology under the v1
 /// intrinsic-identity rule. This seam exists only for stopped-world cutover.
-pub fn validate_legacy_catalog_v1(reader: &PileReader, facts: &TribleSet) -> Result<VoiceCatalog> {
+pub fn validate_legacy_catalog_v1(
+    reader: &PileSnapshot,
+    facts: &TribleSet,
+) -> Result<VoiceCatalog> {
     let route_ids = tagged_entities(facts, KIND_ROUTE);
     let utterance_ids = tagged_entities(facts, KIND_UTTERANCE);
     if let Some(id) = route_ids.intersection(&utterance_ids).next() {
@@ -423,7 +426,7 @@ pub fn validate_legacy_catalog_v1(reader: &PileReader, facts: &TribleSet) -> Res
             facts.len().saturating_sub(accounted)
         );
     }
-    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    validate_payloads(reader, None::<&PileSnapshot>, &catalog)?;
     Ok(catalog)
 }
 
@@ -475,7 +478,7 @@ pub fn load_catalog(facts: &TribleSet) -> Result<VoiceCatalog> {
 }
 
 fn read_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<anybytes::View<str>>
@@ -491,7 +494,7 @@ where
 }
 
 fn read_audio_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: AudioHandle,
 ) -> Result<anybytes::Bytes>
@@ -507,7 +510,7 @@ where
 }
 
 fn validate_payloads<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     catalog: &VoiceCatalog,
 ) -> Result<()>
@@ -526,16 +529,16 @@ where
 }
 
 /// Validate one complete materialized collection's live projection.
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<VoiceCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<VoiceCatalog> {
     let catalog = load_catalog(facts)?;
-    validate_payloads(reader, None::<&PileReader>, &catalog)?;
+    validate_payloads(reader, None::<&PileSnapshot>, &catalog)?;
     Ok(catalog)
 }
 
 /// Validate a complete materialized Voice value while resolving newly staged
 /// payloads from an overlay before they have crossed the commit boundary.
 pub fn validate_catalog_with_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: &Overlay,
     facts: &TribleSet,
 ) -> Result<VoiceCatalog>
@@ -595,7 +598,7 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<VoiceCatalog> {
 
 /// Preflight the exact union produced by one native Voice commit.
 pub fn validate_candidate(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<VoiceCatalog> {
@@ -606,7 +609,7 @@ pub fn validate_candidate(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .context("snapshot staged Voice attachments")?;
     validate_payloads(reader, Some(&overlay), &catalog)?;
     Ok(catalog)
@@ -615,7 +618,7 @@ pub fn validate_candidate(
 /// Strictly load every direct Voice payload named by a legacy authored commit.
 ///
 /// This validates transport closure without granting live semantics.
-pub fn validate_known_payloads(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     for fact in facts {
         if fact.a() == &utterance::text.id() || fact.a() == &metadata::description.id() {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
@@ -644,7 +647,6 @@ mod tests {
 
     use hifitime::Epoch;
     use triblespace::core::id::ExclusiveId;
-    use triblespace::core::repo::BlobStore;
 
     use super::*;
     use crate::storage::open_pile_strict;
@@ -704,7 +706,7 @@ mod tests {
         let pile_path = directory.path().join("empty.pile");
         File::create(&pile_path).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         pile.close().unwrap();
 
         let missing =

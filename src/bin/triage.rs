@@ -14,7 +14,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::cognition as cognition_model;
-use faculties::legacy_hint::open_scope;
 use faculties::memory::{self as memory_model, ChunkContent, MemoryCatalog};
 use faculties::message as message_model;
 use faculties::relations as relations_model;
@@ -34,10 +33,10 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::collection::CollectionStoreExt;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, pattern};
+use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -125,7 +124,7 @@ enum Command {
 /// One canonical collection value observed through the frozen pile prefix.
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl CollectionView {
@@ -142,6 +141,7 @@ struct TriageSnapshot {
     pile_path: PathBuf,
     pile: RefCell<Option<Pile>>,
     signer: SigningKey,
+    store_snapshot: PileSnapshot,
 }
 
 impl TriageSnapshot {
@@ -149,25 +149,39 @@ impl TriageSnapshot {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
-        let pile = open_pile_strict(&cli.pile)?;
+        let mut pile = open_pile_strict(&cli.pile)?;
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze Triage native store snapshot")?;
         Ok(Self {
             pile_path: cli.pile.clone(),
             pile: RefCell::new(Some(pile)),
             signer,
+            store_snapshot,
         })
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
-        let collection = open_scope(pile, scope, &self.signer)?;
-        let (facts, _, reader) = pile
-            .snapshot(collection)
-            .with_context(|| format!("materialize {label} collection"))?
-            .into_parts();
-        Ok(CollectionView { facts, reader })
+        let descriptor =
+            faculties::collection_names::root_descriptor(scope, self.signer.verifying_key());
+        let collection = Collection::<SimpleArchive>::from_descriptor(&descriptor)
+            .with_context(|| format!("type {label} collection descriptor"))?;
+        let facts = if self
+            .store_snapshot
+            .metadata(collection.handle())
+            .with_context(|| format!("inspect {label} collection descriptor"))?
+            .is_some()
+        {
+            faculties::storage::read_fact_collection(collection, &self.store_snapshot)
+                .map(|(facts, _)| facts)
+                .with_context(|| format!("materialize {label} collection"))?
+        } else {
+            TribleSet::new()
+        };
+        Ok(CollectionView {
+            facts,
+            reader: self.store_snapshot.clone(),
+        })
     }
 
     fn cognition(&self) -> Result<CollectionView> {
@@ -347,7 +361,7 @@ fn first_line(text: &str) -> String {
         .to_owned()
 }
 
-fn read_text(reader: &PileReader, handle: TextHandle) -> Result<String> {
+fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read UTF8String {}", hex::encode(handle.raw)))?;
@@ -675,7 +689,7 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     Ok(())
 }
 
-fn chunk_text(reader: &PileReader, chunk: &memory_model::ChunkRow) -> Result<String> {
+fn chunk_text(reader: &PileSnapshot, chunk: &memory_model::ChunkRow) -> Result<String> {
     match chunk.content {
         ChunkContent::Text(handle) => memory_model::read_text(reader, handle),
         ChunkContent::Image(handle) => Ok(format!(
@@ -842,7 +856,7 @@ fn select_request(state: &ExecState, turn: usize) -> Result<&ExecRequestRow> {
 }
 
 fn contexts_for_turn(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     space: &TribleSet,
     exec_state: &ExecState,
     request: Id,

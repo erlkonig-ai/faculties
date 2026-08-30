@@ -15,8 +15,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -865,7 +865,7 @@ fn dag_heads(graph: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
         .collect())
 }
 
-fn load_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<String> {
+fn load_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Habit {field} payload {}", hex::encode(handle.raw)))?;
@@ -873,7 +873,7 @@ fn load_text(reader: &PileReader, handle: TextHandle, field: &str) -> Result<Str
 }
 
 fn load_text_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: TextHandle,
     field: &str,
@@ -907,7 +907,7 @@ where
 /// a standing intention that quietly stops firing is worse than one that
 /// refuses to be read at all, because nobody notices the first.
 fn load_script_overlay<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     handle: ScriptHandle,
     habit: Id,
@@ -942,7 +942,7 @@ where
 }
 
 fn decode_catalog<Overlay>(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     overlay: Option<&Overlay>,
     raw: RawCatalog,
 ) -> Result<Catalog>
@@ -1009,19 +1009,19 @@ where
 }
 
 /// Strictly validate and decode one complete materialized Habit collection.
-pub fn load_catalog(reader: &PileReader, facts: &TribleSet) -> Result<Catalog> {
+pub fn load_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
     let raw = validate_structure(facts)?;
-    decode_catalog(reader, None::<&PileReader>, raw)
+    decode_catalog(reader, None::<&PileSnapshot>, raw)
 }
 
-pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<()> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     load_catalog(reader, facts).map(drop)
 }
 
 /// Preflight the exact set union a publication would create, resolving blob
 /// handles from the staged complete fragment before it is appended.
 pub fn validate_catalog_union(
-    reader: &PileReader,
+    reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<TribleSet> {
@@ -1031,7 +1031,7 @@ pub fn validate_catalog_union(
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
-        .reader()
+        .snapshot()
         .expect("Habit MemoryBlobStore reader creation is infallible");
     decode_catalog(reader, Some(&overlay), raw)?;
     Ok(union)
@@ -1078,7 +1078,7 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
         let mut local = fragment.clone();
         let reader = local
             .blobs_mut()
-            .reader()
+            .snapshot()
             .expect("Habit MemoryBlobStore reader creation is infallible");
         let condition: View<str> = reader.get(raw.condition).map_err(|_| {
             anyhow!(
@@ -1156,12 +1156,14 @@ pub fn publish(
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let snapshot = pile
-            .snapshot(collection)
-            .context("materialize native Habit collection")?;
-        validate_catalog_union(snapshot.reader(), snapshot.facts(), &fragment)
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze native Habit store snapshot")?;
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+            .context("read native Habit collection")?;
+        validate_catalog_union(&store_snapshot, &facts, &fragment)
             .context("preflight complete Habit publication")?;
-        drop(snapshot);
+        drop(store_snapshot);
         pile.commit(collection, &signer, fragment)
             .context("commit complete Habit record")
     })();
@@ -1175,10 +1177,12 @@ pub fn read_catalog(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
-        let snapshot = pile
-            .snapshot(collection)
-            .context("materialize native Habit collection")?;
-        load_catalog(snapshot.reader(), snapshot.facts()).context("validate native Habit catalog")
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze native Habit store snapshot")?;
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+            .context("read native Habit collection")?;
+        load_catalog(&store_snapshot, &facts).context("validate native Habit catalog")
     })();
     finish_pile(pile, result)
 }
@@ -1710,7 +1714,7 @@ mod tests {
         let pile_path = directory.path().join("empty.pile");
         File::create(&pile_path).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let error = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap_err();
         assert!(format!("{error:#}").contains("expected exactly"));
         let error = validate_catalog_union(&reader, &TribleSet::new(), &dangling).unwrap_err();
@@ -1737,7 +1741,7 @@ mod tests {
         let pile_path = directory.path().join("empty.pile");
         File::create(&pile_path).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let union = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         let raw = validate_structure(&union).unwrap();
         assert_eq!(raw.habits.keys().copied().collect::<Vec<_>>(), [native]);
@@ -1933,7 +1937,7 @@ mod tests {
         let pile_path = directory.path().join("empty.pile");
         File::create(&pile_path).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.reader().unwrap();
+        let reader = pile.snapshot().unwrap();
         let error = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains(&format!("{id:x}")), "{rendered}");

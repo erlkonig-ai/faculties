@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -199,7 +199,7 @@ struct RelationsStorage<'a> {
 #[derive(Clone)]
 struct RelationsView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 impl RelationsStorage<'_> {
@@ -219,17 +219,19 @@ impl RelationsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let (facts, _ticket, reader) = pile
-                .snapshot(collection)
-                .map(|snapshot| snapshot.into_parts())
+            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
+            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Relations collection")?;
-            relations::validate_catalog(&reader, &facts)
+            relations::validate_catalog(&store_snapshot, &facts)
                 .context("validate authored Relations collection")?;
             operation(
                 &mut pile,
                 collection,
                 &signer,
-                &RelationsView { facts, reader },
+                &RelationsView {
+                    facts,
+                    reader: store_snapshot,
+                },
             )
         })();
         finish_pile(pile, result)
@@ -275,9 +277,10 @@ impl RelationsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let cover = pile.cover(collection)?;
-            Ok(pile
-                .claims(&cover)?
+            let store_snapshot = pile.snapshot()?;
+            let cover = collection.admitted(&store_snapshot)?;
+            Ok(cover
+                .claims(&store_snapshot)?
                 .iter()
                 .filter(|commit| commit.public_key().raw == author)
                 .count())

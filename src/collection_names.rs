@@ -184,6 +184,8 @@ mod tests {
     use triblespace::core::collection::descriptor;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::SnapshotSource;
+    use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
     #[test]
@@ -222,10 +224,13 @@ mod tests {
         store
             .commit(collection, &foreign, evidence.clone())
             .unwrap();
-        assert!(store.snapshot(collection).unwrap().facts().is_empty());
+        let store_snapshot = store.snapshot().unwrap();
+        let facts = collection.read::<TribleSet, _>(&store_snapshot).unwrap();
+        assert!(facts.is_empty());
 
         store.commit(collection, &local, evidence).unwrap();
-        let snapshot = store.snapshot(collection).unwrap();
-        assert!(expected.difference(snapshot.facts()).is_empty());
+        let store_snapshot = store.snapshot().unwrap();
+        let facts = collection.read::<TribleSet, _>(&store_snapshot).unwrap();
+        assert!(expected.difference(&facts).is_empty());
     }
 }

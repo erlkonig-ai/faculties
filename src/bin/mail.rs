@@ -27,7 +27,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -156,7 +156,7 @@ impl Scopes {
 
 struct CollectionView {
     facts: TribleSet,
-    reader: PileReader,
+    reader: PileSnapshot,
 }
 
 struct Views {
@@ -186,20 +186,39 @@ impl Storage<'_> {
         })
     }
 
-    fn materialize(&self, scope: Id, label: &str) -> Result<CollectionView> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let collection = open_scope(pile, scope, &self.signer)?;
-        let (facts, _, reader) = pile
-            .snapshot(collection)
-            .with_context(|| format!("materialize {label} collection"))?
-            .into_parts();
-        Ok(CollectionView { facts, reader })
-    }
-
     fn views(&self) -> Result<Views> {
+        let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot) = {
+            let mut pile = self.pile.borrow_mut();
+            let pile = pile
+                .as_mut()
+                .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
+            let mail_collection = open_scope(pile, self.scopes.mail, &self.signer)?;
+            let files_collection = open_scope(pile, self.scopes.files, &self.signer)?;
+            let decide_collection = open_scope(pile, self.scopes.decide, &self.signer)?;
+            let relations_collection = open_scope(pile, self.scopes.relations, &self.signer)?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze shared Mail/Files/Decide/Relations store snapshot")?;
+            let (mail_facts, _) =
+                faculties::storage::read_fact_collection(mail_collection, &store_snapshot)
+                    .context("materialize Mail collection")?;
+            let (files_facts, _) =
+                faculties::storage::read_fact_collection(files_collection, &store_snapshot)
+                    .context("materialize Files collection")?;
+            let (decide_facts, _) =
+                faculties::storage::read_fact_collection(decide_collection, &store_snapshot)
+                    .context("materialize Decide collection")?;
+            let (relations_facts, _) =
+                faculties::storage::read_fact_collection(relations_collection, &store_snapshot)
+                    .context("materialize Relations collection")?;
+            (
+                mail_facts,
+                files_facts,
+                decide_facts,
+                relations_facts,
+                store_snapshot,
+            )
+        };
         let secrets = {
             let mut pile = self.pile.borrow_mut();
             let pile = pile
@@ -209,10 +228,22 @@ impl Storage<'_> {
                 .context("discover local Secrets vault epochs")?
         };
         let views = Views {
-            mail: self.materialize(self.scopes.mail, "Mail")?,
-            files: self.materialize(self.scopes.files, "Files")?,
-            decide: self.materialize(self.scopes.decide, "Decide")?,
-            relations: self.materialize(self.scopes.relations, "Relations")?,
+            mail: CollectionView {
+                facts: mail_facts,
+                reader: store_snapshot.clone(),
+            },
+            files: CollectionView {
+                facts: files_facts,
+                reader: store_snapshot.clone(),
+            },
+            decide: CollectionView {
+                facts: decide_facts,
+                reader: store_snapshot.clone(),
+            },
+            relations: CollectionView {
+                facts: relations_facts,
+                reader: store_snapshot,
+            },
             secrets,
         };
         decide::validate_catalog(&views.decide.reader, &views.decide.facts)
@@ -1059,7 +1090,7 @@ where
         )?;
     }
 
-    // A PileReader is an immutable snapshot. Take another reader from the
+    // A PileSnapshot is an immutable snapshot. Take another reader from the
     // same open Pile after Files so exact validation sees both its facts and
     // newly appended attachment blobs.
     let after_files = materialize()?;
