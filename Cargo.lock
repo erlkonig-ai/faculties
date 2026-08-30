@@ -3912,7 +3912,7 @@ dependencies = [
  "tokenizers",
  "tracing",
  "tracing-subscriber",
- "triblespace",
+ "triblespace 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "triblespace-paths",
  "triblespace-search",
  "typst",
@@ -3940,8 +3940,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "triblespace",
- "triblespace-core",
+ "triblespace 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "triblespace-search",
  "zeroize",
 ]
@@ -3957,7 +3957,7 @@ dependencies = [
  "hifitime",
  "rand_core 0.6.4",
  "tempfile",
- "triblespace",
+ "triblespace 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "zeroize",
 ]
 
@@ -6117,7 +6117,7 @@ dependencies = [
  "sha2 0.10.9",
  "symphonia",
  "tokenizers",
- "triblespace",
+ "triblespace 0.47.0",
  "wgpu",
 ]
 
@@ -10418,14 +10418,71 @@ dependencies = [
 name = "triblespace"
 version = "0.47.0"
 dependencies = [
- "triblespace-core",
+ "triblespace-core 0.47.0",
+ "triblespace-macros 0.47.0",
+]
+
+[[package]]
+name = "triblespace"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+dependencies = [
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "triblespace-gpu",
- "triblespace-macros",
+ "triblespace-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
 ]
 
 [[package]]
 name = "triblespace-core"
 version = "0.47.0"
+dependencies = [
+ "ahash",
+ "anybytes",
+ "arbitrary",
+ "arrayvec",
+ "base64 0.22.1",
+ "blake3",
+ "bytemuck",
+ "bytes",
+ "ed25519",
+ "ed25519-dalek",
+ "ethnum",
+ "f256",
+ "hex",
+ "hex-literal",
+ "hifitime",
+ "im",
+ "indexmap",
+ "indxvec",
+ "itertools 0.14.0",
+ "jerky",
+ "json-event-parser",
+ "libc",
+ "memmap2",
+ "num-rational",
+ "num-traits",
+ "page_size",
+ "quick_cache",
+ "rand 0.8.7",
+ "rustversion",
+ "ryu",
+ "serde_json",
+ "signature",
+ "siphasher",
+ "smallvec",
+ "sptr",
+ "triblespace-core-macros 0.47.0",
+ "uuid",
+ "ux",
+ "winnow 0.7.15",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "triblespace-core"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
 dependencies = [
  "ahash",
  "anybytes",
@@ -10467,7 +10524,7 @@ dependencies = [
  "smallvec",
  "sptr",
  "tokio",
- "triblespace-core-macros",
+ "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "url",
  "uuid",
  "ux",
@@ -10484,17 +10541,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "triblespace-macros-common",
+ "triblespace-macros-common 0.47.0",
+]
+
+[[package]]
+name = "triblespace-core-macros"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
 ]
 
 [[package]]
 name = "triblespace-gpu"
 version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
 dependencies = [
  "cubecl",
  "itertools 0.14.0",
  "jerky",
- "triblespace-core",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
 ]
 
 [[package]]
@@ -10506,9 +10575,24 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "triblespace-core",
- "triblespace-core-macros",
- "triblespace-macros-common",
+ "triblespace-core 0.47.0",
+ "triblespace-core-macros 0.47.0",
+ "triblespace-macros-common 0.47.0",
+]
+
+[[package]]
+name = "triblespace-macros"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
+ "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
+ "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
 ]
 
 [[package]]
@@ -10521,20 +10605,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "triblespace-macros-common"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "triblespace-paths"
 version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
 dependencies = [
- "triblespace-core",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
 ]
 
 [[package]]
 name = "triblespace-search"
 version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b#9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
 dependencies = [
  "anybytes",
  "blake3",
  "jerky",
- "triblespace-core",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b)",
  "unicode-properties",
  "unicode-segmentation",
  "zerocopy",

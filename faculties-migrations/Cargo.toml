@@ -30,11 +30,11 @@ hifitime = "4.2.3"
 libc = "0.2"           # APFS clonefile for the disposable activation candidate
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-triblespace = { version = "0.47", path = "../../triblespace-rs" }
+triblespace.workspace = true
 # `triblespace::core::prelude::attributes!` expands to a `::triblespace_core`
 # path, so a crate declaring a retired attribute needs the core crate by name.
-triblespace-core = { path = "../../triblespace-rs/triblespace-core" }
-triblespace-search = { version = "0.47.0", path = "../../triblespace-rs/triblespace-search" }
+triblespace-core.workspace = true
+triblespace-search.workspace = true
 zeroize = "1.9"
 
 # The schemas, catalog validators, and canonical models the transforms read.

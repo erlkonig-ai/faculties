@@ -48,8 +48,6 @@ use triblespace::prelude::*;
 use crate::schemas::blockdag as schema;
 use crate::{archive_source, blockdag, files};
 
-const TOOL_RESULT_STATUS_OK: &str = "urn:triblespace:archive:tool-result-status:v1:ok";
-const TOOL_RESULT_STATUS_ERROR: &str = "urn:triblespace:archive:tool-result-status:v1:error";
 /// Observable projection accounting. Missing or unresolved source evidence is
 /// counted rather than silently replaced with invented values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1249,9 +1247,9 @@ fn project_item(
         }
         RawItem::ToolResultStatus(is_error) => {
             let status = if *is_error {
-                TOOL_RESULT_STATUS_ERROR
+                schema::content_fact::tool_result_status::ERROR
             } else {
-                TOOL_RESULT_STATUS_OK
+                schema::content_fact::tool_result_status::OK
             };
             Ok(Some(blockdag::text_fact(
                 schema::content_fact::modality::EVENT,
@@ -2474,11 +2472,14 @@ mod tests {
         assert_ne!(ok_block, error_block);
         assert_ne!(missing_block, error_block);
         assert_eq!(
-            block_with_payload(&ok.fragment, TOOL_RESULT_STATUS_OK),
+            block_with_payload(&ok.fragment, schema::content_fact::tool_result_status::OK,),
             ok_block
         );
         assert_eq!(
-            block_with_payload(&error.fragment, TOOL_RESULT_STATUS_ERROR),
+            block_with_payload(
+                &error.fragment,
+                schema::content_fact::tool_result_status::ERROR,
+            ),
             error_block
         );
         let (_empty, reader) = empty_reader();

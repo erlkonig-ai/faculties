@@ -303,6 +303,7 @@ fn validate_part(entity: Id, rows: &[Trible]) -> std::result::Result<(u64, Id), 
         schema::content_part::ordinal.id(),
         schema::content_part::fact.id(),
         schema::content_part::responds_to.id(),
+        schema::content_part::resolution.id(),
     ];
     let nonidentity = [metadata::tag.id()];
     validate_intrinsic_entity(

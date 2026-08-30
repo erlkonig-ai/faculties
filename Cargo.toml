@@ -4,6 +4,26 @@
 members = ["faculties-migrations", "faculties-secrets"]
 resolver = "2"
 
+[workspace.dependencies.triblespace]
+version = "0.47"
+git = "https://github.com/triblespace/triblespace-rs"
+rev = "9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+
+[workspace.dependencies.triblespace-core]
+version = "0.47.0"
+git = "https://github.com/triblespace/triblespace-rs"
+rev = "9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+
+[workspace.dependencies.triblespace-paths]
+version = "0.47.0"
+git = "https://github.com/triblespace/triblespace-rs"
+rev = "9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+
+[workspace.dependencies.triblespace-search]
+version = "0.47.0"
+git = "https://github.com/triblespace/triblespace-rs"
+rev = "9a744dc3cd3dd1eb1e2ea71e47ad832d55d1878b"
+
 [package]
 name = "faculties"
 version = "0.20.2"
@@ -104,6 +124,16 @@ name = "status-capture"
 path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
+[[bin]]
+name = "hear"
+path = "src/bin/hear.rs"
+required-features = ["hear"]
+
+[[bin]]
+name = "duplex"
+path = "src/bin/duplex.rs"
+required-features = ["duplex"]
+
 [features]
 # `local-embed` and `widgets` are default: semantic recall is core to knowledge
 # workflows, and the GORBIE viewer is part of the normal office surface.
@@ -141,18 +171,18 @@ voice = ["dep:mary", "mary/speak", "audio"]
 # to build the `Hearing` handle even when only `embed` is called. DEFAULT: it
 # replaces `converse` as the shipping ear surface, and `local-embed` (also
 # default) already pays for `mary/gemma`, so the marginal cost is the
-# tokenizer. Capture itself is `soma-client`, which is unconditional and tiny.
-hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
+# tokenizer. Capture itself is the small optional `soma-client` dependency.
+hear = ["dep:mary", "mary/gemma", "dep:tokenizers", "dep:soma-client"]
 # The `duplex` faculty: a continuously running spoken channel on mary's
 # streaming full-duplex speech model. `mary/personaplex` brings the LM layers
 # (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
 # stack and the streaming codec. `audio` supplies the named-device PLAYBACK
-# plumbing only — the microphone is Soma's, reached through `soma-client`
-# (unconditional and tiny), which is what lets `hear` and `duplex` run at the
-# same time off one device. Off by default: the model runtime is heavy and only
+# plumbing only — the microphone is Soma's, reached through `soma-client`,
+# which is what lets `hear` and `duplex` run at the same time off one device.
+# Off by default: the model runtime is heavy and only
 # this one binary needs it. NOT YET REALTIME on the measured hardware — see the
 # frame-budget section of the binary's module docs before relying on it.
-duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
+duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio", "dep:soma-client"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -160,9 +190,9 @@ clap = { version = "4.5.4", features = ["derive", "env"] }
 ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
-triblespace = { version = "0.47", path = "../triblespace-rs" }
-triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-paths" }
-triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
+triblespace.workspace = true
+triblespace-paths.workspace = true
+triblespace-search.workspace = true
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).
@@ -193,7 +223,7 @@ rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
-soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex (Soma's framed 80 ms capture contract; anyhow + the reqwest already here). Unconditional: the capture seam is not a feature, it is how the body is reached.
+soma-client = { version = "0.1.0", path = "../soma/soma-client", optional = true }  # hear + duplex (Soma's framed 80 ms capture contract; anyhow + the reqwest already here).
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
@@ -242,4 +272,3 @@ faculties-migrations = { path = "faculties-migrations" }
 [patch.crates-io]
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
 cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
-triblespace-core = { path = "../triblespace-rs/triblespace-core" }

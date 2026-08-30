@@ -88,6 +88,13 @@ pub mod content_part {
 pub mod content_fact {
     use super::*;
 
+    /// Canonical semantic payloads distinguishing successful and failed tool
+    /// results without coupling readers to one transcript producer.
+    pub mod tool_result_status {
+        pub const OK: &str = "urn:triblespace:archive:tool-result-status:v1:ok";
+        pub const ERROR: &str = "urn:triblespace:archive:tool-result-status:v1:error";
+    }
+
     attributes! {
         /// IDENTITY. Reified modality entity.
         "9044EA72B7B056F20CB02375ABFB7D87" unsafe as pub modality: GenId;
