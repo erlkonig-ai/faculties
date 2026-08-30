@@ -62,7 +62,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
@@ -1893,7 +1893,7 @@ impl PostureStorage<'_> {
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
             let (facts, _, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .map(|snapshot| snapshot.into_parts())
                 .with_context(|| format!("materialize authored Posture {label} collection"))?;
             Ok(CollectionView { facts, reader })
@@ -1910,11 +1910,10 @@ impl PostureStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
-            let ticket = pile
-                .ticket(collection, &[])
-                .with_context(|| format!("discover authored Posture {label} commits"))?;
-            Ok(ticket
-                .commits()
+            let (_, commits) = pile
+                .snapshot_with_admission::<TribleSet, _>(collection)
+                .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
+            Ok(commits
                 .iter()
                 .copied()
                 .filter(|commit| commit.public_key().raw == author)
@@ -1987,7 +1986,7 @@ impl PostureStorage<'_> {
         label: &str,
         operation: impl FnOnce(
             &mut Pile,
-            CollectionHandle,
+            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &TribleSet,
             &PileReader,
@@ -1998,18 +1997,11 @@ impl PostureStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, scope, &signer)?;
-            let (facts, ticket, reader) = pile
-                .snapshot(collection, &[])
-                .map(|snapshot| snapshot.into_parts())
+            let (snapshot, commits) = pile
+                .snapshot_with_admission(collection)
                 .with_context(|| format!("materialize authored Posture {label} collection"))?;
-            operation(
-                &mut pile,
-                collection,
-                &signer,
-                &facts,
-                &reader,
-                ticket.commits(),
-            )
+            let (facts, _, reader) = snapshot.into_parts();
+            operation(&mut pile, collection, &signer, &facts, &reader, &commits)
         })();
         finish_pile(pile, result)
     }
@@ -6861,10 +6853,64 @@ mod tests {
             .commits()
             .iter()
             .copied()
-            .filter(|commit| commit.collection() == collection)
+            .filter(|commit| commit.collection() == collection.handle())
             .collect::<Vec<_>>();
         assert_eq!(stored, vec![foreign_commit]);
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn unauthorized_duplicate_claim_does_not_poison_scan_atomicity() {
+        let store = TestStore::new();
+        let created_at = point_interval(Epoch::from_unix_seconds(4_100.0));
+        let (files, omissions) = sample_scan_inputs();
+        let (fragment, first_scan) = build_scan_fragment(
+            Path::new("duplicate-author-corpus"),
+            &files,
+            &omissions,
+            created_at,
+            None,
+            IMPLEMENTED.iter().copied().collect(),
+        );
+        let admitted = store
+            .storage()
+            .publish_scan(fragment.clone(), "admitted scan")
+            .unwrap();
+
+        let mut pile = open_pile_strict(&store.pile).unwrap();
+        let local = faculties::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCAN_SCOPE_ID, &local).unwrap();
+        let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+        let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
+        assert_eq!(duplicate.data(), admitted.data());
+        pile.close().unwrap();
+
+        // A later write validates the exact admission roots of its snapshot,
+        // not every currently resident signature over the same payload.
+        let (mut changed_files, omissions) = sample_scan_inputs();
+        changed_files[0].findings[0].value = "Independent observation".to_owned();
+        let (next, next_scan) = build_scan_fragment(
+            Path::new("duplicate-author-corpus"),
+            &changed_files,
+            &omissions,
+            point_interval(Epoch::from_unix_seconds(4_101.0)),
+            None,
+            IMPLEMENTED.iter().copied().collect(),
+        );
+        assert_ne!(next_scan, first_scan);
+        store
+            .storage()
+            .publish_scan(next, "next admitted scan")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .storage()
+                .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
+                .unwrap()
+                .len(),
+            2,
+        );
     }
 
     #[test]

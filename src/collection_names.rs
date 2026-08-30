@@ -13,9 +13,10 @@
 
 use ed25519_dalek::VerifyingKey;
 
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::reach;
 use triblespace::core::collection::{
-    simplearchive_union, CollectionHandle, CollectionRegistrationError, CollectionStoreExt,
+    simplearchive_union, Collection, CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
@@ -151,7 +152,7 @@ pub fn root_descriptor(scope: Id, authority: VerifyingKey) -> Fragment {
     simplearchive_union::descriptor(require_name(scope), authority, require_reach(scope))
 }
 
-/// Register one faculty root and return its descriptor handle.
+/// Register one faculty root and return its typed descriptor handle.
 ///
 /// Registration is idempotent and owns the descriptor's complete attachment
 /// closure. Later publication and snapshots take only the returned handle;
@@ -161,7 +162,7 @@ pub fn open<S>(
     scope: Id,
     authority: VerifyingKey,
 ) -> Result<
-    CollectionHandle,
+    Collection<SimpleArchive>,
     CollectionRegistrationError<
         <S as BlobStorePut>::PutError,
         <S as ArtifactOfferStore>::OfferError,
@@ -170,7 +171,7 @@ pub fn open<S>(
 where
     S: CollectionStoreExt,
 {
-    storage.collection(root_descriptor(scope, authority))
+    storage.collection::<SimpleArchive>(root_descriptor(scope, authority))
 }
 
 #[cfg(test)]
@@ -215,14 +216,16 @@ mod tests {
         let evidence = entity! { _ @ metadata::tag: &scope };
         let expected = evidence.facts().clone();
         let mut store = MemoryRepo::default();
-        let collection = store.collection(descriptor_fragment).unwrap();
+        let collection = store
+            .collection::<SimpleArchive>(descriptor_fragment)
+            .unwrap();
         store
             .commit(collection, &foreign, evidence.clone())
             .unwrap();
-        assert!(store.snapshot(collection, &[]).unwrap().facts().is_empty());
+        assert!(store.snapshot(collection).unwrap().facts().is_empty());
 
         store.commit(collection, &local, evidence).unwrap();
-        let snapshot = store.snapshot(collection, &[]).unwrap();
+        let snapshot = store.snapshot(collection).unwrap();
         assert!(expected.difference(snapshot.facts()).is_empty());
     }
 }

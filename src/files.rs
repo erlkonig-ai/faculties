@@ -973,7 +973,7 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileReader)> {
     let collection = open_scope(pile, crate::schemas::files::DEFAULT_SCOPE_ID, signer)?;
     let (facts, _, reader) = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("materialize Files collection: {error}"))?
         .into_parts();
     Ok((facts, reader))
@@ -999,6 +999,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{BlobStore, BlobStoreGet};
@@ -1504,7 +1505,7 @@ mod tests {
         let signer = SigningKey::generate(&mut OsRng);
         let mut store = MemoryRepo::default();
         let collection = store
-            .collection(crate::collection_names::root_descriptor(
+            .collection::<SimpleArchive>(crate::collection_names::root_descriptor(
                 crate::schemas::files::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             ))
@@ -1524,7 +1525,7 @@ mod tests {
             .commit(collection, &signer, file)
             .expect("commit canonical file");
         let (catalog, _, reader) = store
-            .snapshot(collection, &[])
+            .snapshot::<TribleSet, _>(collection)
             .expect("materialize files")
             .into_parts();
         let content_handle = find!(

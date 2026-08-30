@@ -1,6 +1,6 @@
 //! Portable exact-term-frequency BM25 over canonical Archive blocks.
 //!
-//! This module is one concrete V4 collection recipe, not a registry. Its
+//! This module is one concrete V4 collection mapping, not a registry. Its
 //! source is Archive's canonical `SimpleArchive` union and its target is the
 //! portable BM25 carrier. Every canonical semantic block is a document,
 //! including a genuine textless block. The unique content-free canonical
@@ -10,7 +10,7 @@
 //! `UTF8String` payload is tokenized with [`hash_tokens`], and repeated
 //! documents join by pointwise maximum in the portable carrier.
 //!
-//! Importer receipts are deliberately outside the projection. The recipe
+//! Importer receipts are deliberately outside the projection. The mapping
 //! validates the intrinsic block/part/fact graph it consumes; Archive's full
 //! domain validator remains the publication boundary for source facts.
 
@@ -23,10 +23,13 @@ use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::collection::reach;
 use triblespace::core::collection::records::{
-    collection_authority, collection_recipe, collection_representation, collection_source,
-    CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_mapping, collection_reach, collection_representation,
+    collection_source, mapping_algorithm, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    KIND_COLLECTION_MAPPING,
 };
+use triblespace::core::collection::{CollectionMapping, CollectionOperationError};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -35,7 +38,6 @@ use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::{Inline, InlineEncoding, IntoInline, RawInline, TryFromInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::pile::PileReader;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::Fragment;
 use triblespace::core::trible::{build_intrinsic_entity, IntrinsicEntityRow, Trible, TribleSet};
@@ -45,16 +47,17 @@ use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::schemas::blockdag as schema;
 
-/// Archive-block-text BM25 recipe, version 1.
+/// Archive-block-text BM25 member mapping, version 1.
 ///
-/// Minted with `trible genid` on 2026-08-08:
-/// `0DDC5AFF78EFBC00CA64CEA0F9565291`.
+/// Minted with `trible genid` on 2026-08-30:
+/// `4EC6991611EF484A37FBD95F6E108FC6`.
 ///
 /// Changing the selected graph fields, occurrence aggregation / term-frequency
-/// law, tokenizer behavior, or document/term schemas requires a new recipe id.
+/// law, tokenizer behavior, or document/term schemas requires a new mapping id.
+/// Joining mapped members belongs to [`PortableBM25Blob`], not this identity.
 /// BM25 `k1` / `b` scoring policy is derived query behavior and is deliberately
 /// outside the persisted collection identity.
-pub const ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1: Id = id_hex!("0DDC5AFF78EFBC00CA64CEA0F9565291");
+pub const ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1: Id = id_hex!("4EC6991611EF484A37FBD95F6E108FC6");
 
 pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;
 
@@ -74,17 +77,55 @@ struct ProjectionPlan {
 ///
 /// A descriptor embeds this rather than only naming it, so a reader holding
 /// the pile can learn what the index is without the code that built it.
-pub struct ArchiveBlockTextBm25V1;
+pub struct ArchiveBlockTextBm25MappingV1;
 
-impl MetaDescribe for ArchiveBlockTextBm25V1 {
+impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
     fn describe() -> triblespace::core::trible::Fragment {
-        let id: Id = ARCHIVE_BLOCK_TEXT_BM25_RECIPE_V1;
+        let id: Id = ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1;
         entity! {
             triblespace::core::id::ExclusiveId::force_ref(&id) @
                 metadata::name: "archive-block-text-bm25-v1",
-                metadata::description: "Portable BM25 term index over the text carried by an archive collection's blocks, unioned across its elements. The recipe pins the selected graph fields, the occurrence aggregation and term-frequency law, tokenizer behaviour, and the document and term schemas; changing any of those is a different law and needs a newly minted id. The k1 and b scoring parameters are deliberately NOT pinned: they are query-time behaviour, not part of what the index IS, so two readers may score the same index differently without disagreeing about it.",
-                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+                metadata::description: "Canonical mapping from one Archive SimpleArchive member to one PortableBM25Blob. Every canonical semantic block in that member is one document; Archive's content-free bottom is excluded, selected UTF8String payload occurrences are tokenized with hash_tokens, repeated terms contribute exact frequencies, and repeated documents combine by pointwise maximum. PortableBM25Blob owns target-member validation and join. The k1 and b scoring parameters are deliberately absent because they are query-time behaviour.",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
+    }
+}
+
+/// Bound canonical projection from one Archive fact-set member to its
+/// portable BM25 image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveBlockTextBm25Mapping;
+
+impl CollectionMapping<SimpleArchive, PortableBM25Blob> for ArchiveBlockTextBm25Mapping {
+    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = triblespace::core::collection::descriptor::mapping_algorithm(target.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
+        if actual != Some(ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1) {
+            return Err(CollectionOperationError::Fatal(format!(
+                "Archive BM25 mapping algorithm {:?} does not match archive-block-text-v1 {ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1:X}",
+                actual.map(|id| format!("{id:X}")),
+            )));
+        }
+        Ok(Self)
+    }
+
+    fn map<R>(
+        &self,
+        source: &Blob<SimpleArchive>,
+        reader: &R,
+    ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        derive_element(reader, source.clone())
+            .map_err(|error| CollectionOperationError::Fatal(format!("{error:#}")))
+    }
+}
+
+fn mapping_fragment() -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_MAPPING,
+        mapping_algorithm*: <ArchiveBlockTextBm25MappingV1 as MetaDescribe>::describe(),
     }
 }
 
@@ -100,7 +141,8 @@ pub fn descriptor(authority: VerifyingKey) -> Fragment {
         collection_authority: authority,
         collection_source: source_collection(authority),
         collection_representation*: <PortableBM25Blob as MetaDescribe>::describe(),
-        collection_recipe*: <ArchiveBlockTextBm25V1 as MetaDescribe>::describe(),
+        collection_mapping*: mapping_fragment(),
+        collection_reach*: reach::private(),
     }
 }
 
@@ -124,10 +166,10 @@ pub fn source_collection(authority: VerifyingKey) -> CollectionHandle {
 ///
 /// A missing selected payload is an operational cache miss for an active
 /// builder. A later exact ensure retries with a fresh attachment reader.
-pub fn derive_element(
-    reader: &PileReader,
-    source: Blob<SimpleArchive>,
-) -> Result<Blob<PortableBM25Blob>> {
+pub fn derive_element<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<Blob<PortableBM25Blob>>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+{
     match derive_for_validation(reader, source)? {
         DeriveValidation::Ready(blob) => Ok(blob),
         DeriveValidation::Pending => bail!("Archive BM25 source has a nonresident text payload"),
@@ -135,10 +177,10 @@ pub fn derive_element(
     }
 }
 
-fn derive_for_validation(
-    reader: &PileReader,
-    source: Blob<SimpleArchive>,
-) -> Result<DeriveValidation> {
+fn derive_for_validation<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<DeriveValidation>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+{
     let plan = match projection_plan(source) {
         Ok(plan) => plan,
         Err(reason) => return Ok(DeriveValidation::Rejected(reason)),
@@ -502,6 +544,7 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::id::ExclusiveId;
+    use triblespace::core::repo::pile::PileReader;
     use triblespace::core::repo::{BlobStore, BlobStorePut};
     use triblespace::core::trible::Fragment;
     use triblespace::macros::entity;
@@ -568,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn recipe_v1_freezes_case_punctuation_and_unicode_tokenization() {
+    fn mapping_v1_freezes_case_punctuation_and_unicode_tokenization() {
         let actual: Vec<_> = hash_tokens("Hello, WORLD — hello. 🛰️")
             .into_iter()
             .map(|token| hex::encode_upper(token.raw))

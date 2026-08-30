@@ -1419,7 +1419,7 @@ mod tests {
                 .len(),
             1
         );
-        let snapshot = pile.snapshot(messages, &[]).unwrap();
+        let snapshot = pile.snapshot(messages).unwrap();
         validate_catalog(snapshot.reader(), snapshot.facts(), &relation_facts).unwrap();
         assert_eq!(
             load_message_rows(snapshot.facts()).unwrap()[0].id,

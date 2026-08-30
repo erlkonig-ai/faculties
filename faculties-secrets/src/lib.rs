@@ -22,7 +22,7 @@ use triblespace::core::capability::{
     CapabilityResource,
 };
 use triblespace::core::collection::{
-    reach, simplearchive_union, CapabilityPresentation, CollectionHandle, ACTION_WRITE,
+    reach, simplearchive_union, Collection, CollectionHandle, ACTION_WRITE,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
@@ -111,12 +111,18 @@ pub fn vault_descriptor(vault: Id, authority: VerifyingKey) -> Fragment {
     simplearchive_union::descriptor(&vault_name(vault), authority, reach::private())
 }
 
+/// Typed private `SimpleArchive`-union collection of one vault epoch.
+pub(crate) fn vault_collection(
+    vault: Id,
+    authority: VerifyingKey,
+) -> Collection<blobencodings::SimpleArchive> {
+    Collection::from_descriptor(&vault_descriptor(vault, authority))
+        .expect("vault_descriptor constructs a typed SimpleArchive collection")
+}
+
 /// Exact collection resource governed by `WRITE` and `READ` authority.
 pub fn vault_handle(vault: Id, authority: VerifyingKey) -> CollectionHandle {
-    vault_descriptor(vault, authority)
-        .into_facts()
-        .to_blob()
-        .get_handle()
+    vault_collection(vault, authority).handle()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,11 +207,11 @@ pub struct VaultSnapshot {
 pub struct VaultAccess {
     vault: Id,
     trust_root: VerifyingKey,
-    collection: CollectionHandle,
+    collection: Collection<blobencodings::SimpleArchive>,
     subject: VerifyingKey,
     custody: SigningKey,
     read_bundles: Vec<CapabilityProofBundle>,
-    write_presentations: Vec<CapabilityPresentation>,
+    write_bundles: Vec<CapabilityProofBundle>,
 }
 
 impl VaultAccess {
@@ -215,15 +221,15 @@ impl VaultAccess {
         subject: VerifyingKey,
         custody: SigningKey,
         read_bundles: Vec<CapabilityProofBundle>,
-        write_presentations: Vec<CapabilityPresentation>,
+        write_bundles: Vec<CapabilityProofBundle>,
     ) -> Result<Self> {
         if read_bundles.is_empty() {
             bail!("vault access requires at least one exact READ proof bundle");
         }
-        if write_presentations.is_empty() {
-            bail!("vault access requires at least one exact WRITE presentation");
+        if write_bundles.is_empty() {
+            bail!("vault access requires at least one exact WRITE proof bundle");
         }
-        let collection = vault_handle(vault, trust_root);
+        let collection = vault_collection(vault, trust_root);
         let access = Self {
             vault,
             trust_root,
@@ -231,7 +237,7 @@ impl VaultAccess {
             subject,
             custody,
             read_bundles,
-            write_presentations,
+            write_bundles,
         };
         let instant = triblespace::core::clock::epoch_now();
         access.verify_read_at(instant)?;
@@ -248,7 +254,7 @@ impl VaultAccess {
     }
 
     pub const fn collection(&self) -> CollectionHandle {
-        self.collection
+        self.collection.handle()
     }
 
     pub fn subject(&self) -> VerifyingKey {
@@ -263,14 +269,14 @@ impl VaultAccess {
         &self.read_bundles
     }
 
-    pub fn write_presentations(&self) -> &[CapabilityPresentation] {
-        &self.write_presentations
+    pub fn write_bundles(&self) -> &[CapabilityProofBundle] {
+        &self.write_bundles
     }
 
     pub fn verify_read_at(&self, instant: Epoch) -> Result<()> {
         let atom = CapabilityAtom::new(
             CapabilityAction::new(ACTION_READ),
-            CapabilityResource::from(self.collection),
+            CapabilityResource::from(self.collection.handle()),
         );
         let request = CapabilityRequest::new(atom, CapabilityMode::Invoke);
         let mut failures = Vec::new();
@@ -294,21 +300,20 @@ impl VaultAccess {
     pub fn verify_write_at(&self, instant: Epoch) -> Result<()> {
         let atom = CapabilityAtom::new(
             CapabilityAction::new(ACTION_WRITE),
-            CapabilityResource::from(self.collection),
+            CapabilityResource::from(self.collection.handle()),
         );
-        for (index, presentation) in self.write_presentations.iter().enumerate() {
-            let verified = presentation
-                .bundle()
+        for (index, bundle) in self.write_bundles.iter().enumerate() {
+            let verified = bundle
                 .verify(
                     self.trust_root,
                     instant,
-                    presentation.expected_leaf(),
+                    bundle.proof().leaf_key(),
                     CapabilityRequest::new(atom, CapabilityMode::Invoke),
                 )
-                .with_context(|| format!("verify vault WRITE presentation {index}"))?;
+                .with_context(|| format!("verify vault WRITE proof bundle {index}"))?;
             if verified.effective_validity().is_some() {
                 bail!(
-                    "vault WRITE presentation {index} is bounded; historical commits require unbounded admission"
+                    "vault WRITE proof bundle {index} is bounded; historical commits require unbounded admission"
                 );
             }
         }
@@ -508,7 +513,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
                     access.vault
                 );
             }
-            let collection = access.collection;
+            let collection = access.collection.handle();
             let custody = catalog
                 .custody
                 .context("an accessible vault must declare one custody key")?;
@@ -1174,7 +1179,6 @@ mod tests {
     use triblespace::core::blob::IntoBlob;
     use triblespace::core::capability::CapabilityClaim;
     use triblespace::core::collection::descriptor as descriptor_facts;
-    use triblespace::core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::BlobStore;
 
@@ -1259,10 +1263,8 @@ mod tests {
             descriptor_facts::representation(descriptor.facts()).unwrap(),
             <blobencodings::SimpleArchive as MetaDescribe>::id()
         );
-        assert_eq!(
-            descriptor_facts::recipe(descriptor.facts()).unwrap(),
-            TRIBLE_SET_UNION_RECIPE_V1
-        );
+        assert_eq!(descriptor_facts::source(descriptor.facts()).unwrap(), None);
+        assert_eq!(descriptor_facts::mapping(descriptor.facts()).unwrap(), None);
         assert!(!reach::travels(descriptor.facts()));
         assert_eq!(
             vault_handle(vault, authority),
@@ -1513,18 +1515,19 @@ mod tests {
         let subject = key(3);
         let outsider = key(4);
         let custody = SigningKey::generate(&mut OsRng);
-        let collection = vault_handle(vault, root.verifying_key());
+        let collection = vault_collection(vault, root.verifying_key());
+        let collection_handle = collection.handle();
         let read = root_bundle(
             &root,
             subject.verifying_key(),
-            collection,
+            collection_handle,
             ACTION_READ,
             CapabilityMode::InvokeAndDelegate,
         );
         let write = root_bundle(
             &root,
             subject.verifying_key(),
-            collection,
+            collection_handle,
             ACTION_WRITE,
             CapabilityMode::Invoke,
         );
@@ -1533,7 +1536,10 @@ mod tests {
                 root.verifying_key(),
                 triblespace::core::clock::epoch_now(),
                 subject.verifying_key(),
-                CapabilityRequest::new(atom(collection, ACTION_WRITE), CapabilityMode::Invoke),
+                CapabilityRequest::new(
+                    atom(collection_handle, ACTION_WRITE),
+                    CapabilityMode::Invoke,
+                ),
             )
             .unwrap();
 
@@ -1543,10 +1549,7 @@ mod tests {
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![read.clone()],
-            vec![CapabilityPresentation::new(
-                subject.verifying_key(),
-                write.clone(),
-            )],
+            vec![write.clone()],
         )
         .unwrap();
 
@@ -1570,19 +1573,17 @@ mod tests {
 
         let mut authorized = MemoryRepo::default();
         let registered = authorized
-            .collection(vault_descriptor(vault, root.verifying_key()))
+            .collection::<blobencodings::SimpleArchive>(vault_descriptor(
+                vault,
+                root.verifying_key(),
+            ))
             .unwrap();
         assert_eq!(registered, collection);
+        crate::storage::persist_proof_bundle(&mut authorized, &write).unwrap();
         authorized
             .commit(collection, &subject, fragment.clone())
             .unwrap();
-        assert_eq!(
-            authorized
-                .snapshot(collection, access.write_presentations())
-                .unwrap()
-                .facts(),
-            &facts
-        );
+        assert_eq!(authorized.snapshot(collection).unwrap().facts(), &facts);
 
         let reader = fragment.blobs_mut().reader().unwrap();
         let snapshot =
@@ -1605,17 +1606,14 @@ mod tests {
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![wrong_read],
-            vec![CapabilityPresentation::new(
-                subject.verifying_key(),
-                write.clone(),
-            )],
+            vec![write.clone()],
         )
         .is_err());
 
         let wrong_subject_read = root_bundle(
             &root,
             outsider.verifying_key(),
-            collection,
+            collection_handle,
             ACTION_READ,
             CapabilityMode::Invoke,
         );
@@ -1625,10 +1623,7 @@ mod tests {
             subject.verifying_key(),
             SigningKey::from_bytes(&custody.to_bytes()),
             vec![wrong_subject_read],
-            vec![CapabilityPresentation::new(
-                subject.verifying_key(),
-                write.clone(),
-            )],
+            vec![write.clone()],
         )
         .is_err());
 
@@ -1639,10 +1634,7 @@ mod tests {
             subject.verifying_key(),
             wrong_custody,
             vec![read.clone()],
-            vec![CapabilityPresentation::new(
-                subject.verifying_key(),
-                write.clone(),
-            )],
+            vec![write.clone()],
         )
         .unwrap();
         assert!(SecretsSnapshot::new_accessible(
@@ -1664,10 +1656,7 @@ mod tests {
             subject.verifying_key(),
             custody,
             vec![read],
-            vec![CapabilityPresentation::new(
-                subject.verifying_key(),
-                wrong_write,
-            )],
+            vec![wrong_write],
         )
         .is_err());
     }

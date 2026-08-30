@@ -255,7 +255,7 @@ impl WikiStorage<'_> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, scope, signer)?;
             let (facts, _, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .with_context(|| format!("materialize {label} collection"))?
                 .into_parts();
             Ok(CollectionView { facts, reader })
@@ -511,7 +511,7 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
 fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
     storage.with_pile(|pile, signer| {
         let collection = open_scope(pile, FILES_SCOPE_ID, signer)?;
-        pile.snapshot(collection, &[])
+        pile.snapshot(collection)
             .map(|snapshot| snapshot.into_facts())
             .context("materialize Files collection")
     })

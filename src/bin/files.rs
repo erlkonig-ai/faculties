@@ -15,7 +15,8 @@ use hifitime::Epoch;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
@@ -341,7 +342,7 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
 /// pay to reconstruct the existing collection value.
 fn with_files_store<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Pile, CollectionHandle, &SigningKey) -> Result<T>,
+    f: impl FnOnce(&mut Pile, Collection<SimpleArchive>, &SigningKey) -> Result<T>,
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
@@ -366,11 +367,17 @@ fn with_files_store<T>(
 /// mutation depends on facts already present in the collection.
 fn with_files_view<T>(
     pile: &Path,
-    f: impl FnOnce(&mut Pile, CollectionHandle, &SigningKey, &TribleSet, &PileReader) -> Result<T>,
+    f: impl FnOnce(
+        &mut Pile,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &TribleSet,
+        &PileReader,
+    ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(pile, |store, collection, signer| {
         let (space, _ticket, reader) = store
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .map(|snapshot| snapshot.into_parts())
             .context("materialize Files collection")?;
         f(store, collection, signer, &space, &reader)
@@ -718,7 +725,7 @@ fn cmd_add_dry_run(path: &Path, tags: &[String]) -> Result<()> {
 
 fn cmd_add(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     path: &Path,
     mime_override: Option<&str>,
@@ -788,7 +795,7 @@ fn cmd_add(
 
 fn cmd_fetch(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     url: &str,
     mime_override: Option<&str>,
@@ -1105,7 +1112,7 @@ fn extract_tree<R: BlobStoreGet>(
 
 fn cmd_tag(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,
@@ -1491,7 +1498,7 @@ fn read_embedding<R: BlobStoreGet>(reader: &R, h: EmbHandle) -> Result<Vec<f32>>
 /// vector fanned out to every entity that shares the content.
 fn cmd_embed7b(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,
@@ -1685,7 +1692,7 @@ fn which_pdftoppm() -> Option<PathBuf> {
 /// file entity that shares the content.
 fn cmd_embed7b_pdf(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &TribleSet,
     reader: &PileReader,

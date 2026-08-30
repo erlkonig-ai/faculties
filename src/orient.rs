@@ -32,9 +32,9 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 
 /// One coherent Orient source snapshot plus its maintained checkpoint order.
 ///
-/// Facts, ticket, payload reader, and register are captured from one exact
+/// Facts, cover, payload reader, and register are captured from one exact
 /// collection observation. The maintained artifact is cache exhaust and has
-/// no authority beyond that source ticket.
+/// no authority beyond that source cover.
 pub struct OrientSnapshot {
     facts: TribleSet,
     reader: PileReader,
@@ -42,7 +42,7 @@ pub struct OrientSnapshot {
 }
 
 impl OrientSnapshot {
-    /// Materialized facts admitted by this exact source ticket.
+    /// Materialized facts admitted by this exact source cover.
     pub fn facts(&self) -> &TribleSet {
         &self.facts
     }
@@ -52,7 +52,7 @@ impl OrientSnapshot {
         &self.reader
     }
 
-    /// Maintained checkpoint order attached for this exact ticket.
+    /// Maintained checkpoint order attached for this exact cover.
     pub fn checkpoint_register(&self) -> &LwwIndex {
         &self.checkpoints
     }
@@ -506,7 +506,7 @@ where
 }
 
 /// Capture Orient facts and attach the maintained checkpoint LWW index for
-/// that exact source ticket, constructing missing derived artifacts if needed.
+/// that exact source cover, constructing missing derived artifacts if needed.
 ///
 /// Cross-collection validation of Seen note references remains the caller's
 /// responsibility through [`validate_catalog`], because the Compass frame is
@@ -517,12 +517,12 @@ pub fn materialize_indexed_collection(
 ) -> Result<OrientSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let snapshot = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("snapshot Orient collection: {error}"))?;
-    let (facts, ticket, reader) = snapshot.into_parts();
+    let (facts, cover, reader) = snapshot.into_parts();
     load_checkpoint_events(&reader, &facts).context("validate Orient checkpoint collection")?;
     let checkpoints = checkpoint_register_collection(signer.verifying_key())
-        .ensure_exact(pile, ticket.commits())
+        .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
     Ok(OrientSnapshot {
         facts,

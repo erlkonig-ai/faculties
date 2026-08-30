@@ -280,7 +280,7 @@ impl WebStorage<'_> {
     ) -> Result<CollectionView> {
         let collection = open_scope(pile, scope, signer)?;
         let (facts, _, reader) = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .with_context(|| format!("materialize {label} collection"))?
             .into_parts();
         Ok(CollectionView { facts, reader })
@@ -767,7 +767,7 @@ mod tests {
         let collection =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let facts = pile.snapshot(collection, &[]).unwrap().into_facts();
+        let facts = pile.snapshot(collection).unwrap().into_facts();
         assert_eq!(
             find!(
                 (entity: Id),

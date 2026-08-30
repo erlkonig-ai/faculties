@@ -258,7 +258,7 @@ impl CompassStorage<'_> {
             let by = if let Some(persona) = persona {
                 let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
                 let (relation_facts, _, relation_reader) = pile
-                    .snapshot(collection, &[])
+                    .snapshot(collection)
                     .context("materialize Relations collection for Compass persona")?
                     .into_parts();
                 relations::validate_catalog(&relation_reader, &relation_facts)
@@ -1170,7 +1170,7 @@ mod tests {
 
         // Compass preserves unrelated open-world facts. Multiple values on
         // the order attribute alone do not form a status coordinate and must
-        // not make the maintained register reject the exact ticket.
+        // not make the maintained register reject the exact cover.
         let unrelated = ufoid();
         let first: IntervalValue = {
             let value = Epoch::from_unix_seconds(1.0);

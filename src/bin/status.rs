@@ -108,7 +108,7 @@ fn materialize_scope(
     label: &str,
 ) -> Result<TribleSet> {
     let collection = open_scope(pile, scope, signer)?;
-    pile.snapshot(collection, &[])
+    pile.snapshot(collection)
         .map(|snapshot| snapshot.into_facts())
         .with_context(|| format!("materialize authored {label} collection"))
 }
@@ -455,12 +455,12 @@ mod tests {
                 assert!(rows.is_empty());
 
                 let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-                assert!(pile.ticket(collection, &[])?.commits().is_empty());
+                assert!(pile.cover(collection)?.is_empty());
                 let discovered = triblespace::core::collection::discover_collection_records(pile)?;
                 let resident = discovered
                     .commits()
                     .iter()
-                    .filter(|commit| commit.collection() == collection)
+                    .filter(|commit| commit.collection() == collection.handle())
                     .collect::<Vec<_>>();
                 assert_eq!(resident.len(), 1);
                 assert_eq!(

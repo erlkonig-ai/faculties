@@ -48,13 +48,13 @@ use triblespace::core::capability::{
     CapabilityResource,
 };
 use triblespace::core::collection::records::{
-    collection_authority, collection_reach, collection_recipe, collection_representation,
-    collection_source, CollectionCommit, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_source, CollectionCommit, CollectionHandle,
+    KIND_COLLECTION_DESCRIPTOR,
 };
-use triblespace::core::collection::simplearchive_union::{self, TribleSetUnionV1};
+use triblespace::core::collection::simplearchive_union;
 use triblespace::core::collection::{
-    discover_collection_records, CapabilityPresentation, CollectionRecord, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    discover_collection_cover_authorized_with_admission, discover_collection_records, Collection,
+    CollectionRecord, CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
@@ -62,11 +62,11 @@ use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::{Inline, IntoInline};
-use triblespace::core::metadata::{self, MetaDescribe};
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::{BlobStore, BlobStoreGet, CapabilityProofStore};
 use triblespace::core::trible::{Fragment, Trible, TribleSet};
-use triblespace::macros::{attributes, entity, find, pattern};
+use triblespace::macros::{attributes, find, pattern};
 
 mod retired {
     use super::*;
@@ -171,7 +171,7 @@ struct PreparedVault {
     predecessor: Option<PreparedPredecessor>,
     current_record_ids: BTreeSet<Id>,
     current_ids: BTreeSet<Id>,
-    presentation: Vec<CapabilityPresentation>,
+    current_writers: BTreeSet<[u8; 32]>,
     successor_inbox_commits: Vec<CollectionCommit>,
     successor_proofs: Vec<CapabilityProofBundle>,
     custody: SigningKey,
@@ -285,15 +285,12 @@ fn retired_descriptor(
     namespace: VerifyingKey,
     authority: Option<VerifyingKey>,
 ) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        retired::collection_name: name,
-        retired::collection_namespace: namespace,
-        collection_authority?: authority,
-        collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
-        collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
-        collection_reach*: triblespace::core::collection::reach::private(),
-    }
+    crate::descriptor_authority::retired_named_descriptor(
+        name,
+        namespace,
+        authority,
+        triblespace::core::collection::reach::private(),
+    )
 }
 
 fn retired_inbox_descriptor(recipient: VerifyingKey) -> Fragment {
@@ -699,7 +696,7 @@ fn exact_founder_access(
     })
 }
 
-fn unbounded_write_presentation(
+fn has_unbounded_write_proof(
     candidate: &AccessCandidate,
     authority: VerifyingKey,
     subject: VerifyingKey,
@@ -720,24 +717,44 @@ fn unbounded_write_presentation(
             .is_ok_and(|verified| verified.effective_validity().is_none())
 }
 
-fn current_presentations(
+struct AdmittedCurrent {
+    facts: TribleSet,
+    commits: Vec<CollectionCommit>,
+}
+
+/// Observe one current vault through exactly the writer keys carried by its
+/// validated access envelopes.
+///
+/// Cover membership and COMMIT provenance come from one strict record scan.
+/// Ambient proof-store contents are irrelevant, and a later duplicate claim
+/// over an admitted payload cannot retroactively become a root of this
+/// migration observation.
+fn admitted_current(
+    pile: &mut Pile,
+    descriptor: &Fragment,
+    writers: &BTreeSet<[u8; 32]>,
+) -> Result<AdmittedCurrent> {
+    let collection = Collection::<SimpleArchive>::from_descriptor(descriptor)
+        .map_err(|error| anyhow!("type current Secrets collection: {error}"))?;
+    let (cover, commits) =
+        discover_collection_cover_authorized_with_admission(pile, collection, |subject| {
+            writers.contains(&subject.raw)
+        })
+        .map_err(|error| anyhow!("discover envelope-scoped current Secrets roots: {error}"))?;
+    let facts = pile
+        .materialize::<TribleSet, _>(&cover)
+        .map_err(|error| anyhow!("materialize envelope-scoped current Secrets cover: {error}"))?;
+    Ok(AdmittedCurrent { facts, commits })
+}
+
+fn candidate_writer_keys(
     candidates: &[AccessCandidate],
     collection: CollectionHandle,
-) -> Vec<CapabilityPresentation> {
+) -> BTreeSet<[u8; 32]> {
     candidates
         .iter()
         .filter(|candidate| candidate.vault == collection)
-        .map(|candidate| {
-            (
-                (
-                    candidate.writer.to_bytes(),
-                    candidate.write_bundle.proof().id().raw,
-                ),
-                CapabilityPresentation::new(candidate.writer, candidate.write_bundle.clone()),
-            )
-        })
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
+        .map(|candidate| candidate.writer.to_bytes())
         .collect()
 }
 
@@ -776,21 +793,12 @@ fn successor_inbox_commits(
 fn potentially_admitted_current_record(
     commits: &[CollectionCommit],
     collection: CollectionHandle,
-    authority: VerifyingKey,
-    candidates: &[AccessCandidate],
+    writers: &BTreeSet<[u8; 32]>,
 ) -> bool {
-    let authority = authority.to_bytes();
-    let delegated = candidates
-        .iter()
-        .filter(|candidate| candidate.vault == collection)
-        .map(|candidate| candidate.writer.to_bytes())
-        .collect::<BTreeSet<_>>();
     commits
         .iter()
         .filter(|commit| commit.collection() == collection)
-        .any(|commit| {
-            commit.public_key().raw == authority || delegated.contains(&commit.public_key().raw)
-        })
+        .any(|commit| writers.contains(&commit.public_key().raw))
 }
 
 fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
@@ -855,16 +863,10 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
     for (collection, error) in &discovery.unreadable {
         let inert_inbox = (*collection == old_inbox && old_candidates.is_empty())
             || (*collection == current_inbox && current_candidates.is_empty());
-        let inert_successor = current_authorities
-            .get(collection)
-            .is_some_and(|authority| {
-                !potentially_admitted_current_record(
-                    &commits,
-                    *collection,
-                    *authority,
-                    &current_candidates,
-                )
-            });
+        let inert_successor = current_authorities.get(collection).is_some_and(|_| {
+            let writers = candidate_writer_keys(&current_candidates, *collection);
+            !potentially_admitted_current_record(&commits, *collection, &writers)
+        });
         if !inert_inbox && !inert_successor {
             bail!("{error}");
         }
@@ -914,19 +916,14 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             })
         }).transpose()?;
         let new = secrets::vault_handle(vault, authority);
-        let presentation = current_presentations(&current_candidates, new);
         let current_record_ids = commits
             .iter()
             .filter(|commit| commit.collection() == new)
             .map(CollectionCommit::id)
             .collect::<BTreeSet<_>>();
+        let current_writers = candidate_writer_keys(&current_candidates, new);
         let mut prospective_facts = source_facts.clone();
-        let current = if !potentially_admitted_current_record(
-            &commits,
-            new,
-            authority,
-            &current_candidates,
-        ) {
+        let current = if !potentially_admitted_current_record(&commits, new, &current_writers) {
             Vec::new()
         } else {
             let expected_descriptor = secrets::vault_descriptor(vault, authority);
@@ -935,13 +932,10 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             if resident != *expected_descriptor.facts() {
                 bail!("current vault descriptor for {vault:X} is not canonical");
             }
-            let ticket = pile
-                .ticket(new, &presentation)
-                .map_err(|error| anyhow!("admit current vault {vault:X}: {error}"))?;
-            prospective_facts += pile
-                .materialize(&ticket)
-                .map_err(|error| anyhow!("materialize current vault {vault:X}: {error}"))?;
-            ticket.commits().to_vec()
+            let admitted = admitted_current(pile, &expected_descriptor, &current_writers)
+                .with_context(|| format!("admit current vault {vault:X}"))?;
+            prospective_facts += admitted.facts;
+            admitted.commits
         };
         let current_ids = current
             .iter()
@@ -981,7 +975,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
         });
         let delegated_successor_grant = authority != signer.verifying_key()
             && current_candidates.iter().any(|candidate| {
-                unbounded_write_presentation(
+                has_unbounded_write_proof(
                     candidate,
                     authority,
                     signer.verifying_key(),
@@ -1054,7 +1048,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<PreparedPlan> {
             predecessor,
             current_record_ids,
             current_ids,
-            presentation,
+            current_writers,
             successor_inbox_commits: successor_inbox_commits(&current_candidates, new),
             successor_proofs: successor_proofs(&current_candidates, new),
             custody,
@@ -1169,16 +1163,15 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
         let current_ids = if vault.current_ids.is_empty() {
             BTreeSet::new()
         } else {
-            pile.ticket(vault.summary.new, &vault.presentation)
-                .map_err(|error| {
-                    anyhow!(
-                        "re-admit frozen successor vault {:X}: {error}",
-                        vault.summary.vault
-                    )
+            let descriptor =
+                secrets::vault_descriptor(vault.summary.vault, vault.summary.authority);
+            admitted_current(pile, &descriptor, &vault.current_writers)
+                .with_context(|| {
+                    format!("re-admit frozen successor vault {:X}", vault.summary.vault)
                 })?
-                .commits()
-                .iter()
-                .map(CollectionCommit::id)
+                .commits
+                .into_iter()
+                .map(|commit| commit.id())
                 .collect()
         };
         if current_ids != vault.current_ids {
@@ -1243,9 +1236,9 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<SecretsDescripto
     for vault in &before.vaults {
         let descriptor = secrets::vault_descriptor(vault.summary.vault, vault.summary.authority);
         let registered = pile
-            .collection(descriptor)
+            .collection::<SimpleArchive>(descriptor)
             .map_err(|error| anyhow!("register current vault descriptor: {error}"))?;
-        if registered != vault.summary.new {
+        if registered.handle() != vault.summary.new {
             bail!("registered current vault descriptor changed identity");
         }
         crate::offer_backfill::offer_reused_commit_closure(pile, vault.summary.new, &vault.source)
@@ -1323,18 +1316,6 @@ fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &PreparedPlan) -> Res
                 vault.summary.vault
             );
         }
-        let ticket = pile
-            .ticket(vault.summary.new, &vault.presentation)
-            .map_err(|error| anyhow!("admit migrated vault: {error}"))?;
-        let snapshot = pile
-            .materialize(&ticket)
-            .map_err(|error| anyhow!("materialize migrated vault: {error}"))?;
-        if !vault.source_facts.difference(&snapshot).is_empty() {
-            bail!(
-                "current vault {:X} does not contain the retired fact union",
-                vault.summary.vault
-            );
-        }
     }
     let discovery = faculties::secrets::storage::discover_local_vaults(pile, signer)
         .context("discover migrated Secrets vaults through the runtime path")?;
@@ -1348,6 +1329,12 @@ fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &PreparedPlan) -> Res
                     vault.summary.vault
                 )
             })?;
+        if !vault.source_facts.difference(ready.facts()).is_empty() {
+            bail!(
+                "current vault {:X} does not contain the retired fact union",
+                vault.summary.vault
+            );
+        }
         if ready.catalog().custody.map(|row| row.public_key)
             != Some(vault.custody.verifying_key().to_bytes())
         {
@@ -1399,6 +1386,7 @@ mod tests {
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::capability::{CapabilityAtom, CapabilityClaim};
     use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
+    use triblespace::macros::entity;
     use triblespace::prelude::TryToInline;
 
     struct Fixture {
@@ -1758,12 +1746,12 @@ mod tests {
         );
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let registered = pile
-            .collection(secrets::vault_descriptor(
+            .collection::<SimpleArchive>(secrets::vault_descriptor(
                 fixture.vault,
                 fixture.signer.verifying_key(),
             ))
             .unwrap();
-        assert_eq!(registered, target);
+        assert_eq!(registered.handle(), target);
         let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
         let (read, write) = founder_proofs(&fixture.signer, location);
         publish_access_envelope(
@@ -1966,6 +1954,39 @@ mod tests {
     }
 
     #[test]
+    fn ambient_write_proof_without_an_access_envelope_does_not_suppress_reseat() {
+        let fixture = founder_fixture();
+        let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
+        let ambient = key(0x7e);
+        let write = root_bundle_for(
+            &fixture.signer,
+            ambient.verifying_key(),
+            target,
+            ACTION_WRITE,
+        );
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        store_fragment(
+            &mut pile,
+            secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
+        );
+        persist_proof_bundle(&mut pile, &write).unwrap();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &ambient,
+            target,
+            fixture.source[0].data(),
+            fixture.source[0].metadata(),
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(plan.vaults[0].target_commits, fixture.source.len());
+        let report = publish_path(&fixture.pile, Some(&fixture.key)).unwrap();
+        assert_eq!(report.appended_commits, fixture.source.len());
+        assert!(report.plan.settled());
+    }
+
+    #[test]
     fn foreign_inert_target_commit_without_a_descriptor_cannot_block_reseat() {
         let fixture = founder_fixture();
         let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
@@ -2035,7 +2056,8 @@ mod tests {
     #[test]
     fn conflicting_current_catalog_is_rejected_before_publication() {
         let fixture = founder_fixture();
-        let target = secrets::vault_handle(fixture.vault, fixture.signer.verifying_key());
+        let location = VaultLocation::new(fixture.vault, fixture.signer.verifying_key());
+        let target = location.collection();
         let conflicting = secrets::vault_header_fragment(
             fixture.vault,
             "conflicting epoch",
@@ -2048,6 +2070,19 @@ mod tests {
             &mut pile,
             secrets::vault_descriptor(fixture.vault, fixture.signer.verifying_key()),
         );
+        let (read, write) = founder_proofs(&fixture.signer, location);
+        publish_access_envelope(
+            &mut pile,
+            &fixture.signer,
+            location,
+            &fixture.custody,
+            fixture.signer.verifying_key(),
+            &read,
+            fixture.signer.verifying_key(),
+            &write,
+            triblespace::core::clock::epoch_now(),
+        )
+        .unwrap();
         commit_fragment(&mut pile, &fixture.signer, target, conflicting);
         pile.close().unwrap();
         let before = fs::read(&fixture.pile).unwrap();

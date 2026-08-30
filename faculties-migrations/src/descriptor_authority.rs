@@ -24,14 +24,14 @@ use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{
-    collection_authority, collection_reach, collection_recipe, collection_representation,
-    collection_source, CollectionCommit, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+    collection_authority, collection_reach, collection_representation, collection_source,
+    CollectionCommit, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use triblespace::core::collection::simplearchive_union::{self, TribleSetUnionV1};
+use triblespace::core::collection::simplearchive_union;
 use triblespace::core::collection::{
-    discover_collection_records, CollectionRecord, CollectionStore, CollectionStoreExt,
+    discover_collection_records, Collection, CollectionRecord, CollectionStore, CollectionStoreExt,
 };
-use triblespace::core::id::Id;
+use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -50,6 +50,29 @@ mod retired {
         "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name: ShortString;
         "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_namespace: ED25519PublicKey;
         "D3418873C70392E3ADAA05C00E11A583" unsafe as pub collection_scope: GenId;
+        "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe: GenId;
+    }
+}
+
+/// Retired recipe-description identity embedded in the descriptor epoch this
+/// migration consumes. Current collection descriptors deliberately reject
+/// this field; keeping its exact historical construction here is what lets a
+/// migration identify old roots without restoring the obsolete live API.
+const RETIRED_KIND_COLLECTION_RECIPE: Id =
+    triblespace::core::id::id_hex!("89E53D7FF204516307F0421C05E75000");
+const RETIRED_TRIBLE_SET_UNION_RECIPE_V1: Id =
+    triblespace::core::id::id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45");
+
+struct RetiredTribleSetUnionV1;
+
+impl MetaDescribe for RetiredTribleSetUnionV1 {
+    fn describe() -> Fragment {
+        entity! {
+            ExclusiveId::force_ref(&RETIRED_TRIBLE_SET_UNION_RECIPE_V1) @
+                metadata::name: "trible-set-union-v1",
+                metadata::description: "Set union of the tribles carried by a collection's elements. Associative, commutative and idempotent, so any two states have a least upper bound and merging is order-independent: a collection's value is the union over every element committed to it, and two replicas that have seen the same elements agree regardless of the order they arrived in. Takes no arguments.",
+                metadata::tag: RETIRED_KIND_COLLECTION_RECIPE,
+        }
     }
 }
 
@@ -262,7 +285,7 @@ fn decode_retired_root(facts: &TribleSet) -> Result<RetiredRoot> {
     })
 }
 
-fn retired_descriptor(
+pub(crate) fn retired_named_descriptor(
     name: &str,
     namespace: VerifyingKey,
     authority: Option<VerifyingKey>,
@@ -274,7 +297,7 @@ fn retired_descriptor(
         retired::collection_namespace: namespace,
         collection_authority?: authority,
         collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
-        collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
+        retired::collection_recipe*: <RetiredTribleSetUnionV1 as MetaDescribe>::describe(),
         collection_reach*: reach,
     }
 }
@@ -292,7 +315,7 @@ pub(crate) fn retired_root_descriptor(scope: Id, namespace: VerifyingKey) -> Res
         .into_iter()
         .find(|(candidate, _, _)| *candidate == scope)
         .ok_or_else(|| anyhow!("scope {scope:X} is absent from the ordinary-root registry"))?;
-    Ok(retired_descriptor(name, namespace, None, reach))
+    Ok(retired_named_descriptor(name, namespace, None, reach))
 }
 
 pub(crate) fn descriptor_handle(fragment: &Fragment) -> CollectionHandle {
@@ -339,7 +362,7 @@ fn collection_record_counts(
         *counts.entry(merge.collection()).or_default() += 1;
     }
     for derive in derives {
-        *counts.entry(derive.target()).or_default() += 1;
+        *counts.entry(derive.collection()).or_default() += 1;
     }
     counts
 }
@@ -428,7 +451,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
     let mut selected_epoch_evidence = false;
 
     for (scope, name, reach) in faculties::collection_names::table() {
-        let old_descriptor = retired_descriptor(name, authority, None, reach.clone());
+        let old_descriptor = retired_named_descriptor(name, authority, None, reach.clone());
         let old = descriptor_handle(&old_descriptor);
         let new_descriptor = simplearchive_union::descriptor(name, authority, reach);
         let new = descriptor_handle(&new_descriptor);
@@ -440,10 +463,11 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
             .copied()
             .filter(|commit| commit.collection() == old)
             .collect::<Vec<_>>();
-        // This is the no-presentation admission rule used by `ticket`: the
-        // descriptor authority itself is admitted, arbitrary strictly signed
-        // COMMITs on a publicly computable handle are inert. Counting the
-        // latter would let a foreign writer spoof local epoch ownership.
+        // This is the authority's intrinsic admission rule: the descriptor
+        // authority itself is admitted, while arbitrary strictly signed
+        // COMMITs on a publicly computable handle remain inert without a
+        // resident exact WRITE proof. Counting the latter would let a foreign
+        // writer spoof local epoch ownership.
         selected_epoch_evidence |= !source.is_empty()
             || commits.iter().any(|commit| {
                 commit.collection() == new && commit.public_key().raw == authority.to_bytes()
@@ -485,7 +509,7 @@ fn plan_open(pile: &mut Pile, signer: &SigningKey) -> Result<DescriptorAuthority
                 .count(),
             skipped_derives: derives
                 .iter()
-                .filter(|derive| derive.target() == old)
+                .filter(|derive| derive.collection() == old)
                 .count(),
         });
     }
@@ -643,11 +667,11 @@ fn publish_open(
             .find(|(scope, _, _)| *scope == root.scope)
             .expect("planned root remains in the registry");
         let registered = pile
-            .collection(simplearchive_union::descriptor(
+            .collection::<SimpleArchive>(simplearchive_union::descriptor(
                 &root.name, authority, reach,
             ))
             .map_err(|error| anyhow!("register {} descriptor: {error}", root.name))?;
-        if registered != root.new {
+        if registered.handle() != root.new {
             bail!(
                 "{} descriptor changed identity between plan and publish",
                 root.name
@@ -723,13 +747,12 @@ fn verify_open(pile: &mut Pile, signer: &SigningKey, plan: &DescriptorAuthorityP
             bail!("new {} collection is missing COMMIT {missing}", root.name);
         }
         let old_facts = materialize_source(&reader, &source)?;
-        let ticket = pile
-            .ticket(root.new, &[])
-            .map_err(|error| anyhow!("admit new {} collection: {error}", root.name))?;
-        let new_facts = pile
-            .materialize(&ticket)
-            .map_err(|error| anyhow!("materialize new {} collection: {error}", root.name))?;
-        if !old_facts.difference(&new_facts).is_empty() {
+        let collection = Collection::<SimpleArchive>::from_descriptor(&Fragment::from(descriptor))
+            .map_err(|error| anyhow!("type new {} collection: {error}", root.name))?;
+        let snapshot = pile
+            .snapshot::<TribleSet, _>(collection)
+            .map_err(|error| anyhow!("snapshot new {} collection: {error}", root.name))?;
+        if !old_facts.difference(snapshot.facts()).is_empty() {
             bail!(
                 "new {} collection does not contain the retired open union",
                 root.name
@@ -839,7 +862,7 @@ mod tests {
     #[test]
     fn strict_retired_decoder_rejects_an_off_entity_namespace() {
         let signer = SigningKey::from_bytes(&[0x31; 32]);
-        let mut descriptor = retired_descriptor(
+        let mut descriptor = retired_named_descriptor(
             "wiki",
             signer.verifying_key(),
             None,
@@ -869,7 +892,7 @@ mod tests {
             expected_names.insert(name.to_owned());
             let old = store_fragment(
                 &mut pile,
-                retired_descriptor(name, signer.verifying_key(), None, reach),
+                retired_named_descriptor(name, signer.verifying_key(), None, reach),
             );
             let data = pile
                 .put::<SimpleArchive, _>(one_fact((index + 1) as u8))
@@ -912,7 +935,7 @@ mod tests {
             .unwrap();
         let mut pile = open_pile_strict(&path).unwrap();
         let current = pile
-            .collection(simplearchive_union::descriptor(
+            .collection::<SimpleArchive>(simplearchive_union::descriptor(
                 name,
                 signer.verifying_key(),
                 reach,
@@ -933,7 +956,7 @@ mod tests {
             .unwrap();
         let mut pile = open_pile_strict(&path).unwrap();
         let current = pile
-            .collection(simplearchive_union::descriptor(
+            .collection::<SimpleArchive>(simplearchive_union::descriptor(
                 name,
                 signer.verifying_key(),
                 reach,
@@ -959,7 +982,7 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let old = store_fragment(
             &mut pile,
-            retired_descriptor(name, signer.verifying_key(), None, reach.clone()),
+            retired_named_descriptor(name, signer.verifying_key(), None, reach.clone()),
         );
         let data = pile.put::<SimpleArchive, _>(one_fact(0x6a)).unwrap();
         let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
@@ -979,10 +1002,10 @@ mod tests {
         // A handle is public information. Merely signing a COMMIT for the
         // descriptor computed under `wrong` cannot spoof evidence that this
         // key owns an epoch; without a proof, only the descriptor authority is
-        // admitted by an empty-presentation ticket.
+        // admitted by ordinary resident-proof discovery.
         let mut pile = open_pile_strict(&path).unwrap();
         let wrong_current = pile
-            .collection(simplearchive_union::descriptor(
+            .collection::<SimpleArchive>(simplearchive_union::descriptor(
                 name,
                 wrong.verifying_key(),
                 reach,
@@ -1025,7 +1048,7 @@ mod tests {
             records
                 .commits()
                 .iter()
-                .filter(|commit| commit.collection() == wrong_current)
+                .filter(|commit| commit.collection() == wrong_current.handle())
                 .count(),
             1
         );
@@ -1045,7 +1068,7 @@ mod tests {
         for (index, signer) in [&signer_a, &signer_b].into_iter().enumerate() {
             let old = store_fragment(
                 &mut pile,
-                retired_descriptor(name, signer.verifying_key(), None, reach.clone()),
+                retired_named_descriptor(name, signer.verifying_key(), None, reach.clone()),
             );
             let data = pile
                 .put::<SimpleArchive, _>(one_fact(0x71 + index as u8))
@@ -1107,7 +1130,7 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let old = store_fragment(
             &mut pile,
-            retired_descriptor(name, signer.verifying_key(), None, reach),
+            retired_named_descriptor(name, signer.verifying_key(), None, reach),
         );
         let data = pile.put::<SimpleArchive, _>(one_fact(0x41)).unwrap();
         let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
@@ -1170,7 +1193,7 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let old = store_fragment(
             &mut pile,
-            retired_descriptor(name, signer.verifying_key(), None, reach),
+            retired_named_descriptor(name, signer.verifying_key(), None, reach),
         );
         let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
         let first = pile.put::<SimpleArchive, _>(one_fact(0x31)).unwrap();
@@ -1209,7 +1232,7 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let old = store_fragment(
             &mut pile,
-            retired_descriptor(name, signer.verifying_key(), None, reach),
+            retired_named_descriptor(name, signer.verifying_key(), None, reach),
         );
 
         let mut data_fragment = Fragment::empty();
@@ -1272,7 +1295,7 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let secrets = store_fragment(
             &mut pile,
-            retired_descriptor(
+            retired_named_descriptor(
                 "secrets-access",
                 signer.verifying_key(),
                 None,
@@ -1284,7 +1307,7 @@ mod tests {
             collection_source: secrets,
             collection_authority: signer.verifying_key(),
             collection_representation: <SimpleArchive as MetaDescribe>::id(),
-            collection_recipe: simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            retired::collection_recipe: RETIRED_TRIBLE_SET_UNION_RECIPE_V1,
         };
         let derived = store_fragment(&mut pile, derived_fragment);
         let data = pile.put::<SimpleArchive, _>(one_fact(0x62)).unwrap();

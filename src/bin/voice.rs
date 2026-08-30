@@ -76,7 +76,8 @@ use hifitime::efmt::Formatter;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStore;
@@ -525,7 +526,7 @@ struct VoiceStorage<'a> {
 
 struct VoiceSession<'a> {
     pile: &'a mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &'a ed25519_dalek::SigningKey,
     facts: TribleSet,
     reader: PileReader,
@@ -563,7 +564,7 @@ impl VoiceStorage<'_> {
         let result = (|| {
             let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
             let (facts, _ticket, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .map(|snapshot| snapshot.into_parts())
                 .context("materialize Voice collection")?;
             voice_model::validate_catalog(&reader, &facts)

@@ -36,7 +36,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::{
-    CollectionHandle, CollectionRecord, CollectionStore, CollectionStoreExt,
+    Collection, CollectionRecord, CollectionStore, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -159,7 +159,11 @@ const MAX_WALKED_COMMITS: usize = 100_000;
 /// This is the call every faculty makes before a store-centric collection
 /// operation. It idempotently registers the descriptor and returns its handle;
 /// the pile and signer remain owned by the caller.
-pub fn open_scope(pile: &mut Pile, scope: Id, signer: &SigningKey) -> Result<CollectionHandle> {
+pub fn open_scope(
+    pile: &mut Pile,
+    scope: Id,
+    signer: &SigningKey,
+) -> Result<Collection<SimpleArchive>> {
     let collection = crate::collection_names::open(pile, scope, signer.verifying_key())
         .with_context(|| {
             format!(
@@ -172,7 +176,7 @@ pub fn open_scope(pile: &mut Pile, scope: Id, signer: &SigningKey) -> Result<Col
 }
 
 /// Emit the hint for `scope` at most once per process, to stderr.
-fn warn_once(pile: &mut Pile, scope: Id, collection: CollectionHandle) {
+fn warn_once(pile: &mut Pile, scope: Id, collection: Collection<SimpleArchive>) {
     static WARNED: Mutex<Option<BTreeSet<Id>>> = Mutex::new(None);
 
     if !LEGACY_SOURCES.iter().any(|(known, _)| *known == scope) {
@@ -203,7 +207,7 @@ fn warn_once(pile: &mut Pile, scope: Id, collection: CollectionHandle) {
 pub fn legacy_migration_hint(
     pile: &mut Pile,
     scope: Id,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
 ) -> Option<String> {
     let branch_name = LEGACY_SOURCES
         .iter()
@@ -303,10 +307,8 @@ fn any_scope_anchored_collection(pile: &mut Pile) -> Option<bool> {
 
 /// Whether one collection has no authority-admitted commits, or `None` if its
 /// descriptor or records cannot be observed.
-fn native_scope_is_empty(pile: &mut Pile, collection: CollectionHandle) -> Option<bool> {
-    pile.ticket(collection, &[])
-        .ok()
-        .map(|ticket| ticket.is_empty())
+fn native_scope_is_empty(pile: &mut Pile, collection: Collection<SimpleArchive>) -> Option<bool> {
+    pile.cover(collection).ok().map(|cover| cover.is_empty())
 }
 
 /// Count authored commits reachable from the head of the legacy branch named
@@ -452,7 +454,7 @@ mod tests {
         path
     }
 
-    fn current_collection(pile: &mut Pile, scope: Id) -> CollectionHandle {
+    fn current_collection(pile: &mut Pile, scope: Id) -> Collection<SimpleArchive> {
         crate::collection_names::open(pile, scope, test_authority()).unwrap()
     }
 

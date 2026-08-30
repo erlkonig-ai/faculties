@@ -1115,7 +1115,7 @@ mod tests {
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileReader) {
         let collection = open_scope(pile, scope, signer).unwrap();
-        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
         (facts, reader)
     }
 

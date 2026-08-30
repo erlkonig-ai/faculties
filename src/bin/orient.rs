@@ -253,7 +253,7 @@ fn materialize_scope(
     label: &str,
 ) -> Result<TribleSet> {
     let collection = open_scope(pile, scope, signer)?;
-    pile.snapshot(collection, &[])
+    pile.snapshot(collection)
         .map(|snapshot| snapshot.into_facts())
         .map_err(|error| anyhow!("materialize {label} collection: {error}"))
 }
@@ -1847,7 +1847,7 @@ fn cmd_wake(
     // Memory, Wiki, and Compass share one open Pile handle, but each collection
     // captures its own coherent known-prefix observation; this is deliberately
     // not described as a cross-collection transaction. Wiki carries facts,
-    // reader, and maintained supersession order from one exact source ticket.
+    // reader, and maintained supersession order from one exact source cover.
     // A plain wake cover never consults rebuildable embeddings, so it
     // deliberately cannot be taken down by a missing or corrupt embedding
     // artifact. Exact preserved legacy rows remain durable evidence without

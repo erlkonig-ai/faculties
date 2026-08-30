@@ -122,7 +122,7 @@ pub fn publish_events(
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
         let snapshot = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize native Cognition collection")?;
         let staged = fragments
             .iter()
@@ -519,7 +519,7 @@ mod tests {
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
         validate_catalog(&reader, &facts).unwrap();
         assert_eq!(facts, event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));

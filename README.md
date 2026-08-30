@@ -33,7 +33,7 @@ Install a Rust toolchain (if you don't have one):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Faculties is developed with TribleSpace, Mary, and a small CubeCL fork as one
+Faculties is developed with TribleSpace, Mary, Soma, and a small CubeCL fork as one
 source cohort. Clone them as siblings, then install every faculty CLI (and the
 GUI viewer) onto `$PATH`:
 
@@ -42,9 +42,11 @@ mkdir faculties-source && cd faculties-source
 git clone https://github.com/erlkonig-ai/faculties
 git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
+git clone https://github.com/erlkonig-ai/soma
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 8eb734bc27b9dc860109deba929508701f07adcc
-git -C mary checkout 84857d64b81f7f5f90a30630e220896c3da2e8b8
+git -C triblespace-rs checkout 624f9fc23a484a989389eca0af0f652aba840ead
+git -C mary checkout b7c09009f6bd921f12ecfedeb32e4a4ff94861e2
+git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
 cd faculties
 cargo build --release --workspace --bins --locked

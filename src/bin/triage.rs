@@ -164,7 +164,7 @@ impl TriageSnapshot {
             .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
         let collection = open_scope(pile, scope, &self.signer)?;
         let (facts, _, reader) = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .with_context(|| format!("materialize {label} collection"))?
             .into_parts();
         Ok(CollectionView { facts, reader })

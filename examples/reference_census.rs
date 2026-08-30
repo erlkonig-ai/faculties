@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     )
     .context("register Wiki collection descriptor")?;
     let (facts, _, reader) = store
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .context("snapshot Wiki collection")?
         .into_parts();
     let catalog = wiki_model::load_catalog(&facts)?;

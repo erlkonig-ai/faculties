@@ -193,7 +193,7 @@ impl Storage<'_> {
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
         let collection = open_scope(pile, scope, &self.signer)?;
         let (facts, _, reader) = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .with_context(|| format!("materialize {label} collection"))?
             .into_parts();
         Ok(CollectionView { facts, reader })

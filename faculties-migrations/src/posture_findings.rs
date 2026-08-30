@@ -619,20 +619,23 @@ mod tests {
 
         // A foreign writer can compute the mandatory-authority handle and
         // publish a strictly signed COMMIT on it, but that COMMIT is inert
-        // without a WRITE presentation. It may neither fake this occurrence's
+        // without a resident exact WRITE proof. It may neither fake this occurrence's
         // bridge nor prevent the real retired bridge from being published.
         let foreign = SigningKey::from_bytes(&[0x73; 32]);
         let current_descriptor = faculties::collection_names::root_descriptor(
             DEFAULT_SCAN_SCOPE_ID,
             signer.verifying_key(),
         );
-        let current_handle = pile.collection(current_descriptor).unwrap();
+        let current = pile
+            .collection::<SimpleArchive>(current_descriptor)
+            .unwrap();
+        let current_handle = current.handle();
         let fake_bridge = entity! {
             metadata::tag: KIND_LEGACY_BRIDGE,
             posture::occurrence: occurrence,
             posture::sighting_of: Id::new([0x55; 16]).unwrap(),
         };
-        pile.commit(current_handle, &foreign, fake_bridge).unwrap();
+        pile.commit(current, &foreign, fake_bridge).unwrap();
         pile.close().unwrap();
 
         let error = crate::descriptor_authority::publish_path(&pile_path, Some(&key_path))

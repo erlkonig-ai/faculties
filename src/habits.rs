@@ -1157,7 +1157,7 @@ pub fn publish(
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
         let snapshot = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize native Habit collection")?;
         validate_catalog_union(snapshot.reader(), snapshot.facts(), &fragment)
             .context("preflight complete Habit publication")?;
@@ -1176,7 +1176,7 @@ pub fn read_catalog(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
         let snapshot = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize native Habit collection")?;
         load_catalog(snapshot.reader(), snapshot.facts()).context("validate native Habit catalog")
     })();

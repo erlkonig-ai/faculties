@@ -16,7 +16,8 @@ use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -91,7 +92,7 @@ impl MessageStorage<'_> {
         operation: impl FnOnce(
             &mut Pile,
             &SigningKey,
-            CollectionHandle,
+            Collection<SimpleArchive>,
             &TribleSet,
             &TribleSet,
             &PileReader,
@@ -102,7 +103,7 @@ impl MessageStorage<'_> {
         let result = (|| {
             let relations_collection = open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer)?;
             let (facts, _, reader) = pile
-                .snapshot(relations_collection, &[])
+                .snapshot(relations_collection)
                 .context("materialize authored Relations collection")?
                 .into_parts();
             relations::validate_catalog(&reader, &facts)
@@ -111,7 +112,7 @@ impl MessageStorage<'_> {
 
             let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
             let (message_facts, _, reader) = pile
-                .snapshot(messages, &[])
+                .snapshot(messages)
                 .context("materialize authored Message collection")?
                 .into_parts();
             message::validate_catalog(&reader, &message_facts, &relations_facts)

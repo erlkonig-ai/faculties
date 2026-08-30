@@ -470,7 +470,7 @@ impl CompassBoard {
 
         // Enumerate every goal with the collection's canonical effective
         // status. The storage boundary attached this index for the exact same
-        // source ticket; equal timestamps resolve by event id without doing
+        // source cover; equal timestamps resolve by event id without doing
         // the identity/order joins again here.
         let space = &live.space;
         let status_register = dataset

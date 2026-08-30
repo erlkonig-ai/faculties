@@ -274,7 +274,7 @@ mod tests {
         let collection =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+        let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
         assert_eq!(facts, expected.into_facts());
         cognition::validate_catalog(&reader, &facts).unwrap();
 

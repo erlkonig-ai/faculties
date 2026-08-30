@@ -483,12 +483,13 @@ mod tests {
     use crate::storage::open_pile_strict;
     use crate::test_support::initialize_open_collection_fixture;
     use ed25519_dalek::SigningKey;
-    use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::collection::{Collection, CollectionStoreExt};
 
     fn collection(
         pile: &mut triblespace::core::repo::pile::Pile,
         signer: &SigningKey,
-    ) -> CollectionHandle {
+    ) -> Collection<SimpleArchive> {
         open_scope(pile, DEFAULT_SCOPE_ID, signer).unwrap()
     }
 
@@ -658,7 +659,7 @@ mod tests {
         let signer = initialize_open_collection_fixture(&pile, Some(&key));
         let mut pile_store = open_pile_strict(&pile).unwrap();
         let collection = collection(&mut pile_store, &signer);
-        let before = pile_store.snapshot(collection, &[]).unwrap().into_facts();
+        let before = pile_store.snapshot(collection).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
         let fragment = chunk_fragment(draft("resident only in fragment"))
             .unwrap()
@@ -667,7 +668,7 @@ mod tests {
         assert_eq!(catalog.chunks.len(), 1);
 
         pile_store.commit(collection, &signer, fragment).unwrap();
-        let after = pile_store.snapshot(collection, &[]).unwrap().into_facts();
+        let after = pile_store.snapshot(collection).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
         let catalog = validate_catalog(&reader, &after).unwrap();
         assert_eq!(catalog.chunks.len(), 1);
@@ -688,7 +689,7 @@ mod tests {
         initial += right;
         let collection = collection(&mut pile_store, &signer);
         pile_store.commit(collection, &signer, initial).unwrap();
-        let current = pile_store.snapshot(collection, &[]).unwrap().into_facts();
+        let current = pile_store.snapshot(collection).unwrap().into_facts();
         let reader = pile_store.reader().unwrap();
 
         for mutation in [

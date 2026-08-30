@@ -179,8 +179,8 @@ pub struct WikiCatalog {
 
 /// One coherent Wiki source snapshot and its exact maintained observation order.
 ///
-/// Facts, commits, and reader are captured by one collection observation. The
-/// observed-set projection is then attached for exactly that commit ticket;
+/// Facts, cover, and reader are captured by one collection observation. The
+/// observed-set projection is then attached for exactly that source cover;
 /// its unsigned artifacts are cache exhaust and never additional authority.
 pub struct WikiSnapshot {
     facts: TribleSet,
@@ -200,7 +200,7 @@ impl WikiSnapshot {
         &self.reader
     }
 
-    /// Maintained observation order attached for this snapshot's ticket.
+    /// Maintained observation order attached for this snapshot's source cover.
     pub fn observed(&self) -> &ObservedIndex {
         &self.observed
     }
@@ -741,7 +741,7 @@ where
 ///
 /// Migrations, detached fact-set validation, and tests use this as an oracle.
 /// Durable application reads use [`materialize_indexed_collection`] so the
-/// exact collection ticket and its maintained order stay attached.
+/// exact collection cover and its maintained order stay attached.
 pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
     let order = ObservationOrder::new(space, metadata::supersedes.id());
     load_catalog_with_order(space, &order)
@@ -801,7 +801,7 @@ pub fn validate_catalog(reader: &PileReader, facts: &TribleSet) -> Result<WikiCa
 }
 
 /// Validate one Wiki fact snapshot using an already attached supersession
-/// order for exactly that snapshot's commit ticket.
+/// order for exactly that snapshot's source cover.
 pub fn validate_catalog_with_order<O>(
     reader: &PileReader,
     facts: &TribleSet,
@@ -1283,7 +1283,7 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileReader)> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let (facts, _, reader) = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("materialize Wiki collection: {error}"))?
         .into_parts();
     validate_catalog(&reader, &facts)?;
@@ -1293,10 +1293,10 @@ pub fn materialize_collection(
 /// Capture and validate one durable Wiki snapshot with its exact maintained
 /// supersession index.
 ///
-/// The source facts, commit ticket, and attachment reader come from one
+/// The source facts, exact cover, and attachment reader come from one
 /// [`CollectionStoreExt::snapshot`] observation. Index maintenance happens
 /// only afterward and is attached to
-/// that exact ticket, so it cannot change which authoritative commits this
+/// that exact cover, so it cannot change which authoritative commits this
 /// read admits even if newer commits arrive concurrently.
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
@@ -1304,11 +1304,11 @@ pub fn materialize_indexed_collection(
 ) -> Result<WikiSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let snapshot = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("snapshot Wiki collection: {error}"))?;
-    let (facts, ticket, reader) = snapshot.into_parts();
+    let (facts, cover, reader) = snapshot.into_parts();
     let observed = observed_collection(signer.verifying_key())
-        .ensure_exact(pile, ticket.commits())
+        .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let catalog = validate_catalog_with_order(&reader, &facts, &observed)?;
     Ok(WikiSnapshot {
@@ -1512,10 +1512,10 @@ mod tests {
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
         let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-        let ticket_before = pile.ticket(collection, &[]).unwrap();
+        let cover_before = pile.cover(collection).unwrap();
         let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
-        let ticket_after_index = pile.ticket(collection, &[]).unwrap();
-        assert_eq!(ticket_after_index, ticket_before);
+        let cover_after_index = pile.cover(collection).unwrap();
+        assert_eq!(cover_after_index, cover_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 
         pile.close().unwrap();

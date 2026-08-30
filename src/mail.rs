@@ -3280,7 +3280,7 @@ mod tests {
                 .0;
             let mut materialize = |scope| {
                 let collection = open_scope(&mut pile, scope, &signer).unwrap();
-                let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+                let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
                 CollectionView { facts, reader }
             };
             let views = Views {

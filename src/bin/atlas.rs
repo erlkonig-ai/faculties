@@ -64,7 +64,7 @@ impl AtlasContext {
         let collection = open_scope(&mut self.pile, DEFAULT_SCOPE_ID, &self.signer)?;
         let snapshot = self
             .pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize native Atlas collection")?;
         let (facts, _, reader) = snapshot.into_parts();
         let catalog =

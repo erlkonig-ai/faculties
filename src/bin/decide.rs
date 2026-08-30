@@ -12,7 +12,8 @@ use faculties::legacy_hint::open_scope;
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
-use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::prelude::*;
@@ -122,7 +123,7 @@ impl DecideStorage<'_> {
         &self,
         operation: impl FnOnce(
             &mut Pile,
-            CollectionHandle,
+            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &CollectionView,
         ) -> Result<T>,
@@ -132,7 +133,7 @@ impl DecideStorage<'_> {
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
             let (facts, _ticket, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .map(|snapshot| snapshot.into_parts())
                 .context("materialize authored Decide collection")?;
             decide::validate_catalog(&reader, &facts)

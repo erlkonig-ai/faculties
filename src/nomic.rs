@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mary::selection::{ModelSelector, TokenizerSelector};
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::FactSnapshot;
 use triblespace::core::repo::pile::PileReader;
 
 /// Hugging Face model ids are provenance only; runtime never fetches them.
@@ -43,8 +43,8 @@ pub fn vision_pile() -> PathBuf {
     }
 }
 
-fn load_model_snapshot(path: &Path, model: &str) -> Result<CollectionSnapshot<PileReader>> {
-    // Discover the sole team and freeze its exact ticket from one observed
+fn load_model_snapshot(path: &Path, model: &str) -> Result<FactSnapshot<PileReader>> {
+    // Discover the sole authority and freeze its exact cover from one observed
     // prefix. A second scan could otherwise hide a concurrently appended team.
     let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(path)
         .with_context(|| {
@@ -215,7 +215,7 @@ mod tests {
 
         let text = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
             .expect("load one text collection snapshot");
-        assert_eq!(text.commits().len(), 2);
+        assert_eq!(text.cover().len(), 2);
 
         // Freeze really means freeze: a later same-coordinate model commit
         // cannot change the facts used for either half of this text load.
@@ -264,7 +264,7 @@ mod tests {
         );
         let vision = load_model_snapshot(vision_file.path(), NOMIC_VISION_MODEL)
             .expect("load one vision collection snapshot");
-        assert_eq!(vision.commits().len(), 1);
+        assert_eq!(vision.cover().len(), 1);
         let vision_keymap = mary::selection::load_keymap_from_graph(
             vision.facts(),
             vision.reader(),

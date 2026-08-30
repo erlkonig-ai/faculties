@@ -55,9 +55,9 @@ pub struct BodyCatalog {
 
 /// One coherent Body source snapshot plus its maintained intent register.
 ///
-/// Facts, admitted commits, and the attachment reader are captured by one
+/// Facts, exact cover, and the attachment reader are captured by one
 /// collection observation. The maintained index is then attached for exactly
-/// that commit ticket; it is cache exhaust, never additional authority.
+/// that source cover; it is cache exhaust, never additional authority.
 pub struct BodySnapshot {
     facts: TribleSet,
     reader: PileReader,
@@ -66,7 +66,7 @@ pub struct BodySnapshot {
 }
 
 impl BodySnapshot {
-    /// Materialized facts admitted by this exact source ticket.
+    /// Materialized facts admitted by this exact source cover.
     pub fn facts(&self) -> &TribleSet {
         &self.facts
     }
@@ -518,19 +518,19 @@ pub fn latest_intent<'a>(
 }
 
 /// Capture Body facts and attach the maintained intent LWW index for that
-/// exact source ticket, constructing missing derived artifacts if necessary.
+/// exact source cover, constructing missing derived artifacts if necessary.
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let snapshot = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("snapshot Body collection: {error}"))?;
-    let (facts, ticket, reader) = snapshot.into_parts();
+    let (facts, cover, reader) = snapshot.into_parts();
     let catalog = validate_catalog(&reader, &facts).context("validate Body collection")?;
     let intents = intent_register_collection(signer.verifying_key())
-        .ensure_exact(pile, ticket.commits())
+        .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 #[cfg(test)]
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::{
@@ -107,7 +108,7 @@ where
 {
     let descriptor = crate::collection_names::root_descriptor(scope, authority);
     let collection = store
-        .collection(descriptor.clone())
+        .collection::<SimpleArchive>(descriptor.clone())
         .context("register target collection descriptor")?;
     let records =
         discover_collection_records(store).context("discover native collection records")?;
@@ -115,19 +116,19 @@ where
         .commits()
         .iter()
         .copied()
-        .filter(|commit| commit.collection() == collection)
+        .filter(|commit| commit.collection() == collection.handle())
         .collect();
     let merges = records
         .merges()
         .iter()
         .copied()
-        .filter(|merge| merge.collection() == collection)
+        .filter(|merge| merge.collection() == collection.handle())
         .collect();
     let derives = records
         .derives()
         .iter()
         .copied()
-        .filter(|derive| derive.target() == collection)
+        .filter(|derive| derive.collection() == collection.handle())
         .collect();
 
     Ok(TargetDiscovery {

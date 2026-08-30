@@ -21,8 +21,9 @@ use triblespace::core::capability::{
     CapabilityProofId, CapabilityRequest, CapabilityResource,
 };
 use triblespace::core::collection::{
-    descriptor, discover_collection_records_authorized, reach, simplearchive_union,
-    CapabilityPresentation, CollectionHandle, CollectionStoreExt, ACTION_WRITE,
+    descriptor, discover_collection_cover_authorized, discover_collection_records_authorized,
+    reach, simplearchive_union, Collection, CollectionHandle, CollectionStoreExt, FactCover,
+    ACTION_WRITE,
 };
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
@@ -36,8 +37,9 @@ use triblespace::prelude::*;
 use super::access::{build_access_envelope, load_access_envelope, open_access_envelope};
 use super::schema::{KIND_ACCESS_ENVELOPE, KIND_VAULT};
 use super::{
-    load_catalog, parse_vault_name, seal_version, validate_catalog, vault_descriptor, vault_handle,
-    vault_header_fragment, IntervalValue, SecretsSnapshot, VaultAccess, VaultCatalog, ACTION_READ,
+    load_catalog, parse_vault_name, seal_version, validate_catalog, vault_collection,
+    vault_descriptor, vault_handle, vault_header_fragment, IntervalValue, SecretsSnapshot,
+    VaultAccess, VaultCatalog, ACTION_READ,
 };
 
 const ACCESS_INBOX_NAME: &str = "secrets-access";
@@ -47,7 +49,7 @@ const ACCESS_INBOX_NAME: &str = "secrets-access";
 pub struct VaultLocation {
     vault: Id,
     authority: VerifyingKey,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
 }
 
 impl VaultLocation {
@@ -56,7 +58,7 @@ impl VaultLocation {
         Self {
             vault,
             authority,
-            collection: vault_handle(vault, authority),
+            collection: vault_collection(vault, authority),
         }
     }
 
@@ -69,7 +71,7 @@ impl VaultLocation {
     }
 
     pub const fn collection(&self) -> CollectionHandle {
-        self.collection
+        self.collection.handle()
     }
 }
 
@@ -181,15 +183,18 @@ pub fn access_inbox_handle(recipient: VerifyingKey) -> CollectionHandle {
         .get_handle()
 }
 
-fn register_access_inbox<S>(store: &mut S, recipient: VerifyingKey) -> Result<CollectionHandle>
+fn register_access_inbox<S>(
+    store: &mut S,
+    recipient: VerifyingKey,
+) -> Result<Collection<SimpleArchive>>
 where
     S: CollectionStoreExt,
 {
     let expected = access_inbox_handle(recipient);
     let actual = store
-        .collection(access_inbox_descriptor(recipient))
+        .collection::<SimpleArchive>(access_inbox_descriptor(recipient))
         .map_err(|error| anyhow!("register Secrets access inbox: {error}"))?;
-    if actual != expected {
+    if actual.handle() != expected {
         bail!("registered access-inbox descriptor changed identity");
     }
     Ok(actual)
@@ -361,7 +366,7 @@ where
     Ok(VaultLocation {
         vault,
         authority,
-        collection,
+        collection: vault_collection(vault, authority),
     })
 }
 
@@ -558,7 +563,7 @@ where
     // authorized collection view. Any signer may deliver a candidate; the
     // envelope, proof closure, publisher, and target descriptor below decide
     // whether that candidate contributes access.
-    let commits = discover_collection_records_authorized(store, inbox, |_| true)
+    let commits = discover_collection_records_authorized(store, inbox.handle(), |_| true)
         .context("discover raw Secrets access-inbox candidates")?
         .commits()
         .to_vec();
@@ -571,7 +576,7 @@ where
     // remains the collection's value, but commit-local boundaries prevent an
     // unavailable or malformed leaf from poisoning earlier valid delivery.
     // Rows inside one signed leaf are atomic: multi-writer grants deliberately
-    // publish their complete presentation set in one COMMIT.
+    // publish their complete writer-proof set in one COMMIT.
     for commit in commits {
         let publisher = VerifyingKey::from_bytes(&commit.public_key().raw)
             .expect("collection discovery strictly verifies commit signer keys");
@@ -583,7 +588,7 @@ where
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     None,
                     None,
-                    inbox,
+                    inbox.handle(),
                     None,
                     format!("access-inbox commit {} metadata: {error}", commit.id()),
                 ));
@@ -595,7 +600,7 @@ where
                 VaultDiscoveryIssueKind::InvalidEnvelope,
                 None,
                 None,
-                inbox,
+                inbox.handle(),
                 None,
                 format!("access-inbox commit {} metadata: {error}", commit.id()),
             ));
@@ -609,7 +614,7 @@ where
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     None,
                     None,
-                    inbox,
+                    inbox.handle(),
                     None,
                     format!("access-inbox commit {} data: {error}", commit.id()),
                 ));
@@ -623,7 +628,7 @@ where
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     None,
                     None,
-                    inbox,
+                    inbox.handle(),
                     None,
                     format!("access-inbox commit {} data: {error}", commit.id()),
                 ));
@@ -646,7 +651,7 @@ where
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
                         None,
-                        inbox,
+                        inbox.handle(),
                         None,
                         error.to_string(),
                     ));
@@ -669,7 +674,7 @@ where
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
                         Some(location.authority),
-                        location.collection,
+                        location.collection.handle(),
                         Some(location.vault),
                         error.to_string(),
                     ));
@@ -684,7 +689,7 @@ where
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
                         Some(location.authority),
-                        location.collection,
+                        location.collection.handle(),
                         Some(location.vault),
                         error.to_string(),
                     ));
@@ -707,7 +712,7 @@ where
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
                         Some(location.authority),
-                        location.collection,
+                        location.collection.handle(),
                         Some(location.vault),
                         error.to_string(),
                     ));
@@ -720,7 +725,7 @@ where
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     Some(id),
                     Some(location.authority),
-                    location.collection,
+                    location.collection.handle(),
                     Some(location.vault),
                     "access-inbox commit signer is not the exact READ leaf issuer",
                 ));
@@ -743,13 +748,37 @@ where
     Ok((candidates, issues))
 }
 
-fn presentations(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityPresentation> {
+fn write_bundles(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityProofBundle> {
     candidates
         .iter()
-        .map(|candidate| {
-            CapabilityPresentation::new(candidate.writer, candidate.write_bundle.clone())
-        })
+        .map(|candidate| candidate.write_bundle.clone())
         .collect()
+}
+
+/// Construct the exact vault cover authorized by one opened access-envelope
+/// set, without consulting ambient capability evidence.
+///
+/// Candidate validation has already established that every WRITE bundle is
+/// unbounded, rooted at this collection's authority, and names its explicit
+/// writer. Discovery narrows the durable commit ledger to exactly those writer
+/// keys and strictly verifies their signatures before constructing the typed
+/// cover; replay against the durable store remains provenance-free.
+fn candidate_vault_cover<S>(
+    store: &mut S,
+    location: VaultLocation,
+    candidates: &[ValidatedAccessCandidate],
+) -> Result<FactCover>
+where
+    S: CollectionStoreExt,
+{
+    let writers = candidates
+        .iter()
+        .map(|candidate| candidate.writer.to_bytes())
+        .collect::<BTreeSet<_>>();
+    discover_collection_cover_authorized(store, location.collection, |claimed| {
+        writers.contains(&claimed.raw)
+    })
+    .context("discover candidate-scoped vault cover")
 }
 
 fn read_atom(collection: CollectionHandle) -> CapabilityAtom {
@@ -787,12 +816,12 @@ pub fn founder_proofs(
     (
         root_bundle(
             root,
-            read_atom(location.collection),
+            read_atom(location.collection.handle()),
             CapabilityMode::InvokeAndDelegate,
         ),
         root_bundle(
             root,
-            write_atom(location.collection),
+            write_atom(location.collection.handle()),
             CapabilityMode::InvokeAndDelegate,
         ),
     )
@@ -803,7 +832,7 @@ fn retain_descriptor(fragment: &mut Fragment, location: VaultLocation) -> Result
     let (_, facts, _, blobs) = descriptor.into_parts();
     let retained = fragment.put::<SimpleArchive, _>(facts);
     fragment.blobs_mut().union(blobs);
-    if retained != location.collection {
+    if retained != location.collection.handle() {
         bail!("canonical vault descriptor changed identity while retaining it")
     }
     Ok(())
@@ -828,7 +857,7 @@ pub fn publish_access_envelope(
     instant: Epoch,
 ) -> Result<Id> {
     let mut envelope = build_access_envelope(
-        location.collection,
+        location.collection.handle(),
         custody,
         subject,
         read_bundle,
@@ -869,7 +898,7 @@ where
     let mut by_collection = BTreeMap::<CollectionHandle, Vec<ValidatedAccessCandidate>>::new();
     for candidate in candidates {
         by_collection
-            .entry(candidate.location.collection)
+            .entry(candidate.location.collection.handle())
             .or_default()
             .push(candidate);
     }
@@ -877,15 +906,28 @@ where
     let mut materialized = Vec::new();
     for candidates in by_collection.into_values() {
         let location = candidates[0].location;
-        let supplied = presentations(&candidates);
-        let facts = match store.snapshot(location.collection, &supplied) {
-            Ok(snapshot) => snapshot.into_facts(),
+        let cover = match candidate_vault_cover(store, location, &candidates) {
+            Ok(cover) => cover,
             Err(error) => {
                 issues.push(issue(
                     VaultDiscoveryIssueKind::MaterializationFailed,
                     candidates.first().map(|candidate| candidate.id),
                     Some(location.authority),
-                    location.collection,
+                    location.collection.handle(),
+                    Some(location.vault),
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let facts = match store.materialize::<TribleSet, _>(&cover) {
+            Ok(facts) => facts,
+            Err(error) => {
+                issues.push(issue(
+                    VaultDiscoveryIssueKind::MaterializationFailed,
+                    candidates.first().map(|candidate| candidate.id),
+                    Some(location.authority),
+                    location.collection.handle(),
                     Some(location.vault),
                     error.to_string(),
                 ));
@@ -897,7 +939,7 @@ where
                 VaultDiscoveryIssueKind::MissingHeader,
                 candidates.first().map(|candidate| candidate.id),
                 Some(location.authority),
-                location.collection,
+                location.collection.handle(),
                 Some(location.vault),
                 "vault has no resident canonical header yet",
             ));
@@ -918,7 +960,7 @@ where
                     VaultDiscoveryIssueKind::InvalidVault,
                     candidates.first().map(|candidate| candidate.id),
                     Some(location.authority),
-                    location.collection,
+                    location.collection.handle(),
                     Some(location.vault),
                     error.to_string(),
                 ));
@@ -930,7 +972,7 @@ where
                 VaultDiscoveryIssueKind::InvalidVault,
                 candidates.first().map(|candidate| candidate.id),
                 Some(location.authority),
-                location.collection,
+                location.collection.handle(),
                 Some(location.vault),
                 "capability-native vault has no custody declaration",
             ));
@@ -945,7 +987,7 @@ where
                     VaultDiscoveryIssueKind::CustodyMismatch,
                     Some(candidate.id),
                     Some(location.authority),
-                    location.collection,
+                    location.collection.handle(),
                     Some(location.vault),
                     "opened envelope custody does not match the materialized vault",
                 ));
@@ -963,7 +1005,7 @@ where
                 .iter()
                 .map(|candidate| candidate.read_bundle.clone())
                 .collect(),
-            presentations(&candidates),
+            write_bundles(&candidates),
         ) {
             Ok(access) => access,
             Err(error) => {
@@ -971,7 +1013,7 @@ where
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     Some(first.id),
                     Some(location.authority),
-                    location.collection,
+                    location.collection.handle(),
                     Some(location.vault),
                     error.to_string(),
                 ));
@@ -985,7 +1027,7 @@ where
     let ready = ready
         .into_iter()
         .map(|(location, facts, access)| {
-            locations.insert(location.collection, location);
+            locations.insert(location.collection.handle(), location);
             (location.vault, facts, access)
         })
         .collect::<Vec<_>>();
@@ -1031,11 +1073,14 @@ pub fn create_vault(
     let (root_read, root_write) = founder_proofs(signing_key, location);
 
     let (all_candidates, _) = discover_access_candidates(store, signing_key)?;
-    let suitable = all_candidates
+    let candidates = all_candidates
         .into_iter()
+        .filter(|candidate| candidate.location == location)
+        .collect::<Vec<_>>();
+    let suitable = candidates
+        .iter()
         .filter(|candidate| {
-            candidate.location == location
-                && candidate.writer == signing_key.verifying_key()
+            candidate.writer == signing_key.verifying_key()
                 && candidate
                     .read_bundle
                     .verify(
@@ -1043,18 +1088,20 @@ pub fn create_vault(
                         instant,
                         signing_key.verifying_key(),
                         CapabilityRequest::new(
-                            read_atom(collection),
+                            read_atom(collection.handle()),
                             CapabilityMode::InvokeAndDelegate,
                         ),
                     )
                     .is_ok_and(|verified| verified.effective_validity().is_none())
         })
+        .cloned()
         .collect::<Vec<_>>();
 
+    let cover = candidate_vault_cover(store, location, &candidates)
+        .context("admit envelope-scoped vault before creation")?;
     let existing = store
-        .snapshot(collection, &[])
-        .context("inspect exact vault before creation")?
-        .into_facts();
+        .materialize::<TribleSet, _>(&cover)
+        .context("inspect envelope-scoped vault before creation")?;
     if !existing.is_empty() {
         let reader = store.reader().context("open existing vault attachments")?;
         let catalog = validate_catalog(&reader, vault, &existing)
@@ -1119,13 +1166,15 @@ fn checked_vault<'a, R>(
     location: &VaultLocation,
 ) -> Result<&'a VaultCatalog> {
     let access = snapshot
-        .access_exact(location.collection)
+        .access_exact(location.collection.handle())
         .ok_or_else(|| anyhow!("vault {} has no verified local access", location.vault))?;
-    if access.collection() != location.collection || access.trust_root() != location.authority {
+    if access.collection() != location.collection.handle()
+        || access.trust_root() != location.authority
+    {
         bail!("vault location disagrees with its verified access evidence");
     }
     snapshot
-        .vault_exact(location.collection)
+        .vault_exact(location.collection.handle())
         .map(|vault| vault.catalog())
         .ok_or_else(|| anyhow!("vault {} is not ready in this snapshot", location.vault))
 }
@@ -1137,8 +1186,10 @@ fn validate_prospective_union(vault: Id, current: &TribleSet, candidate: &Fragme
     Ok(())
 }
 
-/// Seal one immutable secret to the vault's single custody key and publish it
-/// under the exact WRITE presentations carried by the local access envelope.
+/// Seal one immutable secret to the vault's single custody key and publish it.
+///
+/// Local publication is unconditional. A later snapshot discovers resident
+/// WRITE proofs and admits this signer only when one authorizes the vault.
 pub fn add_secret<R: BlobStoreGet>(
     store: &mut Pile,
     signing_key: &SigningKey,
@@ -1154,7 +1205,7 @@ pub fn add_secret<R: BlobStoreGet>(
         .context("capability-native vault has no custody declaration")?;
     let sealed = seal_version(name, plaintext, custody.public_key, created_at)?;
     let current = snapshot
-        .vault_exact(location.collection)
+        .vault_exact(location.collection.handle())
         .expect("checked vault above")
         .facts();
     validate_prospective_union(location.vault, current, &sealed.fragment)?;
@@ -1206,8 +1257,8 @@ fn delegating_read_bundle(
 /// Deliver one exact child READ capability and the same vault custody seed to
 /// a recipient's deterministic access inbox.
 ///
-/// One access envelope is emitted for every distinct WRITE presentation needed
-/// to reconstruct the current multi-writer collection.  They are committed as
+/// One access envelope is emitted for every distinct WRITE proof bundle needed
+/// to reconstruct the current multi-writer collection. They are committed as
 /// one inbox fragment, so a recipient never observes only a prefix of the
 /// required writer set.  Work is independent of the number of vault secrets.
 pub fn grant_vault_read<R: BlobStoreGet>(
@@ -1219,7 +1270,7 @@ pub fn grant_vault_read<R: BlobStoreGet>(
 ) -> Result<Vec<Id>> {
     checked_vault(snapshot, location)?;
     let access = snapshot
-        .access_exact(location.collection)
+        .access_exact(location.collection.handle())
         .expect("checked_vault requires access");
     let instant = triblespace::core::clock::epoch_now();
     let child_read = delegating_read_bundle(access, signing_key, recipient, instant)?;
@@ -1227,18 +1278,19 @@ pub fn grant_vault_read<R: BlobStoreGet>(
     let mut envelopes = Fragment::empty();
     let mut seen = BTreeSet::new();
     let mut write_bundles = Vec::new();
-    for writer in access.write_presentations() {
-        let proof_id = writer.bundle().proof().id();
-        if !seen.insert((writer.expected_leaf().to_bytes(), proof_id.raw)) {
+    for bundle in access.write_bundles() {
+        let writer = bundle.proof().leaf_key();
+        let proof_id = bundle.proof().id();
+        if !seen.insert((writer.to_bytes(), proof_id.raw)) {
             continue;
         }
         let envelope = build_access_envelope(
-            location.collection,
+            location.collection.handle(),
             access.custody(),
             recipient,
             &child_read,
-            writer.expected_leaf(),
-            writer.bundle(),
+            writer,
+            bundle,
             access.trust_root(),
             instant,
         )
@@ -1249,16 +1301,16 @@ pub fn grant_vault_read<R: BlobStoreGet>(
                 .context("delegated access envelope did not export its intrinsic id")?,
         );
         envelopes += envelope;
-        write_bundles.push(writer.bundle().clone());
+        write_bundles.push(bundle.clone());
     }
     if envelope_ids.is_empty() {
-        bail!("vault access has no distinct WRITE presentation");
+        bail!("vault access has no distinct WRITE proof bundle");
     }
     retain_descriptor(&mut envelopes, *location)?;
     persist_proof_bundle(store, &child_read).context("persist delegated READ proof closure")?;
     for (index, bundle) in write_bundles.iter().enumerate() {
         persist_proof_bundle(store, bundle)
-            .with_context(|| format!("persist WRITE presentation {index}"))?;
+            .with_context(|| format!("persist WRITE proof bundle {index}"))?;
     }
     let inbox = register_access_inbox(store, recipient)?;
     store
@@ -1376,6 +1428,45 @@ mod tests {
     }
 
     #[test]
+    fn ambient_writer_cannot_poison_or_block_create_retry() {
+        let files = TestPile::new();
+        let founder = key(35);
+        let ambient = key(36);
+        let vault = id(35);
+        let mut pile = files.open();
+        let location = create_vault(&mut pile, &founder, vault, "stable", at(1)).unwrap();
+
+        let ambient_write = CapabilityProofBundle::issue_root(
+            &founder,
+            CapabilityClaim::root(
+                write_atom(location.collection()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            ambient.verifying_key(),
+        )
+        .unwrap();
+        persist_proof_bundle(&mut pile, &ambient_write).unwrap();
+        let poison = vault_header_fragment(
+            vault,
+            "ambient-conflict",
+            at(2),
+            key(37).verifying_key().to_bytes(),
+        )
+        .unwrap();
+        pile.commit(location.collection, &ambient, poison).unwrap();
+
+        create_vault(&mut pile, &founder, vault, "stable", at(999)).unwrap();
+        let discovery = discover_local_vaults(&mut pile, &founder).unwrap();
+        assert!(discovery.issues().is_empty());
+        assert!(discovery
+            .snapshot()
+            .vault_exact(location.collection())
+            .is_some());
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn grant_delivers_every_writer_in_one_inbox_commit() {
         let files = TestPile::new();
         let founder = key(3);
@@ -1439,7 +1530,7 @@ mod tests {
         )
         .unwrap();
         let secret = sealed.secret;
-        pile.commit(location.collection(), &writer, sealed.fragment)
+        pile.commit(location.collection, &writer, sealed.fragment)
             .unwrap();
 
         let founder_view = discover_local_vaults(&mut pile, &founder).unwrap();
@@ -1463,6 +1554,130 @@ mod tests {
                 .unwrap(),
             b"two writers"
         );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn ambient_write_proofs_are_inert_and_onward_grants_preserve_the_envelope_scope() {
+        let files = TestPile::new();
+        let founder = key(31);
+        let ambient = key(32);
+        let leased = key(33);
+        let recipient = key(34);
+        let mut pile = files.open();
+        let location = create_vault(&mut pile, &founder, id(31), "scoped-writers", at(1)).unwrap();
+
+        let founder_view = discover_local_vaults(&mut pile, &founder).unwrap();
+        let custody = SigningKey::from_bytes(
+            &founder_view
+                .snapshot()
+                .access_exact(location.collection())
+                .unwrap()
+                .custody()
+                .to_bytes(),
+        );
+        drop(founder_view);
+
+        let instant = triblespace::core::clock::epoch_now();
+        let unbounded = CapabilityProofBundle::issue_root(
+            &founder,
+            CapabilityClaim::root(
+                write_atom(location.collection()),
+                CapabilityMode::Invoke,
+                None,
+            ),
+            ambient.verifying_key(),
+        )
+        .unwrap();
+        let validity = CapabilityValidity::new(
+            instant - hifitime::Duration::from_seconds(60.0),
+            instant + hifitime::Duration::from_seconds(3600.0),
+        )
+        .unwrap();
+        let bounded = CapabilityProofBundle::issue_root(
+            &founder,
+            CapabilityClaim::root(
+                write_atom(location.collection()),
+                CapabilityMode::Invoke,
+                Some(validity),
+            ),
+            leased.verifying_key(),
+        )
+        .unwrap();
+        persist_proof_bundle(&mut pile, &unbounded).unwrap();
+        persist_proof_bundle(&mut pile, &bounded).unwrap();
+
+        let ambient_secret = seal_version(
+            "ambient-unbounded",
+            b"must stay outside the envelope scope",
+            custody.verifying_key().to_bytes(),
+            at(2),
+        )
+        .unwrap();
+        let ambient_id = ambient_secret.secret;
+        pile.commit(location.collection, &ambient, ambient_secret.fragment)
+            .unwrap();
+        let leased_secret = seal_version(
+            "ambient-bounded",
+            b"must not appear and later expire",
+            custody.verifying_key().to_bytes(),
+            at(3),
+        )
+        .unwrap();
+        let leased_id = leased_secret.secret;
+        pile.commit(location.collection, &leased, leased_secret.fragment)
+            .unwrap();
+
+        let founder_view = discover_local_vaults(&mut pile, &founder).unwrap();
+        assert!(founder_view.issues().is_empty());
+        let founder_access = founder_view
+            .snapshot()
+            .access_exact(location.collection())
+            .unwrap();
+        assert_eq!(founder_access.write_bundles().len(), 1);
+        assert_eq!(
+            founder_access.write_bundles()[0].proof().leaf_key(),
+            founder.verifying_key()
+        );
+        assert!(founder_view
+            .snapshot()
+            .open_exact(location.collection(), ambient_id, &founder)
+            .is_err());
+        assert!(founder_view
+            .snapshot()
+            .open_exact(location.collection(), leased_id, &founder)
+            .is_err());
+
+        let envelopes = grant_vault_read(
+            &mut pile,
+            &founder,
+            &location,
+            founder_view.snapshot(),
+            recipient.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(envelopes.len(), 1);
+        drop(founder_view);
+
+        let recipient_view = discover_local_vaults(&mut pile, &recipient).unwrap();
+        assert!(recipient_view.issues().is_empty());
+        let recipient_access = recipient_view
+            .snapshot()
+            .access_exact(location.collection())
+            .unwrap();
+        assert_eq!(recipient_access.write_bundles().len(), 1);
+        assert_eq!(
+            recipient_access.write_bundles()[0].proof().leaf_key(),
+            founder.verifying_key()
+        );
+        assert!(recipient_view
+            .snapshot()
+            .open_exact(location.collection(), ambient_id, &recipient)
+            .is_err());
+        assert!(recipient_view
+            .snapshot()
+            .open_exact(location.collection(), leased_id, &recipient)
+            .is_err());
         pile.close().unwrap();
     }
 
@@ -1583,7 +1798,7 @@ mod tests {
         let location = create_vault(&mut pile, &founder, id(11), "isolated", at(1)).unwrap();
 
         let inbox = register_access_inbox(&mut pile, founder.verifying_key()).unwrap();
-        let commits = discover_collection_records_authorized(&mut pile, inbox, |_| true)
+        let commits = discover_collection_records_authorized(&mut pile, inbox.handle(), |_| true)
             .unwrap()
             .commits()
             .to_vec();

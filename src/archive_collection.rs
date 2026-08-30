@@ -13,15 +13,13 @@ use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::collection::exact_derived::{
-    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
-};
+use triblespace::core::blob::{Blob, TryFromBlob};
+use triblespace::core::collection::exact_derived::ExactDerivedCollection;
 use triblespace::core::collection::exact_target_compaction::compact_exact_target;
 use triblespace::core::collection::reach;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace::core::collection::{
-    simplearchive_union, CollectionCommit, CollectionData, CollectionHandle, CollectionStoreExt,
+    Collection, CollectionCommit, CollectionStoreExt, CoverAttachment, FactCover,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
@@ -219,7 +217,7 @@ pub struct ArchiveSearchHit {
 /// One atomic canonical Archive import.
 pub struct ArchiveImportWriter {
     pile: Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: SigningKey,
     current: TribleSet,
     delta: Fragment,
@@ -232,7 +230,7 @@ impl ArchiveImportWriter {
         let result = (|| {
             let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer)?;
             let snapshot = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .context("snapshot authored Archive collection")?;
             require_accepted(
                 blockdag::validate_catalog(snapshot.reader(), snapshot.facts())
@@ -421,23 +419,22 @@ fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result
     }
 }
 
-/// Exact V4 raw-Succinct derivation summary.
+/// Exact V4 accelerated-Succinct derivation summary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SuccinctIndexReport {
     pub source_commits: usize,
-    /// Distinct source data elements named by the frozen commit ticket.
+    /// Distinct source data elements named by the frozen source cover.
     pub source_elements: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
     pub target_collection: Inline<Handle<SimpleArchive>>,
 }
 
-/// Ensure an exact resident raw-Succinct cover for the frozen Archive ticket.
+/// Ensure an exact resident accelerated-Succinct view for the frozen Archive cover.
 ///
-/// This is a reproducible physical cover, not new authority. The target uses
-/// V4's canonical raw-Succinct union descriptor; validated source `MERGE`,
-/// target `MERGE`, and cross-representation `DERIVE` equations may cover one
-/// or several signed roots. [`ensure_bm25_index`] provides the analogous exact
-/// projection for Archive full-text search.
+/// This is a reproducible physical cover, not new authority. Canonical raw
+/// Succinct members are derived and merged first; the public target is their
+/// exact Rank9-accelerated image. [`ensure_bm25_index`] provides the analogous
+/// exact projection for Archive full-text search.
 pub fn ensure_succinct_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
@@ -459,25 +456,22 @@ pub fn ensure_succinct_index(
             authority,
             reach::private(),
         );
-        let source = algebra.source_descriptor();
-        let target = algebra.descriptor();
-        let exact = ExactDerivedCollection::new(source, target);
-        let source_elements = distinct_ticket_data(archive.commits()).len();
-        exact
-            .ensure_exact(&mut pile, archive.commits(), &algebra)
-            .context("ensure exact Archive raw-Succinct cover")?;
+        let source_elements = archive.cover().len();
+        algebra
+            .ensure_exact(&mut pile, archive.cover())
+            .context("ensure exact Archive accelerated-Succinct view")?;
 
         Ok(SuccinctIndexReport {
             source_commits: archive.commits().len(),
             source_elements,
-            source_collection: exact.source_collection(),
-            target_collection: exact.target_collection(),
+            source_collection: algebra.source_collection(),
+            target_collection: algebra.collection(),
         })
     })();
     close_pile(
         pile,
         result,
-        "closing Archive pile after raw-Succinct derivation",
+        "closing Archive pile after accelerated-Succinct derivation",
     )
 }
 
@@ -485,7 +479,7 @@ pub fn ensure_succinct_index(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bm25IndexReport {
     pub source_commits: usize,
-    /// Distinct source data elements named by the frozen commit ticket.
+    /// Distinct source data elements named by the frozen source cover.
     pub source_elements: usize,
     pub cover_segments: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
@@ -494,10 +488,10 @@ pub struct Bm25IndexReport {
 
 struct EnsuredBm25 {
     report: Bm25IndexReport,
-    cover: ExactCover<PortableBM25Blob>,
+    cover: CoverAttachment<PortableBM25Blob>,
 }
 
-/// Ensure a portable exact-TF cover of the frozen Archive ticket, then compact
+/// Ensure a portable exact-TF cover of the frozen Archive cover, then compact
 /// its current admissible physical cover through exact `MERGE` equations.
 pub fn ensure_bm25_index(
     pile_path: &std::path::Path,
@@ -520,108 +514,25 @@ fn ensure_bm25_for_snapshot(
 ) -> Result<EnsuredBm25> {
     let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority);
     let target = archive_bm25::descriptor(authority);
-    let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-    let algebra = ArchiveBm25Algebra {
-        authority,
-        reader: pile
-            .reader()
-            .context("open Archive BM25 attachment reader")?,
-    };
-    let source_elements = distinct_ticket_data(archive.commits()).len();
-    let cover = compact_exact_target(&exact, pile, archive.commits(), &algebra)
+    let exact = ExactDerivedCollection::<
+        SimpleArchive,
+        PortableBM25Blob,
+        archive_bm25::ArchiveBlockTextBm25Mapping,
+    >::new(source, target)
+    .context("bind Archive BM25 collection mapping")?;
+    let source_elements = archive.cover().len();
+    let cover = compact_exact_target(&exact, pile, archive.cover())
         .context("ensure and compact exact Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
             source_commits: archive.commits().len(),
             source_elements,
             cover_segments: cover.len(),
-            source_collection: exact.source_collection(),
-            target_collection: exact.target_collection(),
+            source_collection: exact.source_collection().handle(),
+            target_collection: exact.target_collection().handle(),
         },
         cover,
     })
-}
-
-/// Archive's one attachment-aware exact homomorphism.
-///
-/// The reader freezes payload residency for the whole ensure/compaction call.
-/// Every failure is fatal: portable BM25 has no representation-capacity
-/// fallback, and an absent selected payload requires a later retry with a new
-/// reader rather than a different physical cover.
-struct ArchiveBm25Algebra {
-    reader: PileReader,
-    /// Authority whose collections this algebra accepts, so validation
-    /// compares against the exact descriptors this pile addresses.
-    authority: VerifyingKey,
-}
-
-fn fatal_bm25(error: impl std::fmt::Display) -> ExactAlgebraError {
-    ExactAlgebraError::Fatal(error.to_string())
-}
-
-impl ExactDerivedAlgebra<SimpleArchive, PortableBM25Blob> for ArchiveBm25Algebra {
-    fn validate_source(
-        &self,
-        descriptor: &Fragment,
-        source: &Blob<SimpleArchive>,
-    ) -> std::result::Result<(), ExactAlgebraError> {
-        if descriptor.facts()
-            != crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, self.authority)
-                .facts()
-        {
-            return Err(ExactAlgebraError::Fatal(
-                "source descriptor does not match the Archive collection".to_owned(),
-            ));
-        }
-        simplearchive_union::validate_element(source).map_err(fatal_bm25)
-    }
-
-    fn validate_target(
-        &self,
-        descriptor: &Fragment,
-        target: &Blob<PortableBM25Blob>,
-    ) -> std::result::Result<(), ExactAlgebraError> {
-        if descriptor.facts() != archive_bm25::descriptor(self.authority).facts() {
-            return Err(ExactAlgebraError::Fatal(
-                "target descriptor does not match the Archive BM25 recipe".to_owned(),
-            ));
-        }
-        ArchiveBm25::try_from_blob(target.clone())
-            .map(|_| ())
-            .map_err(fatal_bm25)
-    }
-
-    fn join_source(
-        &self,
-        low: &Blob<SimpleArchive>,
-        high: &Blob<SimpleArchive>,
-    ) -> std::result::Result<Blob<SimpleArchive>, ExactAlgebraError> {
-        simplearchive_union::join(low, high).map_err(fatal_bm25)
-    }
-
-    fn derive(
-        &self,
-        source: &Blob<SimpleArchive>,
-    ) -> std::result::Result<Blob<PortableBM25Blob>, ExactAlgebraError> {
-        archive_bm25::derive_element(&self.reader, source.clone())
-            .map_err(|error| ExactAlgebraError::Fatal(format!("{error:#}")))
-    }
-
-    fn join_target(
-        &self,
-        low: &Blob<PortableBM25Blob>,
-        high: &Blob<PortableBM25Blob>,
-    ) -> std::result::Result<Blob<PortableBM25Blob>, ExactAlgebraError> {
-        let low = ArchiveBm25::try_from_blob(low.clone()).map_err(fatal_bm25)?;
-        let high = ArchiveBm25::try_from_blob(high.clone()).map_err(fatal_bm25)?;
-        low.merged(&high)
-            .map(|index| index.to_blob())
-            .map_err(fatal_bm25)
-    }
-}
-
-fn distinct_ticket_data(commits: &[CollectionCommit]) -> BTreeSet<CollectionData> {
-    commits.iter().map(CollectionCommit::data).collect()
 }
 
 fn interval_lower_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
@@ -710,6 +621,7 @@ pub struct ArchiveSnapshot {
     scope: Id,
     facts: TribleSet,
     reader: PileReader,
+    cover: FactCover,
     commits: Vec<CollectionCommit>,
 }
 
@@ -718,7 +630,7 @@ impl ArchiveSnapshot {
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
         scope: Id,
-    ) -> Result<(Pile, CollectionHandle, SigningKey)> {
+    ) -> Result<(Pile, Collection<SimpleArchive>, SigningKey)> {
         if scope != schema::DEFAULT_SCOPE_ID {
             bail!(
                 "Archive runtime only supports fixed scope {:X}",
@@ -731,11 +643,15 @@ impl ArchiveSnapshot {
         Ok((pile, collection, signer))
     }
 
-    fn from_store(pile: &mut Pile, collection: CollectionHandle, scope: Id) -> Result<Self> {
-        let snapshot = pile
-            .snapshot(collection, &[])
+    fn from_store(
+        pile: &mut Pile,
+        collection: Collection<SimpleArchive>,
+        scope: Id,
+    ) -> Result<Self> {
+        let (snapshot, commits) = pile
+            .snapshot_with_admission(collection)
             .context("snapshot authored Archive collection")?;
-        let (facts, ticket, reader) = snapshot.into_parts();
+        let (facts, cover, reader) = snapshot.into_parts();
         require_accepted(
             blockdag::validate_catalog(&reader, &facts)
                 .context("validate materialized Archive catalog")?,
@@ -745,7 +661,8 @@ impl ArchiveSnapshot {
             scope,
             facts,
             reader,
-            commits: ticket.commits().to_vec(),
+            cover,
+            commits,
         })
     }
 
@@ -769,6 +686,11 @@ impl ArchiveSnapshot {
 
     pub fn reader(&self) -> &PileReader {
         &self.reader
+    }
+
+    /// Exact admitted source members represented by this snapshot.
+    pub fn cover(&self) -> &FactCover {
+        &self.cover
     }
 
     pub fn commits(&self) -> &[CollectionCommit] {
@@ -1672,7 +1594,7 @@ mod tests {
     use hifitime::Epoch;
     use tempfile::TempDir;
     use triblespace::core::blob::IntoBlob;
-    use triblespace::core::collection::discover_collection_records;
+    use triblespace::core::collection::{discover_collection_records, simplearchive_union};
 
     fn projection(locator: &str, text: &str) -> Fragment {
         let fact = blockdag::text_fact(
@@ -2053,6 +1975,39 @@ mod tests {
     }
 
     #[test]
+    fn unauthorized_duplicate_claim_is_provenance_not_an_admitted_archive_root() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key_path = directory.path().join("archive.key");
+        let signer = initialize_archive_fixture(&pile_path, &key_path);
+        let fragment = projection("session:duplicate-author", "one payload");
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+        let admitted = pile.commit(collection, &signer, fragment.clone()).unwrap();
+        let foreign = SigningKey::from_bytes(&[0xA7; 32]);
+        let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
+        assert_eq!(duplicate.data(), admitted.data());
+        pile.close().unwrap();
+
+        let snapshot =
+            ArchiveSnapshot::load_local(&pile_path, Some(&key_path), schema::DEFAULT_SCOPE_ID)
+                .unwrap();
+        assert_eq!(snapshot.commits(), &[admitted]);
+        assert_eq!(snapshot.projection_ids().len(), 1);
+        let cover = snapshot.cover().clone();
+        drop(snapshot);
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let claims = pile.claims(&cover).unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(claims.contains(&admitted));
+        assert!(claims.contains(&duplicate));
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn exact_source_snapshots_are_listed_lazily_and_stream_reconstructible() {
         let directory = TempDir::new().unwrap();
         let pile = directory.path().join("archive.pile");
@@ -2195,9 +2150,9 @@ mod tests {
         let derives: Vec<_> = records
             .derives()
             .iter()
-            .filter(|claim| claim.mapping().0 == commit.data())
+            .filter(|claim| claim.input() == commit.data())
             .collect();
-        assert_eq!(derives.len(), 2, "one empty derive per target recipe");
+        assert_eq!(derives.len(), 2, "one empty derive per target mapping");
         pile.close().unwrap();
 
         let snapshot =
@@ -2349,34 +2304,29 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let records = discover_collection_records(&mut pile).unwrap();
+        let authority = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
+        let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority);
+        let raw_target = succinctarchive_union::descriptor(
+            archive_bm25::source_collection(authority),
+            authority,
+            reach::private(),
+        );
         let derive = records
             .derives()
             .iter()
-            .find(|derive| derive.target() == report.target_collection)
+            .find(|derive| derive.collection() == collection_of(&raw_target))
             .copied()
             .expect("stored Archive raw-Succinct DERIVE");
         let reader = pile.reader().unwrap();
-        let (input, output) = derive.mapping();
+        let (input, output) = (derive.input(), derive.output());
         let input: Blob<SimpleArchive> = reader
             .get(Handle::<SimpleArchive>::from_hash(input))
             .unwrap();
         let output: Blob<SuccinctArchiveBlob> = reader
             .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
             .unwrap();
-        let authority = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
-        let source = crate::collection_names::root_descriptor(schema::DEFAULT_SCOPE_ID, authority);
-        succinctarchive_union::validate_derive(
-            &source,
-            &succinctarchive_union::descriptor(
-                archive_bm25::source_collection(authority),
-                authority,
-                reach::private(),
-            ),
-            &derive,
-            &input,
-            &output,
-        )
-        .unwrap();
+        succinctarchive_union::validate_derive(&source, &raw_target, &derive, &input, &output)
+            .unwrap();
         pile.close().unwrap();
     }
 
@@ -2409,7 +2359,7 @@ mod tests {
         let derives: Vec<_> = records
             .derives()
             .iter()
-            .filter(|claim| claim.target() == collection_of(&target))
+            .filter(|claim| claim.collection() == collection_of(&target))
             .copied()
             .collect();
         let merges: Vec<_> = records
@@ -2420,18 +2370,15 @@ mod tests {
             .collect();
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
-        let commits: Vec<_> = records
-            .commits()
-            .iter()
-            .filter(|claim| claim.collection() == collection_of(&source))
-            .copied()
-            .collect();
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let cover = exact.attach_exact(&mut pile, &commits, &algebra).unwrap();
+        let source_collection = Collection::<SimpleArchive>::from_descriptor(&source).unwrap();
+        let source_cover = pile.cover(source_collection).unwrap();
+        let exact = ExactDerivedCollection::<
+            SimpleArchive,
+            PortableBM25Blob,
+            archive_bm25::ArchiveBlockTextBm25Mapping,
+        >::new(source, target)
+        .unwrap();
+        let cover = exact.attach_exact(&mut pile, &source_cover).unwrap();
         assert_eq!(cover.len(), 1);
         pile.close().unwrap();
 
@@ -2572,13 +2519,7 @@ mod tests {
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
         let derive = CollectionDerive::new(collection_of(&target), input_data, output_data);
-        let algebra = ArchiveBm25Algebra {
-            reader,
-            authority: test_authority(&pile_path, &key),
-        };
-        assert_eq!(algebra.derive(&union).unwrap().bytes, output.bytes);
-        algebra.validate_target(&target, &output).unwrap();
-        drop(algebra);
+        drop(reader);
         pile.put::<SimpleArchive, _>(triblespace::core::blob::IntoBlob::<SimpleArchive>::to_blob(
             target.facts().clone(),
         ))
@@ -2598,7 +2539,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_frozen_ticket_excludes_a_later_admitted_commit() {
+    fn bm25_frozen_cover_excludes_a_later_admitted_commit() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2624,8 +2565,8 @@ mod tests {
         let inputs: BTreeSet<_> = records
             .derives()
             .iter()
-            .filter(|claim| claim.target() == collection_of(&target))
-            .map(|claim| claim.mapping().0)
+            .filter(|claim| claim.collection() == collection_of(&target))
+            .map(|claim| claim.input())
             .collect();
         assert_eq!(inputs, BTreeSet::from([first.data()]));
         assert!(!inputs.contains(&later.data()));
@@ -2640,47 +2581,50 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
+        let first_archive =
+            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let first_cover = first_archive.cover().clone();
+        drop(first_archive);
         commit_projection(&pile_path, &key, "session:second", "second residual");
         let archive =
             ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
-        let commits = archive.commits().to_vec();
+        let full_cover = archive.cover().clone();
         drop(archive);
 
         let source = test_source(&pile_path, &key);
         let target = test_target(&pile_path, &key);
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
+        let exact = ExactDerivedCollection::<
+            SimpleArchive,
+            PortableBM25Blob,
+            archive_bm25::ArchiveBlockTextBm25Mapping,
+        >::new(source, target.clone())
+        .unwrap();
 
-        let first = exact
-            .ensure_exact(&mut pile, &commits[..1], &algebra)
-            .unwrap();
+        let first = exact.ensure_exact(&mut pile, &first_cover).unwrap();
         assert_eq!(first.len(), 1);
         drop(first);
         let first_records = discover_collection_records(&mut pile).unwrap();
         let first_derives = first_records
             .derives()
             .iter()
-            .filter(|claim| claim.target() == collection_of(&target))
+            .filter(|claim| claim.collection() == collection_of(&target))
             .count();
         assert_eq!(first_derives, 1);
 
-        let full = exact.ensure_exact(&mut pile, &commits, &algebra).unwrap();
+        let full = exact.ensure_exact(&mut pile, &full_cover).unwrap();
         assert_eq!(full.len(), 2);
         let full_records = discover_collection_records(&mut pile).unwrap();
         let full_derives = full_records
             .derives()
             .iter()
-            .filter(|claim| claim.target() == collection_of(&target))
+            .filter(|claim| claim.collection() == collection_of(&target))
             .count();
         assert_eq!(
             full_derives, 2,
             "only the newly unsupported root is derived"
         );
-        let compacted = compact_exact_target(&exact, &mut pile, &commits, &algebra).unwrap();
+        let compacted = compact_exact_target(&exact, &mut pile, &full_cover).unwrap();
         assert_eq!(compacted.len(), 1);
         drop(compacted);
 
@@ -2689,7 +2633,7 @@ mod tests {
             records_before.derives().len(),
             records_before.merges().len(),
         );
-        let retry = exact.ensure_exact(&mut pile, &commits, &algebra).unwrap();
+        let retry = exact.ensure_exact(&mut pile, &full_cover).unwrap();
         assert_eq!(retry.len(), 1, "the admitted MERGE is reused");
         drop(retry);
         let records_after = discover_collection_records(&mut pile).unwrap();
@@ -2697,46 +2641,6 @@ mod tests {
             (records_after.derives().len(), records_after.merges().len()),
             counts_before,
             "a complete retry publishes no collection records"
-        );
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn exact_ensure_deduplicates_data_without_losing_commit_support() {
-        let directory = TempDir::new().unwrap();
-        let pile_path = directory.path().join("archive.pile");
-        std::fs::File::create(&pile_path).unwrap();
-        let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
-        let first = commit_projection(&pile_path, &key, "session:shared", "shared data");
-        let source = test_source(&pile_path, &key);
-        let target = test_target(&pile_path, &key);
-        let second = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[0xA5; 32]),
-            collection_of(&source),
-            first.data(),
-            first.metadata(),
-        );
-
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        CollectionStore::insert(&mut pile, CollectionRecord::Commit(second)).unwrap();
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let ready = exact
-            .ensure_exact(&mut pile, &[first, second], &algebra)
-            .unwrap();
-        assert_eq!(ready.len(), 1, "equal source data has one canonical image");
-        let records = discover_collection_records(&mut pile).unwrap();
-        assert_eq!(
-            records
-                .derives()
-                .iter()
-                .filter(|claim| { claim.target() == collection_of(&target) })
-                .count(),
-            1,
         );
         pile.close().unwrap();
     }
@@ -2753,6 +2657,8 @@ mod tests {
         let target = test_target(&pile_path, &key);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source_collection = Collection::<SimpleArchive>::from_descriptor(&source).unwrap();
+        let source_cover = pile.cover(source_collection).unwrap();
         let reader = pile.reader().unwrap();
         let input: Blob<SimpleArchive> = reader
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
@@ -2770,17 +2676,18 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
+        let exact = ExactDerivedCollection::<
+            SimpleArchive,
+            PortableBM25Blob,
+            archive_bm25::ArchiveBlockTextBm25Mapping,
+        >::new(source, target)
+        .unwrap();
+        let ready = exact.ensure_exact(&mut pile, &source_cover).unwrap();
         assert_eq!(
             ready
                 .members()
                 .iter()
-                .map(|(data, _)| *data)
+                .map(|(data, _)| Handle::<PortableBM25Blob>::to_hash(*data))
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([output_data])
         );
@@ -2796,102 +2703,5 @@ mod tests {
             "the recovered deterministic equation remains one record"
         );
         pile.close().unwrap();
-    }
-
-    #[test]
-    fn exact_complete_fast_path_needs_no_descriptor_republication() {
-        let directory = TempDir::new().unwrap();
-        let pile_path = directory.path().join("archive.pile");
-        std::fs::File::create(&pile_path).unwrap();
-        let key = directory.path().join("archive.key");
-        let signer = initialize_archive_fixture(&pile_path, &key);
-        let source = test_source(&pile_path, &key);
-        let target = test_target(&pile_path, &key);
-
-        let (_, facts, metafacts, mut blobs) =
-            projection("session:descriptors", "descriptor recovery").into_parts();
-        let data: Blob<SimpleArchive> = facts.to_blob();
-        let metadata: Blob<SimpleArchive> = metafacts.to_blob();
-        let commit = CollectionCommit::sign(
-            &signer,
-            collection_of(&source),
-            Handle::<SimpleArchive>::to_hash(data.get_handle()),
-            metadata.get_handle(),
-        );
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        for (_, blob) in blobs.reader().unwrap() {
-            pile.put::<blobencodings::UnknownBlob, _>(blob).unwrap();
-        }
-        pile.put::<SimpleArchive, _>(data).unwrap();
-        pile.put::<SimpleArchive, _>(metadata).unwrap();
-        CollectionStore::insert(&mut pile, CollectionRecord::Commit(commit)).unwrap();
-        let reader = pile.reader().unwrap();
-        let input: Blob<SimpleArchive> = reader
-            .get(Handle::<SimpleArchive>::from_hash(commit.data()))
-            .unwrap();
-        let output = archive_bm25::derive_element(&reader, input).unwrap();
-        let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive = CollectionDerive::new(collection_of(&target), commit.data(), output_data);
-        drop(reader);
-        pile.put::<PortableBM25Blob, _>(output).unwrap();
-        CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
-        let reader = pile.reader().unwrap();
-        assert!(reader.metadata(collection_of(&source)).unwrap().is_none());
-        assert!(reader.metadata(collection_of(&target)).unwrap().is_none());
-        drop(reader);
-
-        let before = std::fs::metadata(&pile_path).unwrap().len();
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let ready = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
-        assert_eq!(ready.len(), 1);
-        drop(ready);
-        let reader = pile.reader().unwrap();
-        assert!(reader.metadata(collection_of(&source)).unwrap().is_none());
-        assert!(reader.metadata(collection_of(&target)).unwrap().is_none());
-        drop(reader);
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
-
-        let retry = exact.ensure_exact(&mut pile, &[commit], &algebra).unwrap();
-        assert_eq!(retry.len(), 1);
-        drop(retry);
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn exact_ensure_rejects_an_absent_ticket_before_derivation() {
-        let directory = TempDir::new().unwrap();
-        let pile_path = directory.path().join("archive.pile");
-        std::fs::File::create(&pile_path).unwrap();
-        let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
-        let existing = commit_projection(&pile_path, &key, "session:existing", "existing data");
-        let source = test_source(&pile_path, &key);
-        let target = test_target(&pile_path, &key);
-        let absent = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[0x5A; 32]),
-            collection_of(&source),
-            existing.data(),
-            existing.metadata(),
-        );
-        let before = std::fs::metadata(&pile_path).unwrap().len();
-
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let algebra = ArchiveBm25Algebra {
-            reader: pile.reader().unwrap(),
-            authority: test_authority(&pile_path, &key),
-        };
-        let exact = ExactDerivedCollection::new(source.clone(), target.clone());
-        let error = match exact.ensure_exact(&mut pile, &[absent], &algebra) {
-            Ok(_) => panic!("absent frozen ticket was unexpectedly admitted"),
-            Err(error) => error,
-        };
-        assert!(format!("{error:#}").contains("absent or fails strict signature verification"));
-        pile.close().unwrap();
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
     }
 }

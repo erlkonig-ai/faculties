@@ -31,8 +31,8 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// One coherent Compass source snapshot plus its maintained status register.
 ///
-/// Facts, commits, and blob reader are captured at one collection observation;
-/// the index is then attached for exactly that commit ticket. Maintained
+/// Facts, cover, and blob reader are captured at one collection observation;
+/// the index is then attached for exactly that source cover. Maintained
 /// artifacts are cache exhaust, never additional semantic authority.
 pub struct CompassSnapshot {
     facts: TribleSet,
@@ -51,7 +51,7 @@ impl CompassSnapshot {
         &self.reader
     }
 
-    /// Maintained LWW order attached for this snapshot's commit ticket.
+    /// Maintained LWW order attached for this snapshot's source cover.
     pub fn status_register(&self) -> &LwwIndex {
         &self.status
     }
@@ -1027,7 +1027,7 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileReader)> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let (facts, _, reader) = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("materialize Compass collection: {error}"))?
         .into_parts();
     validate_known_payloads(&reader, &facts)?;
@@ -1035,19 +1035,19 @@ pub fn materialize_collection(
 }
 
 /// Capture Compass facts and attach the maintained status LWW index for that
-/// exact source ticket, constructing missing derived artifacts if necessary.
+/// exact source cover, constructing missing derived artifacts if necessary.
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
     let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
     let snapshot = pile
-        .snapshot(collection, &[])
+        .snapshot(collection)
         .map_err(|error| anyhow!("snapshot Compass collection: {error}"))?;
-    let (facts, ticket, reader) = snapshot.into_parts();
+    let (facts, cover, reader) = snapshot.into_parts();
     validate_known_payloads(&reader, &facts)?;
     let status = status_register_collection(signer.verifying_key())
-        .ensure_exact(pile, ticket.commits())
+        .ensure_exact(pile, &cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     Ok(CompassSnapshot {
         facts,

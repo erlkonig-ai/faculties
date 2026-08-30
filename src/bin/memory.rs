@@ -118,7 +118,7 @@ impl MemoryStorage<'_> {
         label: &str,
     ) -> Result<TribleSet> {
         let collection = open_scope(pile, scope, signer)?;
-        pile.snapshot(collection, &[])
+        pile.snapshot(collection)
             .map(|snapshot| snapshot.into_facts())
             .with_context(|| format!("materialize authored {label} collection"))
     }

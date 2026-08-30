@@ -641,7 +641,7 @@ mod tests {
             signer.verifying_key(),
         )
         .unwrap();
-        let ticket_before = pile.ticket(collection, &[]).unwrap();
+        let cover_before = pile.cover(collection).unwrap();
         pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
@@ -654,7 +654,7 @@ mod tests {
             signer.verifying_key(),
         )
         .unwrap();
-        let ticket_after = pile.ticket(collection, &[]).unwrap();
+        let cover_after = pile.cover(collection).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
@@ -664,7 +664,7 @@ mod tests {
             "exact replay must not grow the pile"
         );
         assert_eq!(
-            ticket_before, ticket_after,
+            cover_before, cover_after,
             "maintaining the Wiki index must not advance source authority"
         );
 

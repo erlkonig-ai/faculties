@@ -143,7 +143,7 @@ impl ArchiveStorage<'_> {
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
             let facts = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .map(|snapshot| snapshot.into_facts())
                 .context("materialize Comb cursor collection")?;
             let catalog =
@@ -908,7 +908,7 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
     let result = (|| {
         let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
         let current = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .map(|snapshot| snapshot.into_facts())
             .context("materialize Comb cursor collection before publication")?;
         validate_cursor_update(&current, &fragment)?;

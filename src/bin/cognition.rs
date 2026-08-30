@@ -43,7 +43,7 @@ fn check(cli: &Cli) -> Result<()> {
     let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
     let result = (|| {
         let snapshot = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize native Cognition collection")?;
         let (facts, _, reader) = snapshot.into_parts();
         cognition::validate_catalog(&reader, &facts)?;

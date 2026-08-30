@@ -293,7 +293,7 @@ impl RelationsStorage<'_> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
             let (facts, _, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .context("materialize authored Relations collection")?
                 .into_parts();
             relations::validate_catalog(&reader, &facts)
@@ -311,7 +311,7 @@ impl RelationsStorage<'_> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
             let (facts, _, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .context("materialize authored Relations collection")?
                 .into_parts();
             relations::validate_catalog(&reader, &facts)

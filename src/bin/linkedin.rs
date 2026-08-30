@@ -48,7 +48,8 @@ use faculties::storage::{load_signer, open_pile_strict};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::macros::entity;
@@ -209,7 +210,7 @@ impl RelationsStorage<'_> {
         &self,
         operation: impl FnOnce(
             &mut Pile,
-            CollectionHandle,
+            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &RelationsView,
         ) -> Result<T>,
@@ -219,7 +220,7 @@ impl RelationsStorage<'_> {
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
             let (facts, _ticket, reader) = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .map(|snapshot| snapshot.into_parts())
                 .context("materialize authored Relations collection")?;
             relations::validate_catalog(&reader, &facts)
@@ -274,9 +275,9 @@ impl RelationsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-            let ticket = pile.ticket(collection, &[])?;
-            Ok(ticket
-                .commits()
+            let cover = pile.cover(collection)?;
+            Ok(pile
+                .claims(&cover)?
                 .iter()
                 .filter(|commit| commit.public_key().raw == author)
                 .count())

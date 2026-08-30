@@ -34,7 +34,8 @@ use std::process::Command as PCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileReader};
 use triblespace::core::repo::BlobStoreGet;
@@ -439,7 +440,7 @@ impl BodyStorage<'_> {
         self.with_pile(|pile, signer| {
             let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
             let snapshot = pile
-                .snapshot(collection, &[])
+                .snapshot(collection)
                 .context("materialize Body collection")?;
             f(snapshot.facts(), snapshot.reader())
         })
@@ -643,7 +644,7 @@ fn felt_fragment(
 
 fn keep_felt(
     pile: &mut Pile,
-    collection: CollectionHandle,
+    collection: Collection<SimpleArchive>,
     signer: &ed25519_dalek::SigningKey,
     felt: &Felt,
     note: Option<&str>,
@@ -1260,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_snapshots_are_attached_to_their_exact_commit_ticket() {
+    fn indexed_snapshots_are_attached_to_their_exact_cover() {
         let directory = TestDirectory::new();
         let pile_path = directory.0.join("body.pile");
         let key = directory.0.join("body.key");
@@ -1293,7 +1294,7 @@ mod tests {
                 .unwrap()
                 .id,
             first_id,
-            "the older snapshot must not borrow a later ticket's register"
+            "the older snapshot must not borrow a later cover's register"
         );
         assert_eq!(
             body_model::latest_intent(after.catalog(), after.intent_register())

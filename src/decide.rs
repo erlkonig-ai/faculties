@@ -872,7 +872,7 @@ mod tests {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
             let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
-            let (facts, _, reader) = pile.snapshot(collection, &[]).unwrap().into_parts();
+            let (facts, _, reader) = pile.snapshot(collection).unwrap().into_parts();
             pile.close().unwrap();
             TestView { facts, reader }
         }

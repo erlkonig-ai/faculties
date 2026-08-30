@@ -1616,7 +1616,7 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
     let result = (|| -> Result<()> {
         let snapshot = pile
-            .snapshot(collection, &[])
+            .snapshot(collection)
             .context("materialize the Voice collection")?;
         let (facts, _, reader) = snapshot.into_parts();
         faculties::voice::validate_candidate(&reader, &facts, &fragment)?;
