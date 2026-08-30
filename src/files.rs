@@ -998,7 +998,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
-    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::BlobStoreGet;
 

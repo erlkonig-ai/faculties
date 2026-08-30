@@ -41,7 +41,7 @@ use crate::legacy_hint::open_scope;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
 use triblespace::core::collection::{
-    succinctarchive_union, CollectionDerive, CollectionRecord, CollectionStore,
+    CollectionDerive, CollectionMapping, CollectionRecord, CollectionStore,
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
@@ -1561,8 +1561,6 @@ fn optional_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>>
 mod tests {
     use std::convert::Infallible;
 
-    use triblespace::core::repo::ArtifactHandle;
-
     /// Descriptor-local authority of the Archive fixture.
     fn test_authority(
         pile: &std::path::Path,
@@ -1770,11 +1768,9 @@ mod tests {
             "the long-lived logical delta must not retain embedded bytes"
         );
 
-        // The payload is already durable enough to satisfy a fresh reader,
-        // and its local willingness-to-serve marker is durable, but no signed
-        // collection root makes its facts visible yet.
+        // The payload is already durable enough to satisfy a fresh reader, but
+        // no signed collection root makes its facts visible yet.
         let mut physical = open_pile_strict(&pile).unwrap();
-        assert!(physical.offers_snapshot().unwrap().contains(embedded));
         let reader = physical.snapshot().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
@@ -1823,10 +1819,6 @@ mod tests {
         assert!(snapshot.catalog().is_empty());
         drop(snapshot);
         let mut physical = open_pile_strict(&pile).unwrap();
-        assert!(
-            physical.offers_snapshot().unwrap().contains(embedded),
-            "an orphan OFFER is lawful: it grants neither authority nor retention"
-        );
         let reader = physical.snapshot().unwrap();
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
@@ -1874,7 +1866,7 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum StageEvent {
-        Put(ArtifactHandle),
+        Put(Inline<Handle<UnknownBlob>>),
     }
 
     #[derive(Default)]
@@ -1901,8 +1893,8 @@ mod tests {
     fn streamed_blob_batch_writes_every_content_addressed_member() {
         let first = Blob::<UnknownBlob>::new(Bytes::from_source(b"first".to_vec()));
         let second = Blob::<UnknownBlob>::new(Bytes::from_source(b"second".to_vec()));
-        let first_handle: ArtifactHandle = first.get_handle();
-        let second_handle: ArtifactHandle = second.get_handle();
+        let first_handle = first.get_handle();
+        let second_handle = second.get_handle();
         let mut probe = StageProbe::default();
         stage_embedded_blobs(&mut probe, vec![second, first]).unwrap();
         assert_eq!(
@@ -2351,7 +2343,8 @@ mod tests {
         assert_eq!(merges.len(), 1);
         let store_snapshot = pile.snapshot().unwrap();
         let source_cover = source.admitted(&store_snapshot).unwrap();
-        let exact = ExactDerivedCollection::new(source, target).unwrap();
+        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
+            ExactDerivedCollection::new(source, target).unwrap();
         let cover = exact.attach_exact(&mut pile, &source_cover).unwrap();
         assert_eq!(cover.len(), 1);
         pile.close().unwrap();
@@ -2569,7 +2562,8 @@ mod tests {
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
-        let exact = ExactDerivedCollection::new(source, target).unwrap();
+        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
+            ExactDerivedCollection::new(source, target).unwrap();
 
         let first = exact.ensure_exact(&mut pile, &first_cover).unwrap();
         assert_eq!(first.len(), 1);
@@ -2657,7 +2651,8 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let exact = ExactDerivedCollection::new(source, target).unwrap();
+        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
+            ExactDerivedCollection::new(source, target).unwrap();
         let ready = exact.ensure_exact(&mut pile, &source_cover).unwrap();
         assert_eq!(
             ready

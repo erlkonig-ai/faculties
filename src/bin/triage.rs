@@ -34,7 +34,7 @@ use faculties::triage::{
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
