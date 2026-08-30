@@ -94,7 +94,7 @@ pub fn discover_target<S>(
     authority: VerifyingKey,
 ) -> Result<TargetDiscovery>
 where
-    S: CollectionStoreExt,
+    S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: CollectionRead,
 {
     let collection = crate::collection_names::open(store, scope, authority)

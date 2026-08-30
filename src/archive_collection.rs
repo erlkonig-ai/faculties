@@ -512,8 +512,9 @@ fn ensure_bm25_for_snapshot(
             crate::collection_names::private_policy(authority),
         )
         .context("register Archive BM25 derivation")?;
-    let exact = ExactDerivedCollection::new(archive.collection, target)
-        .context("bind Archive BM25 collection mapping")?;
+    let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
+        ExactDerivedCollection::new(archive.collection, target)
+            .context("bind Archive BM25 collection mapping")?;
     let source_elements = archive.cover().len();
     let cover = compact_exact_target(&exact, pile, archive.cover())
         .context("ensure and compact exact Archive BM25 cover")?;

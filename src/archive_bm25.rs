@@ -39,6 +39,8 @@ use triblespace::macros::entity;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
+use crate::schemas::blockdag as schema;
+
 /// Archive-block-text BM25 member mapping, version 1.
 ///
 /// Minted with `trible genid` on 2026-08-30:
