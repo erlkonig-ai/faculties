@@ -23,7 +23,7 @@ use triblespace::core::repo::{ArtifactOfferStore, BlobStorePut};
 use triblespace::core::trible::Fragment;
 
 use crate::schemas::{
-    atlas, blockdag, body, cognition, compass, decide, discord, embeddings, files, habit,
+    atlas, blockdag, body, cognition, compass, decide, discord, egress, embeddings, files, habit,
     headspace, mail, memory, message, orient, planner, posture, relations, status, teams, voice,
     web, wiki,
 };
@@ -63,6 +63,7 @@ pub fn table() -> Vec<(Id, &'static str, Fragment)> {
         (compass::DEFAULT_SCOPE_ID, "compass", reach::private()),
         (decide::DEFAULT_SCOPE_ID, "decide", reach::private()),
         (discord::DEFAULT_SCOPE_ID, "discord", reach::private()),
+        (egress::DEFAULT_SCOPE_ID, "egress", reach::private()),
         (embeddings::DEFAULT_SCOPE_ID, "embeddings", reach::private()),
         (files::DEFAULT_SCOPE_ID, "files", reach::private()),
         (habit::DEFAULT_SCOPE_ID, "habit", reach::private()),

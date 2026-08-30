@@ -8,6 +8,7 @@ pub mod cognition;
 pub mod compass;
 pub mod decide;
 pub mod discord;
+pub mod egress;
 pub mod embeddings;
 pub mod files;
 pub mod habit;

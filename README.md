@@ -164,7 +164,8 @@ telling the tool what to show you next, and the history falls out naturally.
 | `teams` | Microsoft Teams archive and bridge |
 | `triage` | Workflow staging for inbound items |
 | `archive` | Import external archives (chats, exports) into the pile |
-| `web` | Web search and fetch with results recorded |
+| `web` | Web search and fetch with results recorded; `request`/`result` ask a broker instead |
+| `egress` | Broker: performs sandboxed faculties' outside calls, or records why it refused |
 
 Each faculty's command surface lives under [`src/bin/`](src/bin/), while
 shared schemas, collection semantics, validators, and reusable capabilities

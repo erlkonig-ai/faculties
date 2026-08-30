@@ -1,35 +1,76 @@
+//! `web` — search and browsing, on two paths that write the same facts.
+//!
+//! # Two paths, one ledger
+//!
+//! `search` and `fetch` are the **direct** path: they build an HTTP client,
+//! resolve Tavily/Exa credentials out of the Secrets vault through Headspace,
+//! perform the call in this process and commit the observation. That path is
+//! unchanged and stays the right one for a window that has both a network
+//! route and the keys.
+//!
+//! `request` and `result` are the **brokered** path, for a mind that has
+//! neither. `request` writes what it wants into the Egress ledger and prints
+//! the request id; a broker running outside the sandbox (`egress serve`)
+//! performs it and writes back; `result` reads the answer. The pile is the
+//! entire interface between the two sides.
+//!
+//! # Why this split exists
+//!
+//! **The keys never enter the sandbox — this is the larger half of the win.**
+//! A resident mind's shell commands run in a VM with no internet, so the
+//! direct path cannot work there at all. But the more important consequence is
+//! the one that would still matter if the VM *did* have a network: before the
+//! split, a model driving a shell was driving a process that held decrypted
+//! provider credentials, so anything that reached that shell — prompt
+//! injection through a fetched page, most obviously — reached the keys.
+//! `web request` opens no socket and reads no vault. Only the broker, which
+//! the mind cannot invoke and which runs under the supervision of whatever
+//! enforces the sandbox, ever holds a credential.
+//!
+//! **Egress is auditable because every crossing is a durable fact.** Asking is
+//! a fact, granting is a fact, refusing is a fact. "Everything this mind ever
+//! asked the outside world for" and "what actually crossed, and when" are
+//! queries over an append-only collection, not lines in a log that rotates.
+//!
+//! **Provenance travels with content.** A fulfilment names the observation it
+//! produced; the observation carries the provider, the URL and the time. A
+//! claim sourced from a fetched page traces back through the response to the
+//! exact request that asked for it, and to whoever asked.
+//!
+//! **Denials are recorded, not dropped.** A request the broker refuses — bad
+//! URL, host off the allow list, no credential for the named provider, the
+//! provider erroring, a rate limit — comes back as a denial fact carrying its
+//! category and its reason. A silently discarded request would be
+//! indistinguishable from a slow one, and an unrecorded refusal would destroy
+//! the auditability the design exists for. `result` reports pending, denied
+//! and fulfilled as three different answers, and only an *unknown* request id
+//! is an error.
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use ed25519_dalek::SigningKey;
-use faculties::legacy_hint::open_scope;
-use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
+use anyhow::{bail, Context, Result};
+use clap::{CommandFactory, Parser, Subcommand};
+use faculties::clock;
+use faculties::egress::{self, Denial, RequestSpec, Status};
+use faculties::schemas::egress as egress_schema;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
-use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict};
-use faculties::{clock, headspace};
-use reqwest::blocking::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde::Deserialize;
-use serde_json::json;
-use triblespace::core::collection::CollectionStoreExt;
+use faculties::web::{
+    self, ApiKeys, Backend, LiveBackend, Provider, SearchResult, PARAM_MAX_CHARACTERS,
+    PARAM_MAX_RESULTS, PARAM_PROVIDER,
+};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::prelude::inlineencodings::NsTAIInterval;
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::BlobStoreGet;
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum Provider {
-    Auto,
-    Tavily,
-    Exa,
-}
+type TextHandle = egress::TextHandle;
 
 #[derive(Parser)]
-#[command(version = faculties::GIT_VERSION, name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
+#[command(version = faculties::GIT_VERSION, name = "web", about = "Web search/browsing faculty (Tavily/Exa), directly or through a broker")]
 struct Cli {
     /// Existing pile file. Reads and writes never create it.
     #[arg(long, env = "PILE")]
@@ -45,7 +86,7 @@ struct Cli {
     /// for file input or @- for stdin.
     #[arg(long)]
     exa_api_key: Option<String>,
-    /// Do not write events to the pile; only print results.
+    /// Do not write events to the pile; only print results. Direct path only.
     #[arg(long)]
     no_store: bool,
     #[command(subcommand)]
@@ -54,30 +95,59 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Search the web for a query.
+    /// Search the web for a query, in this process, using this process's keys.
     Search {
         #[arg(help = "Search query. Use @path for file input or @- for stdin.")]
         query: String,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = web::DEFAULT_MAX_RESULTS)]
         max_results: usize,
         #[arg(long, value_enum, default_value_t = Provider::Auto)]
         provider: Provider,
     },
-    /// Fetch and extract a URL (clean text/markdown when supported by provider).
+    /// Fetch and extract a URL, in this process, using this process's keys.
     Fetch {
         url: String,
         #[arg(long, value_enum, default_value_t = Provider::Auto)]
         provider: Provider,
         /// Max characters to return (provider permitting).
-        #[arg(long, default_value_t = 12_000)]
+        #[arg(long, default_value_t = web::DEFAULT_MAX_CHARACTERS)]
         max_characters: usize,
     },
-}
-
-#[derive(Clone, Debug, Default)]
-struct ApiKeys {
-    tavily: Option<String>,
-    exa: Option<String>,
+    /// Ask a broker for a crossing and print the request id.
+    ///
+    /// Needs no network route and no credential. This is the verb a sandboxed
+    /// mind calls.
+    Request {
+        #[arg(help = "Search query or URL. Use @path for file input or @- for stdin.")]
+        target: String,
+        /// What to ask for.
+        #[arg(long, default_value = "search", value_parser = ["search", "fetch"])]
+        kind: String,
+        /// Ask for a specific provider. Omitted means the broker chooses.
+        #[arg(long, value_enum)]
+        provider: Option<Provider>,
+        /// Search only.
+        #[arg(long)]
+        max_results: Option<usize>,
+        /// Fetch only.
+        #[arg(long)]
+        max_characters: Option<usize>,
+        /// Anchor of whoever this is asked for, so a shared pile can still
+        /// answer "everything *this* mind fetched, ever".
+        #[arg(long)]
+        requester: Option<String>,
+    },
+    /// Read the broker's answer to one request.
+    ///
+    /// Prints `status: pending`, `status: denied` or `status: fulfilled`. Only
+    /// an unknown request id is an error — a request nobody has answered yet
+    /// is pending, which is not a failure.
+    Result {
+        request: String,
+        /// Keep re-reading until an answer appears or this long has passed.
+        #[arg(long)]
+        wait: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -92,15 +162,6 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
 
-    let storage = WebStorage {
-        pile: &cli.pile,
-        key: cli.key.as_deref(),
-    };
-    let requested_provider = match cmd {
-        Command::Search { provider, .. } | Command::Fetch { provider, .. } => *provider,
-    };
-    let keys = resolve_api_keys(&cli, storage, requested_provider)?;
-
     match cmd {
         Command::Search {
             query,
@@ -108,21 +169,47 @@ fn run(cli: Cli) -> Result<()> {
             provider,
         } => {
             let query = load_value_or_file(query, "search query")?;
-            cmd_search(&cli, storage, keys, *provider, &query, *max_results)
+            let backend = direct_backend(&cli, *provider)?;
+            cmd_search(&cli, &backend, *provider, &query, *max_results)
         }
         Command::Fetch {
             url,
             provider,
             max_characters,
-        } => cmd_fetch(&cli, storage, keys, *provider, url, *max_characters),
+        } => {
+            let backend = direct_backend(&cli, *provider)?;
+            cmd_fetch(&cli, &backend, *provider, url, *max_characters)
+        }
+        Command::Request {
+            target,
+            kind,
+            provider,
+            max_results,
+            max_characters,
+            requester,
+        } => {
+            let target = load_value_or_file(target, "request target")?;
+            cmd_request(
+                &cli,
+                &target,
+                kind,
+                *provider,
+                *max_results,
+                *max_characters,
+                requester.as_deref(),
+            )
+        }
+        Command::Result { request, wait } => cmd_result(&cli, request, wait.as_deref()),
     }
 }
 
-fn resolve_api_keys(
-    cli: &Cli,
-    storage: WebStorage<'_>,
-    requested_provider: Provider,
-) -> Result<ApiKeys> {
+// --- The direct path: unchanged behaviour, now behind the Backend seam ---
+
+fn direct_backend(cli: &Cli, requested: Provider) -> Result<LiveBackend> {
+    LiveBackend::new(resolve_api_keys(cli, requested)?)
+}
+
+fn resolve_api_keys(cli: &Cli, requested_provider: Provider) -> Result<ApiKeys> {
     let mut tavily = cli
         .tavily_api_key
         .as_deref()
@@ -139,7 +226,7 @@ fn resolve_api_keys(
         Provider::Exa => exa.is_none(),
     };
     if needs_headspace {
-        let configured = storage.open_web_secrets()?;
+        let configured = web::open_web_secrets(&cli.pile, cli.key.as_deref())?;
         tavily = tavily.or(configured.tavily);
         exa = exa.or(configured.exa);
     }
@@ -148,212 +235,314 @@ fn resolve_api_keys(
 
 fn cmd_search(
     cli: &Cli,
-    storage: WebStorage<'_>,
-    keys: ApiKeys,
+    backend: &dyn Backend,
     provider: Provider,
     query: &str,
     max_results: usize,
 ) -> Result<()> {
-    let provider = choose_provider(provider, &keys)?;
-    let client = Client::builder()
-        .user_agent("playground-web-faculty/0")
-        .build()
-        .context("build http client")?;
+    let provider = web::choose_provider(provider, backend).map_err(refusal_error)?;
+    let results = backend
+        .search(provider, query, max_results)
+        .map_err(refusal_error)?;
 
-    let results = match provider {
-        Provider::Tavily => {
-            tavily_search(&client, keys.tavily.as_deref().unwrap(), query, max_results)?
-        }
-        Provider::Exa => exa_search(&client, keys.exa.as_deref().unwrap(), query, max_results)?,
-        Provider::Auto => unreachable!("choose_provider resolves Auto"),
-    };
+    print_search_results(provider.name(), query, &results);
 
-    print_search_results(provider, query, &results);
-
-    if !cli.no_store {
-        storage.store(
-            search_fragment(provider, query, &results, clock::point_now()?)?,
-            "web search observation",
-        )?;
+    if cli.no_store {
+        return Ok(());
     }
-    Ok(())
+    let (fragment, _) = web::search_fragment(provider, query, &results, clock::point_now()?)?;
+    egress::publish(
+        &cli.pile,
+        cli.key.as_deref(),
+        DEFAULT_SCOPE_ID,
+        fragment,
+        "web search observation",
+    )
 }
 
 fn cmd_fetch(
     cli: &Cli,
-    storage: WebStorage<'_>,
-    keys: ApiKeys,
+    backend: &dyn Backend,
     provider: Provider,
     url: &str,
     max_characters: usize,
 ) -> Result<()> {
-    let provider = choose_provider_fetch(provider, &keys)?;
-    let client = Client::builder()
-        .user_agent("playground-web-faculty/0")
-        .build()
-        .context("build http client")?;
-
-    let content = match provider {
-        Provider::Tavily => tavily_extract(&client, keys.tavily.as_deref().unwrap(), url)?,
-        Provider::Exa => exa_contents(&client, keys.exa.as_deref().unwrap(), url, max_characters)?,
-        Provider::Auto => unreachable!("choose_provider resolves Auto"),
-    };
+    let provider = web::choose_provider_fetch(provider, backend).map_err(refusal_error)?;
+    let content = backend
+        .fetch(provider, url, max_characters)
+        .map_err(refusal_error)?;
 
     println!("{content}");
 
     if cli.no_store {
         return Ok(());
     }
-    storage.store(
-        fetch_fragment(provider, url, &content, clock::point_now()?),
+    let (fragment, _) = web::fetch_fragment(provider, url, &content, clock::point_now()?)?;
+    egress::publish(
+        &cli.pile,
+        cli.key.as_deref(),
+        DEFAULT_SCOPE_ID,
+        fragment,
         "web fetch observation",
     )
 }
 
-fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
-    match provider {
-        Provider::Tavily => {
-            if keys.tavily.is_none() {
-                bail!(
-                    "no Tavily credential available (attach an exact Headspace secret or pass --tavily-api-key)"
-                );
-            }
-            Ok(Provider::Tavily)
-        }
-        Provider::Exa => {
-            if keys.exa.is_none() {
-                bail!(
-                    "no Exa credential available (attach an exact Headspace secret or pass --exa-api-key)"
-                );
-            }
-            Ok(Provider::Exa)
-        }
-        Provider::Auto => {
-            if keys.tavily.is_some() {
-                Ok(Provider::Tavily)
-            } else if keys.exa.is_some() {
-                Ok(Provider::Exa)
-            } else {
-                bail!(
-                    "no Web provider credential is referenced by Headspace or explicitly supplied"
-                );
-            }
-        }
+fn refusal_error(refusal: egress::Refusal) -> anyhow::Error {
+    anyhow::anyhow!("{refusal}")
+}
+
+// --- The brokered path ---
+
+fn cmd_request(
+    cli: &Cli,
+    target: &str,
+    kind: &str,
+    provider: Option<Provider>,
+    max_results: Option<usize>,
+    max_characters: Option<usize>,
+    requester: Option<&str>,
+) -> Result<()> {
+    if target.trim().is_empty() {
+        bail!("request target is empty");
     }
-}
+    let operation = web::operation(kind)?;
 
-fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
-    match provider {
-        Provider::Auto => {
-            if keys.exa.is_some() {
-                Ok(Provider::Exa)
-            } else if keys.tavily.is_some() {
-                Ok(Provider::Tavily)
-            } else {
-                bail!(
-                    "no Web provider credential is referenced by Headspace or explicitly supplied"
-                );
-            }
-        }
-        other => choose_provider(other, keys),
+    // Only what was actually asked for is recorded. A default written here
+    // would misreport the ask, and the broker's own default is the honest
+    // place for it.
+    let mut parameters = Vec::new();
+    if let Some(provider) = provider {
+        parameters.push((PARAM_PROVIDER.to_owned(), provider.name().to_owned()));
     }
-}
+    if let Some(max_results) = max_results {
+        parameters.push((PARAM_MAX_RESULTS.to_owned(), max_results.to_string()));
+    }
+    if let Some(max_characters) = max_characters {
+        parameters.push((PARAM_MAX_CHARACTERS.to_owned(), max_characters.to_string()));
+    }
 
-#[derive(Clone, Copy)]
-struct WebStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
-}
-
-struct CollectionView {
-    facts: TribleSet,
-    reader: PileSnapshot,
-}
-
-impl WebStorage<'_> {
-    fn materialize(
-        &self,
-        pile: &mut Pile,
-        signer: &SigningKey,
-        scope: Id,
-        label: &str,
-    ) -> Result<CollectionView> {
-        let collection = open_scope(pile, scope, signer)?;
-        let store_snapshot = pile
-            .snapshot()
-            .with_context(|| format!("freeze {label} store snapshot"))?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .with_context(|| format!("materialize {label} collection"))?;
-        Ok(CollectionView {
-            facts,
-            reader: store_snapshot,
+    let requester = requester
+        .map(|raw| {
+            Id::from_hex(raw.trim()).ok_or_else(|| anyhow::anyhow!("invalid requester id '{raw}'"))
         })
-    }
+        .transpose()?;
 
-    /// Resolve Headspace once and decrypt exactly the credential versions it
-    /// names. Labels and timestamps never participate in runtime selection.
-    fn open_web_secrets(&self) -> Result<ApiKeys> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let headspace =
-                self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
-            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
-                .context("discover readable Secrets vaults")?;
-            let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
-                .context("validate Headspace collection")?;
-            headspace::validate_secret_references(&catalog, secrets.snapshot())
-                .context("validate exact Headspace credential references")?;
-            let (config, _) = headspace::settled_active(&catalog)
-                .context("resolve active Headspace configuration")?;
-            if config.tavily_secret_version.is_none() && config.exa_secret_version.is_none() {
-                return Ok(ApiKeys::default());
+    let spec = RequestSpec {
+        faculty: DEFAULT_SCOPE_ID,
+        operation,
+        target: target.to_owned(),
+        parameters,
+        requester,
+    };
+    let (fragment, id) = egress::request_fragment(&spec, clock::point_now()?)?;
+    egress::publish(
+        &cli.pile,
+        cli.key.as_deref(),
+        egress_schema::DEFAULT_SCOPE_ID,
+        fragment,
+        "egress request",
+    )?;
+
+    println!("request: {id:X}");
+    println!("faculty: web");
+    println!("kind: {kind}");
+    println!("target: {target}");
+    println!("status: pending");
+    println!();
+    println!("read it back with: web result {id:X} --wait 2m");
+    Ok(())
+}
+
+fn cmd_result(cli: &Cli, request: &str, wait: Option<&str>) -> Result<()> {
+    let request = Id::from_hex(request.trim())
+        .ok_or_else(|| anyhow::anyhow!("invalid request id '{request}'"))?;
+    let deadline = wait
+        .map(|raw| {
+            humantime::parse_duration(raw).with_context(|| format!("parse --wait duration '{raw}'"))
+        })
+        .transpose()?
+        .map(|duration| Instant::now() + duration);
+
+    loop {
+        let answer = read_answer(&cli.pile, cli.key.as_deref(), request)?;
+        match answer {
+            Answer::Unknown => bail!(
+                "no Egress request {request:X} in this pile; \
+                 `web request` prints the id it wrote"
+            ),
+            Answer::Pending(record) => {
+                if deadline.is_some_and(|deadline| Instant::now() < deadline) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                println!("request: {request:X}");
+                println!("kind: {}", web::operation_name(record.operation));
+                println!("target: {}", record.target);
+                println!("status: pending");
+                println!();
+                println!("no broker has answered yet. This is not a failure.");
+                return Ok(());
             }
-
-            let opened = headspace::open_active_secrets(&catalog, secrets.snapshot(), &signer)?;
-            Ok(ApiKeys {
-                tavily: opened.tavily_api_key,
-                exa: opened.exa_api_key,
-            })
-        })();
-        finish_pile(pile, result, "credential read")
-    }
-
-    fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        fragment.describe_with(entity! { metadata::description: description });
-        let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
-        let result = pile
-            .commit(collection, &signer, fragment)
-            .context("commit Web observation")
-            .map(|_| ());
-        finish_pile(pile, result, "observation write")
+            Answer::Answered(record, responses) => {
+                let response = &responses[0];
+                println!("request: {request:X}");
+                println!("kind: {}", web::operation_name(record.operation));
+                println!("target: {}", record.target);
+                println!("status: {}", response.status.label());
+                if responses.len() > 1 {
+                    println!(
+                        "note: {} responses recorded for this request; more than one \
+                         broker served this collection",
+                        responses.len()
+                    );
+                }
+                match response.status {
+                    Status::Denied => {
+                        println!(
+                            "denial: {}",
+                            response.denial.map(Denial::label).unwrap_or("unrecorded")
+                        );
+                        println!(
+                            "reason: {}",
+                            response.reason.as_deref().unwrap_or("<none recorded>")
+                        );
+                        return Ok(());
+                    }
+                    Status::Fulfilled => {
+                        let Some(observation) = response.observation else {
+                            bail!("fulfilled response {:X} names no observation", response.id);
+                        };
+                        println!("observation: {observation:X}");
+                        println!();
+                        return print_observation(&cli.pile, cli.key.as_deref(), observation);
+                    }
+                }
+            }
+        }
     }
 }
 
-fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context(format!("close Web pile after {operation}"))),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing Web pile after {operation} also failed: {close_error}"
-        ))),
-    }
+enum Answer {
+    Unknown,
+    Pending(egress::RequestRecord),
+    Answered(egress::RequestRecord, Vec<egress::ResponseRecord>),
 }
 
-#[derive(Clone, Debug)]
-struct SearchResult {
-    url: String,
-    title: Option<String>,
-    snippet: Option<String>,
+/// Find the request by matching its facts, then find responses that name it.
+///
+/// Neither step reconstructs an entity to recompute an id: after construction
+/// an id is opaque, so the only sound way to reach a request is to query the
+/// fields it was built from.
+fn read_answer(pile: &Path, key: Option<&Path>, request: Id) -> Result<Answer> {
+    egress::with_view(
+        pile,
+        key,
+        egress_schema::DEFAULT_SCOPE_ID,
+        |facts, snapshot| {
+            let Some(record) = egress::requests(facts, snapshot, None)?
+                .into_iter()
+                .find(|record| record.id == request)
+            else {
+                return Ok(Answer::Unknown);
+            };
+            let responses = egress::responses_for(facts, snapshot, request)?;
+            if responses.is_empty() {
+                Ok(Answer::Pending(record))
+            } else {
+                Ok(Answer::Answered(record, responses))
+            }
+        },
+    )
 }
 
-fn print_search_results(provider: Provider, query: &str, results: &[SearchResult]) {
-    let provider_name = provider_name(provider);
-    println!("provider: {provider_name}");
+/// Render one Web observation exactly as the direct path would have printed
+/// it, so a mind reading a brokered answer parses the same shape it would
+/// have parsed from `web search` or `web fetch`.
+fn print_observation(pile: &Path, key: Option<&Path>, observation: Id) -> Result<()> {
+    egress::with_view(pile, key, DEFAULT_SCOPE_ID, |facts, snapshot| {
+        let provider = find!(
+            value: String,
+            pattern!(facts, [{ observation @ web_schema::provider: ?value }])
+        )
+        .next()
+        .unwrap_or_else(|| "unknown".to_owned());
+
+        let is_fetch = find!(
+            id: Id,
+            pattern!(facts, [{
+                ?id @ metadata::tag: &web_schema::kind_fetch
+            }])
+        )
+        .any(|id| id == observation);
+
+        if is_fetch {
+            let Some(content) = find!(
+                value: TextHandle,
+                pattern!(facts, [{ observation @ web_schema::content: ?value }])
+            )
+            .next() else {
+                bail!("fetch observation {observation:X} carries no content");
+            };
+            println!("{}", text(snapshot, content, "fetched content")?);
+            return Ok(());
+        }
+
+        let query = match find!(
+            value: TextHandle,
+            pattern!(facts, [{ observation @ web_schema::query: ?value }])
+        )
+        .next()
+        {
+            Some(handle) => text(snapshot, handle, "search query")?,
+            None => bail!("observation {observation:X} is neither a fetch nor a search"),
+        };
+
+        let mut results = Vec::new();
+        for hit in find!(
+            hit: Id,
+            pattern!(facts, [{ observation @ web_schema::result: ?hit }])
+        ) {
+            let Some(url) = find!(
+                value: TextHandle,
+                pattern!(facts, [{ hit @ web_schema::url: ?value }])
+            )
+            .next() else {
+                continue;
+            };
+            let title = find!(
+                value: TextHandle,
+                pattern!(facts, [{ hit @ web_schema::title: ?value }])
+            )
+            .next();
+            let snippet = find!(
+                value: TextHandle,
+                pattern!(facts, [{ hit @ web_schema::snippet: ?value }])
+            )
+            .next();
+            results.push(SearchResult {
+                url: text(snapshot, url, "result url")?,
+                title: title
+                    .map(|handle| text(snapshot, handle, "result title"))
+                    .transpose()?,
+                snippet: snippet
+                    .map(|handle| text(snapshot, handle, "result snippet"))
+                    .transpose()?,
+            });
+        }
+        print_search_results(&provider, &query, &results);
+        Ok(())
+    })
+}
+
+fn text(snapshot: &PileSnapshot, handle: TextHandle, label: &str) -> Result<String> {
+    let view: anybytes::View<str> = snapshot
+        .get(handle)
+        .with_context(|| format!("read Web {label}"))?;
+    Ok(view.to_string())
+}
+
+fn print_search_results(provider: &str, query: &str, results: &[SearchResult]) {
+    println!("provider: {provider}");
     println!("query: {query}");
     println!("results: {}", results.len());
     println!();
@@ -369,264 +558,6 @@ fn print_search_results(provider: Provider, query: &str, results: &[SearchResult
         }
         println!();
     }
-}
-
-fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Tavily => "tavily",
-        Provider::Exa => "exa",
-        Provider::Auto => "auto",
-    }
-}
-
-fn search_fragment(
-    provider: Provider,
-    query: &str,
-    results: &[SearchResult],
-    observed_at: Inline<NsTAIInterval>,
-) -> Result<Fragment> {
-    let mut fragment = Fragment::empty();
-    let query_handle = fragment.put(query.to_owned());
-    let mut result_ids = Vec::with_capacity(results.len());
-
-    for result in results {
-        let url_handle = fragment.put(result.url.clone());
-        let title_handle = result
-            .title
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| fragment.put(value.to_owned()));
-        let snippet_handle = result
-            .snippet
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| fragment.put(value.to_owned()));
-        let result_fragment = entity! { _ @
-            metadata::tag: &web_schema::kind_result,
-            web_schema::url: url_handle,
-            web_schema::title?: title_handle,
-            web_schema::snippet?: snippet_handle,
-        };
-        result_ids.push(
-            result_fragment
-                .root()
-                .ok_or_else(|| anyhow!("Web result fragment has no intrinsic root"))?,
-        );
-        fragment += result_fragment;
-    }
-    fragment += entity! { _ @
-        metadata::tag: &web_schema::kind_search,
-        web_schema::query: query_handle,
-        web_schema::provider: provider_name(provider),
-        metadata::created_at: observed_at,
-        web_schema::result*: result_ids,
-    };
-    Ok(fragment)
-}
-
-fn fetch_fragment(
-    provider: Provider,
-    url: &str,
-    content: &str,
-    observed_at: Inline<NsTAIInterval>,
-) -> Fragment {
-    let mut fragment = Fragment::empty();
-    let url = fragment.put(url.to_owned());
-    let content = fragment.put(content.to_owned());
-    fragment += entity! { _ @
-        metadata::tag: &web_schema::kind_fetch,
-        web_schema::provider: provider_name(provider),
-        metadata::created_at: observed_at,
-        web_schema::url: url,
-        web_schema::content: content,
-    };
-    fragment
-}
-
-// --- Tavily ---
-
-#[derive(Deserialize)]
-struct TavilySearchResponse {
-    results: Vec<TavilyResult>,
-}
-
-#[derive(Deserialize)]
-struct TavilyResult {
-    url: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    content: String,
-}
-
-fn tavily_search(
-    client: &Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>> {
-    let resp: TavilySearchResponse = client
-        .post("https://api.tavily.com/search")
-        .header(CONTENT_TYPE, "application/json")
-        .header(AUTHORIZATION, format!("Bearer {api_key}"))
-        .json(&json!({
-            "query": query,
-            "search_depth": "basic",
-            "max_results": max_results,
-            "include_answer": false,
-            "include_raw_content": false,
-        }))
-        .send()
-        .context("tavily search request")?
-        .error_for_status()
-        .context("tavily search status")?
-        .json()
-        .context("tavily search json")?;
-
-    Ok(resp
-        .results
-        .into_iter()
-        .map(|r| SearchResult {
-            url: r.url,
-            title: Some(r.title).filter(|s| !s.is_empty()),
-            snippet: Some(r.content).filter(|s| !s.is_empty()),
-        })
-        .collect())
-}
-
-#[derive(Deserialize)]
-struct TavilyExtractResponse {
-    results: Vec<TavilyExtractResult>,
-}
-
-#[derive(Deserialize)]
-struct TavilyExtractResult {
-    #[allow(dead_code)]
-    url: String,
-    #[serde(default)]
-    raw_content: String,
-    #[serde(default)]
-    content: String,
-}
-
-fn tavily_extract(client: &Client, api_key: &str, url: &str) -> Result<String> {
-    let resp: TavilyExtractResponse = client
-        .post("https://api.tavily.com/extract")
-        .header(CONTENT_TYPE, "application/json")
-        .header(AUTHORIZATION, format!("Bearer {api_key}"))
-        .json(&json!({
-            "urls": [url],
-            "extract_depth": "basic",
-            "format": "markdown",
-        }))
-        .send()
-        .context("tavily extract request")?
-        .error_for_status()
-        .context("tavily extract status")?
-        .json()
-        .context("tavily extract json")?;
-
-    let Some(first) = resp.results.into_iter().next() else {
-        bail!("tavily extract returned no results");
-    };
-    let text = if !first.raw_content.is_empty() {
-        first.raw_content
-    } else {
-        first.content
-    };
-    Ok(text)
-}
-
-// --- Exa ---
-
-#[derive(Deserialize)]
-struct ExaSearchResponse {
-    results: Vec<ExaResult>,
-}
-
-#[derive(Deserialize)]
-struct ExaResult {
-    url: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    text: String,
-}
-
-fn exa_search(
-    client: &Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>> {
-    let resp: ExaSearchResponse = client
-        .post("https://api.exa.ai/search")
-        .header(CONTENT_TYPE, "application/json")
-        .header("x-api-key", api_key)
-        .json(&json!({
-            "query": query,
-            "numResults": max_results,
-            "text": false,
-        }))
-        .send()
-        .context("exa search request")?
-        .error_for_status()
-        .context("exa search status")?
-        .json()
-        .context("exa search json")?;
-
-    Ok(resp
-        .results
-        .into_iter()
-        .map(|r| SearchResult {
-            url: r.url,
-            title: Some(r.title).filter(|s| !s.is_empty()),
-            snippet: Some(r.text).filter(|s| !s.is_empty()),
-        })
-        .collect())
-}
-
-#[derive(Deserialize)]
-struct ExaContentsResponse {
-    results: Vec<ExaContentsResult>,
-}
-
-#[derive(Deserialize)]
-struct ExaContentsResult {
-    #[allow(dead_code)]
-    url: String,
-    #[serde(default)]
-    text: String,
-}
-
-fn exa_contents(
-    client: &Client,
-    api_key: &str,
-    url: &str,
-    max_characters: usize,
-) -> Result<String> {
-    let resp: ExaContentsResponse = client
-        .post("https://api.exa.ai/contents")
-        .header(CONTENT_TYPE, "application/json")
-        .header("x-api-key", api_key)
-        .json(&json!({
-            "urls": [url],
-            "text": {
-                "maxCharacters": max_characters,
-                "includeHtmlTags": false,
-            },
-        }))
-        .send()
-        .context("exa contents request")?
-        .error_for_status()
-        .context("exa contents status")?
-        .json()
-        .context("exa contents json")?;
-
-    let Some(first) = resp.results.into_iter().next() else {
-        bail!("exa contents returned no results");
-    };
-    Ok(first.text)
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -649,13 +580,7 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-
-    use hifitime::Epoch;
-    use triblespace::macros::{find, pattern};
-
     use super::*;
-    use faculties::storage::{initialize_signer, open_pile_strict};
 
     #[test]
     fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
@@ -672,116 +597,36 @@ mod tests {
     }
 
     #[test]
+    fn the_brokered_verbs_are_present_and_take_no_credential() {
+        let command = Cli::command();
+        let request = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "request")
+            .expect("web exposes a request verb");
+        let arguments = request
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!arguments.contains("tavily_api_key"));
+        assert!(!arguments.contains("exa_api_key"));
+        assert!(command
+            .get_subcommands()
+            .any(|sub| sub.get_name() == "result"));
+    }
+
+    #[test]
     fn explicit_provider_override_does_not_require_headspace_or_a_pile() {
         let missing = PathBuf::from("/definitely/not/a/web-test.pile");
         let cli = Cli {
-            pile: missing.clone(),
+            pile: missing,
             key: None,
             tavily_api_key: Some(" explicit-tavily-key ".to_owned()),
             exa_api_key: None,
             no_store: true,
             command: None,
         };
-        let keys = resolve_api_keys(
-            &cli,
-            WebStorage {
-                pile: &missing,
-                key: None,
-            },
-            Provider::Tavily,
-        )
-        .unwrap();
+        let keys = resolve_api_keys(&cli, Provider::Tavily).unwrap();
         assert_eq!(keys.tavily.as_deref(), Some("explicit-tavily-key"));
         assert!(keys.exa.is_none());
-    }
-
-    #[test]
-    fn search_fragment_composes_results_into_one_commit_payload() {
-        let fragment = search_fragment(
-            Provider::Tavily,
-            "canonical collections",
-            &[
-                SearchResult {
-                    url: "https://one.test".to_owned(),
-                    title: Some("one".to_owned()),
-                    snippet: None,
-                },
-                SearchResult {
-                    url: "https://two.test".to_owned(),
-                    title: None,
-                    snippet: Some("two".to_owned()),
-                },
-            ],
-            clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
-        )
-        .unwrap();
-
-        let facts = fragment.facts();
-        let result_entities = find!(
-            (entity: Id),
-            pattern!(facts, [{ ?entity @ metadata::tag: web_schema::kind_result }])
-        )
-        .collect::<Vec<_>>();
-        let searches = find!(
-            (entity: Id, result: Id),
-            pattern!(facts, [{
-                ?entity @
-                metadata::tag: web_schema::kind_search,
-                web_schema::result: ?result,
-            }])
-        )
-        .collect::<Vec<_>>();
-        assert_eq!(result_entities.len(), 2);
-        assert_eq!(searches.len(), 2);
-        assert_eq!(
-            searches
-                .iter()
-                .map(|(entity, _)| *entity)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn storage_publishes_directly_to_the_native_web_collection() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("web.pile");
-        let key_path = directory.path().join("web.key");
-        File::create(&pile_path).unwrap();
-        initialize_signer(&pile_path, Some(&key_path)).unwrap();
-
-        WebStorage {
-            pile: &pile_path,
-            key: Some(&key_path),
-        }
-        .store(
-            fetch_fragment(
-                Provider::Exa,
-                "https://example.test",
-                "body",
-                clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
-            ),
-            "test Web observation",
-        )
-        .unwrap();
-
-        let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection =
-            faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
-                .unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let (facts, _) =
-            faculties::storage::read_fact_collection(collection, &store_snapshot).unwrap();
-        assert_eq!(
-            find!(
-                (entity: Id),
-                pattern!(&facts, [{ ?entity @ metadata::tag: web_schema::kind_fetch }])
-            )
-            .count(),
-            1
-        );
-        pile.close().unwrap();
     }
 }

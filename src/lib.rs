@@ -53,6 +53,7 @@ pub mod comb;
 pub mod compass;
 pub mod decide;
 pub mod discord;
+pub mod egress;
 pub mod files;
 pub mod habits;
 pub mod headspace;
@@ -79,6 +80,7 @@ pub mod tokens;
 pub mod triage;
 pub mod turntaking;
 pub mod voice;
+pub mod web;
 pub mod wiki;
 pub mod wiki_additive;
 

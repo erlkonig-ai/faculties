@@ -40,3 +40,14 @@ pub mod web_schema {
     #[allow(non_upper_case_globals)]
     pub const kind_fetch: Id = id_hex!("91D6FD34AAB1A9C6B24A39D0674F7359");
 }
+
+/// Web's operation vocabulary for the generic Egress ledger.
+///
+/// An egress request names its faculty by [`DEFAULT_SCOPE_ID`] and its
+/// operation by one of these. They are Web's, not the ledger's: a second
+/// egress faculty mints its own and the broker needs no change.
+///
+/// Minted with `trible genid` on 2026-08-30.
+pub const OPERATION_SEARCH: Id = id_hex!("34BB625AB159D9D0F565E1DE26EF2C89");
+/// See [`OPERATION_SEARCH`]. Minted with `trible genid` on 2026-08-30.
+pub const OPERATION_FETCH: Id = id_hex!("58DC4A1428609773B3CE7D68FF27A6B5");
