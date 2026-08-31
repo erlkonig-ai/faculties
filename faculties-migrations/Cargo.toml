@@ -34,5 +34,4 @@ triblespace-core = { path = "../../triblespace-rs/triblespace-core" }
 faculties = { version = "0.20.2", path = "..", default-features = false }
 
 [dev-dependencies]
-hifitime = "4.2.3"
 tempfile = "3"
