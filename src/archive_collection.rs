@@ -451,7 +451,7 @@ pub fn ensure_succinct_index(
         let algebra = SuccinctArchiveCollection::new(archive.collection, raw, accelerated);
         let source_elements = archive.cover().len();
         algebra
-            .ensure_exact(&mut pile, archive.cover())
+            .ensure(&mut pile, archive.cover())
             .context("ensure exact Archive accelerated-Succinct view")?;
 
         Ok(SuccinctIndexReport {
@@ -2345,7 +2345,7 @@ mod tests {
         let source_cover = source.admitted(&store_snapshot).unwrap();
         let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
             ExactDerivedCollection::new(source, target).unwrap();
-        let cover = exact.attach_exact(&mut pile, &source_cover).unwrap();
+        let cover = exact.attach(&mut pile, &source_cover).unwrap();
         assert_eq!(cover.len(), 1);
         pile.close().unwrap();
 
@@ -2565,7 +2565,7 @@ mod tests {
         let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
             ExactDerivedCollection::new(source, target).unwrap();
 
-        let first = exact.ensure_exact(&mut pile, &first_cover).unwrap();
+        let first = exact.ensure(&mut pile, &first_cover).unwrap();
         assert_eq!(first.len(), 1);
         drop(first);
         let first_records = {
@@ -2579,7 +2579,7 @@ mod tests {
             .count();
         assert_eq!(first_derives, 1);
 
-        let full = exact.ensure_exact(&mut pile, &full_cover).unwrap();
+        let full = exact.ensure(&mut pile, &full_cover).unwrap();
         assert_eq!(full.len(), 2);
         let full_records = {
             let store_snapshot = pile.snapshot().unwrap();
@@ -2606,7 +2606,7 @@ mod tests {
             records_before.derives().len(),
             records_before.merges().len(),
         );
-        let retry = exact.ensure_exact(&mut pile, &full_cover).unwrap();
+        let retry = exact.ensure(&mut pile, &full_cover).unwrap();
         assert_eq!(retry.len(), 1, "the admitted MERGE is reused");
         drop(retry);
         let records_after = {
@@ -2653,7 +2653,7 @@ mod tests {
 
         let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
             ExactDerivedCollection::new(source, target).unwrap();
-        let ready = exact.ensure_exact(&mut pile, &source_cover).unwrap();
+        let ready = exact.ensure(&mut pile, &source_cover).unwrap();
         assert_eq!(
             ready
                 .members()

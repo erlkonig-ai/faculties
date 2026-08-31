@@ -1314,7 +1314,7 @@ pub fn materialize_indexed_collection(
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
     let observed = observed_collection(pile, signer.verifying_key())?
-        .ensure_exact(pile, &cover)
+        .ensure(pile, &cover)
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let catalog = validate_catalog_with_order(&store_snapshot, &facts, &observed)?;
     Ok(WikiSnapshot {

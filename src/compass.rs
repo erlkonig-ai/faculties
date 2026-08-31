@@ -1052,7 +1052,7 @@ pub fn materialize_indexed_collection(
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
     let status = status_register_collection(pile, signer.verifying_key())?
-        .ensure_exact(pile, &cover)
+        .ensure(pile, &cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     Ok(CompassSnapshot {
         facts,

@@ -529,7 +529,7 @@ pub fn materialize_indexed_collection(
     load_checkpoint_events(&store_snapshot, &facts)
         .context("validate Orient checkpoint collection")?;
     let checkpoints = checkpoint_register_collection(pile, signer.verifying_key())?
-        .ensure_exact(pile, &cover)
+        .ensure(pile, &cover)
         .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
     Ok(OrientSnapshot {
         facts,

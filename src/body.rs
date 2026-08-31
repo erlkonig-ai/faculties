@@ -536,7 +536,7 @@ pub fn materialize_indexed_collection(
         .context("read Body collection")?;
     let catalog = validate_catalog(&store_snapshot, &facts).context("validate Body collection")?;
     let intents = intent_register_collection(pile, signer.verifying_key())?
-        .ensure_exact(pile, &cover)
+        .ensure(pile, &cover)
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,
