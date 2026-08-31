@@ -12,14 +12,19 @@
 //! identifier and the key this table is read by, because the migration that
 //! re-seats existing data has to speak both languages at once.
 
+use std::ffi::OsString;
+
+use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::VerifyingKey;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionRegistrationError, CollectionStoreExt,
+    records::CollectionHandle, AdmissionPolicy, Collection, CollectionPolicy,
+    CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
-use triblespace::core::repo::BlobStorePut;
+use triblespace::core::inline::Inline;
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 
 use crate::schemas::{
     atlas, blockdag, body, cognition, compass, decide, discord, embeddings, files, habit,
@@ -107,6 +112,90 @@ pub fn private_policy(authority: VerifyingKey) -> CollectionPolicy {
     )
 }
 
+/// Prefix for exact descriptor overrides understood by every faculty.
+///
+/// The suffix is the canonical collection name, uppercased with `-` replaced
+/// by `_`: `wiki` is `TRIBLESPACE_COLLECTION_WIKI`, while `memory-journal` is
+/// `TRIBLESPACE_COLLECTION_MEMORY_JOURNAL`. Keeping one variable per name lets
+/// a process which reads several faculty collections select each one
+/// independently instead of applying one ambient collection identity to all
+/// of them.
+pub const COLLECTION_OVERRIDE_PREFIX: &str = "TRIBLESPACE_COLLECTION_";
+
+/// Deterministic environment-variable name for one faculty collection.
+pub fn override_env_name(scope: Id) -> String {
+    let name = require_name(scope);
+    let mut variable = String::with_capacity(COLLECTION_OVERRIDE_PREFIX.len() + name.len());
+    variable.push_str(COLLECTION_OVERRIDE_PREFIX);
+    variable.extend(name.bytes().map(|byte| match byte {
+        b'a'..=b'z' => char::from(byte - b'a' + b'A'),
+        b'A'..=b'Z' | b'0'..=b'9' => char::from(byte),
+        b'-' => '_',
+        _ => panic!("collection name {name:?} cannot form an environment variable"),
+    }));
+    variable
+}
+
+fn parse_override(variable: &str, raw: OsString) -> anyhow::Result<CollectionHandle> {
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow!("{variable} is not valid UTF-8"))?;
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("blake3:").unwrap_or(raw);
+    if raw.len() != 64 {
+        bail!("{variable} must be one exact 64-digit hexadecimal collection descriptor handle");
+    }
+    let mut bytes = [0_u8; 32];
+    hex::decode_to_slice(raw, &mut bytes)
+        .with_context(|| format!("{variable} is not a hexadecimal collection descriptor handle"))?;
+    Ok(Inline::new(bytes))
+}
+
+/// Exact descriptor override selected for `scope`, if the operator supplied
+/// one.
+///
+/// Invalid values fail loudly. Falling back to a signer-private descriptor in
+/// that case would silently fork a shared collection into a different identity.
+pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> {
+    let variable = override_env_name(scope);
+    std::env::var_os(&variable)
+        .map(|raw| parse_override(&variable, raw))
+        .transpose()
+}
+
+/// Open the operator-selected exact descriptor, or construct the ordinary
+/// signer-private faculty descriptor when no override is present.
+///
+/// The override path is read-only: its canonical descriptor must already be
+/// resident in the store and validate as a `SimpleArchive` collection. The
+/// caller's signer is deliberately irrelevant on that path. It remains the
+/// author of later COMMITs, whose visibility is decided by the descriptor's
+/// ambient WRITE proofs when a snapshot is admitted.
+pub fn open_configured<S>(
+    storage: &mut S,
+    scope: Id,
+    authority: VerifyingKey,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+{
+    let Some(handle) = configured_handle(scope)? else {
+        return open(storage, scope, authority).context("register signer-private descriptor");
+    };
+
+    let snapshot = storage
+        .snapshot()
+        .context("freeze store while opening configured collection descriptor")?;
+    Collection::open(&snapshot, handle).with_context(|| {
+        format!(
+            "open exact {} descriptor from {}",
+            require_name(scope),
+            override_env_name(scope)
+        )
+    })
+}
+
 /// Register one faculty root and return its typed descriptor handle.
 ///
 /// Registration is idempotent and owns the descriptor's complete attachment
@@ -140,10 +229,15 @@ mod tests {
     fn every_name_is_nonempty_and_no_two_scopes_share_one() {
         let mut names = BTreeSet::new();
         let mut scopes = BTreeSet::new();
+        let mut variables = BTreeSet::new();
         for (scope, name) in table() {
             assert!(!name.is_empty());
             assert!(names.insert(name), "two scopes both claim the name {name}");
             assert!(scopes.insert(scope), "scope {scope:X} appears twice");
+            assert!(
+                variables.insert(override_env_name(scope)),
+                "two collections normalize to one override variable"
+            );
         }
     }
 
@@ -172,5 +266,43 @@ mod tests {
         let store_snapshot = store.snapshot().unwrap();
         let facts = collection.read::<TribleSet, _>(&store_snapshot).unwrap();
         assert!(expected.difference(&facts).is_empty());
+    }
+
+    #[test]
+    fn override_names_and_handles_are_exact() {
+        assert_eq!(
+            override_env_name(memory::DEFAULT_SCOPE_ID),
+            "TRIBLESPACE_COLLECTION_MEMORY_JOURNAL"
+        );
+        let variable = override_env_name(wiki::DEFAULT_SCOPE_ID);
+        let raw = "ab".repeat(32);
+        assert_eq!(
+            parse_override(&variable, OsString::from(&raw)).unwrap().raw,
+            [0xab; 32]
+        );
+        assert_eq!(
+            parse_override(&variable, OsString::from(format!("blake3:{raw}")))
+                .unwrap()
+                .raw,
+            [0xab; 32]
+        );
+        assert!(parse_override(&variable, OsString::from("ab")).is_err());
+        assert!(parse_override(&variable, OsString::from("zz".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn exact_open_keeps_operator_identity_and_tenant_signer_separate() {
+        let operator = SigningKey::from_bytes(&[0x41; 32]);
+        let tenant = SigningKey::from_bytes(&[0x52; 32]);
+        let mut store = MemoryRepo::default();
+        let shared = store
+            .collection("wiki", private_policy(operator.verifying_key()))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let opened = Collection::<SimpleArchive>::open(&snapshot, shared.handle()).unwrap();
+        let private = open(&mut store, wiki::DEFAULT_SCOPE_ID, tenant.verifying_key()).unwrap();
+
+        assert_eq!(opened, shared);
+        assert_ne!(opened, private);
     }
 }

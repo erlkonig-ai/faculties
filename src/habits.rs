@@ -37,10 +37,13 @@ pub fn collection_handle(
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
     let signer = load_signer(pile, key)?;
     let mut store = open_pile_strict(pile)?;
-    let result =
-        crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key())
-            .map(|collection| collection.handle())
-            .context("register Habit collection");
+    let result = crate::collection_names::open_configured(
+        &mut store,
+        DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
+    )
+    .map(|collection| collection.handle())
+    .context("open Habit collection");
     let close = store.close().context("close Habit pile");
     match (result, close) {
         (Ok(handle), Ok(())) => Ok(handle),

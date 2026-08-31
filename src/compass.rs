@@ -70,9 +70,10 @@ pub fn status_register_collection<S>(
     authority: VerifyingKey,
 ) -> Result<LwwRegisterCollection>
 where
-    S: CollectionStoreExt,
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
-    let source = crate::collection_names::open(store, DEFAULT_SCOPE_ID, authority)?;
+    let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     let target = store.derive(
         source,
         RegisterCoordinatesMapping::new(board::status_of.id(), metadata::created_at.id()),

@@ -152,6 +152,9 @@ impl TriageSnapshot {
         // new identity, create a pile, or admit somebody else's COMMITs.
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
         let mut pile = open_pile_strict(&cli.pile)?;
+        let store_snapshot = pile
+            .snapshot()
+            .context("freeze Triage native store snapshot")?;
         let mut registry = MemoryRepo::default();
         let mut collections = std::collections::BTreeMap::new();
         for scope in [
@@ -161,19 +164,27 @@ impl TriageSnapshot {
             RELATIONS_SCOPE_ID,
             MESSAGE_SCOPE_ID,
         ] {
-            let collection =
-                faculties::collection_names::open(&mut registry, scope, signer.verifying_key())
+            let collection = match faculties::collection_names::configured_handle(scope)? {
+                Some(handle) => Collection::<SimpleArchive>::open(&store_snapshot, handle)
                     .with_context(|| {
                         format!(
-                            "register {} collection",
-                            faculties::collection_names::require_name(scope)
+                            "open exact {} collection from {}",
+                            faculties::collection_names::require_name(scope),
+                            faculties::collection_names::override_env_name(scope)
                         )
-                    })?;
+                    })?,
+                None => {
+                    faculties::collection_names::open(&mut registry, scope, signer.verifying_key())
+                        .with_context(|| {
+                            format!(
+                                "register {} collection",
+                                faculties::collection_names::require_name(scope)
+                            )
+                        })?
+                }
+            };
             collections.insert(scope, collection);
         }
-        let store_snapshot = pile
-            .snapshot()
-            .context("freeze Triage native store snapshot")?;
         Ok(Self {
             pile_path: cli.pile.clone(),
             pile: RefCell::new(Some(pile)),

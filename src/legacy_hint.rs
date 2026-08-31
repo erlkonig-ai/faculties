@@ -164,10 +164,10 @@ pub fn open_scope(
     scope: Id,
     signer: &SigningKey,
 ) -> Result<Collection<SimpleArchive>> {
-    let collection = crate::collection_names::open(pile, scope, signer.verifying_key())
+    let collection = crate::collection_names::open_configured(pile, scope, signer.verifying_key())
         .with_context(|| {
             format!(
-                "register collection {}",
+                "open collection {}",
                 crate::collection_names::require_name(scope)
             )
         })?;

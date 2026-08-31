@@ -95,10 +95,10 @@ pub fn discover_target<S>(
 ) -> Result<TargetDiscovery>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: CollectionRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CollectionRead,
 {
-    let collection = crate::collection_names::open(store, scope, authority)
-        .context("register target collection descriptor")?;
+    let collection = crate::collection_names::open_configured(store, scope, authority)
+        .context("open target collection descriptor")?;
     let snapshot = store
         .snapshot()
         .context("freeze target collection store snapshot")?;
@@ -249,8 +249,9 @@ pub fn publish_fragments(
 ) -> Result<Vec<CollectionCommit>> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let collection = crate::collection_names::open(&mut pile, scope, signer.verifying_key())
-        .context("register native collection descriptor")?;
+    let collection =
+        crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+            .context("open native collection descriptor")?;
     let result = (|| {
         let mut commits = Vec::new();
         for fragment in fragments {

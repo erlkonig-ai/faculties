@@ -187,6 +187,18 @@ no mutable head or CAS update, so independently extended pile copies converge
 by concatenation, all backed by the same content-addressed blob store.
 Historical branches are consulted only by explicit migration commands.
 
+By default, a named faculty collection is rooted at the pile's durable signer.
+An operator can instead select an already-resident exact descriptor for one
+name with `TRIBLESPACE_COLLECTION_<NAME>` (64 hexadecimal digits, optionally
+prefixed by `blake3:`). Hyphens become underscores, so examples are
+`TRIBLESPACE_COLLECTION_WIKI` and
+`TRIBLESPACE_COLLECTION_MEMORY_JOURNAL`. Each name has its own variable because
+one binary may read several collections. The override changes only the
+descriptor it opens: `TRIBLESPACE_KEY` remains the local COMMIT signer, and the
+descriptor's resident READ/WRITE proof evidence decides admission. A missing,
+malformed, or wrongly typed exact descriptor is an error; Faculties never
+silently invents a signer-private replacement.
+
 ## GORBIE viewer
 
 The installed `viewer` binary composes the full faculty dashboard —
