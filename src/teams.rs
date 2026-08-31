@@ -311,14 +311,19 @@ pub fn auth_profile_head(catalog: &TribleSet, source: Id) -> AuthProfileHead {
     }
 }
 
-/// Validate exact auth-profile references against one discovered Secrets
+/// Validate the active auth-profile references against one discovered Secrets
 /// vault snapshot. This deliberately performs no name or timestamp resolution.
+///
+/// Superseded profiles are provenance, not live configuration. Their exact
+/// secret versions may legitimately have been left behind by a vault cutover;
+/// requiring those historical versions would make an additive successor
+/// unable to repair the active profile.
 pub fn validate_auth_secret_references<R>(
     teams_catalog: &TribleSet,
     secrets: &SecretsSnapshot<R>,
 ) -> Result<()> {
     for source in auth_profile_sources(teams_catalog) {
-        for profile in auth_profile_ids(teams_catalog, source) {
+        for profile in auth_profile_head_ids(teams_catalog, source) {
             let record = auth_profile(teams_catalog, profile)?;
             for (label, secret) in [
                 ("client secret", record.client_secret_version),
@@ -2996,7 +3001,7 @@ mod tests {
         validate_auth_secret_references(teams.facts(), secrets).unwrap();
 
         let unknown = Id::new([0x33; 16]).unwrap();
-        let (profile, _) = auth_profile_fragment(
+        let (profile, dangling_profile) = auth_profile_fragment(
             source,
             "client",
             "user",
@@ -3010,6 +3015,19 @@ mod tests {
         dangling += profile;
         let error = validate_auth_secret_references(dangling.facts(), secrets).unwrap_err();
         assert!(format!("{error:#}").contains(&format!("{unknown:x}")));
+
+        let (successor, _) = auth_profile_fragment(
+            source,
+            "client",
+            "user",
+            "offline_access",
+            None,
+            Some(exact),
+            [dangling_profile],
+        )
+        .unwrap();
+        dangling += successor;
+        validate_auth_secret_references(dangling.facts(), secrets).unwrap();
 
         drop(discovery);
         pile.close().unwrap();

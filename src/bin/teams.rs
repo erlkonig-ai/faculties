@@ -479,8 +479,6 @@ impl TeamsStorage<'_> {
             validate_catalog(&store_snapshot, &facts).context("validate Teams collection")?;
             let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
                 .context("discover Secrets vaults for Teams")?;
-            teams_core::validate_auth_secret_references(&facts, secrets.snapshot())
-                .context("validate Teams auth-profile Secrets references")?;
             operation(&mut TeamsSession {
                 pile: &mut pile,
                 collection,
@@ -1442,12 +1440,37 @@ fn set_auth_profile(
         .transpose()?;
     let predecessors = teams_core::auth_profile_head_ids(&session.facts, source);
     let scopes = load_value_or_file(scopes, "Teams scopes")?;
+    let canonical_scopes = teams_core::canonical_auth_scopes(&scopes)?;
+    if let teams_core::AuthProfileHead::Unique(current) =
+        teams_core::auth_profile_head(&session.facts, source)
+    {
+        let record = teams_core::auth_profile(&session.facts, current)?;
+        let same_public_state = read_utf8string(
+            &session.reader,
+            record.client_id,
+            "current Teams auth client id",
+        )? == client_id.trim()
+            && read_utf8string(
+                &session.reader,
+                record.user_id,
+                "current Teams auth user id",
+            )? == user_id.trim()
+            && read_utf8string(&session.reader, record.scopes, "current Teams auth scopes")?
+                == canonical_scopes;
+        if same_public_state
+            && record.client_secret_version == client_secret_version
+            && record.delegated_token_version == delegated_token_version
+        {
+            println!("auth_profile: {current:x}");
+            return Ok(());
+        }
+    }
     let mut fragment = source_fragment(tenant);
     let (profile, profile_id) = teams_core::auth_profile_fragment(
         source,
         client_id,
         user_id,
-        &scopes,
+        &canonical_scopes,
         client_secret_version,
         delegated_token_version,
         predecessors,
@@ -3999,6 +4022,78 @@ mod tests {
         let records =
             triblespace::core::collection::discover_collection_records(&store_snapshot).unwrap();
         assert!(records.commits().is_empty());
+    }
+
+    #[test]
+    fn auth_set_can_repair_a_migrated_dangling_profile() {
+        let fixture = Fixture::new();
+        let (_, client_secret, delegated_token) = initialize_test_secrets(&fixture);
+        let tenant = "tenant.example";
+        let source_identity = source_fragment(tenant);
+        let source = source_identity.root().unwrap();
+        let missing = Id::new([0xD8; 16]).unwrap();
+        let (dangling, dangling_id) = teams_core::auth_profile_fragment(
+            source,
+            "client-id",
+            "user-id",
+            "offline_access",
+            Some(missing),
+            Some(missing),
+            [],
+        )
+        .unwrap();
+        let mut historical = source_identity;
+        historical += dangling;
+
+        // Model an additive cutover that retained Teams provenance while the
+        // old vault epoch itself was deliberately left behind.
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        pile.commit(collection, &signer, historical).unwrap();
+        pile.close().unwrap();
+
+        fixture
+            .storage()
+            .with_session(|session| {
+                set_auth_profile(
+                    session,
+                    tenant,
+                    "client-id",
+                    "user-id",
+                    "offline_access",
+                    Some(client_secret),
+                    Some(delegated_token),
+                )?;
+                let head = match teams_core::auth_profile_head(&session.facts, source) {
+                    teams_core::AuthProfileHead::Unique(head) => head,
+                    other => panic!("expected one repaired auth head, got {other:?}"),
+                };
+                assert_ne!(head, dangling_id);
+                let repaired = teams_core::auth_profile(&session.facts, head)?;
+                assert_eq!(repaired.client_secret_version, Some(client_secret));
+                assert_eq!(repaired.delegated_token_version, Some(delegated_token));
+                teams_core::validate_auth_secret_references(
+                    &session.facts,
+                    session.secrets.snapshot(),
+                )?;
+
+                set_auth_profile(
+                    session,
+                    tenant,
+                    "client-id",
+                    "user-id",
+                    "offline_access",
+                    Some(client_secret),
+                    Some(delegated_token),
+                )?;
+                assert_eq!(
+                    teams_core::auth_profile_head(&session.facts, source),
+                    teams_core::AuthProfileHead::Unique(head)
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
