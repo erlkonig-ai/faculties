@@ -3931,7 +3931,6 @@ dependencies = [
  "ed25519-dalek",
  "faculties",
  "hex",
- "hifitime",
  "tempfile",
  "triblespace",
  "triblespace-core",
