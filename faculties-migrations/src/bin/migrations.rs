@@ -34,10 +34,17 @@ enum Command {
         /// Re-plan and report without publishing descriptors or COMMITs.
         #[arg(long)]
         dry_run: bool,
+        /// Print the exact predecessor and successor descriptor handles.
+        ///
+        /// Names are intentionally not selectors across descriptor epochs:
+        /// policy is part of collection identity, so a cutover pile can carry
+        /// several collections with the same human-readable name.
+        #[arg(long)]
+        handles: bool,
     },
 }
 
-fn print_plan(plan: &CollectionPolicyPlan) {
+fn print_plan(plan: &CollectionPolicyPlan, handles: bool) {
     println!("Collection-policy descriptor re-seat");
     println!("ordinary roots   : {}", plan.roots.len());
     println!("missing COMMITs  : {}", plan.missing_commits());
@@ -55,6 +62,10 @@ fn print_plan(plan: &CollectionPolicyPlan) {
             root.skipped_merges,
             root.skipped_derives,
         );
+        if handles {
+            println!("    source=blake3:{}", hex::encode(root.old.raw));
+            println!("    target=blake3:{}", hex::encode(root.new.raw));
+        }
     }
     println!(
         "Secrets access   : {} record(s), excluded",
@@ -78,14 +89,14 @@ fn main() -> Result<()> {
     let key = cli.key.as_deref();
 
     match command {
-        Command::CollectionPolicy { dry_run } => {
+        Command::CollectionPolicy { dry_run, handles } => {
             if dry_run {
                 let plan = collection_policy::plan_path(&cli.pile, key)?;
-                print_plan(&plan);
+                print_plan(&plan, handles);
                 println!("publication      : dry run; source will be replanned");
             } else {
                 let report = collection_policy::publish_path(&cli.pile, key)?;
-                print_plan(&report.plan);
+                print_plan(&report.plan, handles);
                 println!("appended COMMITs : {}", report.appended_commits);
             }
         }
