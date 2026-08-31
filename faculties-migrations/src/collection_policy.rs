@@ -38,7 +38,7 @@ use triblespace::core::collection::records::{
     collection_name, collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace::core::collection::{
-    CollectionCommit, CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
+    CollectionCommit, CollectionRead, CollectionRecord, CollectionStore,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::ed25519::ED25519PublicKey;
@@ -260,10 +260,6 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
 
     for spec in specs {
         let source = records.get(&spec.old).map(Vec::as_slice).unwrap_or(&[]);
-        if source.is_empty() {
-            continue;
-        }
-
         let mut source_commits = 0usize;
         let mut invalid_commits = 0usize;
         let mut unsupported_non_root_commits = 0usize;
@@ -296,7 +292,7 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
         let mut target_by_id = BTreeMap::new();
         let mut target_commits = 0usize;
         for record in target {
-            if let CollectionRecord::Commit(commit) = record {
+            if matches!(record, CollectionRecord::Commit(_)) {
                 target_commits += 1;
             }
             target_by_id.insert(record.id(), *record);
@@ -364,9 +360,6 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<CollectionPolicy
     // then carries the newly observed suffix.
     let mut appended_commits = 0usize;
     for root in &prepared.roots {
-        if root.summary.source_commits == 0 {
-            continue;
-        }
         let collection =
             faculties::collection_names::open(pile, root.summary.scope, signer.verifying_key())
                 .map_err(|error| {
@@ -399,9 +392,6 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<CollectionPolicy
         );
     }
     for root in &after.roots {
-        if root.summary.source_commits == 0 {
-            continue;
-        }
         let _: Blob<SimpleArchive> = snapshot.get(root.summary.new).with_context(|| {
             format!(
                 "read registered current {} descriptor after publication",
@@ -463,7 +453,7 @@ mod tests {
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{
         CollectionData, CollectionDerive, CollectionMerge, CollectionRecordSelector,
-        CollectionStore,
+        CollectionStore, CollectionStoreExt,
     };
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
@@ -550,9 +540,17 @@ mod tests {
         pile.close().unwrap();
 
         let before = plan_path(&path, Some(&key)).unwrap();
-        assert_eq!(before.roots.len(), 1);
+        assert_eq!(
+            before.roots.len(),
+            faculties::collection_names::table().len()
+        );
         assert_eq!(before.missing_commits(), 1);
-        let target = before.roots[0].new;
+        let target = before
+            .roots
+            .iter()
+            .find(|root| root.name == name)
+            .unwrap()
+            .new;
 
         let first = publish_path(&path, Some(&key)).unwrap();
         assert_eq!(first.appended_commits, 1);
@@ -561,6 +559,9 @@ mod tests {
 
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
+        for root in &first.plan.roots {
+            let _: Blob<SimpleArchive> = snapshot.get(root.new).unwrap();
+        }
         let target_commits = collection_records(&snapshot, target)
             .into_iter()
             .filter_map(|record| match record {
@@ -643,13 +644,14 @@ mod tests {
         pile.close().unwrap();
 
         let plan = plan_path(&path, Some(&key)).unwrap();
-        assert_eq!(plan.roots[0].skipped_merges, 1);
-        assert_eq!(plan.roots[0].skipped_derives, 1);
+        let ordinary = plan.roots.iter().find(|root| root.name == name).unwrap();
+        assert_eq!(ordinary.skipped_merges, 1);
+        assert_eq!(ordinary.skipped_derives, 1);
         assert_eq!(plan.secrets.access_collection, access);
         assert_eq!(plan.secrets.access_records, 1);
         assert_eq!(plan.secrets.vaults.len(), 1);
         assert_eq!(plan.secrets.vaults[0].collection, vault);
-        let target = plan.roots[0].new;
+        let target = ordinary.new;
 
         publish_path(&path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&path).unwrap();
