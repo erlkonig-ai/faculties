@@ -15,7 +15,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::exact_derived::ExactDerivedCollection;
-use triblespace::core::collection::exact_target_compaction::compact_exact_target;
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
 };
@@ -484,8 +483,8 @@ struct EnsuredBm25 {
     cover: Cover<PortableBM25Blob>,
 }
 
-/// Ensure a portable exact-TF cover of the frozen Archive cover, then compact
-/// its current admissible physical cover through exact `MERGE` equations.
+/// Ensure and deterministically maintain a portable exact-TF cover of the
+/// frozen Archive cover through exact `DERIVE` and `MERGE` equations.
 pub fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
@@ -516,8 +515,9 @@ fn ensure_bm25_for_snapshot(
         ExactDerivedCollection::new(archive.collection, target)
             .context("bind Archive BM25 collection mapping")?;
     let source_elements = archive.cover().len();
-    let cover = compact_exact_target(&exact, pile, archive.cover())
-        .context("ensure and compact exact Archive BM25 cover")?;
+    let cover = exact
+        .ensure(pile, archive.cover())
+        .context("ensure exact Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
             source_commits: archive.commits().len(),
@@ -2580,7 +2580,7 @@ mod tests {
         assert_eq!(first_derives, 1);
 
         let full = exact.ensure(&mut pile, &full_cover).unwrap();
-        assert_eq!(full.len(), 2);
+        assert_eq!(full.len(), 1);
         let full_records = {
             let store_snapshot = pile.snapshot().unwrap();
             discover_collection_records(&store_snapshot).unwrap()
@@ -2594,10 +2594,6 @@ mod tests {
             full_derives, 2,
             "only the newly unsupported root is derived"
         );
-        let compacted = compact_exact_target(&exact, &mut pile, &full_cover).unwrap();
-        assert_eq!(compacted.len(), 1);
-        drop(compacted);
-
         let records_before = {
             let store_snapshot = pile.snapshot().unwrap();
             discover_collection_records(&store_snapshot).unwrap()
