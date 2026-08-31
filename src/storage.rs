@@ -81,13 +81,12 @@ impl TargetDiscovery {
 
 /// Discover one target directly through the native collection-record store.
 ///
-/// The canonical descriptor is built from `scope` and `authority`, registered
-/// through the store, and the returned handle selects records. No definition
-/// registry, blob scan, or legacy pin lookup participates in target discovery.
-///
-/// Authority is an identity-bearing descriptor fact and the root for snapshot
-/// admission. A collection named under another authority is intentionally a
-/// different collection.
+/// `scope` resolves the faculty's canonical name. Without an exact override,
+/// `authority` seeds the descriptor's direct READ and WRITE policies; with an
+/// override, the selected descriptor keeps its own immutable policies and the
+/// signer must already satisfy WRITE admission. The returned handle selects
+/// records. No definition registry, blob scan, or legacy pin lookup
+/// participates in target discovery.
 pub fn discover_target<S>(
     store: &mut S,
     scope: Id,
@@ -95,7 +94,7 @@ pub fn discover_target<S>(
 ) -> Result<TargetDiscovery>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CollectionRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let collection = crate::collection_names::open_configured(store, scope, authority)
         .context("open target collection descriptor")?;

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 
-/// Initialize the durable signer used by an open-admission collection fixture.
+/// Initialize the durable signer used by a descriptor-policy collection fixture.
 pub(crate) fn initialize_open_collection_fixture(
     pile_path: &Path,
     key_path: Option<&Path>,

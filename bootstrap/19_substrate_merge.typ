@@ -1,9 +1,9 @@
 = Substrate 3/4: Monotonic Merge
 
-Why can independently extended pile states under one team converge
+Why can independently extended pile states converge
 without a mutable coordinator once they are exchanged? Because native storage
 exposes grow-only sets of blobs, signed COMMIT assertions, and reproducible
-equations. Within each team-rooted collection, the semantic value is a union of
+equations. Within each exact descriptor-policy collection, the semantic value is a union of
 fact archives signed by keys with exact positive WRITE authority. COMMITs from
 unauthorized keys can coexist in the physical pile while remaining inert to the
 current faculty view.
@@ -52,12 +52,12 @@ semantics live in the domain model; they are not ambient storage arbitration.
   - No coordinator, no leader election, no lock service.
   - Offline construction followed by deterministic convergence once the same
     authorized record and blob closure is present.
-  - Publication reach is part of the immutable collection descriptor. A peer
-    relays a COMMIT only when it can resolve that descriptor and recognizes its
-    declared reach law; a missing or unknown descriptor is a refusal.
-  - Gossip carries sparse signed evidence, not permission or automatic
-    replication. Referenced blobs remain lazy until local WANT policy asks for
-    them.
+  - Network participation is explicit per descriptor. Discovery may announce
+    only that a peer has new state; semantic disclosure requires a valid READ
+    proof for that exact collection.
+  - Gossip and anti-entropy carry sparse signed evidence, not permission or
+    automatic full replication. Referenced blobs remain lazy until local WANT
+    policy asks for them.
   - Trust per assertion, not per channel: COMMITs are signed, so provenance
     survives any gossip path. Semantic admission still applies exact positive
     WRITE authority when materializing the collection view.
@@ -67,8 +67,7 @@ semantics live in the domain model; they are not ambient storage arbitration.
 [Substrate 1/4: What Is a Trible](wiki:4e19893b36bf37d471bb9ea968edac20) and [Substrate 2/4: The Pile](wiki:5232ea531fedfcb17bf15e88c3d52a36) cover the building blocks. The query-language chapter
 of the `triblespace-rs` book covers monotone queries in
 depth; native collection publication binds each COMMIT to an exact descriptor
-and author key. The descriptor's reach law governs redistribution, while the
-collection's authority observation governs which authors contribute to its
-semantic value.
+and author key. The descriptor's READ policy governs disclosure, while its
+WRITE policy governs which authors contribute to the semantic value.
 
 Next stop: [Substrate 4/4: The Architecture — Zero Sync Code](wiki:6e5f38bdfd589cd0359bf668d1af9841).

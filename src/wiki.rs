@@ -21,7 +21,7 @@ use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
@@ -225,7 +225,7 @@ pub fn observed_collection<S>(
 ) -> Result<ObservedSetCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     let target = store.derive(

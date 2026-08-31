@@ -43,10 +43,11 @@ pub fn vision_pile() -> PathBuf {
 }
 
 fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
-    // Discover the sole authority and freeze its exact cover from one observed
-    // prefix. A second scan could otherwise hide a concurrently appended team.
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(path)
-        .with_context(|| {
+    // Discover the sole policy descriptor and freeze its admitted cover from
+    // one observed prefix. Selection and attachment reads then share that
+    // exact pile snapshot.
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(path).with_context(|| {
             format!(
                 "discover and freeze the sole native Mary collection for {model} in {}",
                 path.display()
@@ -174,29 +175,33 @@ mod tests {
         fragment
     }
 
-    /// The one team every fragment in these fixtures is published under.
-    ///
-    /// The SIGNERS still vary per fragment, deliberately: local admission
-    /// accepts any signer, and one collection carrying commits from several
-    /// keys is exactly the shape this test is about. What must not vary is the
-    /// team, because the team is half of what names the collection — vary that
-    /// and the fixture publishes two model graphs and then cannot say which
-    /// one it meant.
-    fn fixture_team() -> ed25519_dalek::VerifyingKey {
-        SigningKey::from_bytes(&[0x30; 32]).verifying_key()
-    }
-
     fn publish(path: &Path, fragments: impl IntoIterator<Item = Fragment>) {
+        let mut fragments = fragments.into_iter();
+        let Some(first) = fragments.next() else {
+            return;
+        };
+        // One descriptor may admit several independent authors. Preserve that
+        // invariant explicitly: the policy root publishes the first fragment,
+        // making the descriptor discoverable through its native COMMIT, and
+        // grants every later fixture signer before they publish into it.
+        let root = SigningKey::from_bytes(&[0x30; 32]);
         let mut pile = Pile::open(path).expect("open synthetic model pile");
-        for (index, fragment) in fragments.into_iter().enumerate() {
+        mary::model_collection::publish_model_fragment(&mut pile, &root, first)
+            .expect("publish fixture root fragment");
+        for (index, fragment) in fragments.enumerate() {
             let signer = SigningKey::from_bytes(&[0x31 + index as u8; 32]);
-            mary::model_collection::publish_model_fragment(
+            let collection =
+                mary::model_collection::model_graph_collection_or_create(&mut pile, &root)
+                    .expect("open synthetic model policy collection");
+            triblespace::core::collection::grant_collection_write(
                 &mut pile,
-                fixture_team(),
-                &signer,
-                fragment,
+                collection.handle(),
+                &root,
+                signer.verifying_key(),
             )
-            .expect("publish native model fragment");
+            .expect("grant fixture writer");
+            mary::model_collection::publish_model_fragment(&mut pile, &signer, fragment)
+                .expect("publish native model fragment");
         }
         pile.close().expect("close synthetic model pile");
     }

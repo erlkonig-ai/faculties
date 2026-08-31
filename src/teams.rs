@@ -30,8 +30,8 @@ use crate::secrets::SecretsSnapshot;
 const SNAPSHOT_COORDINATE_PREFIX: &str = "teams-legacy-snapshot-v1:";
 
 // These identifiers were published by the legacy Teams Repository schema.
-// They are recognized only to keep plaintext OAuth evidence out of native
-// collection authority. The migration module remains the sole decoder of the
+// They are recognized only to keep plaintext OAuth evidence out of the
+// semantic Teams collection. The migration module remains the sole decoder of the
 // retired rows.
 const RETIRED_OAUTH_KINDS: [Id; 2] = [
     id_hex!("7B6DBE9FD29182D97F1699437CF6627C"),

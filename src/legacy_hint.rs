@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(
             native_scope_is_empty(&mut pile, collection),
             Some(false),
-            "the descriptor authority's commit is admitted directly"
+            "the direct WRITE-policy root's commit is admitted"
         );
         assert_eq!(
             legacy_migration_hint(&mut pile, DEFAULT_SCOPE_ID, collection),

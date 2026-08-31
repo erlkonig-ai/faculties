@@ -791,8 +791,8 @@ fn speak_and_play(
         ref_text.trim().chars().count(),
     );
     let variant = mary::speak::Qwen3TtsVariant::from_env();
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
-        .with_context(|| {
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(&pile).with_context(|| {
             format!(
                 "discover and freeze the sole native Qwen3-TTS snapshot {}",
                 pile.display()

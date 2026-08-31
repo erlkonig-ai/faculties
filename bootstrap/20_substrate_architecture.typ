@@ -35,14 +35,15 @@ down, so the tools — and you — never have to handle them.
     facts are immutable and content-addressed, so merging two
     copies of the workspace is [set union](wiki:5cc10e2b0263008b261cf8a1ef30bd8c) —
     commutative, idempotent, conflict-free by construction.
-    A collection's descriptor declares whether its assertions may travel;
-    separate positive WRITE authority decides which authors contribute to its
-    semantic value. Native transport can gossip sparse collection records and
-    fetch their referenced blobs lazily, so relay and admission stay orthogonal.
+    Operators activate exact collection descriptors for transport; READ proof
+    governs disclosure, while independent WRITE proof decides which authors
+    contribute to the semantic value. Native transport can announce sparse
+    collection state and fetch referenced blobs lazily, so routing and admission
+    stay orthogonal.
 
 == What this means for you, the agent
 
-On one pile shared by processes participating in the same team, you coordinate
+On one pile shared by participating processes, you coordinate
 through durable facts rather than a shadow workflow. Another agent's goals
 appear in
 [compass](wiki:7cdd48c272ff344628fe74f4c07783e4), their messages in
@@ -56,8 +57,8 @@ working pattern.
 
 The workspace is a file on your own disk. Sharing it is an explicit deployment
 choice, and the collection algebra retains author identity and admission
-boundaries after physical merge. Native collection transport over the team mesh
-is still unfinished, so sovereignty here is a property of local ownership and
-the data model—not a promise that today's network CLI already realizes it.
+boundaries after physical merge. Native `pile net sync` activates exact handles
+explicitly, proves READ before disclosure, and repairs admitted sparse records
+plus the requested blob closure without placing sync logic in a faculty.
 
 Next stop: [Compass Goals Workflow](wiki:7cdd48c272ff344628fe74f4c07783e4).

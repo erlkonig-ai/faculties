@@ -63,7 +63,7 @@ signer. This is the minimal shape:
 ```rust
 let signer = load_signer(&cli.pile, cli.key.as_deref())?;
 let mut pile = open_pile_strict(&cli.pile)?;
-let collection = faculties::collection_names::open(
+let collection = faculties::collection_names::open_configured(
     &mut pile,
     DEFAULT_SCOPE_ID,
     signer.verifying_key(),
@@ -79,10 +79,13 @@ pile.commit(collection, &signer, change)?;
 pile.close()?;
 ```
 
-`collection_names::open` registers the canonical self-describing descriptor
-and returns its content handle. The authority is mandatory descriptor data and
-therefore already part of that handle; `snapshot` and `commit` need no separate
-authority argument. `CollectionStoreExt::commit` and the explicit close are
+`collection_names::open_configured` opens the exact descriptor selected for
+this faculty name, or registers the ordinary signer-private descriptor when no
+override is configured. The descriptor carries independent READ and WRITE
+policies as part of its content identity; `snapshot` and `commit` need no
+separate authority argument. An exact override is checked for the expected name
+and current signer's WRITE admission before publication. `CollectionStoreExt::commit`
+and the explicit close are
 substrate APIs. The typed constructor makes one self-contained fragment: its
 intrinsic identity, facts, and attachment bytes travel together. Strict readers
 validate the materialized domain model and payload closure; migrations validate
@@ -91,12 +94,12 @@ union merely to distrust the same constructor that just produced their
 fragment. Add a pre-publication check only for a genuine cross-fragment
 compatibility invariant.
 
-Local publication is unconditional: the signer curates a fragment into its
-local store. Authority is enforced when a snapshot or sync boundary decides
-which resident commits contribute to the collection. The descriptor authority
-is admitted directly; another signer needs an exact WRITE proof for this
-collection. An ordinary faculty command never manufactures authority merely
-because it attempted a write.
+The substrate can retain any structurally valid local COMMIT as evidence;
+authority is enforced when a snapshot or sync boundary decides which resident
+commits contribute to the collection. Faculty CLIs additionally preflight an
+operator-selected exact descriptor so a command cannot report success after
+appending a predictably inert write. Another signer needs an exact WRITE proof;
+attempting a write never manufactures authority.
 
 The fragment carries its facts, metadata, and attachment closure together. The
 COMMIT *is* the curation record—no separate "log that I did this" step. Its

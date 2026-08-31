@@ -1,111 +1,88 @@
-= Recipe: Auth Setup for a Multi-Agent Team
+= Recipe: Share a Collection Between Agents
 
-This recipe bootstraps one team's positive CONNECT authority across two
-machines. The founder publishes a root grant, issues one exact child grant,
-and exports a portable proof bundle. The invitee verifies and imports that
-bundle before native collection synchronization begins. No ambient policy
-database, environment variables, or pre-auth proof fetch is involved.
+Collection synchronization has no ambient team or CONNECT grant. Every exact
+descriptor carries independent READ and WRITE policies, and `pile net sync`
+repairs only the handles named by its operator. The iroh transport already
+authenticates each endpoint key.
 
-== The recipe — founder bootstraps, invites one teammate
+This recipe gives a second node READ and WRITE access to one collection, seeds
+the descriptor and proof records on both sides, then starts repair.
+
+== Prepare one portable bootstrap pile
 
 ```sh
-# === Founder, on machine A ===
+# On the founder, initialize a durable signer and the named collection.
+trible pile create mesh-bootstrap.pile
+trible pile signing-key init mesh-bootstrap.pile --key root.key
+COLLECTION=$(trible pile collection init mesh-bootstrap.pile message --key root.key)
 
-# 1. Create the pile and team. Archive the printed root secret offline.
-trible pile create founder.pile
-trible team create --pile founder.pile --key founder.key
-# → team root pubkey: <team-root>
-# → team root SECRET: <archive offline; never commit>
-# → founder grant:    <founder-grant>
-trible pile net identity --key founder.key
-# → node: <founder-node-id>
-
-# 2. Invitee creates its local pile and transport key, then sends only the
-#    public identity to the founder.
-trible pile create invitee.pile
+# On the invitee, initialize its own durable signer beside its future pile and
+# send only the printed public key to the founder.
+trible pile signing-key init invitee.pile --key invitee.key
 trible pile net identity --key invitee.key
-# → node: <invitee-public-key>
 
-# 3. Founder issues a CONNECT child and writes its complete public proof.
-trible team invite \
-  --pile founder.pile \
-  --team-root <team-root> \
-  --parent <founder-grant> \
-  --key founder.key \
-  --invitee <invitee-public-key> \
-  --out invitee.invite
-# → issued grant:  <invitee-grant>
-# → invite bundle: invitee.invite
+# The founder can use the same durable signer for COMMITs and its iroh endpoint.
+trible pile net identity --key root.key
 
-# 4. Transfer invitee.invite through any ordinary file channel.
+# READ authorizes disclosure and repair for this exact descriptor.
+trible pile collection grant-read mesh-bootstrap.pile "$COLLECTION" \
+  <invitee-public-key> --key root.key
 
-# === Invitee, on machine B ===
-
-# 5. Verify the proof against the local key and import its descriptor, grant
-#    archives, and signed COMMITs. Repeating this command is harmless.
-trible team join \
-  --pile invitee.pile \
-  --key invitee.key \
-  --invite invitee.invite
-# → team root:      <team-root>
-# → accepted grant: <invitee-grant>
-
-# 6. Rehearse the exact claim the transport will authenticate.
-trible pile net status invitee.pile \
-  --key invitee.key \
-  --team-root <team-root> \
-  --grant <invitee-grant>
-
-# 7. Connect and exchange native collection evidence. Referenced content stays
-#    lazy; durable WANTs drive blob, merge-receipt, and derive-receipt fetching.
-trible pile net sync invitee.pile \
-  --peers <founder-node-id> \
-  --key invitee.key \
-  --team-root <team-root> \
-  --grant <invitee-grant>
+# WRITE authorizes the invitee's signed COMMITs in collection snapshots.
+trible pile collection grant-write mesh-bootstrap.pile "$COLLECTION" \
+  <invitee-public-key> --key root.key
 ```
 
-The founder must start `pile net sync founder.pile` with the founder key, team
-root, and founder grant; no `--peers` argument is needed when the invitee is
-dialing it. Add `--delegate` while issuing the invite only if the invitee should
-be able to issue further child CONNECT grants. Sync runs until interrupted
-unless `--duration` or `--quiescent-for` sets a bounded stopping policy.
+The descriptor and proof records are ordinary grow-only pile state. Seed each
+replica by copying the bootstrap pile before it diverges, or concatenate it
+into an existing stopped pile:
 
-== Why each step
+```sh
+cat mesh-bootstrap.pile >> founder.pile
+cat mesh-bootstrap.pile >> invitee.pile
+```
 
-  - *Archive the team-root secret*: it is shown once and deliberately not
-    persisted. Anyone holding it can publish an independent root grant.
-  - *Exchange the invitee's public key*: public keys and invite bundles are not
-    secrets. The invite remains usable only by the private key named at its
-    leaf.
-  - *Transfer one bundle*: it contains the complete bounded root-to-leaf proof,
-    so first contact does not need a pre-auth network exception or an ambient
-    proof store.
-  - *Join before status*: `join` verifies the claim and imports the same
-    immutable evidence that `status` and `sync` later resolve locally.
-  - *Pass root and grant explicitly*: the transport never guesses a team or
-    credential from environment variables or mutable process state.
-  - *Keep gossip distinct from authority*: the team root identifies the gossip
-    topic, while collection descriptors decide what may be relayed and each
-    collection resolver decides which authors have semantic `WRITE` authority.
-    A CONNECT proof grants neither.
+Concatenation is set union during replay. Do not run legacy branch
+consolidation afterward, and do not use a destructive source-deletion option.
 
-== Removing access
+== Activate live repair
 
-There is no renewal or retraction command. Positive grants are grow-only, so
-ending durable access requires a successor team, collection, or key epoch and
-an admission boundary that stops serving the old epoch. Simply issuing a new
-grant under the old team does not invalidate an already accepted proof.
+```sh
+# Founder serves and pulls this collection.
+trible pile net sync founder.pile \
+  --key root.key --collection "$COLLECTION" \
+  --peers <invitee-endpoint-ticket-or-id> --payload demand
 
-== Cross-references
+# Invitee runs the symmetric side.
+trible pile net sync invitee.pile \
+  --key invitee.key --collection "$COLLECTION" \
+  --peers <founder-endpoint-ticket-or-id> --payload demand
+```
 
-  - [Teams: Positive Authority and CONNECT](wiki:67477d2173928fd91ef20173eabfeae4)
-    — the command surface and authority semantics
-  - [Recipe: Multi-Agent Coordination](wiki:45e1b9bef3ad9836536ab7bce367deb0)
-    — agent hand-offs once the substrate is connected
-  - `triblespace-rs/book/src/capability-auth.md` — complete authority and proof
-    reference
-  - `triblespace-rs/book/src/distributed-sync.md` — sparse gossip, direct RPC,
-    and durable WANT reconciliation
+`--direction read-only` pulls without serving; `write-only` serves without
+pulling; the default is bidirectional. `--payload demand` exchanges semantic
+collection evidence and satisfies durable collection-scoped WANTs as needed.
+Use `--payload full` only when this node deliberately mirrors the admitted
+resident blob closure. `--duration` and `--quiescent-for` make a rehearsal
+bounded; otherwise sync runs until interrupted.
+
+Use the same key paths as `TRIBLESPACE_KEY` (or pass them with a faculty's
+`--key`) when publishing. The WRITE grant is about that COMMIT signer; the READ
+grant is what lets the same authenticated endpoint receive collection state.
+
+== Why the boundaries matter
+
+  - Knowing a collection handle is not READ authority.
+  - Routing, gossip, DHT presence, and local WANTs grant no capability.
+  - WRITE decides which signed COMMITs contribute to a snapshot; local storage
+    may still retain inactive evidence.
+  - READ is checked for the exact descriptor before semantic disclosure. Blob
+    handles remain bearer capabilities only inside that authorized exchange.
+  - Capability proofs and claim blobs are portable grow-only evidence. Ending
+    an unexpired grant requires a deliberate new policy/key epoch rather than a
+    hidden mutable revocation list.
+
+See `triblespace-rs/book/src/capability-auth.md` and
+`triblespace-rs/book/src/distributed-sync.md` for the complete model.
 
 Next stop: [Getting Started: Your First Hour (tour complete)](wiki:44d63d174814371c7468a3e604ed2303).

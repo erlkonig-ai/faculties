@@ -15,7 +15,7 @@ use triblespace::core::collection::lww_register::{
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::legacy_hint::open_scope;
@@ -108,7 +108,7 @@ pub fn intent_register_collection<S>(
 ) -> Result<LwwRegisterCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     let target = store.derive(

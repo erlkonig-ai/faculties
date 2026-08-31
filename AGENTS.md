@@ -7,7 +7,7 @@ human-facing project description and install steps are in
 ## What faculties are
 
 Small CLIs that persist their state in a TribleSpace pile. Each binary lives at
-`src/bin/<name>.rs` and publishes through one or more fixed, team-rooted
+`src/bin/<name>.rs` and publishes through one or more fixed, descriptor-policy
 collections. A collection is identified by its semantic descriptor; its value
 is the monotonic union of COMMIT fragments signed by keys with exact positive
 WRITE authority, not a mutable named branch. Shared domain models, schemas,

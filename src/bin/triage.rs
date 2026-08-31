@@ -165,14 +165,12 @@ impl TriageSnapshot {
             MESSAGE_SCOPE_ID,
         ] {
             let collection = match faculties::collection_names::configured_handle(scope)? {
-                Some(handle) => Collection::<SimpleArchive>::open(&store_snapshot, handle)
-                    .with_context(|| {
-                        format!(
-                            "open exact {} collection from {}",
-                            faculties::collection_names::require_name(scope),
-                            faculties::collection_names::override_env_name(scope)
-                        )
-                    })?,
+                Some(handle) => faculties::collection_names::open_exact_in(
+                    &store_snapshot,
+                    scope,
+                    signer.verifying_key(),
+                    handle,
+                )?,
                 None => {
                     faculties::collection_names::open(&mut registry, scope, signer.verifying_key())
                         .with_context(|| {

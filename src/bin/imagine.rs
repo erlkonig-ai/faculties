@@ -121,8 +121,8 @@ fn main() -> anyhow::Result<()> {
         pile.display()
     );
     eprintln!("imagine: weights pile → {}", pile.display());
-    let (_, snapshot) = mary::model_collection::load_sole_model_collection_local_latest(&pile)
-        .with_context(|| {
+    let snapshot =
+        mary::model_collection::load_model_collection_local_latest(&pile).with_context(|| {
             format!(
                 "discovering and freezing the sole FLUX model collection in {}",
                 pile.display()

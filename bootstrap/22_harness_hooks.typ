@@ -210,4 +210,4 @@ background.
   - [Local Messages: Agent-to-Agent Direct Messaging](wiki:65c6965cb3d11052e87804527734a697)
     — what the news mostly consists of
 
-Next stop: [Recipe: Auth Setup for a Multi-Agent Team](wiki:d06247b9d9183721e47a2940806e5d7f).
+Next stop: [Recipe: Share a Collection Between Agents](wiki:d06247b9d9183721e47a2940806e5d7f).

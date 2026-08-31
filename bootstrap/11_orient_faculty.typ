@@ -52,9 +52,10 @@ quiet baseline.
 Wait recomputes the persona-visible semantic view after pile changes and also
 sweeps Habits as wall time advances. A cooldown becoming due or a Habit entering
 an attention state can therefore wake it without any pile growth. The current
-`pile net sync` transport still exchanges legacy heads and blobs, not native
-collection records; do not mistake its running daemon for delivery of these
-events. `orient poll` performs the pile-backed news check without blocking;
+`pile net sync` can repair native collection records and requested blobs for an
+explicitly activated descriptor, but `orient wait` is still what turns newly
+arrived state into a local notification. `orient poll` performs that pile-backed
+news check without blocking;
 `--peek` reports without consuming the checkpoint.
 
 == When not to use it

@@ -14,17 +14,21 @@
 
 use std::ffi::OsString;
 
+use anybytes::View;
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::VerifyingKey;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::utf8string::UTF8String;
+use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
-    records::CollectionHandle, AdmissionPolicy, Collection, CollectionPolicy,
+    descriptor, records::CollectionHandle, AdmissionPolicy, Collection, CollectionPolicy,
     CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofRead, SnapshotSource};
+use triblespace::core::trible::TribleSet;
 
 use crate::schemas::{
     atlas, blockdag, body, cognition, compass, decide, discord, embeddings, files, habit,
@@ -166,11 +170,11 @@ pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> 
 /// Open the operator-selected exact descriptor, or construct the ordinary
 /// signer-private faculty descriptor when no override is present.
 ///
-/// The override path is read-only: its canonical descriptor must already be
-/// resident in the store and validate as a `SimpleArchive` collection. The
-/// caller's signer is deliberately irrelevant on that path. It remains the
-/// author of later COMMITs, whose visibility is decided by the descriptor's
-/// ambient WRITE proofs when a snapshot is admitted.
+/// The override path is non-registering: its canonical descriptor must already
+/// be resident, carry the name assigned to this faculty scope, and admit the
+/// caller's signer under its WRITE policy. Failing before a command can append
+/// an inert COMMIT keeps a mistyped handle or missing grant from looking like a
+/// successful faculty write.
 pub fn open_configured<S>(
     storage: &mut S,
     scope: Id,
@@ -178,7 +182,7 @@ pub fn open_configured<S>(
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let Some(handle) = configured_handle(scope)? else {
         return open(storage, scope, authority).context("register signer-private descriptor");
@@ -187,13 +191,62 @@ where
     let snapshot = storage
         .snapshot()
         .context("freeze store while opening configured collection descriptor")?;
-    Collection::open(&snapshot, handle).with_context(|| {
+    open_exact_in(&snapshot, scope, authority, handle)
+}
+
+/// Open and validate one exact faculty descriptor in an existing snapshot.
+///
+/// This is the coherent read-boundary form used by callers which already froze
+/// a pile prefix. It validates the descriptor's type and faculty name, then
+/// proves that `authority` may publish before any later command can append an
+/// inert COMMIT.
+pub fn open_exact_in<S>(
+    snapshot: &S,
+    scope: Id,
+    authority: VerifyingKey,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: BlobStoreGet + CapabilityProofRead,
+{
+    let collection = Collection::open(snapshot, handle).with_context(|| {
         format!(
             "open exact {} descriptor from {}",
             require_name(scope),
             override_env_name(scope)
         )
-    })
+    })?;
+    let blob: Blob<SimpleArchive> = snapshot
+        .get(handle)
+        .context("read configured collection descriptor while checking its name")?;
+    let facts = TribleSet::try_from_blob(blob)
+        .context("decode configured collection descriptor while checking its name")?;
+    let name_handle = descriptor::name(&facts)
+        .context("decode configured collection name")?
+        .ok_or_else(|| anyhow!("configured faculty collection is derived and has no root name"))?;
+    let name: View<str> = snapshot
+        .get::<View<str>, UTF8String>(name_handle)
+        .context("read configured collection name")?;
+    let expected = require_name(scope);
+    if &*name != expected {
+        bail!(
+            "{} names collection {:?}, not expected faculty collection {:?}",
+            override_env_name(scope),
+            &*name,
+            expected,
+        );
+    }
+    if !collection
+        .writer_is_admitted(snapshot, authority)
+        .context("check configured collection WRITE admission")?
+    {
+        bail!(
+            "durable signer {} is not admitted to WRITE configured collection {:?}",
+            hex::encode(authority.to_bytes()),
+            expected,
+        );
+    }
+    Ok(collection)
 }
 
 /// Register one faculty root and return its typed descriptor handle.
@@ -219,6 +272,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::grant_collection_write;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::SnapshotSource;
@@ -291,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_open_keeps_operator_identity_and_tenant_signer_separate() {
+    fn exact_open_requires_the_expected_name_and_write_admission() {
         let operator = SigningKey::from_bytes(&[0x41; 32]);
         let tenant = SigningKey::from_bytes(&[0x52; 32]);
         let mut store = MemoryRepo::default();
@@ -299,10 +353,58 @@ mod tests {
             .collection("wiki", private_policy(operator.verifying_key()))
             .unwrap();
         let snapshot = store.snapshot().unwrap();
-        let opened = Collection::<SimpleArchive>::open(&snapshot, shared.handle()).unwrap();
+        let opened = open_exact_in(
+            &snapshot,
+            wiki::DEFAULT_SCOPE_ID,
+            operator.verifying_key(),
+            shared.handle(),
+        )
+        .unwrap();
+        assert_eq!(opened, shared);
+        assert!(open_exact_in(
+            &snapshot,
+            wiki::DEFAULT_SCOPE_ID,
+            tenant.verifying_key(),
+            shared.handle(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("is not admitted to WRITE"));
+        drop(snapshot);
+
+        grant_collection_write(
+            &mut store,
+            shared.handle(),
+            &operator,
+            tenant.verifying_key(),
+        )
+        .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let opened = open_exact_in(
+            &snapshot,
+            wiki::DEFAULT_SCOPE_ID,
+            tenant.verifying_key(),
+            shared.handle(),
+        )
+        .unwrap();
         let private = open(&mut store, wiki::DEFAULT_SCOPE_ID, tenant.verifying_key()).unwrap();
 
         assert_eq!(opened, shared);
         assert_ne!(opened, private);
+
+        let wrong_name = store
+            .collection("relations", private_policy(tenant.verifying_key()))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let error = open_exact_in(
+            &snapshot,
+            wiki::DEFAULT_SCOPE_ID,
+            tenant.verifying_key(),
+            wrong_name.handle(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not expected faculty collection"));
     }
 }

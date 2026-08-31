@@ -121,7 +121,9 @@ impl CollectionPolicyPlan {
     }
 
     pub fn settled(&self) -> bool {
-        self.missing_commits() == 0 && self.unsupported_non_root_commits() == 0
+        self.missing_commits() == 0
+            && self.invalid_commits() == 0
+            && self.unsupported_non_root_commits() == 0
     }
 }
 
@@ -347,6 +349,12 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<CollectionPolicy
     let prepared = prepare(&snapshot, signer)?;
     drop(snapshot);
 
+    if prepared.plan.invalid_commits() != 0 {
+        bail!(
+            "collection-policy found {} predecessor COMMIT(s) with invalid signatures; refusing to append any successor records",
+            prepared.plan.invalid_commits(),
+        );
+    }
     if prepared.plan.unsupported_non_root_commits() != 0 {
         bail!(
             "collection-policy found {} strictly signed predecessor COMMIT(s) by non-root writers; this minimal migration will neither silently adopt nor discard potentially delegated data",
@@ -386,8 +394,9 @@ fn publish_open(pile: &mut Pile, signer: &SigningKey) -> Result<CollectionPolicy
     let after = prepare(&snapshot, signer)?;
     if !after.plan.settled() {
         bail!(
-            "collection-policy verification found {} missing successor COMMIT(s) and {} unsupported non-root predecessor COMMIT(s); replay after predecessor writers are quiescent",
+            "collection-policy verification found {} missing successor COMMIT(s), {} invalid predecessor COMMIT(s), and {} unsupported non-root predecessor COMMIT(s); replay after predecessor writers are quiescent",
             after.plan.missing_commits(),
+            after.plan.invalid_commits(),
             after.plan.unsupported_non_root_commits(),
         );
     }
@@ -591,6 +600,38 @@ mod tests {
                 .handle(),
             target,
         );
+    }
+
+    #[test]
+    fn invalid_predecessor_commit_refuses_all_publication() {
+        let (_directory, path, key, signer) = fixture();
+        let (_scope, name) = faculties::collection_names::table()[0];
+        let mut pile = open_pile_strict(&path).unwrap();
+        let old = store_fragment(
+            &mut pile,
+            retired_root_descriptor(name, signer.verifying_key()),
+        );
+        let valid =
+            CollectionCommit::sign(&signer, old, missing_data(0x31), missing_metadata(0x32));
+        let mut bytes = valid.to_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        let invalid = CollectionCommit::from_bytes(bytes);
+        assert!(invalid.verify_strict().is_err());
+        pile.insert(CollectionRecord::Commit(invalid)).unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&path, Some(&key)).unwrap();
+        assert_eq!(plan.invalid_commits(), 1);
+        assert!(!plan.settled());
+        let before = fs::metadata(&path).unwrap().len();
+
+        let error = publish_path(&path, Some(&key)).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid signatures"),
+            "{error:#}"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), before);
     }
 
     #[test]

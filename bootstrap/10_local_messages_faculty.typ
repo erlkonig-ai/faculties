@@ -22,11 +22,10 @@ read acknowledgements.
   - Long technical content — messages are conversational. If
     you're writing more than 5 lines, ask whether a fragment
     would serve better.
-  - Real-time chat. Message is an append-only ledger, and the current fixed
-    Faculty collection descriptors declare private reach. `pile net sync` can
-    transport native collection evidence, but correctly does not relay these
-    private Message COMMITs. Move or concatenate complete pile state through an
-    intended private deployment path before expecting messages on another node.
+  - Low-latency chat without a running watcher or sync session. Message is an
+    append-only ledger; another node sees it only when an operator activates the
+    exact Message descriptor and that peer proves READ authority. Transport does
+    not infer sharing from a faculty name.
 
 == Usage
 
@@ -50,7 +49,7 @@ and durable signer as the Message collection; there is no branch selector.
 
 == Collection and storage
 
-Messages live in one fixed, team-rooted Message collection. Each send or
+Messages live in one fixed descriptor-policy Message collection. Each send or
 acknowledgement publishes an immutable fragment through an independent signed
 COMMIT, so the read history is its own audit trail. Commands accept an existing
 durable signing key through `--key` or `TRIBLESPACE_KEY`; ordinary reads and
@@ -58,8 +57,8 @@ writes never create one.
 
 Pile concatenation preserves both record sets physically. Current faculty reads
 admit only COMMITs made by keys with exact positive WRITE authority, so two
-processes share one logical inbox only when they intentionally share the team
-root and its authority evidence. Unauthorized COMMITs remain inert evidence
+processes share one logical inbox only when they intentionally share the exact
+descriptor and its policy evidence. Unauthorized COMMITs remain inert evidence
 rather than silently becoming trusted messages. Distinct sends by any admitted
 authors remain distinct immutable messages; exact retries converge.
 
@@ -69,4 +68,4 @@ authors remain distinct immutable messages; exact retries converge.
   - "Tool Selection: Faculties First" — when to reach for
     message vs wiki vs compass
 
-Next stop: [Teams: Positive Authority and CONNECT](wiki:67477d2173928fd91ef20173eabfeae4).
+Next stop: [Teams: Microsoft Graph Archive and Bridge](wiki:67477d2173928fd91ef20173eabfeae4).

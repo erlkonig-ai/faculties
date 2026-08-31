@@ -163,6 +163,15 @@ impl DiscordSession<'_> {
 }
 
 impl DiscordStorage<'_> {
+    /// Prove that this process can publish to the selected collection before
+    /// an outbound Discord side effect occurs.
+    fn preflight_write(&self) -> Result<()> {
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).map(|_| ());
+        finish_pile(pile, result)
+    }
+
     fn with_session<T>(
         &self,
         operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
@@ -271,16 +280,41 @@ fn require_token(cli: &Cli) -> Result<String> {
 }
 
 fn send(storage: DiscordStorage<'_>, token: &str, channel_id: &str, raw_text: &str) -> Result<()> {
+    send_with(storage, token, channel_id, raw_text, post_message)
+}
+
+fn send_with(
+    storage: DiscordStorage<'_>,
+    token: &str,
+    channel_id: &str,
+    raw_text: &str,
+    post: impl FnOnce(&str, &str, &str) -> Result<JsonValue>,
+) -> Result<()> {
     discord_model::validate_snowflake(channel_id).context("invalid channel id")?;
     let text = faculties::text_arg(raw_text, "message text")?;
     if text.trim().is_empty() {
         bail!("empty message body");
     }
 
-    // Fail before the external side effect if this process has no durable
-    // collection authority.
-    load_signer(storage.pile, storage.key)?;
+    storage
+        .preflight_write()
+        .context("preflight Discord collection WRITE admission")?;
+    let payload = post(token, channel_id, &text)?;
+    let messages = parse_messages(vec![payload], channel_id)?;
+    let message_id = messages
+        .first()
+        .map(|message| message.external_id.as_str())
+        .ok_or_else(|| anyhow!("Discord send response contained no message"))?;
+    let fragment = build_ingest_fragment(&messages, None, fetch_attachment_bytes)?;
+    storage.publish(
+        fragment,
+        format!("discord: sent and observed message {message_id} in channel {channel_id}"),
+    )?;
+    println!("Sent and stored message {message_id} in channel {channel_id}");
+    Ok(())
+}
 
+fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
     let response = client
@@ -295,20 +329,7 @@ fn send(storage: DiscordStorage<'_>, token: &str, channel_id: &str, raw_text: &s
         let body = response.text().unwrap_or_default();
         bail!("discord send failed ({status}): {body}");
     }
-
-    let payload: JsonValue = response.json().context("parse send response")?;
-    let messages = parse_messages(vec![payload], channel_id)?;
-    let message_id = messages
-        .first()
-        .map(|message| message.external_id.as_str())
-        .ok_or_else(|| anyhow!("Discord send response contained no message"))?;
-    let fragment = build_ingest_fragment(&messages, None, fetch_attachment_bytes)?;
-    storage.publish(
-        fragment,
-        format!("discord: sent and observed message {message_id} in channel {channel_id}"),
-    )?;
-    println!("Sent and stored message {message_id} in channel {channel_id}");
-    Ok(())
+    response.json().context("parse send response")
 }
 
 #[derive(Debug, Clone)]
@@ -1196,6 +1217,9 @@ mod tests {
     use super::*;
     use faculties::schemas::files::KIND_FILE;
     use std::fs::File;
+    use std::sync::Mutex;
+
+    static COLLECTION_OVERRIDE_ENV: Mutex<()> = Mutex::new(());
 
     fn message_json(
         id: &str,
@@ -1233,6 +1257,45 @@ mod tests {
             pile,
             key: Some(key),
         }
+    }
+
+    #[test]
+    fn unauthorized_collection_fails_before_remote_post() {
+        let _guard = COLLECTION_OVERRIDE_ENV.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (pile_path, key) = fresh_storage(&directory);
+        let root = SigningKey::from_bytes(&[0x41; 32]);
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let collection = pile
+            .collection(
+                "discord",
+                faculties::collection_names::private_policy(root.verifying_key()),
+            )
+            .unwrap();
+        pile.close().unwrap();
+
+        let variable = faculties::collection_names::override_env_name(DEFAULT_SCOPE_ID);
+        let previous = std::env::var_os(&variable);
+        std::env::set_var(&variable, hex::encode(collection.handle().raw));
+        let mut posts = 0;
+        let result = send_with(
+            test_storage(&pile_path, &key),
+            "unused-token",
+            "100000000000000002",
+            "must not leave this process",
+            |_, _, _| {
+                posts += 1;
+                Ok(json!({}))
+            },
+        );
+        match previous {
+            Some(value) => std::env::set_var(&variable, value),
+            None => std::env::remove_var(&variable),
+        }
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("WRITE admission"), "{error:#}");
+        assert_eq!(posts, 0, "authorization failure must precede HTTP POST");
     }
 
     #[test]

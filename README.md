@@ -44,8 +44,8 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 624f9fc23a484a989389eca0af0f652aba840ead
-git -C mary checkout b7c09009f6bd921f12ecfedeb32e4a4ff94861e2
+git -C triblespace-rs checkout 7ddf1cc55fed21f3341c2885884a2399486ac533
+git -C mary checkout 38c911cae75d1659219909d99fd0e8d35ada78eb
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
 cd faculties
@@ -91,7 +91,7 @@ tour (a start-here hub plus a "Next stop" spine), in four layers:
   3. **Recipes and coordination** (4) — chained-faculty workflows:
      research (compass → web → files → wiki), multi-agent
      coordination (relations + message + orient + compass), harness
-     hooks, and team auth setup (`trible team` + `pile net`).
+     hooks, and collection-policy grants plus `pile net` synchronization.
   4. **Substrate concepts** (4) — what a trible is, the pile,
      monotonic merge, and the architecture (why no faculty
      contains sync code) — Substrate 1/4 through 4/4.
@@ -115,10 +115,10 @@ compass list                       # 7 hands-on goals in TODO
 
 The logical seed is built deterministically from the checked-in
 `bootstrap/*.typ` sources. Bootstrap signs the Wiki and Compass content COMMITs
-directly with the recipient's durable key under that key's collection
-namespace. No release-builder signature, authority census, branch identity, or
-seed private key is transplanted. Re-running `bootstrap import` with the same
-key is exactly idempotent.
+directly with the recipient's durable key into deterministic collections whose
+READ and WRITE policies are rooted at that key. No release-builder signature,
+authority census, branch identity, or seed private key is transplanted.
+Re-running `bootstrap import` with the same key is exactly idempotent.
 
 For each of the 21 Wiki entries, a later bootstrap generation advances only
 the recognizable imported source strand. Recipient edits are never silently
@@ -177,15 +177,14 @@ env-var support). You can pass `--pile <path>` to override it for a
 single call. Create a pile explicitly with `trible pile create new.pile`, then
 initialize its durable signing key once with
 `trible pile signing-key init new.pile`. Faculties publish independent signed
-COMMITs into fixed namespaced collections. A descriptor names the collection's
-meaning, namespace, optional capability root, and reach; its known facts are
-the validated union of its admitted COMMITs. Ordinary local faculty
-collections use explicit open admission. Capability-controlled collections,
-such as Secrets vaults, instead consume exact presented `WRITE(collection)`
-proofs—there is no ambient authority ledger or store-wide grant scan. There is
-no mutable head or CAS update, so independently extended pile copies converge
-by concatenation, all backed by the same content-addressed blob store.
-Historical branches are consulted only by explicit migration commands.
+COMMITs into self-describing collections. A descriptor fixes the collection's
+name, member encoding, and independent READ and WRITE admission policies; its
+content handle is the collection identity. A snapshot admits exactly the
+COMMITs whose signers satisfy that descriptor's WRITE policy using resident
+capability-proof evidence. There is no ambient team, owner namespace, mutable
+head, or CAS update, so independently extended pile copies converge by
+concatenation, all backed by the same content-addressed blob store. Historical
+branches are consulted only by explicit migration commands.
 
 By default, a named faculty collection is rooted at the pile's durable signer.
 An operator can instead select an already-resident exact descriptor for one
@@ -195,9 +194,10 @@ prefixed by `blake3:`). Hyphens become underscores, so examples are
 `TRIBLESPACE_COLLECTION_MEMORY_JOURNAL`. Each name has its own variable because
 one binary may read several collections. The override changes only the
 descriptor it opens: `TRIBLESPACE_KEY` remains the local COMMIT signer, and the
-descriptor's resident READ/WRITE proof evidence decides admission. A missing,
-malformed, or wrongly typed exact descriptor is an error; Faculties never
-silently invents a signer-private replacement.
+descriptor's resident policy and proof evidence decide admission. A missing,
+malformed, wrongly typed, wrongly named, or non-writable exact descriptor is an
+error before publication; Faculties never silently invents a signer-private
+replacement or appends an inert COMMIT.
 
 ## GORBIE viewer
 

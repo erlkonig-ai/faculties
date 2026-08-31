@@ -21,7 +21,8 @@ self.pile
     content-addressed store in a single file.
   - A signed *COMMIT* says "this canonical fact archive is a member of this
     exact collection". The collection is named by a self-describing descriptor
-    containing its scope, representation, and recipe—not by a mutable pointer.
+    containing its name, member encoding, and independent READ and WRITE
+    policies—not by a mutable pointer.
   - Unsigned *MERGE* and *DERIVE* records describe reproducible algebraic work:
     moving within a collection by union, or across collections by a canonical
     homomorphism. They accelerate reads but grant no publication authority.
@@ -52,9 +53,9 @@ of a published fact.
     mutable pin logs are not part of this native convergence claim. Physical
     presence is not admission: current faculties materialize only strictly
     valid COMMITs whose authors have exact positive WRITE authority.
-  - *Transport-capable algebra*: descriptor reach decides whether sparse
-    collection records travel, while positive WRITE authority independently
-    decides semantic admission. Referenced blobs remain lazy and WANTable, so
+  - *Transport-capable algebra*: operators explicitly activate exact collection
+    handles. READ proofs govern disclosure, while WRITE proofs independently
+    decide semantic admission. Referenced blobs remain lazy and WANTable, so
     replicas can exchange evidence before paying for its complete closure.
 
 == Further reading

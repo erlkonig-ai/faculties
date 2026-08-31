@@ -76,7 +76,7 @@ const WIKI_SEED: &[WikiSeed] = &[
     },
     WikiSeed {
         anchor: id_hex!("67477D2173928FD91EF20173EABFEAE4"),
-        title: "Teams: Positive Authority and CONNECT",
+        title: "Teams: Microsoft Graph Archive and Bridge",
         content: include_str!("../bootstrap/09_teams_faculty.typ"),
         tags: &["bootstrap", "onboarding", "teams", "auth"],
     },
@@ -124,7 +124,7 @@ const WIKI_SEED: &[WikiSeed] = &[
     },
     WikiSeed {
         anchor: id_hex!("D06247B9D9183721E47A2940806E5D7F"),
-        title: "Recipe: Auth Setup for a Multi-Agent Team",
+        title: "Recipe: Share a Collection Between Agents",
         content: include_str!("../bootstrap/16_auth_setup_workflow.typ"),
         tags: &["bootstrap", "onboarding", "recipe", "auth"],
     },

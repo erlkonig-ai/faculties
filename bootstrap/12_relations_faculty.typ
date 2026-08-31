@@ -8,7 +8,7 @@ registry.
 
 == Why a separate faculty
 
-Each kind of state lives in its own fixed, team-rooted collection. Relations,
+Each kind of state lives in its own fixed descriptor-policy collection. Relations,
 Message, and Compass therefore retain separate semantics while sharing one
 pile. Faculties that need people-references materialize Relations without
 claiming those facts as their own schema.

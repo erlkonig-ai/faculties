@@ -63,7 +63,7 @@ the durable-archive step. Use the right one for each job.
 == Collection and storage
 
 Unless `--no-store` is set, each `search` and `fetch` publishes an immutable
-event into one fixed, team-rooted Web collection. There is no branch selector
+event into one fixed descriptor-policy Web collection. There is no branch selector
 or mutable head. Events accrete; nothing is overwritten. Runtime credentials
 come from exact Secrets versions selected through Headspace, or from explicit
 per-invocation overrides; they are not stored in the public event facts.

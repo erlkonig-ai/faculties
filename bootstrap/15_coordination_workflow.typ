@@ -2,10 +2,9 @@
 
 How several agents sharing one pile divide work, hand it off, and review one
 another without a shadow workflow. This recipe chains `relations`, `message`,
-`orient`, and `compass`. Their fixed Faculty collections currently declare
-private reach, so the native team mesh deliberately does not relay their
-COMMITs between independent piles. Share one pile or move its complete private
-state through an intended deployment path for this workflow.
+`orient`, and `compass`. Processes may share one pile, or operators may activate
+the exact descriptors between independent piles after installing appropriate
+READ and WRITE proofs. Faculty names alone never imply network sharing.
 
 == Setup once
 
@@ -95,7 +94,7 @@ status edits stay quiet.
   - "Relations: People and Handle Mappings"
   - "Orient: The Situation-Snapshot Faculty"
   - "Compass Goals Workflow"
-  - "Teams: Positive Authority and CONNECT"
+  - [Recipe: Share a Collection Between Agents](wiki:d06247b9d9183721e47a2940806e5d7f)
   - [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
 
 Next stop: [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac).
