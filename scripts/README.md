@@ -1,7 +1,10 @@
 # Atomic local release cohorts
 
 `install-release-cohort` installs every executable found directly in one build
-directory as one immutable generation. Build with `--workspace` so the
+directory as one content-verified, versioned generation. A generation path is
+write-once by the installer: staging refuses to overwrite it, but the installer
+does not claim filesystem immutability or remove owner write permission. Build
+with `--workspace` so the
 `migrations` binary — which lives in the `faculties-migrations` member crate and
 is the only path from a pre-collection pile to a native one — is part of the
 cohort. The installer refuses a build directory without it, so accidentally
@@ -19,8 +22,12 @@ deletes or rewrites that executable on the operator's behalf.
 The installer refuses dirty Git repositories among the selected local Cargo
 dependencies. Each generation carries `Cargo.lock` and a JSON manifest with
 the exact source revisions and tree hashes, requested and resolved Cargo
-features, verbose rustc version, and SHA-256/size of every binary. Untracked
-siblings and `target/` output outside that source closure do not block a release.
+features, verbose Cargo and rustc versions, the allowlisted `RUSTFLAGS` and
+`CARGO_INCREMENTAL` environment when present, and SHA-256/size of every binary.
+An exact GB10 runner can additionally provide its validated runner identity,
+source-cohort digest, and argv receipt through `GB10_EXACT_INVOCATION`.
+Untracked siblings and `target/` output outside that source closure do not block
+a release.
 
 Build and inspect without writing anything:
 
@@ -31,8 +38,8 @@ scripts/install-release-cohort target/release \
   --dry-run
 ```
 
-Stage the immutable generation, validate its copied bytes, and only then switch
-the complete command cohort:
+Stage the content-verified generation, validate its copied bytes, and only then
+switch the complete command cohort:
 
 ```sh
 scripts/install-release-cohort target/release \
@@ -45,8 +52,9 @@ Omit `--stage-only` for a single stage-and-activate operation. Pass the same
 `--features a,b` and `--no-default-features` choices used for `cargo build`;
 they are recorded as provenance rather than guessed from opaque executables.
 Existing commands not managed by this installer are never overwritten. Old
-generations remain immutable under `~/.local/lib/faculties/releases/`; rollback
-is the same verified atomic activation command with an older generation.
+generations remain versioned under `~/.local/lib/faculties/releases/`, and the
+installer never rewrites their paths; rollback is the same verified atomic
+activation command with an older generation.
 
 Activation changes the `current` symlink for **new** processes. A process that
 was already running keeps its old executable mapped, even when its command path

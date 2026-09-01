@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from typing import Any
 
 
 SCRIPT = Path(__file__).with_name("install-release-cohort")
@@ -55,6 +56,7 @@ class ReleaseCohortTest(unittest.TestCase):
         self, generation: str, *extra: str, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
         invocation_env = os.environ.copy()
+        invocation_env.pop("GB10_EXACT_INVOCATION", None)
         invocation_env["PATH"] = os.pathsep.join(
             [str(self.prefix / "bin"), invocation_env.get("PATH", "")]
         )
@@ -78,6 +80,19 @@ class ReleaseCohortTest(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=invocation_env,
         )
+
+    @staticmethod
+    def exact_invocation() -> dict[str, Any]:
+        return {
+            "format": 1,
+            "runner": {
+                "path": "mary/scripts/gb10-runner",
+                "revision": "a" * 40,
+                "sha256": "b" * 64,
+            },
+            "source_cohort_sha256": "c" * 64,
+            "command": ["cargo", "build", "--release", "--locked"],
+        }
 
     def activate(
         self, generation: str, *, path: str | None = None
@@ -148,6 +163,132 @@ class ReleaseCohortTest(unittest.TestCase):
             stdout=subprocess.PIPE,
         ).stdout
         self.assertEqual(output, "second orient\n")
+
+    def test_records_allowlisted_build_environment_and_cargo_version(self) -> None:
+        staged = self.invoke(
+            "recipe-environment",
+            "--stage-only",
+            env={
+                "RUSTFLAGS": "-Ctarget-cpu=native",
+                "CARGO_INCREMENTAL": "0",
+                "BUILD_SECRET": "must not enter provenance",
+            },
+        )
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        manifest = json.loads(
+            (
+                self.prefix
+                / "lib"
+                / "faculties"
+                / "releases"
+                / "recipe-environment"
+                / "manifest.json"
+            ).read_text()
+        )
+        recipe = manifest["build_recipe"]
+        self.assertEqual(recipe["format"], 1)
+        self.assertEqual(
+            recipe["environment"],
+            {"RUSTFLAGS": "-Ctarget-cpu=native", "CARGO_INCREMENTAL": "0"},
+        )
+        self.assertTrue(recipe["cargo_version_verbose"].startswith("cargo "))
+
+    def test_exact_invocation_recipe_survives_stage_and_activation(self) -> None:
+        receipt = self.exact_invocation()
+        staged = self.invoke(
+            "exact-recipe",
+            "--stage-only",
+            env={"GB10_EXACT_INVOCATION": json.dumps(receipt)},
+        )
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        activated = self.activate("exact-recipe")
+        self.assertEqual(activated.returncode, 0, activated.stderr)
+        manifest = json.loads(
+            (
+                self.prefix
+                / "lib"
+                / "faculties"
+                / "current"
+                / "manifest.json"
+            ).read_text()
+        )
+        recipe = manifest["build_recipe"]
+        self.assertEqual(recipe["runner"], receipt["runner"])
+        self.assertEqual(
+            recipe["source_cohort_sha256"], receipt["source_cohort_sha256"]
+        )
+        self.assertEqual(recipe["command"], receipt["command"])
+
+    def test_rejects_malformed_exact_invocation_hash(self) -> None:
+        for field in ("runner", "source"):
+            with self.subTest(field=field):
+                receipt = self.exact_invocation()
+                if field == "runner":
+                    receipt["runner"]["sha256"] = "B" * 64
+                else:
+                    receipt["source_cohort_sha256"] = "c" * 63
+                result = self.invoke(
+                    f"malformed-{field}",
+                    "--stage-only",
+                    env={"GB10_EXACT_INVOCATION": json.dumps(receipt)},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("lowercase hexadecimal", result.stderr)
+                self.assertFalse(
+                    (
+                        self.prefix
+                        / "lib"
+                        / "faculties"
+                        / "releases"
+                        / f"malformed-{field}"
+                    ).exists()
+                )
+
+    def test_rejects_unknown_exact_invocation_fields(self) -> None:
+        receipt = self.exact_invocation()
+        receipt["surprise"] = "not part of format 1"
+        result = self.invoke(
+            "unknown-receipt-field",
+            "--stage-only",
+            env={"GB10_EXACT_INVOCATION": json.dumps(receipt)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected surprise", result.stderr)
+
+    def test_rejects_partial_exact_recipe_during_activation(self) -> None:
+        staged = self.invoke("partial-recipe", "--stage-only")
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        manifest_path = (
+            self.prefix
+            / "lib"
+            / "faculties"
+            / "releases"
+            / "partial-recipe"
+            / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        manifest["build_recipe"]["runner"] = self.exact_invocation()["runner"]
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        activated = self.activate("partial-recipe")
+        self.assertNotEqual(activated.returncode, 0)
+        self.assertIn("must be present together", activated.stderr)
+
+    def test_activates_legacy_format_one_manifest_without_build_recipe(self) -> None:
+        staged = self.invoke("legacy-recipe", "--stage-only")
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        manifest_path = (
+            self.prefix
+            / "lib"
+            / "faculties"
+            / "releases"
+            / "legacy-recipe"
+            / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["build_recipe"]
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        activated = self.activate("legacy-recipe")
+        self.assertEqual(activated.returncode, 0, activated.stderr)
 
     def test_dry_run_writes_nothing(self) -> None:
         self.binary("orient", "dry")

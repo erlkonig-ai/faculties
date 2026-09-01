@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import platform
 import re
 import shutil
@@ -22,6 +23,9 @@ from typing import Any
 GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 BINARY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 REQUIRED_COHORT_BINARIES = frozenset({"migrations"})
+BUILD_ENVIRONMENT = ("RUSTFLAGS", "CARGO_INCREMENTAL")
+HEX_40_RE = re.compile(r"^[0-9a-f]{40}$")
+HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ReleaseError(RuntimeError):
@@ -191,6 +195,145 @@ def parse_features(value: str) -> list[str]:
     return features
 
 
+def require_exact_keys(value: dict[str, Any], expected: set[str], subject: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = ", ".join(sorted(expected - actual))
+        extra = ", ".join(sorted(actual - expected))
+        detail = []
+        if missing:
+            detail.append(f"missing {missing}")
+        if extra:
+            detail.append(f"unexpected {extra}")
+        raise ReleaseError(f"invalid {subject} fields: {'; '.join(detail)}")
+
+
+def validate_runner(value: Any, subject: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{subject} must be an object")
+    require_exact_keys(value, {"path", "revision", "sha256"}, subject)
+    path = value["path"]
+    revision = value["revision"]
+    digest = value["sha256"]
+    if not isinstance(path, str) or not path:
+        raise ReleaseError(f"{subject}.path must be a nonempty relative string")
+    parsed_path = PurePosixPath(path)
+    if (
+        parsed_path.is_absolute()
+        or parsed_path == PurePosixPath(".")
+        or any(part in {"", ".", ".."} for part in parsed_path.parts)
+        or parsed_path.as_posix() != path
+    ):
+        raise ReleaseError(f"{subject}.path must be a normalized relative path")
+    if not isinstance(revision, str) or not HEX_40_RE.fullmatch(revision):
+        raise ReleaseError(
+            f"{subject}.revision must be 40 lowercase hexadecimal characters"
+        )
+    if not isinstance(digest, str) or not HEX_64_RE.fullmatch(digest):
+        raise ReleaseError(
+            f"{subject}.sha256 must be 64 lowercase hexadecimal characters"
+        )
+    return {"path": path, "revision": revision, "sha256": digest}
+
+
+def validate_command(value: Any, subject: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(argument, str) or not argument for argument in value)
+    ):
+        raise ReleaseError(f"{subject} must be a nonempty array of nonempty strings")
+    return list(value)
+
+
+def parse_exact_invocation(value: str) -> dict[str, Any]:
+    try:
+        receipt = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ReleaseError("GB10_EXACT_INVOCATION is not valid JSON") from error
+    if not isinstance(receipt, dict):
+        raise ReleaseError("GB10_EXACT_INVOCATION must be an object")
+    require_exact_keys(
+        receipt,
+        {"format", "runner", "source_cohort_sha256", "command"},
+        "GB10_EXACT_INVOCATION",
+    )
+    if type(receipt["format"]) is not int or receipt["format"] != 1:
+        raise ReleaseError("GB10_EXACT_INVOCATION.format must be 1")
+    source_digest = receipt["source_cohort_sha256"]
+    if not isinstance(source_digest, str) or not HEX_64_RE.fullmatch(source_digest):
+        raise ReleaseError(
+            "GB10_EXACT_INVOCATION.source_cohort_sha256 must be 64 lowercase "
+            "hexadecimal characters"
+        )
+    return {
+        "runner": validate_runner(
+            receipt["runner"], "GB10_EXACT_INVOCATION.runner"
+        ),
+        "source_cohort_sha256": source_digest,
+        "command": validate_command(
+            receipt["command"], "GB10_EXACT_INVOCATION.command"
+        ),
+    }
+
+
+def build_recipe_from_environment() -> dict[str, Any]:
+    recipe: dict[str, Any] = {
+        "format": 1,
+        "environment": {
+            name: os.environ[name] for name in BUILD_ENVIRONMENT if name in os.environ
+        },
+        "cargo_version_verbose": run("cargo", "--version", "--verbose").rstrip(),
+    }
+    exact_invocation = os.environ.get("GB10_EXACT_INVOCATION")
+    if exact_invocation is not None:
+        recipe.update(parse_exact_invocation(exact_invocation))
+    return recipe
+
+
+def validate_build_recipe(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ReleaseError("staged build_recipe must be an object")
+    base_fields = {"format", "environment", "cargo_version_verbose"}
+    exact_fields = {"runner", "source_cohort_sha256", "command"}
+    fields = set(value)
+    present_exact = fields & exact_fields
+    if present_exact and present_exact != exact_fields:
+        raise ReleaseError(
+            "staged build_recipe runner, source_cohort_sha256, and command must be present together"
+        )
+    require_exact_keys(
+        value,
+        base_fields | (exact_fields if present_exact else set()),
+        "staged build_recipe",
+    )
+    if type(value["format"]) is not int or value["format"] != 1:
+        raise ReleaseError("staged build_recipe.format must be 1")
+    environment = value["environment"]
+    if not isinstance(environment, dict):
+        raise ReleaseError("staged build_recipe.environment must be an object")
+    if any(name not in BUILD_ENVIRONMENT for name in environment):
+        raise ReleaseError(
+            "staged build_recipe.environment contains an unallowlisted name"
+        )
+    if any(not isinstance(item, str) for item in environment.values()):
+        raise ReleaseError("staged build_recipe.environment values must be strings")
+    cargo_version = value["cargo_version_verbose"]
+    if not isinstance(cargo_version, str) or not cargo_version:
+        raise ReleaseError(
+            "staged build_recipe.cargo_version_verbose must be a nonempty string"
+        )
+    if present_exact:
+        validate_runner(value["runner"], "staged build_recipe.runner")
+        source_digest = value["source_cohort_sha256"]
+        if not isinstance(source_digest, str) or not HEX_64_RE.fullmatch(source_digest):
+            raise ReleaseError(
+                "staged build_recipe.source_cohort_sha256 must be 64 lowercase "
+                "hexadecimal characters"
+            )
+        validate_command(value["command"], "staged build_recipe.command")
+
+
 def expected_link(prefix: Path, binary: str) -> str:
     destination = prefix / "lib" / "faculties" / "current" / "bin" / binary
     return os.path.relpath(destination, prefix / "bin")
@@ -302,6 +445,7 @@ def manifest_for(
             "lockfile": "Cargo.lock",
             "lockfile_sha256": sha256(lock_path),
         },
+        "build_recipe": build_recipe_from_environment(),
         "rustc": run("rustc", "--version", "--verbose").rstrip(),
         "sources": repositories,
         "binaries": [
@@ -425,6 +569,8 @@ def validate_staged_release(
         raise ReleaseError(
             f"staged release manifest does not name generation {generation}"
         )
+    if "build_recipe" in manifest:
+        validate_build_recipe(manifest["build_recipe"])
     cargo = manifest.get("cargo")
     if not isinstance(cargo, dict):
         raise ReleaseError("staged release manifest has no Cargo provenance")
@@ -554,11 +700,11 @@ def parser() -> argparse.ArgumentParser:
         default=Path("~/.local"),
         help="installation prefix (default: ~/.local)",
     )
-    result.add_argument("--generation", help="immutable release generation name")
+    result.add_argument("--generation", help="versioned release generation name")
     result.add_argument(
         "--stage-only",
         action="store_true",
-        help="publish and verify the immutable generation without switching current",
+        help="publish and verify a write-once generation without switching current",
     )
     result.add_argument(
         "--activate-staged",

@@ -47,6 +47,11 @@ cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
 ```
 
+The installer stages a content-verified, versioned generation and refuses to
+rewrite an existing generation path. That is a write-once installer policy,
+not filesystem immutability: generation files remain owner-writable, and the
+installer does not `chmod` them read-only.
+
 Atomic activation affects only processes launched afterward. Restart all
 long-lived Faculties writers after installing a cohort, especially armed
 `orient wait` watchers; use `lsof -a -d txt -p <pid>` to verify the executable

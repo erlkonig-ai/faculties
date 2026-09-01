@@ -54,8 +54,10 @@ scripts/install-release-cohort target/release
 cargo install --path ../triblespace-rs/trible --locked
 ```
 
-The cohort installer publishes one immutable generation through
-`~/.local/bin`; put that directory before `~/.cargo/bin` on `PATH`. Do not also
+The cohort installer publishes one content-verified, versioned generation
+through `~/.local/bin`. Each generation path is write-once by the installer,
+not protected by filesystem immutability or permission changes. Put that
+directory before `~/.cargo/bin` on `PATH`. Do not also
 run `cargo install --path . --bins`: that creates a second unmanaged Faculties
 suite in `~/.cargo/bin`, where an older parser can shadow the active cohort and
 misread newer pile records. The installer refuses activation when an earlier
