@@ -51,31 +51,8 @@ pub struct ChunkRow {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MemoryCatalog {
+struct MemoryCatalog {
     pub chunks: BTreeMap<Id, ChunkRow>,
-}
-
-impl MemoryCatalog {
-    pub fn node_ids(&self) -> BTreeSet<Id> {
-        self.chunks.keys().copied().collect()
-    }
-
-    pub fn chunk_ids(&self) -> Vec<Id> {
-        self.chunks.keys().copied().collect()
-    }
-
-    /// Exact targets of an extrinsic historical name.
-    ///
-    /// A legacy chunk id named one historical state, not a moving branch.  A
-    /// union may nevertheless reveal several targets for the same name; that
-    /// ambiguity is returned rather than arbitrated.
-    pub fn alias_targets(&self, alias: Id) -> Vec<Id> {
-        self.chunks
-            .values()
-            .filter(|row| row.aliases.contains(&alias))
-            .map(|row| row.id)
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,7 +306,7 @@ fn load_chunk(space: &TribleSet, id: Id) -> Result<Option<ChunkRow>> {
 /// Strictly project every canonical entry in the episodic Memory journal.
 /// Historical retraction entities and unrelated preserved facts are inert:
 /// only canonical `KIND_CHUNK_ID` records participate in this read model.
-pub fn load_catalog(space: &TribleSet) -> Result<MemoryCatalog> {
+fn load_catalog(space: &TribleSet) -> Result<MemoryCatalog> {
     let chunk_ids = tagged_entities(space, KIND_CHUNK_ID);
     let mut catalog = MemoryCatalog::default();
     for id in &chunk_ids {
@@ -421,10 +398,10 @@ where
     Ok(())
 }
 
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<MemoryCatalog> {
+pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
     let catalog = load_catalog(facts)?;
     validate_payloads(reader, None::<&PileSnapshot>, &catalog)?;
-    Ok(catalog)
+    Ok(())
 }
 
 /// Validate the exact union a publication would create, including blobs still
@@ -433,7 +410,7 @@ pub fn validate_candidate(
     reader: &PileSnapshot,
     current: &TribleSet,
     fragment: &Fragment,
-) -> Result<MemoryCatalog> {
+) -> Result<()> {
     let prior = load_catalog(current)?;
     let mut union = current.clone();
     union += fragment.facts().clone();
@@ -451,7 +428,7 @@ pub fn validate_candidate(
         .snapshot()
         .context("snapshot staged Memory attachments")?;
     validate_payloads(reader, Some(&overlay), &catalog)?;
-    Ok(catalog)
+    Ok(())
 }
 
 pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
@@ -563,7 +540,8 @@ mod tests {
         };
 
         let catalog = load_catalog(&facts([base_fragment, later_fragment, retraction])).unwrap();
-        assert_eq!(catalog.chunk_ids(), vec![base.min(later), base.max(later)]);
+        let ids: Vec<Id> = catalog.chunks.keys().copied().collect();
+        assert_eq!(ids, vec![base.min(later), base.max(later)]);
         assert_eq!(catalog.chunks[&later].predecessors, BTreeSet::from([base]));
     }
 
@@ -641,8 +619,8 @@ mod tests {
             metadata::created_at: point(30.0),
         };
 
-        let catalog = validate_catalog(&reader, rows.facts()).unwrap();
-        assert!(catalog.chunks.is_empty());
+        validate_catalog(&reader, rows.facts()).unwrap();
+        assert!(load_catalog(rows.facts()).unwrap().chunks.is_empty());
         pile_store.close().unwrap();
     }
 
@@ -660,14 +638,14 @@ mod tests {
         let fragment = chunk_fragment(draft("resident only in fragment"))
             .unwrap()
             .0;
-        let catalog = validate_candidate(&reader, &before, &fragment).unwrap();
-        assert_eq!(catalog.chunks.len(), 1);
+        validate_candidate(&reader, &before, &fragment).unwrap();
+        assert_eq!(load_catalog(&before).unwrap().chunks.len(), 0);
 
         pile_store.commit(collection, &signer, fragment).unwrap();
         let reader = pile_store.snapshot().unwrap();
         let (after, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
-        let catalog = validate_catalog(&reader, &after).unwrap();
-        assert_eq!(catalog.chunks.len(), 1);
+        validate_catalog(&reader, &after).unwrap();
+        assert_eq!(load_catalog(&after).unwrap().chunks.len(), 1);
         pile_store.close().unwrap();
     }
 
