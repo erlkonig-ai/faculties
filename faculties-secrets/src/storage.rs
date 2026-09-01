@@ -742,10 +742,9 @@ fn read_vault_cover<S>(snapshot: &S, cover: &FactCover) -> Result<TribleSet>
 where
     S: BlobStoreGet + BlobStoreMeta + triblespace::core::collection::CollectionRead,
 {
-    let physical = cover
-        .resolve(snapshot)
-        .context("resolve candidate-scoped vault cover")?;
-    TribleSet::try_from_cover(&physical, snapshot).context("read candidate-scoped vault cover")
+    cover
+        .materialize::<TribleSet, _>(snapshot)
+        .context("read candidate-scoped vault cover")
 }
 
 fn read_atom(collection: CollectionHandle) -> CapabilityAtom {

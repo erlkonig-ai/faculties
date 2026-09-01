@@ -28,7 +28,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
-    CollectionRecordSelector, CollectionStoreExt, FactCover, TryFromCover,
+    CollectionRecordSelector, CollectionStoreExt, FactCover,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
@@ -145,10 +145,8 @@ where
     let cover = collection
         .admitted(snapshot)
         .context("discover authorized collection cover")?;
-    let physical = cover
-        .resolve(snapshot)
-        .context("resolve authorized collection cover")?;
-    let facts = TribleSet::try_from_cover(&physical, snapshot)
+    let facts = cover
+        .materialize::<TribleSet, _>(snapshot)
         .context("read authorized collection facts")?;
     Ok((facts, cover))
 }
@@ -165,10 +163,8 @@ where
     let (cover, commits) = collection
         .admitted_with_commits(snapshot)
         .context("discover authorized collection cover and commits")?;
-    let physical = cover
-        .resolve(snapshot)
-        .context("resolve authorized collection cover")?;
-    let facts = TribleSet::try_from_cover(&physical, snapshot)
+    let facts = cover
+        .materialize::<TribleSet, _>(snapshot)
         .context("read authorized collection facts")?;
     Ok((facts, cover, commits))
 }
