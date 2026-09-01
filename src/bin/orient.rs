@@ -4211,6 +4211,52 @@ mod tests {
     }
 
     #[test]
+    fn selected_checkpoint_view_ignores_malformed_discarded_payload() {
+        use faculties::schemas::orient::{checkpoint, KIND_CHECKPOINT_EVENT};
+
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let mut malformed = Fragment::empty();
+        let payload = malformed.put::<blobencodings::UTF8String, _>("not a checkpoint view");
+        malformed += entity! {
+            metadata::tag: &KIND_CHECKPOINT_EVENT,
+            checkpoint::persona: &persona,
+            checkpoint::view: payload,
+            metadata::created_at: epoch_interval(Epoch::from_unix_seconds(1.0)),
+        };
+        let expected = view("current");
+        malformed += orient_model::checkpoint_fragment(
+            persona,
+            &expected,
+            epoch_interval(Epoch::from_unix_seconds(2.0)),
+        )
+        .unwrap()
+        .0;
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            malformed,
+        );
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        assert_eq!(
+            latest_checkpoint_view(&catalogs, persona).unwrap(),
+            Some(expected)
+        );
+        let error = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("parse Orient checkpoint view"),
+            "{error:#}"
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn live_habit_nudge_and_script_are_selected_payload_obligations() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
