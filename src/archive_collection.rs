@@ -303,6 +303,54 @@ impl ArchiveImportWriter {
         self.delta.facts().len()
     }
 
+    /// Publish ONE rollout's staged delta and keep the pile open.
+    ///
+    /// Atomicity is per rollout; it was never per PROCESS. Opening the pile
+    /// costs ~9.3 s on the live 44 GB pile against ~1 s of actual projection
+    /// for a 478 KB rollout (measured 2026-09-01), so paying it once per file
+    /// put a full Codex backfill — 3,161 refused rollouts — at about 8.2 hours
+    /// of pure pile-opening before any work. JP: "we can commit multiple times
+    /// in the same process right xD?" Yes. Same one-signed-COMMIT-per-rollout
+    /// guarantee, one open.
+    ///
+    /// `current` MUST absorb what was just published, or the next rollout's
+    /// idempotence check would re-stage facts this commit already carries —
+    /// which is the whole reason resumed Codex rollouts (they replay large
+    /// parent prefixes) are cheap to ingest in sequence rather than expensive.
+    pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
+        if self.delta.facts().is_empty() {
+            return Ok(None);
+        }
+        let reader = self
+            .pile
+            .snapshot()
+            .context("open staged Archive dependency reader")?;
+        let (_, validation) = blockdag::validate_catalog_union(&reader, &self.current, &self.delta)
+            .context("validate staged Archive union")?;
+        require_accepted(validation, "staged Archive union")?;
+        let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
+        let published = fragment.facts().clone();
+        let commit = self
+            .pile
+            .commit(self.collection, &self.signer, fragment)
+            .context("commit authored Archive projection unit")?;
+        self.current += published;
+        Ok(Some(commit))
+    }
+
+    /// Close the pile, publishing any still-staged delta first.
+    pub fn close<T>(mut self, surrounding: Result<T>) -> Result<T> {
+        let result = surrounding.and_then(|value| {
+            self.commit_unit()?;
+            Ok(value)
+        });
+        close_pile(
+            self.pile,
+            result,
+            "closing Archive pile after failure also failed",
+        )
+    }
+
     pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, Option<CollectionCommit>)> {
         let result = surrounding.and_then(|value| {
             if self.delta.facts().is_empty() {

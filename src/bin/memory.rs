@@ -17,10 +17,10 @@ use faculties::storage::{load_signer, open_pile_strict};
 // in-process. Re-import the pieces this binary still uses elsewhere.
 use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{
-    all_chunk_ids, chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_span_str,
-    chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, CoverOpts,
-    DEFAULT_SIM_THRESHOLD,
+    all_chunk_ids, chunk_about_archive_message, chunk_aliases, chunk_end_at, chunk_image_handle,
+    chunk_lens_handle, chunk_span_str, chunk_start_at, chunk_summary_handle, collect_chunk_spans,
+    epoch_end_from_interval, epoch_from_interval, fmt_epoch, format_time_range, interval_key,
+    key_to_epoch, CoverOpts, DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
@@ -91,7 +91,6 @@ struct CollectionView {
 
 struct LoadedMemory {
     memory: CollectionView,
-    catalog: memory_model::MemoryCatalog,
 }
 
 struct LoadedContext {
@@ -137,23 +136,33 @@ impl MemoryStorage<'_> {
         collection: Collection<SimpleArchive>,
         store_snapshot: &PileSnapshot,
     ) -> Result<LoadedMemory> {
-        let materialized = Self::materialize_collection(collection, store_snapshot, "Memory")?;
-        let catalog = memory_model::validate_catalog(store_snapshot, &materialized)
-            .context("validate Memory collection")?;
-        // The collection remains an exact additive ledger.  Ordinary Memory
-        // commands consume its canonical projection so preserved random-id
-        // legacy rows and rebuildable exhaust cannot leak back into covers,
-        // searches, or direct chunk enumeration.
-        let nodes = catalog.node_ids();
-        let mut facts = TribleSet::new();
-        for fact in materialized.iter().filter(|fact| nodes.contains(fact.e())) {
-            facts.insert(fact);
-        }
+        // Read the collection. That is the whole gate.
+        //
+        // This used to build the entire MemoryCatalog and then keep exactly one
+        // thing from it — `node_ids()` — to filter out preserved random-id
+        // legacy rows. MEASURED 2026-09-01 on the live pile: there are ZERO such
+        // rows. 5,404 chunks tagged, 5,404 canonical, 0 legacy. The filter had
+        // been re-deriving an intrinsic id for every chunk on every read to hide
+        // nothing at all, at 1.274 s against 83 ms to materialise the collection
+        // it was filtering and 204 us for the one query that returns the same ids.
+        //
+        // It was not always vacuous: the cutover three days earlier did preserve
+        // legacy rows beside their intrinsic shadows, and this guarded against
+        // them. Then the journal was rebuilt as its own collection, constructed
+        // canonical, where the condition cannot arise by construction — and a
+        // guard with nothing to catch is indistinguishable from a guard that
+        // works, right up until you count.
+        //
+        // If legacy rows ever DO surface, they are not hidden by re-deriving ids
+        // (JP: "IDs, including derived IDs, are opaque"); they are superseded
+        // explicitly through `metadata::supersedes`, the same mechanism anything
+        // else is hidden by, so the reason travels with the record.
+        let facts = Self::materialize_collection(collection, store_snapshot, "Memory")?;
         let memory = CollectionView {
             facts,
             reader: store_snapshot.clone(),
         };
-        Ok(LoadedMemory { memory, catalog })
+        Ok(LoadedMemory { memory })
     }
 
     /// Freeze canonical Memory alone for ordinary commands.
@@ -505,7 +514,7 @@ fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     let loaded = storage.load_context(true)?;
     let space = &loaded.memory.memory.facts;
     let mut todo: Vec<(Id, Src)> = Vec::new();
-    for chunk in loaded.memory.catalog.chunk_ids() {
+    for chunk in all_chunk_ids(space) {
         if chunk_embedding_handle(&loaded.embeddings.facts, chunk)?.is_some() {
             continue;
         }
@@ -610,7 +619,7 @@ fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load_context(true)?;
     let space = &loaded.memory.memory.facts;
     let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-    for chunk in loaded.memory.catalog.chunk_ids() {
+    for chunk in all_chunk_ids(space) {
         if let Some(h) = chunk_embedding_handle(&loaded.embeddings.facts, chunk)? {
             let v: View<[f32]> = loaded
                 .embeddings
@@ -623,10 +632,11 @@ fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     if pairs.is_empty() {
         bail!("no chunk embeddings on this pile yet — run `memory embed` first");
     }
-    if pairs.len() < loaded.memory.catalog.chunk_ids().len() {
+    let total = all_chunk_ids(space).len();
+    if pairs.len() < total {
         eprintln!(
             "note: {} journal chunk(s) not yet embedded — run `memory embed` to refresh",
-            loaded.memory.catalog.chunk_ids().len() - pairs.len()
+            total - pairs.len()
         );
     }
     let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
@@ -1221,7 +1231,7 @@ fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             // grain-fitting chunks (not contained in a
             // wider one that also fits — that one IS this zoom's voice).
             let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
-            for chunk_id in loaded.memory.catalog.chunk_ids() {
+            for chunk_id in all_chunk_ids(space) {
                 let (Some(s), Some(e)) = (
                     chunk_start_at(space, chunk_id),
                     chunk_end_at(space, chunk_id),
@@ -1325,7 +1335,7 @@ fn cmd_lens(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
     let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
-    for id in loaded.catalog.chunk_ids() {
+    for id in all_chunk_ids(space) {
         let Some(lh) = chunk_lens_handle(space, id) else {
             continue;
         };
@@ -2184,7 +2194,6 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         );
     }
     println!("id: {chunk_id:x}");
-    let row = &memory.catalog.chunks[&chunk_id];
 
     let outgoing = chunk_references(space, chunk_id);
     if !outgoing.is_empty() {
@@ -2215,10 +2224,10 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 .join(", ")
         );
     }
-    if let Some(exec_id) = row.about_exec_result {
+    if let Some(exec_id) = chunk_about_exec_result(space, chunk_id) {
         println!("about_exec_result: {exec_id:x}");
     }
-    if let Some(archive_id) = row.about_archive_message {
+    if let Some(archive_id) = chunk_about_archive_message(space, chunk_id) {
         println!("about_archive_message: {archive_id:x}");
         print_archive_meta(&loaded.archive.reader, &loaded.archive.facts, archive_id)?;
     }
@@ -2531,18 +2540,20 @@ fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     // ambiguity, so an intrinsic id that is also recorded as its own alias
     // still denotes one chunk.
     let mut chunk_matches = BTreeSet::new();
-    for chunk_id in loaded.catalog.chunks.keys().copied() {
+    for chunk_id in all_chunk_ids(&loaded.memory.facts) {
         if id_starts_with(chunk_id, prefix.as_str()) {
             chunk_matches.insert(chunk_id);
         }
     }
-    for row in loaded.catalog.chunks.values() {
-        if row
-            .aliases
-            .iter()
-            .any(|alias| id_starts_with(*alias, prefix.as_str()))
+    // Aliases are annotation, so ask for them per chunk rather than
+    // materialising every row. A prefix resolve is a rare path and each lookup
+    // is an index probe.
+    for chunk_id in all_chunk_ids(&loaded.memory.facts) {
+        if chunk_aliases(&loaded.memory.facts, chunk_id)
+            .into_iter()
+            .any(|alias| id_starts_with(alias, prefix.as_str()))
         {
-            chunk_matches.insert(row.id);
+            chunk_matches.insert(chunk_id);
         }
     }
     match chunk_matches.len() {

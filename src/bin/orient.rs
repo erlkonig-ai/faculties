@@ -1877,15 +1877,16 @@ fn cmd_wake(
             .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
         let catalogs = load_native_catalogs(&mut storage, &signer)?;
 
-        let memory_catalog = memory_model::validate_catalog(&memory_reader, &memory_facts)
-            .map_err(|error| anyhow!("validate Memory collection: {error:#}"))?;
-        let nodes = memory_catalog.node_ids();
-        let mut memory = TribleSet::new();
-        for fact in memory_facts.iter().filter(|fact| nodes.contains(fact.e())) {
-            memory.insert(fact);
-        }
+        // `render_cover` reads the collection directly. This used to build the
+        // whole MemoryCatalog first and keep only `node_ids()`, to filter out
+        // preserved random-id legacy rows — of which there are ZERO on the live
+        // pile (measured 2026-09-01: 5,404 tagged, 5,404 canonical). It cost
+        // ~1.2 s of a ~10.4 s `orient wake` to hide nothing, and `memory_cover`
+        // never touched the catalog in the first place. Removed alongside the
+        // identical gate in `bin/memory.rs`; if legacy rows ever surface they
+        // are superseded explicitly rather than hidden by re-derived ids.
         let cover = render_cover(
-            &memory,
+            &memory_facts,
             &TribleSet::new(),
             &memory_reader,
             &CoverOpts::plain(chars),

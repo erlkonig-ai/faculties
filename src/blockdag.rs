@@ -349,11 +349,48 @@ pub fn block(
     if parts.exports().next().is_none() && (!predecessors.is_empty() || timestamp.is_some()) {
         bail!("a content-free block must be the predecessor-free, timeless canonical bottom");
     }
-    let fragment = entity! { _ @
+    // IDENTITY IS `previous` + CONTENT. The timestamp is an ANNOTATION on that
+    // identity, not part of it.
+    //
+    // It used to be in the core, for a good reason: first blocks have no
+    // `previous`, so without a timestamp two conversations opening with the
+    // same content collide at the root. But that assumed the timestamp is a
+    // property of the EVENT. For Codex it is a property of WHEN THE FILE WAS
+    // WRITTEN, and it changes on every reload.
+    //
+    // MEASURED 2026-09-01, two consecutive rollouts of one resumed session:
+    // three byte-identical payloads, ZERO with the same timestamp — each
+    // restamped to the replay moment (13:12:16.185Z -> 14:03:56.153Z), and two
+    // events originally 1 ms apart collapsed onto the SAME new value, so the
+    // original timing is destroyed rather than shifted. Identical text
+    // therefore hashed to different blocks, and the replayed prefix was
+    // re-stored: 872 KB of source added 1238 KB of pile. With ONE 2026-08
+    // conversation carrying 622 rollouts, that is one conversation stored
+    // several hundred times.
+    //
+    // Collapsing is also the TRUER statement. A replayed block is the same
+    // block observed again; storing it 622 times asserts 622 distinct events.
+    // Nothing is lost by collapsing, because multiplicity lives where it is
+    // actually true: `source_projection` is identified by source locator and
+    // raw record bytes and carries its own `source_timestamp`, so every
+    // occurrence stays distinguishable and a query joining on time enumerates
+    // them all. JP: "the timestamps unfold them."
+    //
+    // Root collisions become correct rather than hazardous: two conversations
+    // that genuinely open with identical content DO share that opening, and
+    // diverge at the first block that differs. This mirrors what Memory
+    // already does — `observed_at` is a BTreeSet in `annotate_chunk`, never in
+    // `chunk_core` ("genuine creation/import observations, outside intrinsic
+    // state").
+    let mut fragment = entity! { _ @
         schema::block::previous*: predecessors.iter(),
-        schema::block::timestamp?: timestamp,
         schema::block::contains*: parts,
     };
+    let root = rooted(&fragment, "block")?;
+    fragment += entity! { ExclusiveId::force_ref(&root) @
+        schema::block::timestamp?: timestamp,
+    };
+    debug_assert_eq!(fragment.root(), Some(root));
     attach_kind(fragment, schema::block::KIND, "block")
 }
 

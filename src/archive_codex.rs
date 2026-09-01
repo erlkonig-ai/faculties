@@ -619,12 +619,27 @@ fn consistent_session_id(payload: &CodexPayload) -> Result<String> {
         .session_id
         .as_deref()
         .filter(|value| !value.trim().is_empty());
-    if let (Some(id), Some(session_id)) = (id, session_id) {
-        if id != session_id {
-            bail!("Codex session_meta payload id {id:?} disagrees with session_id {session_id:?}");
-        }
-    }
-    id.or(session_id)
+    // `id` and `session_id` are DIFFERENT THINGS in the post-2026-07 rollout
+    // format, and requiring them equal refused every recent Codex session.
+    // MEASURED 2026-09-01 over 8,265 rollouts in ~/.codex/sessions/2026:
+    //
+    //   2026-01..06   0% refused   (older shape: `id` only, no session_id)
+    //   2026-07..09  99% refused   (3,161 files carrying both)
+    //
+    // That is a clean format cutover, not a data defect — and it meant the
+    // Codex half of the archive silently stopped ingesting in July while
+    // nothing announced it. Exactly the failure the archive epic exists to
+    // prevent (compass 9d9768c9: "the absence of a transcript is
+    // indistinguishable from its never having existed").
+    //
+    // `id` identifies THIS ROLLOUT and matches the filename; `session_id`
+    // identifies the CONVERSATION and is stable across resumes. The archive's
+    // unit is a conversation — a DAG whose complete ancestry `archive thread`
+    // walks — so `session_id` is the correct identity and must WIN. Preferring
+    // `id` would shatter one resumed conversation into as many conversations
+    // as it had resumes.
+    session_id
+        .or(id)
         .map(ToString::to_string)
         .ok_or_else(|| anyhow!("Codex session_meta payload has neither id nor session_id"))
 }

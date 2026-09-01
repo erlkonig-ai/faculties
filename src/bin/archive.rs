@@ -60,10 +60,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Project one source into the Archive and publish one COMMIT.
+    /// Project one or more sources into the Archive, publishing one COMMIT each.
+    ///
+    /// Several PATHS are projected in ONE process: the pile is opened once and
+    /// each source still gets its own signed commit. Atomicity is per source,
+    /// not per process — and the open costs ~9.3 s on the live pile against ~1 s
+    /// of projection for a small rollout, so a per-file process put a 3,161-file
+    /// Codex backfill at ~8.2 hours of pure opening.
     Import {
-        /// Source file or directory accepted by the selected adapter.
-        path: PathBuf,
+        /// Source files (or a directory, where the adapter accepts one).
+        #[arg(required = true, num_args = 1..)]
+        path: Vec<PathBuf>,
         /// Source adapter used to interpret PATH.
         #[arg(long, value_enum, default_value = "claude-code")]
         source: ImportSource,
@@ -203,6 +210,41 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     });
 }
 
+/// Import every PATH in one process, one signed COMMIT per source.
+///
+/// A failure names the path that caused it and stops: the sources already
+/// committed stay committed, because each was its own atomic publication. That
+/// is the property that made per-file processes look necessary; it never was.
+fn run_import_all(
+    storage: ArchiveStorage<'_>,
+    paths: &[PathBuf],
+    source: ImportSource,
+) -> Result<()> {
+    if paths.len() == 1 {
+        return run_import(storage, &paths[0], source);
+    }
+    let total = paths.len();
+    if source == ImportSource::Codex {
+        // The batch case that matters: 3,161 refused Codex rollouts, and the
+        // open is ~9.3 s against ~1 s of projection. One open, N commits.
+        let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+        let result = (|| {
+            for (index, path) in paths.iter().enumerate() {
+                eprintln!("[{}/{total}] {}", index + 1, path.display());
+                run_codex_into(&mut writer, path)
+                    .with_context(|| format!("import {}", path.display()))?;
+            }
+            Ok(())
+        })();
+        return writer.close(result);
+    }
+    for (index, path) in paths.iter().enumerate() {
+        eprintln!("[{}/{total}] {}", index + 1, path.display());
+        run_import(storage, path, source).with_context(|| format!("import {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn run_import(storage: ArchiveStorage<'_>, path: &Path, source: ImportSource) -> Result<()> {
     match source {
         ImportSource::Agy => run_agy_import(storage, path),
@@ -252,6 +294,29 @@ fn run_claude_code_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()
 }
 
 fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let result = run_codex_into(&mut writer, path);
+    writer.close(result)
+}
+
+/// Project one Codex rollout into an ALREADY-OPEN writer and commit it.
+///
+/// Split out so a batch can open the pile once and still publish one signed
+/// commit per rollout — the atomicity was always per source, never per process.
+fn run_codex_into(writer: &mut ArchiveImportWriter, path: &Path) -> Result<()> {
+    let projection = archive_codex::project_path(path, |projected| {
+        writer
+            .stage_fragment(projected.fragment)
+            .with_context(|| format!("stage {}", projected.source_path.display()))
+    });
+    let summary = projection?;
+    let commit = writer.commit_unit()?;
+    print_codex_import_summary(&summary, commit.is_some());
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn run_codex_import_legacy(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
     let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_codex::project_path(path, |projected| {
         writer
@@ -1039,7 +1104,7 @@ fn main() -> Result<()> {
         key: cli.key.as_deref(),
     };
     match command {
-        Command::Import { path, source } => run_import(storage, &path, source),
+        Command::Import { path, source } => run_import_all(storage, &path, source),
         Command::List { limit } => run_list(storage, limit),
         Command::Show { id } => run_show(storage, &id),
         Command::Thread { id, limit } => run_thread(storage, &id, limit),

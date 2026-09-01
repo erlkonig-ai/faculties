@@ -79,6 +79,16 @@ pub fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> 
     find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
 }
 
+/// What archive message this chunk is about, if any.
+pub fn chunk_about_archive_message(space: &TribleSet, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_archive_message: ?v }])).next()
+}
+
+/// A chunk's extrinsic historical names. Annotation, never intrinsic state.
+pub fn chunk_aliases(space: &TribleSet, id: Id) -> Vec<Id> {
+    find!(v: Id, pattern!(space, [{ id @ metadata::anchor: ?v }])).collect()
+}
+
 pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
 }
