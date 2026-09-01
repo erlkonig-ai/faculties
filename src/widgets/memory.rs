@@ -28,7 +28,11 @@ use hifitime::Epoch;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::memory::{self, ChunkContent};
+use crate::memory::{self};
+use crate::memory_cover::{
+    all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_end_at,
+    chunk_references, chunk_start_at, chunk_summary_handle,
+};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 use triblespace::core::id::Id;
 
@@ -106,23 +110,25 @@ impl MemorySnapshot {
         // this exact snapshot already.  Keeping the widget boundary strict
         // makes a directly embedded viewer surface malformed structure or
         // missing payloads as a diagnostic instead of partially rendering it.
-        let catalog = memory::validate_catalog(dataset.reader, dataset.facts)
+        memory::validate_catalog(dataset.reader, dataset.facts)
             .map_err(|error| format!("validate Memory collection: {error:#}"))?;
+        let space = dataset.facts;
+        let mut ids = all_chunk_ids(space);
+        ids.sort_unstable();
         let mut chunks = Vec::new();
-        for id in catalog.chunk_ids() {
-            let row = &catalog.chunks[&id];
-            let (start, _): (Epoch, Epoch) = row
-                .start_at
+        for id in ids {
+            let (start, _): (Epoch, Epoch) = chunk_start_at(space, id)
+                .ok_or_else(|| format!("Memory chunk {id:x} is missing start"))?
                 .try_from_inline()
                 .map_err(|error| format!("decode Memory chunk {id:x} start: {error:?}"))?;
-            let (end, _): (Epoch, Epoch) = row
-                .end_at
+            let (end, _): (Epoch, Epoch) = chunk_end_at(space, id)
+                .ok_or_else(|| format!("Memory chunk {id:x} is missing end"))?
                 .try_from_inline()
                 .map_err(|error| format!("decode Memory chunk {id:x} end: {error:?}"))?;
-            let summary = match row.content {
-                ChunkContent::Text(handle) => memory::read_text(dataset.reader, handle)
+            let summary = match chunk_summary_handle(space, id) {
+                Some(handle) => memory::read_text(dataset.reader, handle)
                     .map_err(|error| format!("read Memory chunk {id:x}: {error:#}"))?,
-                ChunkContent::Image(_) => "Image memory".to_owned(),
+                None => "Image memory".to_owned(),
             };
             chunks.push(ChunkRow {
                 id,
@@ -131,9 +137,9 @@ impl MemorySnapshot {
                 end: epoch_to_chrono(end)
                     .ok_or_else(|| format!("Memory chunk {id:x} end is outside viewer range"))?,
                 summary,
-                reference_count: row.references.len(),
-                about_exec_result: row.about_exec_result,
-                about_archive_message: row.about_archive_message,
+                reference_count: chunk_references(space, id).len(),
+                about_exec_result: chunk_about_exec_result(space, id),
+                about_archive_message: chunk_about_archive_message(space, id),
             });
         }
         let total = chunks.len();
@@ -548,10 +554,10 @@ mod tests {
         let (second_fragment, second) = chunk("second telling");
         fragment += second_fragment;
 
-        let catalog = memory::load_catalog(fragment.facts()).unwrap();
+        let mut ids = all_chunk_ids(fragment.facts());
+        ids.sort_unstable();
         let mut expected = vec![first, second];
         expected.sort_unstable();
-        assert_eq!(catalog.chunk_ids(), expected);
-        assert_eq!(catalog.chunks.len(), 2);
+        assert_eq!(ids, expected);
     }
 }
