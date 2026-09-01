@@ -91,7 +91,7 @@ class ReleaseCohortTest(unittest.TestCase):
                 "sha256": "b" * 64,
             },
             "source_cohort_sha256": "c" * 64,
-            "command": ["cargo", "build", "--release", "--locked"],
+            "command": ["cargo", "build", "--config", "", "--release", "--locked"],
         }
 
     def activate(

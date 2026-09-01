@@ -240,9 +240,9 @@ def validate_command(value: Any, subject: str) -> list[str]:
     if (
         not isinstance(value, list)
         or not value
-        or any(not isinstance(argument, str) or not argument for argument in value)
+        or any(not isinstance(argument, str) for argument in value)
     ):
-        raise ReleaseError(f"{subject} must be a nonempty array of nonempty strings")
+        raise ReleaseError(f"{subject} must be a nonempty array of strings")
     return list(value)
 
 
