@@ -245,13 +245,59 @@ struct NativeCatalogs {
     reader: PileSnapshot,
 }
 
-fn read_collection(
+#[derive(Debug)]
+struct PhysicalCoverIncompleteness {
+    collection: &'static str,
+    missing: FactCover,
+}
+
+impl std::fmt::Display for PhysicalCoverIncompleteness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} collection awaits {} cover member(s)",
+            self.collection,
+            self.missing.len(),
+        )
+    }
+}
+
+enum FactCollectionLoad {
+    Coherent(TribleSet, FactCover),
+    Incomplete(PhysicalCoverIncompleteness),
+}
+
+fn read_collection_if_available(
     collection: Collection<SimpleArchive>,
     store_snapshot: &PileSnapshot,
-    label: &str,
-) -> Result<(TribleSet, FactCover)> {
-    faculties::storage::read_fact_collection(collection, store_snapshot)
-        .map_err(|error| anyhow!("materialize {label} collection: {error}"))
+    label: &'static str,
+) -> Result<FactCollectionLoad> {
+    let cover = collection
+        .admitted(store_snapshot)
+        .map_err(|error| anyhow!("admit {label} collection: {error}"))?;
+    let available = cover
+        .available(store_snapshot)
+        .map_err(|error| anyhow!("inspect {label} collection residency: {error}"))?;
+    if available != cover {
+        let missing = cover
+            .difference(&available)
+            .expect("availability remains in the admitted collection lattice");
+        return Ok(FactCollectionLoad::Incomplete(
+            PhysicalCoverIncompleteness {
+                collection: label,
+                missing,
+            },
+        ));
+    }
+    let facts = cover
+        .materialize::<TribleSet, _>(store_snapshot)
+        .map_err(|error| anyhow!("materialize {label} collection: {error}"))?;
+    Ok(FactCollectionLoad::Coherent(facts, cover))
+}
+
+enum NativeCatalogLoad {
+    Coherent(NativeCatalogs),
+    Incomplete(PhysicalCoverIncompleteness),
 }
 
 /// Read every collection that contributes to Orient from one refreshed Pile.
@@ -262,7 +308,7 @@ fn load_catalogs(
     signer: &SigningKey,
     include_habits: bool,
     validate_whole_catalogs: bool,
-) -> Result<NativeCatalogs> {
+) -> Result<NativeCatalogLoad> {
     let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
     let mail_collection = open_scope(pile, MAIL_SCOPE_ID, signer)?;
     // Teams participates in news but is deliberately not run through
@@ -283,18 +329,29 @@ fn load_catalogs(
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
 
-    let (relations_facts, _) = read_collection(relations_collection, &reader, "Relations")?;
-    let (mail_facts, _) = read_collection(mail_collection, &reader, "Mail")?;
-    let (teams_facts, _) = read_collection(teams_collection, &reader, "Teams")?;
-    let (message_facts, _) = read_collection(message_collection, &reader, "Message")?;
-    let (compass_facts, compass_cover) = read_collection(compass_collection, &reader, "Compass")?;
-    let (status_facts, _) = read_collection(status_collection, &reader, "Status")?;
-    let habit_facts = habit_collection
-        .map(|collection| read_collection(collection, &reader, "Habit"))
-        .transpose()?
-        .map(|(facts, _)| facts);
-    let (checkpoint_facts, checkpoint_cover) =
-        read_collection(checkpoint_collection, &reader, "Orient")?;
+    macro_rules! coherent {
+        ($collection:expr, $label:literal) => {
+            match read_collection_if_available($collection, &reader, $label)? {
+                FactCollectionLoad::Coherent(facts, cover) => (facts, cover),
+                FactCollectionLoad::Incomplete(incomplete) => {
+                    return Ok(NativeCatalogLoad::Incomplete(incomplete));
+                }
+            }
+        };
+    }
+
+    let (relations_facts, _) = coherent!(relations_collection, "Relations");
+    let (mail_facts, _) = coherent!(mail_collection, "Mail");
+    let (teams_facts, _) = coherent!(teams_collection, "Teams");
+    let (message_facts, _) = coherent!(message_collection, "Message");
+    let (compass_facts, compass_cover) = coherent!(compass_collection, "Compass");
+    let (status_facts, _) = coherent!(status_collection, "Status");
+    let habit_facts = if let Some(collection) = habit_collection {
+        Some(coherent!(collection, "Habit").0)
+    } else {
+        None
+    };
+    let (checkpoint_facts, checkpoint_cover) = coherent!(checkpoint_collection, "Orient");
 
     if validate_whole_catalogs {
         relations::validate_catalog(&reader, &relations_facts)
@@ -323,7 +380,7 @@ fn load_catalogs(
         orient_model::checkpoint_register_collection(pile, signer.verifying_key())?
             .ensure(pile, &checkpoint_cover)
             .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
-    Ok(NativeCatalogs {
+    Ok(NativeCatalogLoad::Coherent(NativeCatalogs {
         messages: message_facts,
         mail: mail_facts,
         teams: teams_facts,
@@ -335,11 +392,43 @@ fn load_catalogs(
         checkpoints: checkpoint_facts,
         checkpoint_register,
         reader,
-    })
+    }))
 }
 
 fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
-    load_catalogs(pile, signer, true, true)
+    match load_catalogs(pile, signer, true, true)? {
+        NativeCatalogLoad::Coherent(catalogs) => Ok(catalogs),
+        NativeCatalogLoad::Incomplete(incomplete) => Err(anyhow!(
+            "physical collection cover is incomplete: {incomplete}"
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum CatalogAdvance {
+    Coherent,
+    Incomplete(PhysicalCoverIncompleteness),
+}
+
+#[derive(Default)]
+struct CoherentCatalogs {
+    current: Option<NativeCatalogs>,
+}
+
+impl CoherentCatalogs {
+    fn advance(&mut self, pile: &mut Pile, signer: &SigningKey) -> Result<CatalogAdvance> {
+        match load_catalogs(pile, signer, true, true)? {
+            NativeCatalogLoad::Coherent(catalogs) => {
+                self.current = Some(catalogs);
+                Ok(CatalogAdvance::Coherent)
+            }
+            NativeCatalogLoad::Incomplete(incomplete) => Ok(CatalogAdvance::Incomplete(incomplete)),
+        }
+    }
+
+    fn get(&self) -> Option<&NativeCatalogs> {
+        self.current.as_ref()
+    }
 }
 
 /// Load exactly the domains consulted by one non-blocking news check.
@@ -349,8 +438,11 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
 /// history on every prompt. Exact collection materialization still withholds
 /// incomplete covers, while the maintained checkpoint index names the one
 /// canonical event row this poll must decode.
-fn load_poll_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
-    load_catalogs(pile, signer, false, false)
+fn load_poll_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Option<NativeCatalogs>> {
+    match load_catalogs(pile, signer, false, false)? {
+        NativeCatalogLoad::Coherent(catalogs) => Ok(Some(catalogs)),
+        NativeCatalogLoad::Incomplete(_) => Ok(None),
+    }
 }
 
 fn native_task_title(catalogs: &NativeCatalogs, task: Id) -> String {
@@ -1666,7 +1758,9 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let catalogs = load_poll_catalogs(&mut pile, &signer)?;
+        let Some(catalogs) = load_poll_catalogs(&mut pile, &signer)? else {
+            return Ok(());
+        };
         let persona_id = resolve_native_persona(&catalogs, input)?;
         match check_news_once(&mut pile, &signer, &catalogs, persona_id, peek)? {
             // News printed (+ checkpoint advanced unless peeking).
@@ -1721,6 +1815,12 @@ fn cmd_migrate_note_frontier(
     close_pile(pile, result)
 }
 
+struct WaitOutcome {
+    news_printed: bool,
+    incomplete: Option<PhysicalCoverIncompleteness>,
+    had_coherent_catalogs: bool,
+}
+
 fn cmd_wait(
     pile_path: &Path,
     key: Option<&Path>,
@@ -1746,16 +1846,63 @@ fn cmd_wait(
             .len();
         pile.refresh()
             .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
-        let mut catalogs = load_native_catalogs(&mut pile, &signer)?;
-        let persona_id = resolve_native_persona(&catalogs, persona_input)?;
+        let poll = Duration::from_millis(poll_ms.max(1));
+        let start = Instant::now();
+        let mut catalogs = CoherentCatalogs::default();
+        let mut incomplete;
+
+        // A watcher may start after a COMMIT arrived but before its immutable
+        // member bytes. Such a prefix is parsed and meaningful, just not yet
+        // physically readable. Wait for a longer prefix instead of failing or
+        // inventing a partial semantic baseline.
+        loop {
+            match catalogs.advance(&mut pile, &signer)? {
+                CatalogAdvance::Coherent => {
+                    incomplete = None;
+                    break;
+                }
+                CatalogAdvance::Incomplete(pending) => incomplete = Some(pending),
+            }
+
+            if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
+                return Ok(WaitOutcome {
+                    news_printed: false,
+                    incomplete,
+                    had_coherent_catalogs: false,
+                });
+            }
+            std::thread::sleep(poll);
+            let current_length = std::fs::metadata(pile_path)
+                .map_err(|error| anyhow!("stat pile {}: {error}", pile_path.display()))?
+                .len();
+            if current_length == observed_length {
+                continue;
+            }
+            pile.refresh()
+                .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
+            // Bytes appended during refresh or catalog loading remain beyond
+            // this sampled watermark and cause another pass.
+            observed_length = current_length;
+        }
+
+        let current = catalogs
+            .get()
+            .expect("coherent advance installs native catalogs");
+        let persona_id = resolve_native_persona(current, persona_input)?;
         // Already-due habits establish a quiet, process-local baseline. A
         // rearmed one-shot watcher therefore waits for a transition instead
         // of reporting the same unsatisfied intention forever.
-        let mut habit_seen = observe_habits(&catalogs, pile_path, epoch_seconds(clock::now()?))?;
+        let mut habit_seen = observe_habits(current, pile_path, epoch_seconds(clock::now()?))?;
         let mut last_habit_sweep = Instant::now();
 
-        match check_news_once(&mut pile, &signer, &catalogs, persona_id, false)? {
-            NewsCheck::Fired => return Ok((true, true)),
+        match check_news_once(&mut pile, &signer, current, persona_id, false)? {
+            NewsCheck::Fired => {
+                return Ok(WaitOutcome {
+                    news_printed: true,
+                    incomplete: None,
+                    had_coherent_catalogs: true,
+                });
+            }
             NewsCheck::Quiet => {}
             NewsCheck::NoCheckpoint(view) => {
                 save_checkpoint(
@@ -1763,18 +1910,19 @@ fn cmd_wait(
                     &signer,
                     persona_id,
                     &view,
-                    all_note_ids(&catalogs.compass),
+                    all_note_ids(&current.compass),
                 )?;
             }
         }
 
-        let poll = Duration::from_millis(poll_ms.max(1));
-        let start = Instant::now();
-
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok((false, false));
+                    return Ok(WaitOutcome {
+                        news_printed: false,
+                        incomplete,
+                        had_coherent_catalogs: true,
+                    });
                 }
             }
             std::thread::sleep(poll);
@@ -1791,22 +1939,39 @@ fn cmd_wait(
                 continue;
             }
 
-            if pile_changed {
+            let coherent_append = if pile_changed {
                 pile.refresh()
                     .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
-                catalogs = load_native_catalogs(&mut pile, &signer)?;
-            }
+                // Do not retry an immutable incomplete prefix. An append which
+                // raced this attempt remains beyond the sampled watermark.
+                observed_length = current_length;
+                match catalogs.advance(&mut pile, &signer)? {
+                    CatalogAdvance::Coherent => {
+                        incomplete = None;
+                        true
+                    }
+                    CatalogAdvance::Incomplete(pending) => {
+                        incomplete = Some(pending);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
 
+            let current = catalogs
+                .get()
+                .expect("the wait loop retains its last coherent catalogs");
             // This happens before the append-driven news path. If ordinary
             // news and a Habit transition arrive together, both are printed
             // before the one-shot watcher exits; rearming cannot erase either.
-            let current_habits = observe_habits(&catalogs, pile_path, now_secs)?;
+            let current_habits = observe_habits(current, pile_path, now_secs)?;
             let habit_fired = print_habit_transitions(&habit_seen, &current_habits);
             habit_seen = current_habits;
             last_habit_sweep = Instant::now();
 
-            let ordinary_fired = if pile_changed {
-                match check_news_once(&mut pile, &signer, &catalogs, persona_id, false)? {
+            let ordinary_fired = if coherent_append {
+                match check_news_once(&mut pile, &signer, current, persona_id, false)? {
                     NewsCheck::Fired => true,
                     NewsCheck::Quiet => false,
                     NewsCheck::NoCheckpoint(view) => {
@@ -1818,7 +1983,7 @@ fn cmd_wait(
                             &signer,
                             persona_id,
                             &view,
-                            all_note_ids(&catalogs.compass),
+                            all_note_ids(&current.compass),
                         )?;
                         false
                     }
@@ -1827,26 +1992,33 @@ fn cmd_wait(
                 false
             };
             if habit_fired || ordinary_fired {
-                return Ok((true, true));
-            }
-            // Advance only through the exact prefix refreshed above. An
-            // external append (or our own checkpoint append) which raced with
-            // processing remains beyond this watermark and triggers another
-            // refresh instead of being silently swallowed.
-            if pile_changed {
-                observed_length = current_length;
+                return Ok(WaitOutcome {
+                    news_printed: true,
+                    incomplete,
+                    had_coherent_catalogs: true,
+                });
             }
         }
     })();
-    let (changed, news_printed) = close_pile(pile, result)?;
-    if news_printed {
+    let outcome = close_pile(pile, result)?;
+    if outcome.news_printed {
         // Terse path: the News: reasons and the novel detail were already
         // printed inside the wait loop — don't re-dump the full snapshot.
         return Ok(());
     }
-    if !changed {
-        println!("No change detected since wait started; showing current snapshot.");
+    if let Some(incomplete) = outcome.incomplete {
+        if outcome.had_coherent_catalogs {
+            println!(
+                "The latest pile prefix is awaiting sync closure ({incomplete}); the watcher retained its last coherent snapshot."
+            );
+        } else {
+            println!(
+                "No coherent snapshot became available before wait ended; the latest pile prefix is awaiting sync closure ({incomplete})."
+            );
+        }
+        return Ok(());
     }
+    println!("No change detected since wait started; showing current snapshot.");
     cmd_show(
         pile_path,
         key,
@@ -1907,7 +2079,15 @@ fn cmd_wake(
         let memory_reader = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze Memory store snapshot: {error}"))?;
-        let (memory_facts, _) = read_collection(memory_collection, &memory_reader, "Memory")?;
+        let (memory_facts, _) =
+            match read_collection_if_available(memory_collection, &memory_reader, "Memory")? {
+                FactCollectionLoad::Coherent(facts, cover) => (facts, cover),
+                FactCollectionLoad::Incomplete(incomplete) => {
+                    return Err(anyhow!(
+                        "physical collection cover is incomplete: {incomplete}"
+                    ));
+                }
+            };
         let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
             .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
         let catalogs = load_native_catalogs(&mut storage, &signer)?;
@@ -2011,9 +2191,14 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anybytes::Bytes;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use triblespace::core::collection::{
+        empty_metadata_handle, CollectionCommit, CollectionRecord,
+    };
+    use triblespace::prelude::inlineencodings::Handle;
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
@@ -2054,6 +2239,31 @@ mod tests {
         pile.commit(collection, signer, fragment).unwrap();
     }
 
+    fn append_commit_before_member(
+        pile: &mut Pile,
+        signer: &SigningKey,
+        scope: Id,
+        member: &Blob<SimpleArchive>,
+    ) {
+        let collection =
+            faculties::collection_names::open(pile, scope, signer.verifying_key()).unwrap();
+        let commit = CollectionCommit::sign(
+            signer,
+            collection.handle(),
+            Handle::<SimpleArchive>::to_hash(member.get_handle()),
+            empty_metadata_handle(),
+        );
+        pile.insert(CollectionRecord::Commit(commit)).unwrap();
+    }
+
+    fn opaque_fact_member() -> Blob<SimpleArchive> {
+        let entity = ufoid();
+        let kind = ufoid().id;
+        entity! { &entity @ metadata::tag: &kind }
+            .into_facts()
+            .to_blob()
+    }
+
     fn profile(label: &str) -> relations::ProfileInput {
         relations::ProfileInput {
             label: label.to_owned(),
@@ -2070,6 +2280,161 @@ mod tests {
             roster: BTreeSet::new(),
             notes: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn incomplete_prefix_after_baseline_retains_last_coherent_catalogs() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+        let baseline = load_watched_view(catalogs.get().unwrap(), persona).unwrap();
+
+        let missing = opaque_fact_member();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Incomplete(_)
+        ));
+        assert_eq!(
+            load_watched_view(catalogs.get().unwrap(), persona).unwrap(),
+            baseline,
+            "an incomplete append must not replace the coherent semantic view",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn startup_incomplete_prefix_waits_without_a_partial_baseline() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let missing = opaque_fact_member();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
+
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Incomplete(_)
+        ));
+        assert!(
+            catalogs.get().is_none(),
+            "startup must wait for physical closure rather than inventing a partial baseline",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn poll_loader_is_quiet_and_does_not_append_until_cover_closes() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        assert!(load_poll_catalogs(&mut pile, &signer).unwrap().is_some());
+
+        let missing = opaque_fact_member();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        assert!(
+            load_poll_catalogs(&mut pile, &signer).unwrap().is_none(),
+            "a transient physical gap is a quiet poll, not a failed hook",
+        );
+        let after = fs::metadata(&fixture.path).unwrap().len();
+        assert_eq!(
+            before, after,
+            "with descriptors already established, an incomplete poll must not append a checkpoint",
+        );
+
+        pile.put::<SimpleArchive, _>(missing).unwrap();
+        assert!(
+            load_poll_catalogs(&mut pile, &signer).unwrap().is_some(),
+            "a later append makes the complete semantic cover readable",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn later_member_append_advances_a_startup_incomplete_catalog() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let missing = opaque_fact_member();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Incomplete(_)
+        ));
+
+        pile.put::<SimpleArchive, _>(missing).unwrap();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+        assert_eq!(catalogs.get().unwrap().relations.len(), 1);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn external_member_append_closes_a_refreshed_incomplete_cover() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let mut reader = open_pile_strict(&fixture.path).unwrap();
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut reader, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+
+        let missing = opaque_fact_member();
+        let mut writer = open_pile_strict(&fixture.path).unwrap();
+        append_commit_before_member(&mut writer, &signer, RELATIONS_SCOPE_ID, &missing);
+        writer.close().unwrap();
+
+        reader.refresh().unwrap();
+        assert!(matches!(
+            catalogs.advance(&mut reader, &signer).unwrap(),
+            CatalogAdvance::Incomplete(_)
+        ));
+
+        let mut writer = open_pile_strict(&fixture.path).unwrap();
+        writer.put::<SimpleArchive, _>(missing).unwrap();
+        writer.close().unwrap();
+
+        reader.refresh().unwrap();
+        assert!(matches!(
+            catalogs.advance(&mut reader, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+        assert_eq!(catalogs.get().unwrap().relations.len(), 1);
+        reader.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_resident_member_is_a_fatal_catalog_error() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+
+        let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xA5; 63]));
+        pile.put::<SimpleArchive, _>(malformed.clone()).unwrap();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &malformed);
+        let error = catalogs.advance(&mut pile, &signer).unwrap_err();
+        assert!(format!("{error:#}").contains("materialize Relations collection"));
+        assert!(
+            catalogs.get().is_some(),
+            "fatal input must not erase the prior coherent observation",
+        );
+        pile.close().unwrap();
     }
 
     #[test]
@@ -2869,6 +3234,53 @@ mod tests {
     }
 
     #[test]
+    fn retained_catalogs_support_due_habit_transition_during_incomplete_prefix() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let (definition, habit) =
+            habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches", None, &[])
+                .unwrap();
+        let completed_at = Epoch::from_unix_seconds(100.0);
+        let completed_secs = epoch_seconds(completed_at);
+        let (completion, _) =
+            habits::completion_fragment(habit, epoch_interval(completed_at)).unwrap();
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, definition);
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, completion);
+        let mut catalogs = CoherentCatalogs::default();
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Coherent
+        ));
+        let before =
+            observe_habits(catalogs.get().unwrap(), &fixture.path, completed_secs).unwrap();
+        assert!(before.due.is_empty());
+
+        let missing = opaque_fact_member();
+        append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
+        assert!(matches!(
+            catalogs.advance(&mut pile, &signer).unwrap(),
+            CatalogAdvance::Incomplete(_)
+        ));
+
+        let after =
+            observe_habits(catalogs.get().unwrap(), &fixture.path, completed_secs + 1).unwrap();
+        assert_eq!(
+            newly_due(&before, &after),
+            [(
+                habit,
+                DueHabit {
+                    label: "lineage-hygiene".to_owned(),
+                    nudge: "inspect branches".to_owned(),
+                },
+            )],
+            "the retained coherent catalogs remain usable for time-driven observation during an incomplete prefix",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn habit_attention_transition_wakes_once() {
         let habit = Id::new([0xA5; 16]).unwrap();
         let quiet = HabitObservation::default();
@@ -2953,7 +3365,7 @@ mod tests {
         commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, message_fragment);
 
         let full = load_native_catalogs(&mut pile, &signer).unwrap();
-        let poll = load_poll_catalogs(&mut pile, &signer).unwrap();
+        let poll = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
         assert_eq!(
             load_watched_view(&poll, persona).unwrap(),
             load_watched_view(&full, persona).unwrap(),
@@ -2978,7 +3390,7 @@ mod tests {
             NewsCheck::Fired
         ));
         assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
-        let after = load_poll_catalogs(&mut pile, &signer).unwrap();
+        let after = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
         assert_eq!(
             latest_checkpoint_view(&after, persona).unwrap(),
             Some(baseline)
