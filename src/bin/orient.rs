@@ -441,33 +441,6 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     }
 }
 
-#[derive(Debug)]
-enum CatalogAdvance {
-    Coherent,
-    Incomplete(PhysicalCoverIncompleteness),
-}
-
-#[derive(Default)]
-struct CoherentCatalogs {
-    current: Option<NativeCatalogs>,
-}
-
-impl CoherentCatalogs {
-    fn advance(&mut self, pile: &mut Pile, signer: &SigningKey) -> Result<CatalogAdvance> {
-        match load_catalogs(pile, signer, true, false)? {
-            NativeCatalogLoad::Coherent(catalogs) => {
-                self.current = Some(catalogs);
-                Ok(CatalogAdvance::Coherent)
-            }
-            NativeCatalogLoad::Incomplete(incomplete) => Ok(CatalogAdvance::Incomplete(incomplete)),
-        }
-    }
-
-    fn get(&self) -> Option<&NativeCatalogs> {
-        self.current.as_ref()
-    }
-}
-
 /// Load exactly the domains consulted by one non-blocking news check.
 ///
 /// The query paths validate the rows and payloads they actually interpret;
@@ -2702,28 +2675,31 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_prefix_after_baseline_retains_last_coherent_catalogs() {
+    fn incomplete_prefix_after_baseline_retains_current_wait_frame() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
         let persona = ufoid().id;
+        let persona_input = format!("{persona:x}");
         let mut pile = open_pile_strict(&fixture.path).unwrap();
-        let mut catalogs = CoherentCatalogs::default();
-        assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Coherent
-        ));
-        let baseline = load_watched_view(catalogs.get().unwrap(), persona).unwrap();
+        let baseline =
+            match load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 1).unwrap() {
+                WaitFrameLoad::Ready(frame) => frame,
+                WaitFrameLoad::Pending(incomplete) => {
+                    panic!("initial wait frame is incomplete: {incomplete:?}")
+                }
+            };
+        let baseline_view = load_watched_view(&baseline.catalogs, persona).unwrap();
 
         let missing = opaque_fact_member();
         append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
         assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Incomplete(_)
+            load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 2).unwrap(),
+            WaitFrameLoad::Pending(Some(_))
         ));
         assert_eq!(
-            load_watched_view(catalogs.get().unwrap(), persona).unwrap(),
-            baseline,
-            "an incomplete append must not replace the coherent semantic view",
+            load_watched_view(&baseline.catalogs, persona).unwrap(),
+            baseline_view,
+            "the actual wait frame remains usable when a newer frame is incomplete",
         );
         pile.close().unwrap();
     }
@@ -2732,19 +2708,22 @@ mod tests {
     fn startup_incomplete_prefix_waits_without_a_partial_baseline() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
+        let persona = ufoid().id;
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         let missing = opaque_fact_member();
         append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
 
-        let mut catalogs = CoherentCatalogs::default();
         assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Incomplete(_)
+            load_wait_frame(
+                &mut pile,
+                &signer,
+                &fixture.path,
+                &format!("{persona:x}"),
+                1,
+            )
+            .unwrap(),
+            WaitFrameLoad::Pending(Some(_))
         ));
-        assert!(
-            catalogs.get().is_none(),
-            "startup must wait for physical closure rather than inventing a partial baseline",
-        );
         pile.close().unwrap();
     }
 
@@ -2777,24 +2756,28 @@ mod tests {
     }
 
     #[test]
-    fn later_member_append_advances_a_startup_incomplete_catalog() {
+    fn later_member_append_advances_a_startup_incomplete_wait_frame() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let persona_input = format!("{persona:x}");
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         let missing = opaque_fact_member();
         append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
-        let mut catalogs = CoherentCatalogs::default();
         assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Incomplete(_)
+            load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 1).unwrap(),
+            WaitFrameLoad::Pending(Some(_))
         ));
 
         pile.put::<SimpleArchive, _>(missing).unwrap();
-        assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Coherent
-        ));
-        assert_eq!(catalogs.get().unwrap().relations.len(), 1);
+        let frame =
+            match load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 2).unwrap() {
+                WaitFrameLoad::Ready(frame) => frame,
+                WaitFrameLoad::Pending(incomplete) => {
+                    panic!("closed wait frame remained incomplete: {incomplete:?}")
+                }
+            };
+        assert_eq!(frame.catalogs.relations.len(), 1);
         pile.close().unwrap();
     }
 
@@ -2802,11 +2785,12 @@ mod tests {
     fn external_member_append_closes_a_refreshed_incomplete_cover() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let persona_input = format!("{persona:x}");
         let mut reader = open_pile_strict(&fixture.path).unwrap();
-        let mut catalogs = CoherentCatalogs::default();
         assert!(matches!(
-            catalogs.advance(&mut reader, &signer).unwrap(),
-            CatalogAdvance::Coherent
+            load_wait_frame(&mut reader, &signer, &fixture.path, &persona_input, 1).unwrap(),
+            WaitFrameLoad::Ready(_)
         ));
 
         let missing = opaque_fact_member();
@@ -2816,8 +2800,8 @@ mod tests {
 
         reader.refresh().unwrap();
         assert!(matches!(
-            catalogs.advance(&mut reader, &signer).unwrap(),
-            CatalogAdvance::Incomplete(_)
+            load_wait_frame(&mut reader, &signer, &fixture.path, &persona_input, 2).unwrap(),
+            WaitFrameLoad::Pending(Some(_))
         ));
 
         let mut writer = open_pile_strict(&fixture.path).unwrap();
@@ -2825,11 +2809,15 @@ mod tests {
         writer.close().unwrap();
 
         reader.refresh().unwrap();
-        assert!(matches!(
-            catalogs.advance(&mut reader, &signer).unwrap(),
-            CatalogAdvance::Coherent
-        ));
-        assert_eq!(catalogs.get().unwrap().relations.len(), 1);
+        let frame = match load_wait_frame(&mut reader, &signer, &fixture.path, &persona_input, 3)
+            .unwrap()
+        {
+            WaitFrameLoad::Ready(frame) => frame,
+            WaitFrameLoad::Pending(incomplete) => {
+                panic!("externally closed wait frame remained incomplete: {incomplete:?}")
+            }
+        };
+        assert_eq!(frame.catalogs.relations.len(), 1);
         reader.close().unwrap();
     }
 
@@ -2837,21 +2825,30 @@ mod tests {
     fn malformed_resident_member_is_a_fatal_catalog_error() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let persona_input = format!("{persona:x}");
         let mut pile = open_pile_strict(&fixture.path).unwrap();
-        let mut catalogs = CoherentCatalogs::default();
-        assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Coherent
-        ));
+        let baseline =
+            match load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 1).unwrap() {
+                WaitFrameLoad::Ready(frame) => frame,
+                WaitFrameLoad::Pending(incomplete) => {
+                    panic!("initial wait frame is incomplete: {incomplete:?}")
+                }
+            };
+        let baseline_view = load_watched_view(&baseline.catalogs, persona).unwrap();
 
         let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xA5; 63]));
         pile.put::<SimpleArchive, _>(malformed.clone()).unwrap();
         append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &malformed);
-        let error = catalogs.advance(&mut pile, &signer).unwrap_err();
+        let error = match load_wait_frame(&mut pile, &signer, &fixture.path, &persona_input, 2) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed resident member unexpectedly produced a wait frame"),
+        };
         assert!(format!("{error:#}").contains("materialize Relations collection"));
-        assert!(
-            catalogs.get().is_some(),
-            "fatal input must not erase the prior coherent observation",
+        assert_eq!(
+            load_watched_view(&baseline.catalogs, persona).unwrap(),
+            baseline_view,
+            "fatal input must not alter the caller's prior wait frame",
         );
         pile.close().unwrap();
     }
@@ -3677,9 +3674,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_catalogs_support_due_habit_transition_during_incomplete_prefix() {
+    fn retained_wait_frame_supports_due_habit_transition_during_incomplete_prefix() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let persona_input = format!("{persona:x}");
         let (definition, habit) =
             habits::habit_fragment("lineage-hygiene", "every 1s", "inspect branches", None, &[])
                 .unwrap();
@@ -3691,24 +3690,38 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, definition);
         commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, completion);
-        let mut catalogs = CoherentCatalogs::default();
-        assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Coherent
-        ));
-        let before =
-            observe_habits(catalogs.get().unwrap(), &fixture.path, completed_secs).unwrap();
+        let baseline = match load_wait_frame(
+            &mut pile,
+            &signer,
+            &fixture.path,
+            &persona_input,
+            completed_secs,
+        )
+        .unwrap()
+        {
+            WaitFrameLoad::Ready(frame) => frame,
+            WaitFrameLoad::Pending(incomplete) => {
+                panic!("initial wait frame is incomplete: {incomplete:?}")
+            }
+        };
+        let before = baseline.habits.clone();
         assert!(before.due.is_empty());
 
         let missing = opaque_fact_member();
         append_commit_before_member(&mut pile, &signer, RELATIONS_SCOPE_ID, &missing);
         assert!(matches!(
-            catalogs.advance(&mut pile, &signer).unwrap(),
-            CatalogAdvance::Incomplete(_)
+            load_wait_frame(
+                &mut pile,
+                &signer,
+                &fixture.path,
+                &persona_input,
+                completed_secs + 1,
+            )
+            .unwrap(),
+            WaitFrameLoad::Pending(Some(_))
         ));
 
-        let after =
-            observe_habits(catalogs.get().unwrap(), &fixture.path, completed_secs + 1).unwrap();
+        let after = observe_habits(&baseline.catalogs, &fixture.path, completed_secs + 1).unwrap();
         assert_eq!(
             newly_due(&before, &after),
             [(
@@ -3718,7 +3731,7 @@ mod tests {
                     nudge: "inspect branches".to_owned(),
                 },
             )],
-            "the retained coherent catalogs remain usable for time-driven observation during an incomplete prefix",
+            "the retained wait frame remains usable for time-driven observation during an incomplete prefix",
         );
         pile.close().unwrap();
     }
