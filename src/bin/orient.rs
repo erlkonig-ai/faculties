@@ -18,8 +18,8 @@ use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::storage::{load_signer, open_pile_strict};
 use faculties::{
-    clock, compass, habits, mail as mail_model, memory as memory_model, message,
-    orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
+    clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
+    teams as teams_model, wiki as wiki_model,
 };
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

@@ -17,10 +17,11 @@ use faculties::storage::{load_signer, open_pile_strict};
 // in-process. Re-import the pieces this binary still uses elsewhere.
 use faculties::legacy_hint::open_scope;
 use faculties::memory_cover::{
-    all_chunk_ids, chunk_about_archive_message, chunk_aliases, chunk_end_at, chunk_image_handle,
-    chunk_lens_handle, chunk_span_str, chunk_start_at, chunk_summary_handle, collect_chunk_spans,
-    epoch_end_from_interval, epoch_from_interval, fmt_epoch, format_time_range, interval_key,
-    key_to_epoch, CoverOpts, DEFAULT_SIM_THRESHOLD,
+    all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
+    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_references, chunk_span_str,
+    chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
+    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, CoverOpts,
+    DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
@@ -347,24 +348,6 @@ fn chunk_oneline(reader: &PileSnapshot, space: &TribleSet, id: Id) -> String {
         return format!("[image memory @ {}]", chunk_span_str(space, id));
     }
     String::new()
-}
-
-/// Outgoing contextual references of a canonical chunk.
-fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
-    let mut children: Vec<Id> =
-        find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
-    // Sort referenced chunks by their start_at time.
-    children.sort_by_key(|child_id| {
-        chunk_start_at(space, *child_id)
-            .map(interval_key)
-            .unwrap_or(i128::MAX)
-    });
-    children.dedup();
-    children
-}
-
-fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
-    find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
 }
 
 // ---------------------------------------------------------------------------

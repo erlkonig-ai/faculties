@@ -93,6 +93,25 @@ pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
 }
 
+/// Outgoing contextual references of a canonical chunk, ordered by `start_at`.
+pub fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
+    let mut children: Vec<Id> =
+        find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
+    // Sort referenced chunks by their start_at time.
+    children.sort_by_key(|child_id| {
+        chunk_start_at(space, *child_id)
+            .map(interval_key)
+            .unwrap_or(i128::MAX)
+    });
+    children.dedup();
+    children
+}
+
+/// The exec result this chunk is about, if it records one.
+pub fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
+}
+
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
 #[cfg(feature = "local-embed")]
 pub fn chunk_embedding_handle(
