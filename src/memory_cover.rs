@@ -112,6 +112,13 @@ pub fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
     find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
 }
 
+/// Genuine creation/import observations for a chunk. These sit OUTSIDE
+/// intrinsic state -- they are additive provenance, so several may coexist and
+/// that multiplicity is returned rather than arbitrated.
+pub fn chunk_observed_at(space: &TribleSet, id: Id) -> Vec<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ metadata::created_at: ?v }])).collect()
+}
+
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
 #[cfg(feature = "local-embed")]
 pub fn chunk_embedding_handle(

@@ -14,7 +14,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::cognition as cognition_model;
-use faculties::memory::{self as memory_model, ChunkContent, MemoryCatalog};
+use faculties::memory::{self as memory_model};
+use faculties::memory_cover::{
+    all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
+    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
+    chunk_start_at, chunk_summary_handle,
+};
 use faculties::message as message_model;
 use faculties::relations as relations_model;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
@@ -239,11 +244,11 @@ impl TriageSnapshot {
             .context("discover readable Secrets vaults")
     }
 
-    fn memory(&self) -> Result<(CollectionView, MemoryCatalog)> {
+    fn memory(&self) -> Result<CollectionView> {
         let view = self.view(MEMORY_SCOPE_ID, "Memory")?;
-        let catalog = memory_model::validate_catalog(&view.reader, &view.facts)
+        memory_model::validate_catalog(&view.reader, &view.facts)
             .context("validate Memory collection")?;
-        Ok((view, catalog))
+        Ok(view)
     }
 
     fn relations(&self) -> Result<CollectionView> {
@@ -721,19 +726,25 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     Ok(())
 }
 
-fn chunk_text(reader: &PileSnapshot, chunk: &memory_model::ChunkRow) -> Result<String> {
-    match chunk.content {
-        ChunkContent::Text(handle) => memory_model::read_text(reader, handle),
-        ChunkContent::Image(handle) => Ok(format!(
+fn chunk_text(reader: &PileSnapshot, space: &TribleSet, id: Id) -> Result<String> {
+    if let Some(handle) = chunk_summary_handle(space, id) {
+        return memory_model::read_text(reader, handle);
+    }
+    if let Some(handle) = chunk_image_handle(space, id) {
+        return Ok(format!(
             "<image: {} bytes>",
             memory_model::read_image(reader, handle)?.len()
-        )),
+        ));
     }
+    Ok(String::new())
 }
 
-fn format_span(chunk: &memory_model::ChunkRow) -> String {
-    let start = interval_key(chunk.start_at);
-    let end = interval_key(chunk.end_at);
+fn format_span(space: &TribleSet, id: Id) -> String {
+    let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
+        return "?".to_string();
+    };
+    let start = interval_key(s);
+    let end = interval_key(e);
     format!(
         "{}..{} ({})",
         format_tai_ns(start),
@@ -743,12 +754,14 @@ fn format_span(chunk: &memory_model::ChunkRow) -> String {
 }
 
 fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
-    let (memory, catalog) = snapshot.memory()?;
+    let memory = snapshot.memory()?;
     let (_, headspace) = snapshot.headspace()?;
-    let chunk_ids = catalog.chunk_ids();
+    let space = &memory.facts;
+    let mut chunk_ids = all_chunk_ids(space);
+    chunk_ids.sort();
     let mut all_chunk_chars = 0usize;
     for id in &chunk_ids {
-        all_chunk_chars += chunk_text(&memory.reader, &catalog.chunks[id])?.len();
+        all_chunk_chars += chunk_text(&memory.reader, space, *id)?.len();
     }
     let budget = headspace.budget()?;
     let fill = if budget.body_budget_chars > 0 {
@@ -758,7 +771,7 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
     };
     println!("Memory cover");
     println!("- Memory facts: {}", memory.facts.len());
-    println!("- catalog: {} chunks", catalog.chunks.len());
+    println!("- chunks: {}", chunk_ids.len());
     println!();
     println!("Budget");
     println!(
@@ -778,12 +791,11 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
         println!("- empty");
     }
     for id in chunk_ids {
-        let chunk = &catalog.chunks[&id];
-        let text = chunk_text(&memory.reader, chunk)?;
+        let text = chunk_text(&memory.reader, space, id)?;
         println!(
             "- chunk {} | {} | {}",
             fmt_id(id),
-            format_span(chunk),
+            format_span(space, id),
             if full {
                 text
             } else {
@@ -794,20 +806,16 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
     Ok(())
 }
 
-fn matching_memory_nodes(catalog: &MemoryCatalog, prefix: &str) -> BTreeSet<Id> {
+fn matching_memory_nodes(space: &TribleSet, prefix: &str) -> BTreeSet<Id> {
     let prefix = prefix.trim().to_ascii_uppercase();
-    let mut matches: BTreeSet<Id> = catalog
-        .node_ids()
-        .into_iter()
-        .filter(|id| format!("{id:X}").starts_with(&prefix))
-        .collect();
-    for chunk in catalog.chunks.values() {
-        if chunk
-            .aliases
-            .iter()
-            .any(|alias| format!("{alias:X}").starts_with(&prefix))
+    let mut matches: BTreeSet<Id> = BTreeSet::new();
+    for id in all_chunk_ids(space) {
+        if format!("{id:X}").starts_with(&prefix)
+            || chunk_aliases(space, id)
+                .iter()
+                .any(|alias| format!("{alias:X}").starts_with(&prefix))
         {
-            matches.insert(chunk.id);
+            matches.insert(id);
         }
     }
     matches
@@ -826,7 +834,7 @@ fn print_ids(label: &str, ids: impl IntoIterator<Item = Id>) {
     }
 }
 
-fn print_observations(observations: &BTreeSet<Interval>) {
+fn print_observations(observations: &[Interval]) {
     if !observations.is_empty() {
         println!("  observations:");
         for observation in observations {
@@ -836,8 +844,8 @@ fn print_observations(observations: &BTreeSet<Interval>) {
 }
 
 fn cmd_chunk(snapshot: &TriageSnapshot, prefix: &str) -> Result<()> {
-    let (memory, catalog) = snapshot.memory()?;
-    let matches = matching_memory_nodes(&catalog, prefix);
+    let memory = snapshot.memory()?;
+    let matches = matching_memory_nodes(&memory.facts, prefix);
     if matches.is_empty() {
         bail!("no canonical Memory chunk or alias matches prefix '{prefix}'");
     }
@@ -849,23 +857,23 @@ fn cmd_chunk(snapshot: &TriageSnapshot, prefix: &str) -> Result<()> {
         if index > 0 {
             println!();
         }
-        let chunk = &catalog.chunks[&id];
+        let space = &memory.facts;
         println!("Chunk {}", fmt_id(id));
-        println!("  span: {}", format_span(chunk));
-        print_ids("references", chunk.references.iter().copied());
-        print_ids("aliases", chunk.aliases.iter().copied());
-        if let Some(exec) = chunk.about_exec_result {
+        println!("  span: {}", format_span(space, id));
+        print_ids("references", chunk_references(space, id).into_iter());
+        print_ids("aliases", chunk_aliases(space, id).into_iter());
+        if let Some(exec) = chunk_about_exec_result(space, id) {
             println!("  about exec result: {}", fmt_id(exec));
         }
-        if let Some(message) = chunk.about_archive_message {
+        if let Some(message) = chunk_about_archive_message(space, id) {
             println!("  about archive message: {}", fmt_id(message));
         }
-        if let Some(lens) = chunk.lens {
+        if let Some(lens) = chunk_lens_handle(space, id) {
             println!("  lens: {}", memory_model::read_text(&memory.reader, lens)?);
         }
-        print_observations(&chunk.observed_at);
+        print_observations(&chunk_observed_at(space, id));
         println!("  content:");
-        for line in chunk_text(&memory.reader, chunk)?.lines() {
+        for line in chunk_text(&memory.reader, space, id)?.lines() {
             println!("    {line}");
         }
     }
@@ -1293,10 +1301,10 @@ mod tests {
         fixture.publish(MEMORY_SCOPE_ID, left);
         fixture.publish(MEMORY_SCOPE_ID, right);
 
-        let (view, catalog) = fixture.snapshot().memory().unwrap();
+        let view = fixture.snapshot().memory().unwrap();
         assert!(!view.facts.is_empty());
-        assert_eq!(catalog.node_ids(), BTreeSet::from([left_id, right_id]));
-        assert_eq!(catalog.chunks.len(), 2);
+        let ids: BTreeSet<Id> = all_chunk_ids(&view.facts).into_iter().collect();
+        assert_eq!(ids, BTreeSet::from([left_id, right_id]));
     }
 
     #[test]
