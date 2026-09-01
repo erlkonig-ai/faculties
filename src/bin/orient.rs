@@ -257,7 +257,12 @@ fn read_collection(
 /// Read every collection that contributes to Orient from one refreshed Pile.
 /// Collection history and record ordering stop at this boundary: callers see
 /// only their materialized set values.
-fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
+fn load_catalogs(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    include_habits: bool,
+    validate_whole_catalogs: bool,
+) -> Result<NativeCatalogs> {
     let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
     let mail_collection = open_scope(pile, MAIL_SCOPE_ID, signer)?;
     // Teams participates in news but is deliberately not run through
@@ -269,7 +274,9 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     let message_collection = open_scope(pile, MESSAGE_SCOPE_ID, signer)?;
     let compass_collection = open_scope(pile, COMPASS_SCOPE_ID, signer)?;
     let status_collection = open_scope(pile, STATUS_SCOPE_ID, signer)?;
-    let habit_collection = open_scope(pile, HABIT_SCOPE_ID, signer)?;
+    let habit_collection = include_habits
+        .then(|| open_scope(pile, HABIT_SCOPE_ID, signer))
+        .transpose()?;
     let checkpoint_collection =
         open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
     let reader = pile
@@ -282,24 +289,32 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     let (message_facts, _) = read_collection(message_collection, &reader, "Message")?;
     let (compass_facts, compass_cover) = read_collection(compass_collection, &reader, "Compass")?;
     let (status_facts, _) = read_collection(status_collection, &reader, "Status")?;
-    let (habit_facts, _) = read_collection(habit_collection, &reader, "Habit")?;
+    let habit_facts = habit_collection
+        .map(|collection| read_collection(collection, &reader, "Habit"))
+        .transpose()?
+        .map(|(facts, _)| facts);
     let (checkpoint_facts, checkpoint_cover) =
         read_collection(checkpoint_collection, &reader, "Orient")?;
 
-    relations::validate_catalog(&reader, &relations_facts)
-        .map_err(|error| anyhow!("validate Relations collection: {error:#}"))?;
-    mail_model::validate_local_catalog(&reader, &mail_facts)
-        .map_err(|error| anyhow!("validate Mail collection: {error:#}"))?;
-    message::validate_catalog(&reader, &message_facts, &relations_facts)
-        .map_err(|error| anyhow!("validate Message collection: {error:#}"))?;
-    compass::validate_known_payloads(&reader, &compass_facts)
-        .map_err(|error| anyhow!("validate Compass collection: {error:#}"))?;
-    status::validate_catalog(&reader, &status_facts)
-        .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
-    let habits = habits::load_catalog(&reader, &habit_facts)
-        .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
-    orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
-        .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
+    if validate_whole_catalogs {
+        relations::validate_catalog(&reader, &relations_facts)
+            .map_err(|error| anyhow!("validate Relations collection: {error:#}"))?;
+        mail_model::validate_local_catalog(&reader, &mail_facts)
+            .map_err(|error| anyhow!("validate Mail collection: {error:#}"))?;
+        message::validate_catalog(&reader, &message_facts, &relations_facts)
+            .map_err(|error| anyhow!("validate Message collection: {error:#}"))?;
+        compass::validate_known_payloads(&reader, &compass_facts)
+            .map_err(|error| anyhow!("validate Compass collection: {error:#}"))?;
+        status::validate_catalog(&reader, &status_facts)
+            .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
+        orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
+            .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
+    }
+    let habits = habit_facts
+        .map(|facts| habits::load_catalog(&reader, &facts))
+        .transpose()
+        .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?
+        .unwrap_or_default();
 
     let compass_status = compass::status_register_collection(pile, signer.verifying_key())?
         .ensure(pile, &compass_cover)
@@ -308,7 +323,6 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         orient_model::checkpoint_register_collection(pile, signer.verifying_key())?
             .ensure(pile, &checkpoint_cover)
             .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
-
     Ok(NativeCatalogs {
         messages: message_facts,
         mail: mail_facts,
@@ -322,6 +336,21 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
         checkpoint_register,
         reader,
     })
+}
+
+fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
+    load_catalogs(pile, signer, true, true)
+}
+
+/// Load exactly the domains consulted by one non-blocking news check.
+///
+/// The query paths validate the rows and payloads they actually interpret;
+/// running every faculty's whole-catalog audit here would validate unrelated
+/// history on every prompt. Exact collection materialization still withholds
+/// incomplete covers, while the maintained checkpoint index names the one
+/// canonical event row this poll must decode.
+fn load_poll_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
+    load_catalogs(pile, signer, false, false)
 }
 
 fn native_task_title(catalogs: &NativeCatalogs, task: Id) -> String {
@@ -1222,11 +1251,15 @@ fn latest_checkpoint_view(
     catalogs: &NativeCatalogs,
     persona: Id,
 ) -> Result<Option<orient_model::WatchedView>> {
-    let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
-    Ok(
-        orient_model::latest_checkpoint(events, &catalogs.checkpoint_register, persona)?
-            .map(|event| event.view),
-    )
+    let Some(event) = catalogs.checkpoint_register.winner(persona) else {
+        return Ok(None);
+    };
+    let checkpoint =
+        orient_model::load_checkpoint_event(&catalogs.reader, &catalogs.checkpoints, event)?;
+    if checkpoint.persona != persona {
+        bail!("Orient checkpoint register selects {event:x} for the wrong persona");
+    }
+    Ok(Some(checkpoint.view))
 }
 
 fn save_checkpoint(
@@ -1286,12 +1319,14 @@ fn migrate_note_frontier(
             fmt_id(stale[0]),
         );
     }
-    let events = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)?;
+    let event = catalogs
+        .checkpoint_register
+        .winner(persona)
+        .ok_or_else(|| {
+            anyhow!("cannot migrate note frontier for {persona:x}: no checkpoint exists")
+        })?;
     let checkpoint =
-        orient_model::latest_checkpoint(events, &catalogs.checkpoint_register, persona)?
-            .ok_or_else(|| {
-                anyhow!("cannot migrate note frontier for {persona:x}: no checkpoint exists")
-            })?;
+        orient_model::load_checkpoint_event(&catalogs.reader, &catalogs.checkpoints, event)?;
     // `created_at` is authored event time, not publication order: a delayed or
     // backdated note may enter the pile after this checkpoint. A stopped-world
     // migration therefore baselines the one coherent current Compass snapshot
@@ -1631,7 +1666,7 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let catalogs = load_native_catalogs(&mut pile, &signer)?;
+        let catalogs = load_poll_catalogs(&mut pile, &signer)?;
         let persona_id = resolve_native_persona(&catalogs, input)?;
         match check_news_once(&mut pile, &signer, &catalogs, persona_id, peek)? {
             // News printed (+ checkpoint advanced unless peeking).
@@ -2888,6 +2923,66 @@ mod tests {
             check_news_once(&mut pile, &signer, &catalogs, persona, false).unwrap(),
             NewsCheck::Fired
         ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn poll_loader_preserves_news_and_peek_checkpoint_semantics() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let sender = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(sender, profile("sender"))
+            .unwrap()
+            .0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let (message_fragment, message_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(persona),
+            "hello",
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, message_fragment);
+
+        let full = load_native_catalogs(&mut pile, &signer).unwrap();
+        let poll = load_poll_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(
+            load_watched_view(&poll, persona).unwrap(),
+            load_watched_view(&full, persona).unwrap(),
+        );
+        assert_eq!(
+            latest_checkpoint_view(&poll, persona).unwrap(),
+            latest_checkpoint_view(&full, persona).unwrap(),
+        );
+        assert_eq!(
+            view_news(
+                &baseline,
+                &load_watched_view(&poll, persona).unwrap(),
+                persona,
+                &BTreeSet::new(),
+            ),
+            [format!("new message [{message_id:x}]")],
+        );
+
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        assert!(matches!(
+            check_news_once(&mut pile, &signer, &poll, persona, true).unwrap(),
+            NewsCheck::Fired
+        ));
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+        let after = load_poll_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(
+            latest_checkpoint_view(&after, persona).unwrap(),
+            Some(baseline)
+        );
         pile.close().unwrap();
     }
 

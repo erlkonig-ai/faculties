@@ -452,6 +452,58 @@ where
     Ok(events)
 }
 
+/// Load and validate one checkpoint selected by a maintained index.
+///
+/// Exact collection materialization has already established availability of
+/// the source cover. This validates the selected row and payload without
+/// reparsing every historical checkpoint on each poll.
+pub fn load_checkpoint_event<Store>(
+    reader: &Store,
+    facts: &TribleSet,
+    event: Id,
+) -> Result<CheckpointEvent>
+where
+    Store: BlobStoreGet + ?Sized,
+{
+    if !exists!(pattern!(facts, [{ event @ metadata::tag: &KIND_CHECKPOINT_EVENT }])) {
+        bail!("Orient checkpoint register selects non-checkpoint event {event:x}");
+    }
+    let persona = exactly_one(
+        event,
+        "checkpoint::persona",
+        find!(persona: Id, pattern!(facts, [{ event @ checkpoint::persona: ?persona }])).collect(),
+    )?;
+    let handle = exactly_one(
+        event,
+        "checkpoint::view",
+        find!(handle: TextHandle, pattern!(facts, [{ event @ checkpoint::view: ?handle }]))
+            .collect(),
+    )?;
+    let at = exactly_one(
+        event,
+        "metadata::created_at",
+        find!(at: IntervalValue, pattern!(facts, [{ event @ metadata::created_at: ?at }]))
+            .collect(),
+    )?;
+    point_time(at).with_context(|| format!("validate Orient checkpoint {event:x}"))?;
+    let encoded: View<str> = reader
+        .get(handle)
+        .with_context(|| format!("read Orient checkpoint view {}", hex::encode(handle.raw)))?;
+    let view = parse_view(&encoded)?;
+    let canonical = checkpoint_record(persona, handle, at)
+        .root()
+        .expect("canonical Orient checkpoint has one intrinsic root");
+    if event != canonical {
+        bail!("Orient checkpoint {event:x} is not intrinsic; canonical identity is {canonical:x}");
+    }
+    Ok(CheckpointEvent {
+        event,
+        persona,
+        view,
+        at,
+    })
+}
+
 /// Latest checkpoint for one exact persona anchor in an exact maintained
 /// register frame.
 ///
@@ -646,6 +698,34 @@ mod tests {
                 right_view
             }
         );
+    }
+
+    #[test]
+    fn selected_checkpoint_load_matches_full_catalog() {
+        let persona = Id::new([4; 16]).unwrap();
+        let other = Id::new([6; 16]).unwrap();
+        let mut all = Fragment::empty();
+        for (owner, seconds, label) in [
+            (persona, 1.0, "old"),
+            (other, 9.0, "other"),
+            (persona, 3.0, "latest"),
+            (persona, 2.0, "middle"),
+        ] {
+            let view = WatchedView {
+                goals_view: label.to_owned(),
+                ..WatchedView::default()
+            };
+            all += checkpoint_fragment(owner, &view, at(seconds)).unwrap().0;
+        }
+        let mut staged = all.clone();
+        let reader = staged.blobs_mut().snapshot().unwrap();
+        let index = checkpoint_index(all.facts());
+        let events = load_checkpoint_events(&reader, all.facts()).unwrap();
+        let full = latest_checkpoint(events, &index, persona).unwrap().unwrap();
+        let selected =
+            load_checkpoint_event(&reader, all.facts(), index.winner(persona).unwrap()).unwrap();
+        assert_eq!(selected, full);
+        assert_eq!(selected.view.goals_view, "latest");
     }
 
     fn validated_compass(persona: Id, note: Id) -> Fragment {
