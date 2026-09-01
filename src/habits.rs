@@ -30,6 +30,16 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
+/// Attachment handles of one live definition, selected structurally before
+/// any payload is read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveHabitPayloads {
+    pub habit: Id,
+    pub condition: TextHandle,
+    pub nudge: TextHandle,
+    pub script: Option<ScriptHandle>,
+}
+
 /// Content identity of the Habit collection this pile roots.
 pub fn collection_handle(
     pile: &Path,
@@ -605,6 +615,30 @@ struct RawCatalog {
     assertions: BTreeMap<Id, StateAssertion>,
 }
 
+impl RawCatalog {
+    fn live_ids(&self) -> BTreeSet<Id> {
+        let superseded: BTreeSet<Id> = self
+            .habits
+            .values()
+            .flat_map(|habit| habit.supersedes.iter().copied())
+            .collect();
+        self.habits
+            .keys()
+            .filter(|habit| !superseded.contains(*habit))
+            .copied()
+            .collect()
+    }
+
+    fn retain_live(&mut self) {
+        let live = self.live_ids();
+        self.habits.retain(|habit, _| live.contains(habit));
+        self.completions
+            .retain(|_, completion| live.contains(&completion.habit));
+        self.assertions
+            .retain(|_, assertion| live.contains(&assertion.habit));
+    }
+}
+
 fn parse_habit(facts: &TribleSet, id: Id) -> Result<RawHabit> {
     Ok(RawHabit {
         id,
@@ -1008,6 +1042,37 @@ where
 /// Strictly validate and decode one complete materialized Habit collection.
 pub fn load_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
     let raw = validate_structure(facts)?;
+    decode_catalog(reader, None::<&PileSnapshot>, raw)
+}
+
+/// Select the payload obligations of only maximal (live) definitions.
+/// Superseded definitions remain queryable history, but their attachments can
+/// neither affect current evaluation nor hold an observer hostage.
+pub fn live_payloads(facts: &TribleSet) -> Result<Vec<LiveHabitPayloads>> {
+    let raw = validate_structure(facts)?;
+    let live = raw.live_ids();
+    Ok(live
+        .into_iter()
+        .map(|habit| {
+            let definition = &raw.habits[&habit];
+            LiveHabitPayloads {
+                habit,
+                condition: definition.condition,
+                nudge: definition.nudge,
+                script: definition.script,
+            }
+        })
+        .collect())
+}
+
+/// Decode only current standing intentions.
+///
+/// The full structural catalog is still checked so state and completion DAGs
+/// retain their normal semantics. Blob reads are restricted to maximal
+/// definitions; stale history is not an operational dependency of a watcher.
+pub fn load_live_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
+    let mut raw = validate_structure(facts)?;
+    raw.retain_live();
     decode_catalog(reader, None::<&PileSnapshot>, raw)
 }
 

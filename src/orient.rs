@@ -216,7 +216,7 @@ pub fn point_time(value: IntervalValue) -> Result<i128> {
     Ok(lower)
 }
 
-fn checkpoint_record(persona: Id, view: TextHandle, at: IntervalValue) -> Fragment {
+fn checkpoint_facts(persona: Id, view: TextHandle, at: IntervalValue) -> Fragment {
     entity! {
         metadata::tag: &KIND_CHECKPOINT_EVENT,
         checkpoint::persona: &persona,
@@ -286,7 +286,7 @@ pub fn checkpoint_fragment(
     point_time(at)?;
     let mut fragment = Fragment::empty();
     let handle = fragment.put::<blobencodings::UTF8String, _>(serialize_view(view)?);
-    let record = checkpoint_record(persona, handle, at);
+    let record = checkpoint_facts(persona, handle, at);
     let event = record
         .root()
         .expect("canonical Orient checkpoint has one intrinsic root");
@@ -302,6 +302,20 @@ pub struct CheckpointEvent {
     pub at: IntervalValue,
 }
 
+/// Structural fields of one selected checkpoint before its view payload is
+/// read.
+///
+/// Hot observers use this to ask the store whether the exact payload is
+/// resident without turning absence into a failed typed read. Once resident,
+/// [`load_checkpoint_event`] remains the strict decoding boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointRecord {
+    pub event: Id,
+    pub persona: Id,
+    pub view: TextHandle,
+    pub at: IntervalValue,
+}
+
 fn exactly_one<T>(event: Id, field: &str, values: Vec<T>) -> Result<T> {
     if values.len() != 1 {
         bail!(
@@ -310,6 +324,43 @@ fn exactly_one<T>(event: Id, field: &str, values: Vec<T>) -> Result<T> {
         );
     }
     Ok(values.into_iter().next().expect("one value"))
+}
+
+/// Read and authenticate the inline structure of one checkpoint without
+/// touching its UTF-8 view attachment.
+pub fn checkpoint_record(facts: &TribleSet, event: Id) -> Result<CheckpointRecord> {
+    if !exists!(pattern!(facts, [{ event @ metadata::tag: &KIND_CHECKPOINT_EVENT }])) {
+        bail!("Orient checkpoint register selects non-checkpoint event {event:x}");
+    }
+    let record = CheckpointRecord {
+        event,
+        persona: exactly_one(
+            event,
+            "checkpoint::persona",
+            find!(persona: Id, pattern!(facts, [{ event @ checkpoint::persona: ?persona }]))
+                .collect(),
+        )?,
+        view: exactly_one(
+            event,
+            "checkpoint::view",
+            find!(handle: TextHandle, pattern!(facts, [{ event @ checkpoint::view: ?handle }]))
+                .collect(),
+        )?,
+        at: exactly_one(
+            event,
+            "metadata::created_at",
+            find!(at: IntervalValue, pattern!(facts, [{ event @ metadata::created_at: ?at }]))
+                .collect(),
+        )?,
+    };
+    point_time(record.at).with_context(|| format!("validate Orient checkpoint {event:x}"))?;
+    let canonical = checkpoint_facts(record.persona, record.view, record.at)
+        .root()
+        .expect("canonical Orient checkpoint has one intrinsic root");
+    if event != canonical {
+        bail!("Orient checkpoint {event:x} is not intrinsic; canonical identity is {canonical:x}");
+    }
+    Ok(record)
 }
 
 /// Load the exact checkpoint event set, rejecting malformed or nonintrinsic
@@ -361,7 +412,7 @@ where
             .get(handle)
             .with_context(|| format!("read Orient checkpoint view {}", hex::encode(handle.raw)))?;
         let view = parse_view(&encoded)?;
-        let record = checkpoint_record(persona, handle, at);
+        let record = checkpoint_facts(persona, handle, at);
         let canonical = record
             .root()
             .expect("canonical Orient checkpoint has one intrinsic root");
@@ -465,42 +516,19 @@ pub fn load_checkpoint_event<Store>(
 where
     Store: BlobStoreGet + ?Sized,
 {
-    if !exists!(pattern!(facts, [{ event @ metadata::tag: &KIND_CHECKPOINT_EVENT }])) {
-        bail!("Orient checkpoint register selects non-checkpoint event {event:x}");
-    }
-    let persona = exactly_one(
-        event,
-        "checkpoint::persona",
-        find!(persona: Id, pattern!(facts, [{ event @ checkpoint::persona: ?persona }])).collect(),
-    )?;
-    let handle = exactly_one(
-        event,
-        "checkpoint::view",
-        find!(handle: TextHandle, pattern!(facts, [{ event @ checkpoint::view: ?handle }]))
-            .collect(),
-    )?;
-    let at = exactly_one(
-        event,
-        "metadata::created_at",
-        find!(at: IntervalValue, pattern!(facts, [{ event @ metadata::created_at: ?at }]))
-            .collect(),
-    )?;
-    point_time(at).with_context(|| format!("validate Orient checkpoint {event:x}"))?;
-    let encoded: View<str> = reader
-        .get(handle)
-        .with_context(|| format!("read Orient checkpoint view {}", hex::encode(handle.raw)))?;
+    let record = checkpoint_record(facts, event)?;
+    let encoded: View<str> = reader.get(record.view).with_context(|| {
+        format!(
+            "read Orient checkpoint view {}",
+            hex::encode(record.view.raw)
+        )
+    })?;
     let view = parse_view(&encoded)?;
-    let canonical = checkpoint_record(persona, handle, at)
-        .root()
-        .expect("canonical Orient checkpoint has one intrinsic root");
-    if event != canonical {
-        bail!("Orient checkpoint {event:x} is not intrinsic; canonical identity is {canonical:x}");
-    }
     Ok(CheckpointEvent {
         event,
-        persona,
+        persona: record.persona,
         view,
-        at,
+        at: record.at,
     })
 }
 

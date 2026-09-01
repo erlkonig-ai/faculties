@@ -319,6 +319,20 @@ pub struct ProjectionView {
     pub attachments: Vec<Id>,
 }
 
+/// The exact structural fields needed to decide and summarize inbox
+/// attention, without reading a body, envelope address set, attachment, or
+/// other parser payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionSummaryRecord {
+    pub id: Id,
+    pub source: Id,
+    pub wire: Id,
+    pub from: Option<TextHandle>,
+    pub subject: TextHandle,
+    pub claimed_date: Option<IntervalValue>,
+    pub spam: bool,
+}
+
 /// Transport meaning of the immutable source observation behind a parser
 /// projection. This is source evidence, not mutable mailbox state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2672,11 +2686,16 @@ fn text_values(
         .collect()
 }
 
-pub fn projection_view(
-    reader: &PileSnapshot,
+/// Read the structural inbox-summary projection without touching any blob.
+///
+/// This is deliberately smaller than [`projection_view`]: a watcher can
+/// decide whether a wire is unread and inspect residency of only the From and
+/// Subject it would actually print. Missing Body or attachment bytes are not
+/// relevant to that operation.
+pub fn projection_summary_record(
     facts: &TribleSet,
     projection_id: Id,
-) -> Result<ProjectionView> {
+) -> Result<ProjectionSummaryRecord> {
     if !ids_of_kind(facts, KIND_PARSED_PROJECTION).contains(&projection_id) {
         bail!("unknown Mail projection {projection_id:x}");
     }
@@ -2684,45 +2703,70 @@ pub fn projection_view(
         find!(v: Id, pattern!(facts, [{ projection_id @ projection::source: ?v }])).collect(),
         "projection source",
     )?;
-    let wire_id = required(
-        find!(v: Id, pattern!(facts, [{ source @ observation::wire: ?v }])).collect(),
-        "source wire message",
-    )?;
-    let from_handle = one(
-        find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::from: ?v }])).collect(),
-        "projection From",
-    )?;
-    let subject = required(
-        find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::subject: ?v }]))
-            .collect(),
-        "projection subject",
-    )?;
+    Ok(ProjectionSummaryRecord {
+        id: projection_id,
+        source,
+        wire: required(
+            find!(v: Id, pattern!(facts, [{ source @ observation::wire: ?v }])).collect(),
+            "source wire message",
+        )?,
+        from: one(
+            find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::from: ?v }]))
+                .collect(),
+            "projection From",
+        )?,
+        subject: required(
+            find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::subject: ?v }]))
+                .collect(),
+            "projection subject",
+        )?,
+        claimed_date: one(
+            find!(v: IntervalValue, pattern!(facts, [{ projection_id @ projection::claimed_date: ?v }]))
+                .collect(),
+            "projection claimed date",
+        )?,
+        spam: required(
+            find!(v: bool, pattern!(facts, [{ projection_id @ projection::spam: ?v }])).collect(),
+            "projection spam flag",
+        )?,
+    })
+}
+
+pub fn projection_view(
+    reader: &PileSnapshot,
+    facts: &TribleSet,
+    projection_id: Id,
+) -> Result<ProjectionView> {
+    let summary = projection_summary_record(facts, projection_id)?;
     let body = required(
         find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::body: ?v }])).collect(),
         "projection body",
     )?;
     Ok(ProjectionView {
         id: projection_id,
-        source,
-        wire: wire_id,
-        message_id: wire_claimed_message_id(reader, facts, wire_id)?,
-        from: from_handle.map(|handle| read_text(reader, handle)).transpose()?,
+        source: summary.source,
+        wire: summary.wire,
+        message_id: wire_claimed_message_id(reader, facts, summary.wire)?,
+        from: summary
+            .from
+            .map(|handle| read_text(reader, handle))
+            .transpose()?,
         to: text_values(reader, facts, projection_id, projection::to.id())?,
         cc: text_values(reader, facts, projection_id, projection::cc.id())?,
         bcc: text_values(reader, facts, projection_id, projection::bcc.id())?,
-        subject: read_text(reader, subject)?,
+        subject: read_text(reader, summary.subject)?,
         body: read_text(reader, body)?,
-        claimed_date: one(
-            find!(v: IntervalValue, pattern!(facts, [{ projection_id @ projection::claimed_date: ?v }])).collect(),
-            "projection claimed date",
-        )?,
-        in_reply_to: sorted_ids(find!(v: Id, pattern!(facts, [{ projection_id @ projection::in_reply_to: ?v }]))),
-        references: sorted_ids(find!(v: Id, pattern!(facts, [{ projection_id @ projection::reference: ?v }]))),
-        spam: required(
-            find!(v: bool, pattern!(facts, [{ projection_id @ projection::spam: ?v }])).collect(),
-            "projection spam flag",
-        )?,
-        attachments: sorted_ids(find!(v: Id, pattern!(facts, [{ projection_id @ projection::attachment: ?v }]))),
+        claimed_date: summary.claimed_date,
+        in_reply_to: sorted_ids(
+            find!(v: Id, pattern!(facts, [{ projection_id @ projection::in_reply_to: ?v }])),
+        ),
+        references: sorted_ids(
+            find!(v: Id, pattern!(facts, [{ projection_id @ projection::reference: ?v }])),
+        ),
+        spam: summary.spam,
+        attachments: sorted_ids(
+            find!(v: Id, pattern!(facts, [{ projection_id @ projection::attachment: ?v }])),
+        ),
     })
 }
 

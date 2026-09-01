@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
@@ -23,12 +23,14 @@ use faculties::{
 };
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::BlobStoreList;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
@@ -114,15 +116,6 @@ enum Command {
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,
-        /// Max local messages to show
-        #[arg(long, default_value_t = 10)]
-        message_limit: usize,
-        /// Max doing goals to show
-        #[arg(long, default_value_t = 5)]
-        doing_limit: usize,
-        /// Max todo goals to show
-        #[arg(long, default_value_t = 5)]
-        todo_limit: usize,
         /// Poll interval for the append-only pile growth gate
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
@@ -239,10 +232,54 @@ struct NativeCatalogs {
     compass_status: LwwIndex,
     relations: TribleSet,
     status: TribleSet,
-    habits: habits::Catalog,
+    habits: TribleSet,
     checkpoints: TribleSet,
     checkpoint_register: LwwIndex,
     reader: PileSnapshot,
+}
+
+/// A typed, read-only structural gate around payload decoding.
+///
+/// The plan is built from ordinary fact queries. It asks the immutable pile
+/// snapshot only whether every selected content address exists, using the
+/// untyped handle representation. Typed `get` calls happen solely inside the
+/// continuation after the whole plan is resident, so absence is a coherent
+/// pending state while present-but-invalid bytes remain a hard error.
+#[derive(Default)]
+struct StructuralPayloadPlan {
+    handles: BTreeSet<[u8; 32]>,
+}
+
+enum PayloadReadiness<T> {
+    Pending,
+    Ready(T),
+}
+
+impl StructuralPayloadPlan {
+    fn require_utf8(&mut self, handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>) {
+        self.handles.insert(handle.raw);
+    }
+
+    fn require_bytes(&mut self, handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>>) {
+        self.handles.insert(handle.raw);
+    }
+
+    fn resolve<T>(
+        self,
+        reader: &PileSnapshot,
+        ready: impl FnOnce() -> Result<T>,
+    ) -> Result<PayloadReadiness<T>> {
+        for raw in self.handles {
+            let handle = Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(raw);
+            if !reader
+                .contains_blob(handle)
+                .map_err(|error| anyhow!("inspect selected Orient payload residency: {error}"))?
+            {
+                return Ok(PayloadReadiness::Pending);
+            }
+        }
+        ready().map(PayloadReadiness::Ready)
+    }
 }
 
 #[derive(Debug)]
@@ -364,14 +401,14 @@ fn load_catalogs(
             .map_err(|error| anyhow!("validate Compass collection: {error:#}"))?;
         status::validate_catalog(&reader, &status_facts)
             .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
+        if let Some(facts) = habit_facts.as_ref() {
+            habits::validate_catalog(&reader, facts)
+                .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
+        }
         orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
             .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
     }
-    let habits = habit_facts
-        .map(|facts| habits::load_catalog(&reader, &facts))
-        .transpose()
-        .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?
-        .unwrap_or_default();
+    let habits = habit_facts.unwrap_or_default();
 
     let compass_status = compass::status_register_collection(pile, signer.verifying_key())?
         .ensure(pile, &compass_cover)
@@ -417,7 +454,7 @@ struct CoherentCatalogs {
 
 impl CoherentCatalogs {
     fn advance(&mut self, pile: &mut Pile, signer: &SigningKey) -> Result<CatalogAdvance> {
-        match load_catalogs(pile, signer, true, true)? {
+        match load_catalogs(pile, signer, true, false)? {
             NativeCatalogLoad::Coherent(catalogs) => {
                 self.current = Some(catalogs);
                 Ok(CatalogAdvance::Coherent)
@@ -445,14 +482,15 @@ fn load_poll_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Option<Nat
     }
 }
 
-fn native_task_title(catalogs: &NativeCatalogs, task: Id) -> String {
+fn native_task_title(catalogs: &NativeCatalogs, task: Id) -> Result<String> {
     find!(
         handle: compass::TextHandle,
         pattern!(&catalogs.compass, [{ task @ board::title: ?handle }])
     )
     .next()
-    .and_then(|handle| compass::read_text(&catalogs.reader, handle).ok())
-    .unwrap_or_default()
+    .map(|handle| compass::read_text(&catalogs.reader, handle))
+    .transpose()
+    .map(|title| title.unwrap_or_default())
 }
 
 fn render_native_messages(
@@ -494,7 +532,7 @@ fn render_native_messages(
     writeln!(
         out,
         "Local messages (unread inbox for {}):",
-        native_person_label(catalogs, persona)
+        read_native_person_label(catalogs, persona)?
     )
     .unwrap();
     if unread.is_empty() {
@@ -508,8 +546,8 @@ fn render_native_messages(
             "- [{}] {} {} -> {} (unread)",
             fmt_id(row.id),
             format_age(now, interval_key(row.created_at)),
-            native_person_label(catalogs, row.from),
-            native_person_label(catalogs, row.to),
+            read_native_person_label(catalogs, row.from)?,
+            read_native_person_label(catalogs, row.to)?,
         )
         .unwrap();
         let body = message::read_body(&catalogs.reader, row.body)?;
@@ -527,8 +565,8 @@ fn render_native_messages(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MailSummary {
     claimed_at: Option<i128>,
-    from: Option<String>,
-    subject: String,
+    from: Option<mail_model::TextHandle>,
+    subject: mail_model::TextHandle,
     spam: bool,
 }
 
@@ -547,7 +585,7 @@ fn native_unread_mail(catalogs: &NativeCatalogs, persona: Id) -> Result<BTreeMap
         if !row.unread {
             continue;
         }
-        let view = mail_model::projection_view(&catalogs.reader, &catalogs.mail, row.projection)?;
+        let view = mail_model::projection_summary_record(&catalogs.mail, row.projection)?;
         let summary = MailSummary {
             claimed_at: view.claimed_date.map(interval_key),
             from: view.from,
@@ -675,7 +713,16 @@ fn native_teams_messages(catalogs: &NativeCatalogs) -> Result<BTreeSet<Id>> {
 
 /// Newest observation of one logical Teams message, with the display name and
 /// body worth printing when it turns up as news.
-fn teams_message_detail(catalogs: &NativeCatalogs, message: Id) -> Result<(String, String)> {
+#[derive(Clone, Copy)]
+struct TeamsMessageDetailHandles {
+    author: Option<teams_model::TextHandle>,
+    content: Option<teams_model::TextHandle>,
+}
+
+fn teams_message_detail_handles(
+    catalogs: &NativeCatalogs,
+    message: Id,
+) -> Result<TeamsMessageDetailHandles> {
     let newest = find!(
         (modified: IntervalValue, observation: Id),
         pattern!(&catalogs.teams, [{
@@ -688,24 +735,36 @@ fn teams_message_detail(catalogs: &NativeCatalogs, message: Id) -> Result<(Strin
     .map(|(modified, observation)| (interval_key(modified), observation))
     .max();
     let Some((_, observation)) = newest else {
-        return Ok(("(unknown)".to_owned(), "(no observation)".to_owned()));
+        return Ok(TeamsMessageDetailHandles {
+            author: None,
+            content: None,
+        });
     };
     let author = find!(
         handle: teams_model::TextHandle,
         pattern!(&catalogs.teams, [{ observation @ teams::author_name: ?handle }])
     )
-    .next()
-    .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams author display name"))
-    .transpose()?
-    .unwrap_or_else(|| "(unknown)".to_owned());
+    .next();
     let content = find!(
         handle: teams_model::TextHandle,
         pattern!(&catalogs.teams, [{ observation @ archive::content: ?handle }])
     )
-    .next()
-    .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams message content"))
-    .transpose()?
-    .unwrap_or_else(|| "(no content)".to_owned());
+    .next();
+    Ok(TeamsMessageDetailHandles { author, content })
+}
+
+fn teams_message_detail(catalogs: &NativeCatalogs, message: Id) -> Result<(String, String)> {
+    let handles = teams_message_detail_handles(catalogs, message)?;
+    let author = handles
+        .author
+        .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams author display name"))
+        .transpose()?
+        .unwrap_or_else(|| "(unknown)".to_owned());
+    let content = handles
+        .content
+        .map(|handle| teams_model::read_text(&catalogs.reader, handle, "Teams message content"))
+        .transpose()?
+        .unwrap_or_else(|| "(no content)".to_owned());
     Ok((author, content))
 }
 
@@ -741,7 +800,7 @@ fn render_native_mail(
     writeln!(
         out,
         "Mail (unread for {}):",
-        native_person_label(catalogs, persona)
+        read_native_person_label(catalogs, persona)?
     )
     .unwrap();
     if rows.is_empty() {
@@ -754,15 +813,13 @@ fn render_native_mail(
             .claimed_at
             .map(|at| format_age(now, at))
             .unwrap_or_else(|| "?".to_owned());
-        writeln!(
-            out,
-            "- [{}] {} {} — {}",
-            fmt_id(wire),
-            age,
-            summary.from.unwrap_or_else(|| "(no From)".to_owned()),
-            summary.subject,
-        )
-        .unwrap();
+        let from = summary
+            .from
+            .map(|handle| mail_model::read_text(&catalogs.reader, handle))
+            .transpose()?
+            .unwrap_or_else(|| "(no From)".to_owned());
+        let subject = mail_model::read_text(&catalogs.reader, summary.subject)?;
+        writeln!(out, "- [{}] {} {} — {}", fmt_id(wire), age, from, subject,).unwrap();
     }
     Ok(out)
 }
@@ -771,7 +828,7 @@ fn render_native_compass_goals(
     catalogs: &NativeCatalogs,
     doing_limit: usize,
     todo_limit: usize,
-) -> String {
+) -> Result<String> {
     use std::fmt::Write as _;
 
     let goals = compass::goal_ids(&catalogs.compass);
@@ -814,7 +871,7 @@ fn render_native_compass_goals(
     writeln!(out, "Compass:").unwrap();
     if doing.is_empty() && todo.is_empty() {
         writeln!(out, "- No goals.").unwrap();
-        return out;
+        return Ok(out);
     }
     writeln!(out, "Doing:").unwrap();
     if doing.is_empty() {
@@ -825,7 +882,7 @@ fn render_native_compass_goals(
                 out,
                 "- [{}] {}{}",
                 fmt_id(task),
-                native_task_title(catalogs, task),
+                native_task_title(catalogs, task)?,
                 render_tags(&entity_tags(&catalogs.compass, task)),
             )
             .unwrap();
@@ -840,13 +897,13 @@ fn render_native_compass_goals(
                 out,
                 "- [{}] {}{}",
                 fmt_id(task),
-                native_task_title(catalogs, task),
+                native_task_title(catalogs, task)?,
                 render_tags(&entity_tags(&catalogs.compass, task)),
             )
             .unwrap();
         }
     }
-    out
+    Ok(out)
 }
 
 fn render_window_status(catalogs: &NativeCatalogs) -> Result<String> {
@@ -859,7 +916,7 @@ fn render_window_status(catalogs: &NativeCatalogs) -> Result<String> {
             .get(person)
             .map(|row| status::read_text(&catalogs.reader, row.text))
             .transpose()?;
-        rows.push((native_person_label(catalogs, *person), text));
+        rows.push((read_native_person_label(catalogs, *person)?, text));
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -898,7 +955,8 @@ fn observe_habits(
 ) -> Result<HabitObservation> {
     let at = habits::evaluation_dir(pile);
     let mut observation = HabitObservation::default();
-    for row in catalogs.habits.rows()? {
+    let live = habits::load_live_catalog(&catalogs.reader, &catalogs.habits)?;
+    for row in live.rows()? {
         let state = habits::evaluate(&row, now_secs, &at);
         match &state {
             habits::State::Due => {
@@ -992,31 +1050,43 @@ fn newly_needing_attention(
         .collect()
 }
 
-fn print_habit_transitions(previous: &HabitObservation, current: &HabitObservation) -> bool {
+fn render_habit_transitions(
+    previous: &HabitObservation,
+    current: &HabitObservation,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
     let due = newly_due(previous, current);
     let attention = newly_needing_attention(previous, current);
     if due.is_empty() && attention.is_empty() {
-        return false;
+        return None;
     }
+    let mut out = String::new();
     for (id, habit) in &due {
-        println!("News: habit [{}] became due ({})", fmt_id(*id), habit.label);
+        writeln!(
+            out,
+            "News: habit [{}] became due ({})",
+            fmt_id(*id),
+            habit.label
+        )
+        .unwrap();
     }
     for (id, _) in &attention {
-        println!("News: habit [{}] needs attention", fmt_id(*id));
+        writeln!(out, "News: habit [{}] needs attention", fmt_id(*id)).unwrap();
     }
     if !due.is_empty() {
-        println!("\nHabits newly due:");
+        writeln!(out, "\nHabits newly due:").unwrap();
         for (_, habit) in due {
-            println!("- {}: {}", habit.label, habit.nudge);
+            writeln!(out, "- {}: {}", habit.label, habit.nudge).unwrap();
         }
     }
     if !attention.is_empty() {
-        println!("\nHabit attention:");
+        writeln!(out, "\nHabit attention:").unwrap();
         for (_, warning) in attention {
-            println!("- {warning}");
+            writeln!(out, "- {warning}").unwrap();
         }
     }
-    true
+    Some(out)
 }
 
 fn resolve_native_persona(catalogs: &NativeCatalogs, input: &str) -> Result<Id> {
@@ -1029,87 +1099,127 @@ fn resolve_native_persona(catalogs: &NativeCatalogs, input: &str) -> Result<Id> 
         .require_unique("person", input)
 }
 
-fn profile_inputs(
-    reader: &PileSnapshot,
-    facts: &TribleSet,
-    person: Id,
-) -> Result<Vec<relations::ProfileInput>> {
-    let heads = match relations::profile_head(facts, person)? {
+fn resolve_native_persona_if_ready(
+    catalogs: &NativeCatalogs,
+    input: &str,
+) -> Result<PayloadReadiness<Id>> {
+    if let Some(id) = Id::from_hex(input.trim()) {
+        return Ok(PayloadReadiness::Ready(id));
+    }
+    persona_selector_payloads(catalogs)?
+        .resolve(&catalogs.reader, || resolve_native_persona(catalogs, input))
+}
+
+fn profile_head_ids(facts: &TribleSet, person: Id) -> Result<Vec<Id>> {
+    Ok(match relations::profile_head(facts, person)? {
         relations::Head::Missing => Vec::new(),
         relations::Head::Unique(id) => vec![id],
         relations::Head::Forked(ids) => ids,
-    };
-    heads
-        .into_iter()
-        .map(|id| {
-            let snapshot = relations::profile_snapshot(facts, id)?;
-            relations::profile_input(reader, &snapshot)
-        })
-        .collect()
+    })
 }
 
-fn native_person_label(catalogs: &NativeCatalogs, person: Id) -> String {
-    match profile_inputs(&catalogs.reader, &catalogs.relations, person) {
-        Ok(inputs) if inputs.len() == 1 => inputs[0].label.clone(),
-        _ => fmt_id(person),
+fn profile_lookup_handles(facts: &TribleSet, person: Id) -> Result<Vec<relations::TextHandle>> {
+    let mut handles = Vec::new();
+    for head in profile_head_ids(facts, person)? {
+        let snapshot = relations::profile_snapshot(facts, head)?;
+        handles.push(snapshot.label);
+        handles.extend(snapshot.aliases);
     }
+    handles.sort_unstable_by_key(|handle| handle.raw);
+    handles.dedup();
+    Ok(handles)
+}
+
+fn persona_selector_payloads(catalogs: &NativeCatalogs) -> Result<StructuralPayloadPlan> {
+    let mut plan = StructuralPayloadPlan::default();
+    for person in relations::person_anchors(&catalogs.relations) {
+        for handle in profile_lookup_handles(&catalogs.relations, person)? {
+            plan.require_utf8(handle);
+        }
+    }
+    Ok(plan)
+}
+
+fn native_person_label_handle(
+    catalogs: &NativeCatalogs,
+    person: Id,
+) -> Result<Option<relations::TextHandle>> {
+    let relations::Head::Unique(head) = relations::profile_head(&catalogs.relations, person)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        relations::profile_snapshot(&catalogs.relations, head)?.label,
+    ))
+}
+
+fn read_native_person_label(catalogs: &NativeCatalogs, person: Id) -> Result<String> {
+    native_person_label_handle(catalogs, person)?
+        .map(|handle| relations::read_text(&catalogs.reader, handle))
+        .transpose()
+        .map(|label| label.unwrap_or_else(|| fmt_id(person)))
 }
 
 fn persona_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<String>> {
-    let mut keys = HashSet::new();
-    for profile in profile_inputs(&catalogs.reader, &catalogs.relations, persona)? {
-        keys.insert(profile.label.to_ascii_lowercase());
-        keys.extend(
-            profile
-                .aliases
-                .into_iter()
-                .map(|alias| alias.to_ascii_lowercase()),
-        );
-    }
-    Ok(keys)
+    profile_lookup_handles(&catalogs.relations, persona)?
+        .into_iter()
+        .map(|handle| {
+            relations::read_text(&catalogs.reader, handle).map(|value| value.to_ascii_lowercase())
+        })
+        .collect()
 }
 
 /// Every textual group selector that may currently address `persona`.
 ///
 /// Attention is a conservative read projection, not a mutation precondition:
 /// a legitimate fork in one group must not disable every watcher. We therefore
-/// union names and membership over each group's maximal heads. Settled
+/// inspect each maximal snapshot independently. A fork head names an
+/// attention group only when that same snapshot contains the persona; names
+/// from a sibling head cannot borrow another head's membership. Settled
 /// same-person components still participate in membership, while an exact id
 /// without a Relations person record simply belongs to no group yet.
-fn group_attention_keys(
-    reader: &PileSnapshot,
+fn group_attention_name_handles(
     facts: &TribleSet,
     persona: Id,
-) -> Result<HashSet<String>> {
+) -> Result<Vec<relations::TextHandle>> {
     if !relations::person_anchors(facts).contains(&persona) {
-        return Ok(HashSet::new());
+        return Ok(Vec::new());
     }
     let equivalent = relations::IdentityComponents::from_facts(facts)?.component(persona)?;
-    let mut keys = HashSet::new();
+    let mut handles = Vec::new();
     for group in relations::group_anchors(facts) {
         let heads = match relations::group_head(facts, group)? {
             relations::Head::Missing => continue,
             relations::Head::Unique(head) => vec![head],
             relations::Head::Forked(heads) => heads,
         };
-        let snapshots: Vec<_> = heads
-            .into_iter()
-            .map(|head| relations::group_snapshot(facts, head))
-            .collect::<Result<_>>()?;
-        if snapshots
-            .iter()
-            .flat_map(|snapshot| snapshot.members.iter())
-            .any(|member| equivalent.contains(member))
-        {
-            for snapshot in snapshots {
-                keys.insert(relations::lookup_key(&relations::read_text(
-                    reader,
-                    snapshot.name,
-                )?));
+        for head in heads {
+            let snapshot = relations::group_snapshot(facts, head)?;
+            if snapshot
+                .members
+                .iter()
+                .any(|member| equivalent.contains(member))
+            {
+                handles.push(snapshot.name);
             }
         }
     }
-    Ok(keys)
+    handles.sort_unstable_by_key(|handle| handle.raw);
+    handles.dedup();
+    Ok(handles)
+}
+
+fn group_attention_keys(
+    reader: &PileSnapshot,
+    facts: &TribleSet,
+    persona: Id,
+) -> Result<HashSet<String>> {
+    group_attention_name_handles(facts, persona)?
+        .into_iter()
+        .map(|handle| {
+            relations::read_text(reader, handle).map(|value| relations::lookup_key(&value))
+        })
+        .collect()
 }
 
 fn attention_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<String>> {
@@ -1120,6 +1230,44 @@ fn attention_keys(catalogs: &NativeCatalogs, persona: Id) -> Result<HashSet<Stri
         persona,
     )?);
     Ok(keys)
+}
+
+fn latest_checkpoint_record(
+    catalogs: &NativeCatalogs,
+    persona: Id,
+) -> Result<Option<orient_model::CheckpointRecord>> {
+    catalogs
+        .checkpoint_register
+        .winner(persona)
+        .map(|event| orient_model::checkpoint_record(&catalogs.checkpoints, event))
+        .transpose()
+}
+
+fn observation_payloads(
+    catalogs: &NativeCatalogs,
+    persona: Id,
+    include_habits: bool,
+) -> Result<StructuralPayloadPlan> {
+    let mut plan = StructuralPayloadPlan::default();
+    for handle in profile_lookup_handles(&catalogs.relations, persona)? {
+        plan.require_utf8(handle);
+    }
+    for handle in group_attention_name_handles(&catalogs.relations, persona)? {
+        plan.require_utf8(handle);
+    }
+    if let Some(checkpoint) = latest_checkpoint_record(catalogs, persona)? {
+        plan.require_utf8(checkpoint.view);
+    }
+    if include_habits {
+        for payloads in habits::live_payloads(&catalogs.habits)? {
+            plan.require_utf8(payloads.condition);
+            plan.require_utf8(payloads.nudge);
+            if let Some(script) = payloads.script {
+                plan.require_bytes(script);
+            }
+        }
+    }
+    Ok(plan)
 }
 
 fn status_roster(catalogs: &NativeCatalogs) -> Result<BTreeSet<Id>> {
@@ -1343,13 +1491,16 @@ fn latest_checkpoint_view(
     catalogs: &NativeCatalogs,
     persona: Id,
 ) -> Result<Option<orient_model::WatchedView>> {
-    let Some(event) = catalogs.checkpoint_register.winner(persona) else {
+    let Some(record) = latest_checkpoint_record(catalogs, persona)? else {
         return Ok(None);
     };
     let checkpoint =
-        orient_model::load_checkpoint_event(&catalogs.reader, &catalogs.checkpoints, event)?;
+        orient_model::load_checkpoint_event(&catalogs.reader, &catalogs.checkpoints, record.event)?;
     if checkpoint.persona != persona {
-        bail!("Orient checkpoint register selects {event:x} for the wrong persona");
+        bail!(
+            "Orient checkpoint register selects {:x} for the wrong persona",
+            record.event
+        );
     }
     Ok(Some(checkpoint.view))
 }
@@ -1374,13 +1525,11 @@ fn require_seen_frontier(
     persona: Id,
 ) -> Result<(BTreeSet<Id>, BTreeSet<Id>)> {
     let universe = all_note_ids(&catalogs.compass);
-    let (observed, initialized) = observed_notes(catalogs, persona)?;
-    if !initialized {
+    let observed = orient_model::seen_notes(&catalogs.checkpoints, persona);
+    if !orient_model::has_seen_notes_frontier(&catalogs.checkpoints, persona) {
         bail!(
-            "Orient's note frontier is not initialized for this persona: {} current notes exist, {} occur in legacy checkpoints, and {} have no legacy observation record. Stop Compass writers, then run `orient --persona <persona> migrate-note-frontier` once to baseline one coherent current Compass snapshot",
+            "Orient's note frontier is not initialized for this persona: {} current notes exist. Stop Compass writers, then run `orient --persona <persona> migrate-note-frontier` once to baseline one coherent current Compass snapshot",
             universe.len(),
-            observed.len(),
-            universe.difference(&observed).count(),
         );
     }
     Ok((universe, observed))
@@ -1458,7 +1607,7 @@ fn cmd_show(
             pile_path,
             epoch_seconds(clock::now()?),
         )?));
-        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
+        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit)?;
         let window_status = render_window_status(&catalogs)?;
         if let Some(persona_id) = persona_id {
             let view = load_watched_view(&catalogs, persona_id)?;
@@ -1606,25 +1755,75 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
-/// Print only the *novel* content behind the news — new peer messages, Mail
-/// and Teams messages, plus newly-arrived roster members — so a woken watcher gets what changed,
-/// not a full re-dump of the snapshot. The `News:` reason lines are printed by
-/// the caller; this fills in the detail worth reading.
-fn print_news_detail(
+fn news_detail_payloads(
     catalogs: &NativeCatalogs,
     old: &orient_model::WatchedView,
     new: &orient_model::WatchedView,
     persona_id: Id,
-) -> Result<()> {
+) -> Result<StructuralPayloadPlan> {
+    let mut plan = StructuralPayloadPlan::default();
+    let message_rows = message::load_message_rows(&catalogs.messages)?;
+    for id in new.unread.difference(&old.unread) {
+        if let Some(row) = message_rows.iter().find(|row| row.id == *id) {
+            plan.require_utf8(row.body);
+            if let Some(label) = native_person_label_handle(catalogs, row.from)? {
+                plan.require_utf8(label);
+            }
+        }
+    }
+    let mail = native_unread_mail(catalogs, persona_id)?;
+    for wire in new.mail_unread.difference(&old.mail_unread) {
+        let summary = mail
+            .get(wire)
+            .ok_or_else(|| anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire)))?;
+        if let Some(from) = summary.from {
+            plan.require_utf8(from);
+        }
+        plan.require_utf8(summary.subject);
+    }
+    for message in new.teams.difference(&old.teams) {
+        let handles = teams_message_detail_handles(catalogs, *message)?;
+        if let Some(author) = handles.author {
+            plan.require_utf8(author);
+        }
+        if let Some(content) = handles.content {
+            plan.require_utf8(content);
+        }
+    }
+    for person in new
+        .roster
+        .difference(&old.roster)
+        .filter(|person| **person != persona_id)
+    {
+        if let Some(label) = native_person_label_handle(catalogs, *person)? {
+            plan.require_utf8(label);
+        }
+    }
+    Ok(plan)
+}
+
+/// Render only the *novel* content behind the news — new peer messages, Mail
+/// and Teams messages, plus newly-arrived roster members — so a woken watcher gets what changed,
+/// not a full re-dump of the snapshot. The `News:` reason lines are rendered by
+/// the caller; this fills in the detail worth reading.
+fn render_news_detail(
+    catalogs: &NativeCatalogs,
+    old: &orient_model::WatchedView,
+    new: &orient_model::WatchedView,
+    persona_id: Id,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
     let new_msgs: Vec<Id> = new.unread.difference(&old.unread).copied().collect();
     if !new_msgs.is_empty() {
         let rows = message::load_message_rows(&catalogs.messages)?;
-        println!("\nNew messages:");
+        writeln!(out, "\nNew messages:").unwrap();
         for id in &new_msgs {
             if let Some(row) = rows.iter().find(|r| r.id == *id) {
-                let from = native_person_label(catalogs, row.from);
+                let from = read_native_person_label(catalogs, row.from)?;
                 let body = message::read_body(&catalogs.reader, row.body)?;
-                println!("- {from}: {body}");
+                writeln!(out, "- {from}: {body}").unwrap();
             }
         }
     }
@@ -1635,25 +1834,26 @@ fn print_news_detail(
         .collect();
     if !new_mail.is_empty() {
         let summaries = native_unread_mail(catalogs, persona_id)?;
-        println!("\nNew mail:");
+        writeln!(out, "\nNew mail:").unwrap();
         for wire in &new_mail {
             let summary = summaries.get(wire).ok_or_else(|| {
                 anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire))
             })?;
-            println!(
-                "- [{}] {} — {}",
-                fmt_id(*wire),
-                summary.from.as_deref().unwrap_or("(no From)"),
-                summary.subject,
-            );
+            let from = summary
+                .from
+                .map(|handle| mail_model::read_text(&catalogs.reader, handle))
+                .transpose()?
+                .unwrap_or_else(|| "(no From)".to_owned());
+            let subject = mail_model::read_text(&catalogs.reader, summary.subject)?;
+            writeln!(out, "- [{}] {} — {}", fmt_id(*wire), from, subject,).unwrap();
         }
     }
     let new_teams: Vec<Id> = new.teams.difference(&old.teams).copied().collect();
     if !new_teams.is_empty() {
-        println!("\nNew Teams messages:");
+        writeln!(out, "\nNew Teams messages:").unwrap();
         for message in &new_teams {
             let (author, content) = teams_message_detail(catalogs, *message)?;
-            println!("- {author}: {content}");
+            writeln!(out, "- {author}: {content}").unwrap();
         }
     }
     let new_people: Vec<Id> = new
@@ -1663,12 +1863,12 @@ fn print_news_detail(
         .filter(|person| *person != persona_id)
         .collect();
     if !new_people.is_empty() {
-        println!("\nNew status window(s):");
+        writeln!(out, "\nNew status window(s):").unwrap();
         for id in &new_people {
-            println!("- {}", native_person_label(catalogs, *id));
+            writeln!(out, "- {}", read_native_person_label(catalogs, *id)?).unwrap();
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Outcome of one shot of the wait fire-path (`check_news_once`).
@@ -1681,6 +1881,116 @@ enum NewsCheck {
     /// establish the baseline (`wait` and non-peeking `poll` save it
     /// silently; peeking remains read-only).
     NoCheckpoint(orient_model::WatchedView),
+    /// At least one selected referenced payload has not arrived. No output or
+    /// checkpoint was produced.
+    Pending,
+}
+
+enum PreparedNews {
+    Fired {
+        report: String,
+        view: orient_model::WatchedView,
+        newly_observed: Vec<Id>,
+    },
+    Quiet {
+        checkpoint: Option<(orient_model::WatchedView, Vec<Id>)>,
+    },
+    NoCheckpoint(orient_model::WatchedView),
+}
+
+fn write_complete_report(output: &mut impl Write, report: &str, description: &str) -> Result<()> {
+    output
+        .write_all(report.as_bytes())
+        .with_context(|| format!("write complete {description}"))?;
+    output
+        .flush()
+        .with_context(|| format!("flush complete {description}"))
+}
+
+fn prepare_news_once(
+    catalogs: &NativeCatalogs,
+    persona_id: Id,
+    peek: bool,
+) -> Result<PayloadReadiness<PreparedNews>> {
+    let prerequisites = observation_payloads(catalogs, persona_id, false)?;
+    let PayloadReadiness::Ready((view, seen)) = prerequisites.resolve(&catalogs.reader, || {
+        Ok((
+            load_watched_view(catalogs, persona_id)?,
+            latest_checkpoint_view(catalogs, persona_id)?,
+        ))
+    })?
+    else {
+        return Ok(PayloadReadiness::Pending);
+    };
+    let Some(seen) = seen else {
+        return Ok(PayloadReadiness::Ready(PreparedNews::NoCheckpoint(view)));
+    };
+    let (universe, observed) = require_seen_frontier(catalogs, persona_id)?;
+    let newly_observed = universe.difference(&observed).copied().collect::<Vec<_>>();
+    let reasons = view_news(&seen, &view, persona_id, &observed);
+    if reasons.is_empty() {
+        let checkpoint = (!peek && (view != seen || !newly_observed.is_empty()))
+            .then_some((view, newly_observed));
+        return Ok(PayloadReadiness::Ready(PreparedNews::Quiet { checkpoint }));
+    }
+
+    let detail = news_detail_payloads(catalogs, &seen, &view, persona_id)?;
+    detail.resolve(&catalogs.reader, || {
+        use std::fmt::Write as _;
+
+        let mut report = String::new();
+        for reason in &reasons {
+            writeln!(report, "News: {reason}").unwrap();
+        }
+        report.push_str(&render_news_detail(catalogs, &seen, &view, persona_id)?);
+        Ok(PreparedNews::Fired {
+            report,
+            view,
+            newly_observed,
+        })
+    })
+}
+
+fn apply_prepared_news(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    persona_id: Id,
+    peek: bool,
+    prepared: PreparedNews,
+    prefix: &str,
+    output: &mut impl Write,
+) -> Result<NewsCheck> {
+    match prepared {
+        PreparedNews::Fired {
+            report,
+            view,
+            newly_observed,
+        } => {
+            let mut complete = String::with_capacity(prefix.len() + report.len());
+            complete.push_str(prefix);
+            complete.push_str(&report);
+            write_complete_report(output, &complete, "Orient news report")?;
+            if !peek {
+                save_checkpoint(pile, signer, persona_id, &view, newly_observed)?;
+            }
+            Ok(NewsCheck::Fired)
+        }
+        PreparedNews::Quiet { checkpoint } => {
+            if !prefix.is_empty() {
+                write_complete_report(output, prefix, "Orient habit report")?;
+            }
+            if let Some((view, newly_observed)) = checkpoint {
+                save_checkpoint(pile, signer, persona_id, &view, newly_observed)?;
+            }
+            Ok(NewsCheck::Quiet)
+        }
+        PreparedNews::NoCheckpoint(view) => {
+            if !prefix.is_empty() {
+                write_complete_report(output, prefix, "Orient habit report")?;
+            }
+            Ok(NewsCheck::NoCheckpoint(view))
+        }
+    }
 }
 
 /// One shot of the wait fire-path for a persona: load the current
@@ -1696,43 +2006,23 @@ fn check_news_once(
     persona_id: Id,
     peek: bool,
 ) -> Result<NewsCheck> {
-    let view = load_watched_view(catalogs, persona_id)?;
-    let Some(seen) = latest_checkpoint_view(catalogs, persona_id)? else {
-        return Ok(NewsCheck::NoCheckpoint(view));
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    check_news_once_to(pile, signer, catalogs, persona_id, peek, &mut output)
+}
+
+fn check_news_once_to(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    catalogs: &NativeCatalogs,
+    persona_id: Id,
+    peek: bool,
+    output: &mut impl Write,
+) -> Result<NewsCheck> {
+    let PayloadReadiness::Ready(prepared) = prepare_news_once(catalogs, persona_id, peek)? else {
+        return Ok(NewsCheck::Pending);
     };
-    let (universe, observed) = require_seen_frontier(catalogs, persona_id)?;
-    let reasons = view_news(&seen, &view, persona_id, &observed);
-    if reasons.is_empty() {
-        if !peek && (view != seen || universe != observed) {
-            save_checkpoint(
-                pile,
-                signer,
-                persona_id,
-                &view,
-                universe.difference(&observed).copied(),
-            )?;
-        }
-        return Ok(NewsCheck::Quiet);
-    }
-    for reason in &reasons {
-        println!("News: {reason}");
-    }
-    print_news_detail(catalogs, &seen, &view, persona_id)?;
-    // Advance the checkpoint — the terse path skips cmd_show, which is
-    // what normally saves it. Without this the checkpoint never moves
-    // and every re-arm / next poll instantly re-fires on the same news.
-    // Peek mode skips the save: report without consuming, for hooks that
-    // can't tell whose turn they fire on (root vs subagent).
-    if !peek {
-        save_checkpoint(
-            pile,
-            signer,
-            persona_id,
-            &view,
-            universe.difference(&observed).copied(),
-        )?;
-    }
-    Ok(NewsCheck::Fired)
+    apply_prepared_news(pile, signer, persona_id, peek, prepared, "", output)
 }
 
 /// One-shot, non-blocking `wait`: report news since the persona's
@@ -1761,7 +2051,11 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
         let Some(catalogs) = load_poll_catalogs(&mut pile, &signer)? else {
             return Ok(());
         };
-        let persona_id = resolve_native_persona(&catalogs, input)?;
+        let PayloadReadiness::Ready(persona_id) =
+            resolve_native_persona_if_ready(&catalogs, input)?
+        else {
+            return Ok(());
+        };
         match check_news_once(&mut pile, &signer, &catalogs, persona_id, peek)? {
             // News printed (+ checkpoint advanced unless peeking).
             NewsCheck::Fired => {}
@@ -1784,6 +2078,10 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
                     )?;
                 }
             }
+            // A referenced payload selected by the current semantic view is
+            // not resident yet. Poll is silent and read-only; a later hook or
+            // armed watcher retries after sync appends it.
+            NewsCheck::Pending => {}
         }
         Ok(())
     })();
@@ -1818,7 +2116,56 @@ fn cmd_migrate_note_frontier(
 struct WaitOutcome {
     news_printed: bool,
     incomplete: Option<PhysicalCoverIncompleteness>,
+    payload_pending: bool,
     had_coherent_catalogs: bool,
+}
+
+struct WaitFrame {
+    catalogs: NativeCatalogs,
+    persona: Id,
+    habits: HabitObservation,
+    news: PreparedNews,
+}
+
+enum WaitFrameLoad {
+    Pending(Option<PhysicalCoverIncompleteness>),
+    Ready(WaitFrame),
+}
+
+fn load_wait_frame(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    pile_path: &Path,
+    persona_input: &str,
+    now_secs: i64,
+) -> Result<WaitFrameLoad> {
+    let catalogs = match load_catalogs(pile, signer, true, false)? {
+        NativeCatalogLoad::Incomplete(incomplete) => {
+            return Ok(WaitFrameLoad::Pending(Some(incomplete)));
+        }
+        NativeCatalogLoad::Coherent(catalogs) => catalogs,
+    };
+    let PayloadReadiness::Ready(persona) =
+        resolve_native_persona_if_ready(&catalogs, persona_input)?
+    else {
+        return Ok(WaitFrameLoad::Pending(None));
+    };
+    let PayloadReadiness::Ready(habits) = observation_payloads(&catalogs, persona, true)?
+        .resolve(&catalogs.reader, || {
+            observe_habits(&catalogs, pile_path, now_secs)
+        })?
+    else {
+        return Ok(WaitFrameLoad::Pending(None));
+    };
+    let PayloadReadiness::Ready(news) = prepare_news_once(&catalogs, persona, false)? else {
+        return Ok(WaitFrameLoad::Pending(None));
+    };
+    Ok(WaitFrameLoad::Ready(WaitFrame {
+        catalogs,
+        persona,
+        habits,
+        news,
+    }))
 }
 
 fn cmd_wait(
@@ -1826,9 +2173,6 @@ fn cmd_wait(
     key: Option<&Path>,
     persona: Option<&str>,
     target: Option<WaitTarget>,
-    message_limit: usize,
-    doing_limit: usize,
-    todo_limit: usize,
     poll_ms: u64,
 ) -> Result<()> {
     let Some(persona_input) = persona else {
@@ -1848,26 +2192,37 @@ fn cmd_wait(
             .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
-        let mut catalogs = CoherentCatalogs::default();
-        let mut incomplete;
+        let mut incomplete = None;
+        let mut payload_pending = false;
 
-        // A watcher may start after a COMMIT arrived but before its immutable
-        // member bytes. Such a prefix is parsed and meaningful, just not yet
-        // physically readable. Wait for a longer prefix instead of failing or
-        // inventing a partial semantic baseline.
-        loop {
-            match catalogs.advance(&mut pile, &signer)? {
-                CatalogAdvance::Coherent => {
+        // A watcher may start after either a collection member or one of the
+        // selected referenced payloads was announced but before its bytes.
+        // Neither gap is a semantic baseline. Wait for a later append and
+        // install only a frame whose exact observation is physically closed.
+        let initial = loop {
+            match load_wait_frame(
+                &mut pile,
+                &signer,
+                pile_path,
+                persona_input,
+                epoch_seconds(clock::now()?),
+            )? {
+                WaitFrameLoad::Ready(frame) => {
                     incomplete = None;
-                    break;
+                    payload_pending = false;
+                    break frame;
                 }
-                CatalogAdvance::Incomplete(pending) => incomplete = Some(pending),
+                WaitFrameLoad::Pending(root) => {
+                    payload_pending = root.is_none();
+                    incomplete = root;
+                }
             }
 
             if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
                 return Ok(WaitOutcome {
                     news_printed: false,
                     incomplete,
+                    payload_pending,
                     had_coherent_catalogs: false,
                 });
             }
@@ -1883,23 +2238,27 @@ fn cmd_wait(
             // Bytes appended during refresh or catalog loading remain beyond
             // this sampled watermark and cause another pass.
             observed_length = current_length;
-        }
+        };
 
-        let current = catalogs
-            .get()
-            .expect("coherent advance installs native catalogs");
-        let persona_id = resolve_native_persona(current, persona_input)?;
+        let WaitFrame {
+            catalogs: mut current,
+            persona: persona_id,
+            habits: mut habit_seen,
+            news,
+        } = initial;
         // Already-due habits establish a quiet, process-local baseline. A
         // rearmed one-shot watcher therefore waits for a transition instead
         // of reporting the same unsatisfied intention forever.
-        let mut habit_seen = observe_habits(current, pile_path, epoch_seconds(clock::now()?))?;
         let mut last_habit_sweep = Instant::now();
 
-        match check_news_once(&mut pile, &signer, current, persona_id, false)? {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        match apply_prepared_news(&mut pile, &signer, persona_id, false, news, "", &mut output)? {
             NewsCheck::Fired => {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     incomplete: None,
+                    payload_pending: false,
                     had_coherent_catalogs: true,
                 });
             }
@@ -1913,6 +2272,7 @@ fn cmd_wait(
                     all_note_ids(&current.compass),
                 )?;
             }
+            NewsCheck::Pending => unreachable!("a ready wait frame contains prepared news"),
         }
 
         loop {
@@ -1921,6 +2281,7 @@ fn cmd_wait(
                     return Ok(WaitOutcome {
                         news_printed: false,
                         incomplete,
+                        payload_pending,
                         had_coherent_catalogs: true,
                     });
                 }
@@ -1939,62 +2300,75 @@ fn cmd_wait(
                 continue;
             }
 
-            let coherent_append = if pile_changed {
+            if pile_changed {
                 pile.refresh()
                     .map_err(|error| anyhow!("refresh pile {}: {error}", pile_path.display()))?;
                 // Do not retry an immutable incomplete prefix. An append which
                 // raced this attempt remains beyond the sampled watermark.
                 observed_length = current_length;
-                match catalogs.advance(&mut pile, &signer)? {
-                    CatalogAdvance::Coherent => {
+                match load_wait_frame(&mut pile, &signer, pile_path, persona_input, now_secs)? {
+                    WaitFrameLoad::Ready(candidate) => {
                         incomplete = None;
-                        true
-                    }
-                    CatalogAdvance::Incomplete(pending) => {
-                        incomplete = Some(pending);
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            let current = catalogs
-                .get()
-                .expect("the wait loop retains its last coherent catalogs");
-            // This happens before the append-driven news path. If ordinary
-            // news and a Habit transition arrive together, both are printed
-            // before the one-shot watcher exits; rearming cannot erase either.
-            let current_habits = observe_habits(current, pile_path, now_secs)?;
-            let habit_fired = print_habit_transitions(&habit_seen, &current_habits);
-            habit_seen = current_habits;
-            last_habit_sweep = Instant::now();
-
-            let ordinary_fired = if coherent_append {
-                match check_news_once(&mut pile, &signer, current, persona_id, false)? {
-                    NewsCheck::Fired => true,
-                    NewsCheck::Quiet => false,
-                    NewsCheck::NoCheckpoint(view) => {
-                        // This can only happen if an external rewrite removed
-                        // the append-only checkpoint collection. Retain total
-                        // behavior without inventing a partial baseline.
-                        save_checkpoint(
+                        payload_pending = false;
+                        let habit_report = render_habit_transitions(&habit_seen, &candidate.habits)
+                            .unwrap_or_default();
+                        let habit_fired = !habit_report.is_empty();
+                        let ordinary = apply_prepared_news(
                             &mut pile,
                             &signer,
-                            persona_id,
-                            &view,
-                            all_note_ids(&current.compass),
+                            candidate.persona,
+                            false,
+                            candidate.news,
+                            &habit_report,
+                            &mut output,
                         )?;
-                        false
+                        let ordinary_fired = matches!(&ordinary, NewsCheck::Fired);
+                        if let NewsCheck::NoCheckpoint(view) = ordinary {
+                            save_checkpoint(
+                                &mut pile,
+                                &signer,
+                                candidate.persona,
+                                &view,
+                                all_note_ids(&candidate.catalogs.compass),
+                            )?;
+                        }
+                        if habit_fired || ordinary_fired {
+                            return Ok(WaitOutcome {
+                                news_printed: true,
+                                incomplete: None,
+                                payload_pending: false,
+                                had_coherent_catalogs: true,
+                            });
+                        }
+                        current = candidate.catalogs;
+                        habit_seen = candidate.habits;
+                        last_habit_sweep = Instant::now();
+                        continue;
+                    }
+                    WaitFrameLoad::Pending(root) => {
+                        payload_pending = root.is_none();
+                        incomplete = root;
                     }
                 }
-            } else {
-                false
-            };
-            if habit_fired || ordinary_fired {
+            }
+
+            // A physically incomplete newer frame never replaces `current`.
+            // Time-driven Habit transitions therefore remain observable from
+            // the last complete frame while sync closes the append.
+            let current_habits = observe_habits(&current, pile_path, now_secs)?;
+            let habit_report =
+                render_habit_transitions(&habit_seen, &current_habits).unwrap_or_default();
+            let habit_fired = !habit_report.is_empty();
+            if habit_fired {
+                write_complete_report(&mut output, &habit_report, "Orient habit report")?;
+            }
+            habit_seen = current_habits;
+            last_habit_sweep = Instant::now();
+            if habit_fired {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     incomplete,
+                    payload_pending,
                     had_coherent_catalogs: true,
                 });
             }
@@ -2018,15 +2392,20 @@ fn cmd_wait(
         }
         return Ok(());
     }
-    println!("No change detected since wait started; showing current snapshot.");
-    cmd_show(
-        pile_path,
-        key,
-        persona,
-        message_limit,
-        doing_limit,
-        todo_limit,
-    )
+    if outcome.payload_pending {
+        if outcome.had_coherent_catalogs {
+            println!(
+                "The latest pile prefix is awaiting selected payload closure; the watcher retained its last coherent snapshot."
+            );
+        } else {
+            println!(
+                "No coherent snapshot became available before wait ended; selected payloads are still awaiting sync closure."
+            );
+        }
+        return Ok(());
+    }
+    println!("No change detected since wait started.");
+    Ok(())
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -2108,7 +2487,7 @@ fn cmd_wake(
         )?;
 
         let beliefs = wiki_model::cover_fragments(wiki.store_snapshot(), wiki.catalog())?;
-        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit);
+        let goals = render_native_compass_goals(&catalogs, doing_limit, todo_limit)?;
         Ok((cover, beliefs, goals))
     })();
     let (cover, beliefs, goals) = close_pile(storage, result)?;
@@ -2152,20 +2531,11 @@ fn main() -> Result<()> {
             doing_limit,
             todo_limit,
         ),
-        Command::Wait {
-            target,
-            message_limit,
-            doing_limit,
-            todo_limit,
-            poll_ms,
-        } => cmd_wait(
+        Command::Wait { target, poll_ms } => cmd_wait(
             &cli.pile,
             cli.key.as_deref(),
             cli.persona.as_deref(),
             target,
-            message_limit,
-            doing_limit,
-            todo_limit,
             poll_ms,
         ),
         Command::Wake {
@@ -2237,6 +2607,55 @@ mod tests {
         let collection =
             faculties::collection_names::open(pile, scope, signer.verifying_key()).unwrap();
         pile.commit(collection, signer, fragment).unwrap();
+    }
+
+    fn facts_only(fragment: Fragment) -> Fragment {
+        Fragment::from(fragment.into_facts())
+    }
+
+    fn load_wait_catalogs(pile: &mut Pile, signer: &SigningKey) -> NativeCatalogs {
+        match load_catalogs(pile, signer, true, false).unwrap() {
+            NativeCatalogLoad::Coherent(catalogs) => catalogs,
+            NativeCatalogLoad::Incomplete(incomplete) => {
+                panic!("test collection cover is incomplete: {incomplete}")
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        calls: usize,
+        flushes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingFlushWriter {
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for FailingFlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected flush failure"))
+        }
     }
 
     fn append_commit_before_member(
@@ -3183,9 +3602,33 @@ mod tests {
 
         assert_eq!(
             keys,
-            HashSet::from(["reviewers".to_owned(), "review-team".to_owned()]),
-            "all maximal names of a containing fork address the member, while an unrelated fork is inert"
+            HashSet::from(["reviewers".to_owned()]),
+            "only the fork snapshot that contains the member contributes its name"
         );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn exact_persona_id_ignores_an_unrelated_missing_profile_payload() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let other = ufoid().id;
+        let (profile, _, _) = relations::person_fragment(other, profile("missing")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, facts_only(profile));
+
+        assert!(matches!(
+            load_wait_frame(
+                &mut pile,
+                &signer,
+                &fixture.path,
+                &format!("{persona:x}"),
+                1,
+            )
+            .unwrap(),
+            WaitFrameLoad::Ready(frame) if frame.persona == persona
+        ));
         pile.close().unwrap();
     }
 
@@ -3486,6 +3929,529 @@ mod tests {
         assert!(view_news(&incoming, &read, persona, &BTreeSet::new()).is_empty());
         let rendered = render_native_mail(&catalogs, Some(persona), 10).unwrap();
         assert!(rendered.contains("- None"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn missing_new_message_body_is_pending_then_fires_once_after_arrival() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let sender = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(sender, profile("sender"))
+            .unwrap()
+            .0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let body = Blob::<blobencodings::UTF8String>::new(Bytes::from(b"hello".to_vec()));
+        let envelope = message::envelope_fragment(
+            sender,
+            persona,
+            body.get_handle(),
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+            None,
+            None,
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, envelope);
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Pending
+        ));
+        assert!(output.is_empty());
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+        assert_eq!(
+            latest_checkpoint_view(&catalogs, persona).unwrap(),
+            Some(baseline.clone())
+        );
+
+        pile.put::<blobencodings::UTF8String, _>(body).unwrap();
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Fired
+        ));
+        assert!(String::from_utf8(output).unwrap().contains("sender: hello"));
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Quiet
+        ));
+        assert!(output.is_empty());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn missing_new_teams_content_is_pending_then_fires_with_other_payloads_absent() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+
+        let source_fragment = teams_model::source_fragment(TEAMS_TENANT);
+        let source = source_fragment.root().unwrap();
+        let (auth_fragment, _) = teams_model::auth_profile_fragment(
+            source,
+            "client-id",
+            TEAMS_OWN_USER,
+            "Chat.ReadWrite offline_access",
+            Some(ufoid().id),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            TEAMS_SCOPE_ID,
+            source_fragment + auth_fragment,
+        );
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let author = "Colleague";
+        let content = "<p>payload arrived</p>";
+        let observation = teams_observation(
+            source,
+            "missing-content",
+            "colleague-graph-user-id",
+            author,
+            content,
+            10.0,
+        );
+        commit_scope(&mut pile, &signer, TEAMS_SCOPE_ID, facts_only(observation));
+        pile.put::<blobencodings::UTF8String, _>(Blob::new(Bytes::from(
+            author.as_bytes().to_vec(),
+        )))
+        .unwrap();
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Pending
+        ));
+        assert!(output.is_empty());
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+
+        pile.put::<blobencodings::UTF8String, _>(Blob::new(Bytes::from(
+            content.as_bytes().to_vec(),
+        )))
+        .unwrap();
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Fired
+        ));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Colleague: <p>payload arrived</p>"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn mail_summary_waits_for_subject_but_not_body_or_envelope_payloads() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+
+        let account = ufoid().id;
+        let (account_fragment, config) = mail_model::account_config_fragment(
+            account,
+            mail_model::AccountConfigInput {
+                address: "persona@example.test".to_owned(),
+                display_name: "Persona".to_owned(),
+                pop_endpoint: "pop.example.test:995".to_owned(),
+                smtp_endpoint: "smtp.example.test:465".to_owned(),
+                username: "persona@example.test".to_owned(),
+                credential: ufoid().id,
+                enabled: true,
+                predecessors: Vec::new(),
+            },
+        )
+        .unwrap();
+        commit_scope(&mut pile, &signer, MAIL_SCOPE_ID, account_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let raw = b"From: sender@example.test\r\nTo: persona@example.test\r\nSubject: Selected subject\r\nMessage-ID: <summary-missing@example.test>\r\nDate: Tue, 11 Aug 2026 06:00:00 +0200\r\n\r\nUnselected body\r\n";
+        let parsed = mail_model::parse_rfc5322(raw).unwrap();
+        let publication = mail_model::pop_publication(account, config, "uid-summary", raw).unwrap();
+        let summary =
+            mail_model::projection_summary_record(publication.mail.facts(), publication.projection)
+                .unwrap();
+        let from =
+            Blob::<blobencodings::UTF8String>::new(Bytes::from(parsed.from.unwrap().into_bytes()));
+        let subject =
+            Blob::<blobencodings::UTF8String>::new(Bytes::from(parsed.subject.into_bytes()));
+        assert_eq!(summary.from, Some(from.get_handle()));
+        assert_eq!(summary.subject, subject.get_handle());
+        commit_scope(
+            &mut pile,
+            &signer,
+            MAIL_SCOPE_ID,
+            facts_only(publication.mail),
+        );
+        pile.put::<blobencodings::UTF8String, _>(from).unwrap();
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Pending
+        ));
+        assert!(output.is_empty());
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+
+        pile.put::<blobencodings::UTF8String, _>(subject).unwrap();
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Fired
+        ));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("sender@example.test — Selected subject"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn selected_checkpoint_view_waits_for_its_payload() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let baseline = view("");
+        let encoded = orient_model::serialize_view(&baseline).unwrap();
+        let view_blob =
+            Blob::<blobencodings::UTF8String>::new(Bytes::from(encoded.as_bytes().to_vec()));
+        let (checkpoint, event) = orient_model::checkpoint_fragment(
+            persona,
+            &baseline,
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+        )
+        .unwrap();
+        assert_eq!(
+            orient_model::checkpoint_record(checkpoint.facts(), event)
+                .unwrap()
+                .view,
+            view_blob.get_handle(),
+        );
+        let mut checkpoint = facts_only(checkpoint);
+        checkpoint += orient_model::seen_notes_fragment(persona, std::iter::empty());
+
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            checkpoint,
+        );
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Pending
+        ));
+        assert!(output.is_empty());
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+
+        pile.put::<blobencodings::UTF8String, _>(view_blob).unwrap();
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        assert!(matches!(
+            prepare_news_once(&catalogs, persona, false).unwrap(),
+            PayloadReadiness::Ready(PreparedNews::Quiet { .. })
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn live_habit_nudge_and_script_are_selected_payload_obligations() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let condition = "when @script --due";
+        let nudge = "inspect the branches";
+        let script = b"#!/bin/sh\nexit 0\n".to_vec();
+        let (definition, _) = habits::habit_fragment(
+            "lineage-hygiene",
+            condition,
+            nudge,
+            Some(script.clone()),
+            &[],
+        )
+        .unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, facts_only(definition));
+        pile.put::<blobencodings::UTF8String, _>(Blob::new(Bytes::from(
+            condition.as_bytes().to_vec(),
+        )))
+        .unwrap();
+
+        let catalogs = load_wait_catalogs(&mut pile, &signer);
+        assert!(matches!(
+            observation_payloads(&catalogs, persona, true)
+                .unwrap()
+                .resolve(&catalogs.reader, || habits::load_live_catalog(
+                    &catalogs.reader,
+                    &catalogs.habits,
+                )
+                .map(|_| ()))
+                .unwrap(),
+            PayloadReadiness::Pending
+        ));
+
+        pile.put::<blobencodings::UTF8String, _>(Blob::new(Bytes::from(nudge.as_bytes().to_vec())))
+            .unwrap();
+        let catalogs = load_wait_catalogs(&mut pile, &signer);
+        assert!(matches!(
+            observation_payloads(&catalogs, persona, true)
+                .unwrap()
+                .resolve(&catalogs.reader, || habits::load_live_catalog(
+                    &catalogs.reader,
+                    &catalogs.habits,
+                )
+                .map(|_| ()))
+                .unwrap(),
+            PayloadReadiness::Pending
+        ));
+
+        pile.put::<blobencodings::RawBytes, _>(Blob::new(Bytes::from(script)))
+            .unwrap();
+        let catalogs = load_wait_catalogs(&mut pile, &signer);
+        assert!(matches!(
+            observation_payloads(&catalogs, persona, true)
+                .unwrap()
+                .resolve(&catalogs.reader, || habits::load_live_catalog(
+                    &catalogs.reader,
+                    &catalogs.habits,
+                )
+                .map(|_| ()))
+                .unwrap(),
+            PayloadReadiness::Ready(())
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn co_fired_habit_and_ordinary_news_are_one_buffer_before_checkpoint() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let view = view("");
+        let prepared = PreparedNews::Fired {
+            report: "News: ordinary\n".to_owned(),
+            view: view.clone(),
+            newly_observed: Vec::new(),
+        };
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut output = CountingWriter::default();
+        assert!(matches!(
+            apply_prepared_news(
+                &mut pile,
+                &signer,
+                persona,
+                false,
+                prepared,
+                "News: habit\n",
+                &mut output,
+            )
+            .unwrap(),
+            NewsCheck::Fired
+        ));
+        assert_eq!(output.calls, 1);
+        assert_eq!(output.flushes, 1);
+        assert_eq!(output.bytes, b"News: habit\nNews: ordinary\n");
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(
+            latest_checkpoint_view(&catalogs, persona).unwrap(),
+            Some(view)
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn failed_report_flush_cannot_advance_the_checkpoint() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let view = view("");
+        let prepared = PreparedNews::Fired {
+            report: "News: ordinary\n".to_owned(),
+            view,
+            newly_observed: Vec::new(),
+        };
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = FailingFlushWriter::default();
+        let error = match apply_prepared_news(
+            &mut pile,
+            &signer,
+            persona,
+            false,
+            prepared,
+            "News: habit\n",
+            &mut output,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("flush failure must abort publication"),
+        };
+        assert!(format!("{error:#}").contains("injected flush failure"));
+        assert_eq!(output.bytes, b"News: habit\nNews: ordinary\n");
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        assert_eq!(latest_checkpoint_view(&catalogs, persona).unwrap(), None);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn invalid_resident_selected_utf8_is_fatal_before_any_report_or_checkpoint() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let sender = ufoid().id;
+        let mut relations_fragment = relations::person_fragment(persona, profile("persona"))
+            .unwrap()
+            .0;
+        relations_fragment += relations::person_fragment(sender, profile("sender"))
+            .unwrap()
+            .0;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let invalid = Blob::<blobencodings::UTF8String>::new(Bytes::from(vec![0xff]));
+        let envelope = message::envelope_fragment(
+            sender,
+            persona,
+            invalid.get_handle(),
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+            None,
+            None,
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, envelope);
+        pile.put::<blobencodings::UTF8String, _>(invalid).unwrap();
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        let error =
+            match check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output) {
+                Err(error) => error,
+                Ok(_) => panic!("resident malformed UTF-8 must be fatal"),
+            };
+        assert!(format!("{error:#}").contains("read Message body"));
+        assert!(
+            output.is_empty(),
+            "rendering must finish before output begins"
+        );
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+        assert_eq!(
+            latest_checkpoint_view(&catalogs, persona).unwrap(),
+            Some(baseline)
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn unrelated_missing_message_payload_does_not_block_a_quiet_poll() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let other = ufoid().id;
+        let (relations_fragment, _, _) =
+            relations::person_fragment(persona, profile("persona")).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, RELATIONS_SCOPE_ID, relations_fragment);
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+
+        let absent = Inline::<inlineencodings::Handle<blobencodings::UTF8String>>::new([0xa5; 32]);
+        let unrelated = message::envelope_fragment(
+            persona,
+            other,
+            absent,
+            epoch_interval(Epoch::from_unix_seconds(1.0)),
+            None,
+            None,
+        );
+        commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, unrelated);
+
+        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        let mut output = Vec::new();
+        assert!(matches!(
+            check_news_once_to(&mut pile, &signer, &catalogs, persona, false, &mut output,)
+                .unwrap(),
+            NewsCheck::Quiet
+        ));
+        assert!(output.is_empty());
+        assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn superseded_habit_payloads_do_not_enter_the_wait_plan() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let (old, old_id) =
+            habits::habit_fragment("sweep", "every 1h", "old nudge", None, &[]).unwrap();
+        let (current, _) =
+            habits::habit_fragment("sweep", "every 1h", "current nudge", None, &[old_id]).unwrap();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, facts_only(old));
+        commit_scope(&mut pile, &signer, HABIT_SCOPE_ID, current);
+
+        let catalogs = load_wait_catalogs(&mut pile, &signer);
+        assert!(matches!(
+            observation_payloads(&catalogs, persona, true)
+                .unwrap()
+                .resolve(&catalogs.reader, || habits::load_live_catalog(
+                    &catalogs.reader,
+                    &catalogs.habits,
+                )
+                .map(|_| ()))
+                .unwrap(),
+            PayloadReadiness::Ready(())
+        ));
         pile.close().unwrap();
     }
 
