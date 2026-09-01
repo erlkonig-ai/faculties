@@ -126,14 +126,6 @@ fn one_required<T: Ord>(values: BTreeSet<T>, entity: Id, field: &str) -> Result<
         .ok_or_else(|| anyhow!("Memory entity {entity:x} is missing {field}"))
 }
 
-fn entity_facts(space: &TribleSet, entity: Id) -> TribleSet {
-    let mut facts = TribleSet::new();
-    for fact in space.iter().filter(|fact| fact.e() == &entity) {
-        facts.insert(fact);
-    }
-    facts
-}
-
 fn tagged_entities(space: &TribleSet, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: kind }])).collect()
 }
@@ -330,9 +322,6 @@ fn load_chunk(space: &TribleSet, id: Id) -> Result<Option<ChunkRow>> {
     }
     for at in &row.observed_at {
         point_bounds(Some(id), "chunk observation time", *at)?;
-    }
-    if entity_facts(space, id) != *chunk_record(&row).facts() {
-        bail!("Memory chunk {id:x} is not one canonical immutable record");
     }
     Ok(Some(row))
 }
@@ -591,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_ambiguity_and_extra_canonical_facts_are_rejected() {
+    fn scalar_ambiguity_is_rejected_but_unmodelled_annotations_are_inert() {
         let (fragment, id) = chunk_fragment(draft("one")).unwrap();
         let other = "two".to_owned().to_blob().get_handle();
         let corrupt = fragment + entity! { ExclusiveId::force_ref(&id) @ ctx::summary: other };
@@ -603,9 +592,16 @@ mod tests {
             fragment.clone() + entity! { ExclusiveId::force_ref(&unknown) @ ctx::reference: id };
         assert_eq!(load_catalog(&facts([unrelated])).unwrap().chunks.len(), 1);
 
-        let corrupt =
+        // OPEN WORLD: an attribute this reader does not model is an ANNOTATION,
+        // not corruption. Ignoring it is the property that lets a newer writer
+        // add facts without making every older reader refuse the record --- the
+        // same property that makes `cat a.pile >> b.pile` safe. A reader that
+        // rejected here would have the polarity backwards.
+        let annotated =
             fragment + entity! { ExclusiveId::force_ref(&id) @ metadata::description: other };
-        assert!(load_catalog(&facts([corrupt])).is_err());
+        let catalog = load_catalog(&facts([annotated])).unwrap();
+        assert_eq!(catalog.chunks.len(), 1);
+        assert!(catalog.chunks.contains_key(&id));
     }
 
     #[test]
