@@ -10524,6 +10524,7 @@ dependencies = [
  "anybytes",
  "blake3",
  "jerky",
+ "mary",
  "triblespace-core",
  "unicode-properties",
  "unicode-segmentation",
