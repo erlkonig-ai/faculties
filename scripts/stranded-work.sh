@@ -28,14 +28,23 @@
 # thing you have decided to leave alone will not nag once you mark the habit done.
 
 set -uo pipefail
-# Derive the workspace root from this script's own location rather than hardcoding
-# it. This file lives at <root>/faculties/scripts/, so two parents up is the root.
+# Prefer the evaluator's workspace cwd when this script has been materialized
+# from its carried blob; otherwise derive the root from the source checkout.
 # An absolute operator path would (a) work on exactly one machine and (b) carry a
 # protected term into a public repository -- the pre-push guard refused this file
 # on its first push for exactly that, and was right to.
 _self=${BASH_SOURCE[0]:-$0}
 _here=$(cd "$(dirname "$_self")" && pwd)
-ROOT=${STRANDED_ROOT:-$(cd "$_here/../.." && pwd)}
+if [ -n "${STRANDED_ROOT:-}" ]; then
+  ROOT=$STRANDED_ROOT
+elif [ -e "$PWD/faculties/.git" ]; then
+  # Habit carries this script as a blob and materializes it in a content-addressed
+  # cache. In that case its source path says nothing about the workspace, while
+  # the evaluator deliberately runs it from the directory containing the pile.
+  ROOT=$PWD
+else
+  ROOT=$(cd "$_here/../.." && pwd)
+fi
 DUE_ONLY=0
 [ "${1:-}" = "--due" ] && DUE_ONLY=1
 
