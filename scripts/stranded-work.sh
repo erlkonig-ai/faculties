@@ -60,6 +60,17 @@ note() {
   [ "$DUE_ONLY" = "1" ] && exit 0
 }
 
+# GNU `stat -f` is not the BSD formatter: it succeeds and prints filesystem
+# metadata, so an `A || B` probe silently feeds prose into the age arithmetic.
+# Try the GNU spelling first and accept only the numeric value both variants
+# promise before falling back to BSD/macOS.
+mtime() {
+  local value
+  value=$(stat -c %Y "./$1" 2>/dev/null) || value=$(stat -f %m "./$1" 2>/dev/null) || return 1
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$value"
+}
+
 # A WORKTREE's `.git` is a FILE, not a directory. Testing `-d` skipped all 33 of
 # them here against 42 real repositories -- a 44% blind spot in exactly the
 # artifact class this file exists for. Worktrees are also the only place a
@@ -109,7 +120,7 @@ for repo in "$ROOT"/*/; do
   dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
   if [ "${dirty:-0}" -gt 0 ]; then
     oldest=$(git status --porcelain --untracked-files=no 2>/dev/null | awk '{print $NF}' \
-             | while read -r f; do [ -e "$f" ] && stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null; done \
+             | while read -r f; do [ -e "$f" ] && mtime "$f"; done \
              | sort -n | head -1)
     if [ -n "$oldest" ]; then
       agem=$(( ( $(date +%s) - oldest ) / 60 ))
