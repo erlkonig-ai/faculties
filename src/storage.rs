@@ -28,11 +28,11 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
-    CollectionRecordSelector, CollectionStoreExt, FactCover,
+    CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource, StoreRead};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 
@@ -116,7 +116,7 @@ where
             CollectionRecord::Commit(commit) => match commit.verify_strict() {
                 Ok(()) => commits.push(commit),
                 Err(error) => diagnostics.push(CollectionRecordDiagnostic {
-                    id: commit.id(),
+                    record: commit,
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 }),
             },
@@ -134,21 +134,23 @@ where
 }
 
 /// Read one authorized SimpleArchive union through a caller-supplied coherent
-/// store snapshot, returning the semantic cover used for maintained indexes.
+/// store snapshot, returning the foundational support used for maintained indexes.
 pub fn read_fact_collection<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
-) -> Result<(TribleSet, FactCover)>
+) -> Result<(TribleSet, Support)>
 where
-    S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+    S: StoreRead,
 {
-    let cover = collection
+    let support = collection
         .admitted(snapshot)
-        .context("discover authorized collection cover")?;
-    let facts = cover
-        .materialize::<TribleSet, _>(snapshot)
+        .context("discover authorized collection support")?;
+    let facts = snapshot
+        .collection_exact(collection, &support)
+        .context("attach authorized collection support")?
+        .view::<TribleSet>()
         .context("read authorized collection facts")?;
-    Ok((facts, cover))
+    Ok((facts, support))
 }
 
 /// Read one authorized SimpleArchive union and retain the exact provenance
@@ -156,17 +158,19 @@ where
 pub fn read_fact_collection_with_commits<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
-) -> Result<(TribleSet, FactCover, Vec<CollectionCommit>)>
+) -> Result<(TribleSet, Support, Vec<CollectionCommit>)>
 where
-    S: BlobStoreGet + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+    S: StoreRead,
 {
-    let (cover, commits) = collection
+    let (support, commits) = collection
         .admitted_with_commits(snapshot)
-        .context("discover authorized collection cover and commits")?;
-    let facts = cover
-        .materialize::<TribleSet, _>(snapshot)
+        .context("discover authorized collection support and commits")?;
+    let facts = snapshot
+        .collection_exact(collection, &support)
+        .context("attach authorized collection support")?
+        .view::<TribleSet>()
         .context("read authorized collection facts")?;
-    Ok((facts, cover, commits))
+    Ok((facts, support, commits))
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.

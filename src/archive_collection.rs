@@ -12,14 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::exact_derived::ExactDerivedCollection;
 use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping, SuccinctArchiveCollection,
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionStoreExt, Cover, FactCover,
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -468,13 +468,13 @@ fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SuccinctIndexReport {
     pub source_commits: usize,
-    /// Distinct source data elements named by the frozen source cover.
+    /// Distinct source data elements named by the frozen foundational support.
     pub source_elements: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
     pub target_collection: Inline<Handle<SimpleArchive>>,
 }
 
-/// Ensure an exact resident accelerated-Succinct view for the frozen Archive cover.
+/// Ensure an exact resident accelerated-Succinct view for frozen Archive support.
 ///
 /// This is a reproducible physical cover, not new authority. Canonical raw
 /// Succinct members are derived and merged first; the public target is their
@@ -496,17 +496,23 @@ pub fn ensure_succinct_index(
         let accelerated = pile
             .derive(raw, RawToRank9AcceleratedMapping, policy)
             .context("register Archive Rank9-accelerated derivation")?;
-        let algebra = SuccinctArchiveCollection::new(archive.collection, raw, accelerated);
-        let source_elements = archive.cover().len();
-        algebra
-            .ensure(&mut pile, archive.cover())
-            .context("ensure exact Archive accelerated-Succinct view")?;
+        let source_elements = archive.support().len();
+        pile.maintain_exact::<SimpleToSuccinctMapping>(raw, archive.support())
+            .context("maintain exact Archive raw-Succinct view")?;
+        let maintained = pile
+            .maintain_exact::<RawToRank9AcceleratedMapping>(accelerated, archive.support())
+            .context("maintain exact Archive accelerated-Succinct view")?;
+        let _: UnionArchive<OrderedUniverse> = maintained
+            .collection_exact(accelerated, archive.support())
+            .context("attach exact Archive accelerated-Succinct view")?
+            .view()
+            .context("read exact Archive accelerated-Succinct view")?;
 
         Ok(SuccinctIndexReport {
             source_commits: archive.commits().len(),
             source_elements,
-            source_collection: algebra.source_collection().handle(),
-            target_collection: algebra.collection().handle(),
+            source_collection: archive.collection.handle(),
+            target_collection: accelerated.handle(),
         })
     })();
     close_pile(
@@ -520,7 +526,7 @@ pub fn ensure_succinct_index(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bm25IndexReport {
     pub source_commits: usize,
-    /// Distinct source data elements named by the frozen source cover.
+    /// Distinct source data elements named by the frozen foundational support.
     pub source_elements: usize,
     pub cover_segments: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
@@ -529,11 +535,11 @@ pub struct Bm25IndexReport {
 
 struct EnsuredBm25 {
     report: Bm25IndexReport,
-    cover: Cover<PortableBM25Blob>,
+    index: ArchiveBm25,
 }
 
 /// Ensure and deterministically maintain a portable exact-TF cover of the
-/// frozen Archive cover through exact `DERIVE` and `MERGE` equations.
+/// frozen Archive support through exact `DERIVE` and `MERGE` equations.
 pub fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
@@ -560,22 +566,26 @@ fn ensure_bm25_for_snapshot(
             crate::collection_names::private_policy(authority),
         )
         .context("register Archive BM25 derivation")?;
-    let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
-        ExactDerivedCollection::new(archive.collection, target)
-            .context("bind Archive BM25 collection mapping")?;
-    let source_elements = archive.cover().len();
-    let cover = exact
-        .ensure(pile, archive.cover())
-        .context("ensure exact Archive BM25 cover")?;
+    let source_elements = archive.support().len();
+    let maintained = pile
+        .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, archive.support())
+        .context("maintain exact Archive BM25 cover")?;
+    let attached = maintained
+        .collection_exact(target, archive.support())
+        .context("attach exact Archive BM25 cover")?;
+    let cover_segments = attached.cover().len();
+    let index = attached
+        .view::<ArchiveBm25>()
+        .context("read exact Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
             source_commits: archive.commits().len(),
             source_elements,
-            cover_segments: cover.len(),
-            source_collection: exact.source_collection().handle(),
-            target_collection: exact.target_collection().handle(),
+            cover_segments,
+            source_collection: archive.collection.handle(),
+            target_collection: target.handle(),
         },
-        cover,
+        index,
     })
 }
 
@@ -587,7 +597,7 @@ fn interval_lower_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
 }
 
 /// One frozen Archive view and one resident portable BM25 index attached from
-/// the exact cover of the same admitted source commits.
+/// the exact foundational support of the same admitted source commits.
 pub struct ArchiveSearchSnapshot {
     archive: ArchiveSnapshot,
     index: ArchiveBm25,
@@ -604,31 +614,8 @@ impl ArchiveSearchSnapshot {
             let authority = signer.verifying_key();
             let archive =
                 ArchiveSnapshot::from_store(&mut pile, collection, schema::DEFAULT_SCOPE_ID)?;
-            let ensured = ensure_bm25_for_snapshot(&mut pile, &archive, authority)?;
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze ensured Archive BM25 store snapshot")?;
-            let mut segments = Vec::with_capacity(ensured.cover.len());
-            for handle in ensured.cover.members() {
-                let data = Handle::<PortableBM25Blob>::to_hash(handle);
-                let blob: Blob<PortableBM25Blob> =
-                    store_snapshot.get(handle).with_context(|| {
-                        format!("load Archive BM25 segment {}", hex::encode_upper(data.raw))
-                    })?;
-                segments.push(ArchiveBm25::try_from_blob(blob).with_context(|| {
-                    format!(
-                        "attach Archive BM25 segment {}",
-                        hex::encode_upper(data.raw)
-                    )
-                })?);
-            }
-            let index = match segments.len() {
-                0 => ArchiveBm25::merge(std::iter::empty::<&ArchiveBm25>())
-                    .context("construct the empty Archive BM25 resident view")?,
-                1 => segments.pop().expect("one attached Archive BM25 element"),
-                _ => ArchiveBm25::merge(segments.iter())
-                    .context("join exact Archive BM25 cover for resident search")?,
-            };
+            let EnsuredBm25 { index, .. } =
+                ensure_bm25_for_snapshot(&mut pile, &archive, authority)?;
             Ok(Self { archive, index })
         })();
         close_pile(
@@ -674,7 +661,7 @@ pub struct ArchiveSnapshot {
     collection: Collection<SimpleArchive>,
     facts: TribleSet,
     store_snapshot: PileSnapshot,
-    cover: FactCover,
+    support: Support,
     commits: Vec<CollectionCommit>,
 }
 
@@ -704,7 +691,7 @@ impl ArchiveSnapshot {
         let store_snapshot = pile
             .snapshot()
             .context("freeze authored Archive store snapshot")?;
-        let (facts, cover, commits) =
+        let (facts, support, commits) =
             crate::storage::read_fact_collection_with_commits(collection, &store_snapshot)
                 .context("read authored Archive collection")?;
         require_accepted(
@@ -717,7 +704,7 @@ impl ArchiveSnapshot {
             collection,
             facts,
             store_snapshot,
-            cover,
+            support,
             commits,
         })
     }
@@ -744,9 +731,9 @@ impl ArchiveSnapshot {
         &self.store_snapshot
     }
 
-    /// Exact admitted source members represented by this snapshot.
-    pub fn cover(&self) -> &FactCover {
-        &self.cover
+    /// Exact admitted foundational support represented by this snapshot.
+    pub fn support(&self) -> &Support {
+        &self.support
     }
 
     pub fn commits(&self) -> &[CollectionCommit] {
@@ -2005,12 +1992,12 @@ mod tests {
                 .unwrap();
         assert_eq!(snapshot.commits(), &[admitted]);
         assert_eq!(snapshot.projection_ids().len(), 1);
-        let cover = snapshot.cover().clone();
+        let support = snapshot.support().clone();
         drop(snapshot);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let claims = cover.commits(&store_snapshot).unwrap();
+        let claims = support.commits(&store_snapshot).unwrap();
         assert_eq!(claims.len(), 2);
         assert!(claims.contains(&admitted));
         assert!(claims.contains(&duplicate));
@@ -2393,11 +2380,11 @@ mod tests {
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_cover = source.admitted(&store_snapshot).unwrap();
-        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
-            ExactDerivedCollection::new(source, target).unwrap();
-        let cover = exact.attach(&mut pile, &source_cover).unwrap();
-        assert_eq!(cover.len(), 1);
+        let source_support = source.admitted(&store_snapshot).unwrap();
+        let attached = store_snapshot
+            .collection_exact(target, &source_support)
+            .unwrap();
+        assert_eq!(attached.cover().len(), 1);
         pile.close().unwrap();
 
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
@@ -2595,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_exact_ensure_derives_only_the_residual_and_reuses_its_merge() {
+    fn bm25_exact_maintenance_derives_only_the_residual_and_reuses_its_merge() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2604,22 +2591,24 @@ mod tests {
         commit_projection(&pile_path, &key, "session:first", "first residual");
         let first_archive =
             ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
-        let first_cover = first_archive.cover().clone();
+        let first_support = first_archive.support().clone();
         drop(first_archive);
         commit_projection(&pile_path, &key, "session:second", "second residual");
         let archive =
             ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
-        let full_cover = archive.cover().clone();
+        let full_support = archive.support().clone();
         drop(archive);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
-        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
-            ExactDerivedCollection::new(source, target).unwrap();
-
-        let first = exact.ensure(&mut pile, &first_cover).unwrap();
-        assert_eq!(first.len(), 1);
+        let first_snapshot = pile
+            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &first_support)
+            .unwrap();
+        let first = first_snapshot
+            .collection_exact(target, &first_support)
+            .unwrap();
+        assert_eq!(first.cover().len(), 1);
         drop(first);
         let first_records = {
             let store_snapshot = pile.snapshot().unwrap();
@@ -2632,8 +2621,13 @@ mod tests {
             .count();
         assert_eq!(first_derives, 1);
 
-        let full = exact.ensure(&mut pile, &full_cover).unwrap();
-        assert_eq!(full.len(), 1);
+        let full_snapshot = pile
+            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support)
+            .unwrap();
+        let full = full_snapshot
+            .collection_exact(target, &full_support)
+            .unwrap();
+        assert_eq!(full.cover().len(), 1);
         let full_records = {
             let store_snapshot = pile.snapshot().unwrap();
             discover_collection_records(&store_snapshot).unwrap()
@@ -2655,8 +2649,13 @@ mod tests {
             records_before.derives().len(),
             records_before.merges().len(),
         );
-        let retry = exact.ensure(&mut pile, &full_cover).unwrap();
-        assert_eq!(retry.len(), 1, "the admitted MERGE is reused");
+        let retry_snapshot = pile
+            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support)
+            .unwrap();
+        let retry = retry_snapshot
+            .collection_exact(target, &full_support)
+            .unwrap();
+        assert_eq!(retry.cover().len(), 1, "the admitted MERGE is reused");
         drop(retry);
         let records_after = {
             let store_snapshot = pile.snapshot().unwrap();
@@ -2671,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_ensure_recovers_a_pending_derive_with_a_missing_output() {
+    fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2683,7 +2682,7 @@ mod tests {
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_cover = source.admitted(&store_snapshot).unwrap();
+        let source_support = source.admitted(&store_snapshot).unwrap();
         let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
@@ -2700,11 +2699,15 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let exact: ExactDerivedCollection<archive_bm25::ArchiveBlockTextBm25Mapping> =
-            ExactDerivedCollection::new(source, target).unwrap();
-        let ready = exact.ensure(&mut pile, &source_cover).unwrap();
+        let ready_snapshot = pile
+            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &source_support)
+            .unwrap();
+        let ready = ready_snapshot
+            .collection_exact(target, &source_support)
+            .unwrap();
         assert_eq!(
             ready
+                .cover()
                 .members()
                 .map(Handle::<PortableBM25Blob>::to_hash)
                 .collect::<BTreeSet<_>>(),

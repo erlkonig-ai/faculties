@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::lww_register::LwwIndex;
-use triblespace::core::collection::observed_union::ObservedIndex;
-use triblespace::core::collection::{Collection, CollectionHandle, FactCover};
+use triblespace::core::collection::lww_register::{LwwIndex, RegisterCoordinatesMapping};
+use triblespace::core::collection::observed_union::{ObserveStatesMapping, ObservedIndex};
+use triblespace::core::collection::{
+    Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
+};
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::core::trible::TribleSet;
@@ -652,7 +654,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, (Collection<SimpleArchive>, TribleSet, FactCover)>::new();
+        let mut by_scope = BTreeMap::<Id, (Collection<SimpleArchive>, TribleSet, Support)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
@@ -666,17 +668,24 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             .snapshot()
             .map_err(|error| format!("freeze viewer store snapshot: {error}"))?;
         for (scope, label, collection) in collections {
-            let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
-                .map_err(|error| format!("materialize {label} collection: {error:#}"))?;
-            by_scope.insert(scope, (collection, facts, cover));
+            let (facts, support) =
+                crate::storage::read_fact_collection(collection, &store_snapshot)
+                    .map_err(|error| format!("materialize {label} collection: {error:#}"))?;
+            by_scope.insert(scope, (collection, facts, support));
         }
 
-        if let Some((_, _, cover)) = by_scope.get(&COMPASS_SCOPE_ID) {
-            let index =
+        if let Some((_, _, support)) = by_scope.get(&COMPASS_SCOPE_ID) {
+            let target =
                 crate::compass::status_register_collection(&mut pile, signer.verifying_key())
-                    .map_err(|error| format!("register Compass status collection: {error:#}"))?
-                    .ensure(&mut pile, cover)
-                    .map_err(|error| format!("maintain Compass status register: {error}"))?;
+                    .map_err(|error| format!("register Compass status collection: {error:#}"))?;
+            let maintained = pile
+                .maintain_exact::<RegisterCoordinatesMapping>(target, support)
+                .map_err(|error| format!("maintain Compass status register: {error}"))?;
+            let index = maintained
+                .collection_exact(target, support)
+                .map_err(|error| format!("attach Compass status register: {error}"))?
+                .view::<LwwIndex>()
+                .map_err(|error| format!("read Compass status register: {error}"))?;
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -686,11 +695,17 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             );
         }
 
-        if let Some((_, _, cover)) = by_scope.get(&WIKI_SCOPE_ID) {
-            let index = crate::wiki::observed_collection(&mut pile, signer.verifying_key())
-                .map_err(|error| format!("register Wiki observation collection: {error:#}"))?
-                .ensure(&mut pile, cover)
+        if let Some((_, _, support)) = by_scope.get(&WIKI_SCOPE_ID) {
+            let target = crate::wiki::observed_collection(&mut pile, signer.verifying_key())
+                .map_err(|error| format!("register Wiki observation collection: {error:#}"))?;
+            let maintained = pile
+                .maintain_exact::<ObserveStatesMapping>(target, support)
                 .map_err(|error| format!("maintain Wiki supersession index: {error}"))?;
+            let index = maintained
+                .collection_exact(target, support)
+                .map_err(|error| format!("attach Wiki supersession index: {error}"))?
+                .view::<ObservedIndex>()
+                .map_err(|error| format!("read Wiki supersession index: {error}"))?;
             observed_by_scope
                 .entry(WIKI_SCOPE_ID)
                 .or_default()
@@ -752,7 +767,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 
 fn validate_catalog(
     reader: &PileSnapshot,
-    by_scope: &BTreeMap<Id, (Collection<SimpleArchive>, TribleSet, FactCover)>,
+    by_scope: &BTreeMap<Id, (Collection<SimpleArchive>, TribleSet, Support)>,
     observed_by_scope: &BTreeMap<Id, BTreeMap<Id, ObservedIndex>>,
     sources: &BTreeSet<SourceKey>,
     secrets: Option<&SecretsSnapshot<PileSnapshot>>,
