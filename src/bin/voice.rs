@@ -65,7 +65,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::schemas::voice::{
     route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
 };
@@ -561,7 +561,8 @@ impl VoiceStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
+            let collection =
+                open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Voice collection")?;
@@ -1376,7 +1377,12 @@ mod tests {
 
         let mut pile_storage = open_pile_strict(&pile).unwrap();
         let signer = faculties::storage::load_signer(&pile, Some(&key)).unwrap();
-        let collection = open_scope(&mut pile_storage, COLLECTION_SCOPE_ID, &signer).unwrap();
+        let collection = open_configured(
+            &mut pile_storage,
+            COLLECTION_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
         let discovery = discover_target(
             &mut pile_storage,
             COLLECTION_SCOPE_ID,

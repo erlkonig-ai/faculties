@@ -24,7 +24,7 @@ use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::wiki::{
     attrs, authorship_fragment, extract_link_targets, revision_fragment,
     revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
@@ -1289,7 +1289,7 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileSnapshot)> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
@@ -1309,7 +1309,7 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
@@ -1333,7 +1333,7 @@ pub fn commit_collection(
     // The signature is curation of this fragment into the collection. Author
     // attribution lives inside the revision artifact and is intentionally not
     // inferred from, or forced equal to, this signer.
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
 }
@@ -1517,7 +1517,8 @@ mod tests {
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_before = collection.admitted(&store_snapshot).unwrap();
         let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();

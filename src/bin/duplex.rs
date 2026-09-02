@@ -1601,7 +1601,7 @@ impl Ledger {
 /// One utterance, one commit — the exact record shape `voice shout` writes, so
 /// nothing that reads the collection has to learn a new one.
 fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<()> {
-    use faculties::legacy_hint::open_scope;
+    use faculties::collection_names::open_configured;
     use faculties::schemas::voice::{CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
     use faculties::storage::{load_signer, open_pile_strict};
     use triblespace::core::collection::CollectionStoreExt;
@@ -1613,7 +1613,7 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
 
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_scope(&mut pile, COLLECTION_SCOPE_ID, &signer)?;
+    let collection = open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
     let result = (|| -> Result<()> {
         let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
         let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)

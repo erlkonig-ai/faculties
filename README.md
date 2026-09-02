@@ -185,8 +185,9 @@ content handle is the collection identity. A snapshot admits exactly the
 COMMITs whose signers satisfy that descriptor's WRITE policy using resident
 capability-proof evidence. There is no ambient team, owner namespace, mutable
 head, or CAS update, so independently extended pile copies converge by
-concatenation, all backed by the same content-addressed blob store. Historical
-branches are consulted only by explicit migration commands.
+concatenation, all backed by the same content-addressed blob store. Ordinary
+runtime never probes historical Repository branches; the shipped migration is
+an explicit re-seat between native collection-policy descriptor epochs.
 
 By default, a named faculty collection is rooted at the pile's durable signer.
 An operator can instead select an already-resident exact descriptor for one

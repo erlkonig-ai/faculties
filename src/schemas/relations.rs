@@ -12,15 +12,10 @@ use triblespace::core::metadata;
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
-pub const DEFAULT_BRANCH: &str = "relations";
-
 /// Stable extrinsic scope of the authored Relations collection.
 ///
 /// Minted with `trible genid` on 2026-08-08.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("A36AB53B3F9B4D52AC6BD473C1F8C4F1");
-
-/// Name of the pre-collection Relations branch this scope replaced.
-pub const LEGACY_BRANCH_NAME: &str = DEFAULT_BRANCH;
 
 pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 

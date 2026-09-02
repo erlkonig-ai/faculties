@@ -27,7 +27,7 @@ use crate::schemas::orient::{
     checkpoint, observation, DEFAULT_SCOPE_ID, KIND_CHECKPOINT_EVENT, KIND_SEEN, KIND_SEEN_FRONTIER,
 };
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -603,7 +603,7 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<OrientSnapshot> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Orient store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Orient collection")?;
@@ -778,7 +778,8 @@ mod tests {
         fragment += checkpoint_fragment(persona, &expected, at(2.0)).unwrap().0;
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
 
         let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();

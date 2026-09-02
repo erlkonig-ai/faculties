@@ -19,7 +19,7 @@ use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
@@ -1216,7 +1216,7 @@ pub fn publish(
     validate_publication_fragment(&fragment)?;
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let result = (|| {
         let store_snapshot = pile
             .snapshot()
@@ -1237,7 +1237,7 @@ pub fn publish(
 pub fn read_catalog(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let result = (|| {
         let store_snapshot = pile
             .snapshot()
@@ -1577,7 +1577,8 @@ mod tests {
 
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         assert_eq!(
             collection,
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key(),)

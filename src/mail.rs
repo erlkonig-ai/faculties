@@ -3240,7 +3240,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use crate::legacy_hint::open_scope;
+    use crate::collection_names::open_configured;
     use crate::relations::{self, ProfileInput};
     use crate::schemas::{
         decide as decide_schema, files as files_schema, mail as mail_schema,
@@ -3321,11 +3321,30 @@ mod tests {
                 .unwrap()
                 .into_parts()
                 .0;
-            let mail = open_scope(&mut pile, mail_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
-            let files = open_scope(&mut pile, files_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
-            let decide = open_scope(&mut pile, decide_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
-            let relations =
-                open_scope(&mut pile, relations_schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+            let mail = open_configured(
+                &mut pile,
+                mail_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
+            let files = open_configured(
+                &mut pile,
+                files_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
+            let decide = open_configured(
+                &mut pile,
+                decide_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
+            let relations = open_configured(
+                &mut pile,
+                relations_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
             let store_snapshot = pile.snapshot().unwrap();
             let materialize = |collection| {
                 let (facts, _) =

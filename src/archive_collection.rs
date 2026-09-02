@@ -35,7 +35,7 @@ use crate::blockdag::{self, CatalogValidation};
 use crate::schemas::{blockdag as schema, files as files_schema};
 use crate::storage::{load_signer, open_pile_strict};
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 #[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
@@ -226,7 +226,8 @@ impl ArchiveImportWriter {
         let signer = load_signer(pile_path, key_path)?;
         let mut pile = open_pile_strict(pile_path)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer)?;
+            let collection =
+                open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze authored Archive store snapshot")?;
@@ -691,7 +692,7 @@ impl ArchiveSnapshot {
         }
         let signer = load_signer(pile_path, key_path)?;
         let mut pile = open_pile_strict(pile_path)?;
-        let collection = open_scope(&mut pile, scope, &signer)?;
+        let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
         Ok((pile, collection, signer))
     }
 
@@ -1991,7 +1992,8 @@ mod tests {
         let fragment = projection("session:duplicate-author", "one payload");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let admitted = pile.commit(collection, &signer, fragment.clone()).unwrap();
         let foreign = SigningKey::from_bytes(&[0xA7; 32]);
         let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
@@ -2137,7 +2139,8 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let commit = pile.commit(collection, &signer, Fragment::empty()).unwrap();
         pile.close().unwrap();
 
@@ -2479,7 +2482,8 @@ mod tests {
             projection_split_across_source_elements("session:split", "closure needle");
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, block_element).unwrap();
         pile.commit(collection, &signer, remainder_element).unwrap();
         let _target = test_target(&mut pile, collection, &pile_path, &key);
@@ -2510,7 +2514,8 @@ mod tests {
             projection_split_across_source_elements("session:routed", "routed needle");
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection = open_scope(&mut pile, schema::DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let block_commit = pile.commit(collection, &signer, block_element).unwrap();
         let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);

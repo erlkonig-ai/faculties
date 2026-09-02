@@ -56,7 +56,6 @@ pub mod discord;
 pub mod files;
 pub mod habits;
 pub mod headspace;
-pub mod legacy_hint;
 pub mod mail;
 pub mod mail_pop;
 pub mod memory;

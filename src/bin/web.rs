@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::storage as vaults;
@@ -278,7 +278,7 @@ impl WebStorage<'_> {
         scope: Id,
         label: &str,
     ) -> Result<CollectionView> {
-        let collection = open_scope(pile, scope, signer)?;
+        let collection = open_configured(pile, scope, signer.verifying_key())?;
         let store_snapshot = pile
             .snapshot()
             .with_context(|| format!("freeze {label} store snapshot"))?;
@@ -323,7 +323,7 @@ impl WebStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         fragment.describe_with(entity! { metadata::description: description });
         let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+        let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         let result = pile
             .commit(collection, &signer, fragment)
             .context("commit Web observation")

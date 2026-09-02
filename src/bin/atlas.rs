@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use faculties::atlas::{self, AtlasCatalog, AtlasEntry};
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::{CliRequest, Faculty, Invocation, Param, Spec, Verb};
@@ -60,7 +60,11 @@ impl AtlasContext {
     }
 
     fn with_catalog<T>(&mut self, operation: impl FnOnce(&AtlasCatalog) -> Result<T>) -> Result<T> {
-        let collection = open_scope(&mut self.pile, DEFAULT_SCOPE_ID, &self.signer)?;
+        let collection = open_configured(
+            &mut self.pile,
+            DEFAULT_SCOPE_ID,
+            self.signer.verifying_key(),
+        )?;
         let store_snapshot = self
             .pile
             .snapshot()

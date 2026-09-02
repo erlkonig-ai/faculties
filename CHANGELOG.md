@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Runtime collection opens no longer probe retired Repository history.**
+  Every caller opens its configured native descriptor directly; the obsolete
+  `legacy_hint` ancestry walk, branch-name table, and frozen compatibility
+  fixture are gone. The explicit `migrations collection-policy` command remains
+  the one shipped transformation and ordinary reads have no hidden migration
+  scan.
+
 - **Orient validates the data it observes, not every historical row.** `show`,
   `wait`, and `poll` still require exact resident collection covers and reject
   malformed archive bytes, but typed query paths now decode only selected
@@ -248,21 +255,6 @@ All notable changes to this project will be documented in this file.
   invariant is untouched and still lives in code -- there is no path from
   `voice say` to a room speaker.
 
-- **Migration generations now have stable semantic names and fitting execution
-  boundaries.** The original
-  pre-collection transition is `migrations legacy-branches plan|activate`;
-  `plan-cutover` and `activate-cutover` are removed rather than retained as
-  ambiguous aliases. The later unpublished subject-bearing Secrets envelope
-  generation has its own `migrations secrets-direct-proofs plan|activate`
-  bridge and a distinct retired wire tag. Its trust basis is the durable root's
-  signature on delivery into that same root's deterministic private inbox, the
-  recipient-sealed context, and the matching custody declaration in the
-  existing root/root vault — never the retired proof signatures. Planning is
-  read-only and classifies exact pending, complete, ambiguous, and malformed
-  states. Activation is online and additive: it appends each fresh direct root
-  proof's claims and native proof record, then one access-inbox COMMIT per
-  pending vault, touches no vault COMMIT, and replans to zero pending work.
-
 - **Faculty-authored chronology now fails closed on clock errors.** Clock reads
   that timestamp collection facts or operational records pass through one
   fallible shared capability. A failed read therefore aborts before a
@@ -271,25 +263,6 @@ All notable changes to this project will be documented in this file.
   represent an unavailable current instant as unknown or omit its age marker;
   source records with genuinely absent timestamps remain optional and
   unchanged.
-
-- **`migrations legacy-branches plan` now recognizes an already-published native
-  cutover.** Planning still derives the legacy projection from one frozen pile
-  prefix, then deterministically replays each planned collection commit and
-  Secrets access-envelope publication in bounded scratch storage and compares
-  their exact records and blob closure with that same snapshot. The report
-  distinguishes missing, partial, and already-complete publication per
-  collection, ignores unrelated later commits, treats an authored empty
-  fragment as a real commit, and flags vault custody or access drift. This
-  keeps the read-only planner useful after a cutover without mistaking a
-  completed live pile for work that should be activated a second time;
-  `legacy-branches activate` remains the aggregate semantic validator. If one valid
-  historical Secrets scope carries repeated creation observations, direct
-  vault activation projects their earliest point as the immutable vault
-  genesis; intrinsic scope identity was `(creator, name)`, and the preserved
-  legacy prefix retains the complete observation set. Direct-recipient vaults
-  created after that catalog generation are inventoried from the durable
-  root's exact historical READ grants and materialized only from strictly
-  verified root-authored commits; dormant foreign commits remain inert.
 
 - **`converse` — a half-duplex talk-loop bridge.** Three seams that already
   existed are now joined into one spoken loop: a listener appends utterances

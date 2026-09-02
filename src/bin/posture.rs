@@ -35,8 +35,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::decide::{self, Resolution};
-use faculties::legacy_hint::open_scope;
 #[cfg(test)]
 use faculties::posture_finding::Inner;
 use faculties::posture_finding::{
@@ -1891,7 +1891,7 @@ impl PostureStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, scope, &signer)?;
+            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
@@ -1913,7 +1913,7 @@ impl PostureStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let author = signer.verifying_key().to_bytes();
         let result = (|| {
-            let collection = open_scope(&mut pile, scope, &signer)?;
+            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
@@ -2003,7 +2003,7 @@ impl PostureStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, scope, &signer)?;
+            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
             let reader = pile
                 .snapshot()
                 .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
@@ -6839,7 +6839,8 @@ mod tests {
         );
         let mut pile = open_pile_strict(&store.pile).unwrap();
         let local = faculties::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCAN_SCOPE_ID, &local).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
         let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
         // Publication is an unconditional local ledger append. Admission is a
         // separate read concern rooted in this collection's immutable WRITE
@@ -6889,7 +6890,8 @@ mod tests {
 
         let mut pile = open_pile_strict(&store.pile).unwrap();
         let local = faculties::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCAN_SCOPE_ID, &local).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
         let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
         let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
         assert_eq!(duplicate.data(), admitted.data());

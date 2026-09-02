@@ -17,12 +17,6 @@ use triblespace_search::schemas::Embedding;
 /// `56002AB0A2A7D56753EE20C61900BFB0`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("56002AB0A2A7D56753EE20C61900BFB0");
 
-/// Exact name of the pre-collection repository branch.
-///
-/// New collection operations address [`DEFAULT_SCOPE_ID`]; this name is input
-/// vocabulary for the one-way stopped-world migration only.
-pub const FILES_BRANCH_NAME: &str = "files";
-
 // ── kinds ────────────────────────────────────────────────────────────────
 pub const KIND_FILE: Id = id_hex!("1F9C9DCA69504452F318BA11E81D47D1");
 /// A normalized IANA media type such as `text/plain` or `image/png`.

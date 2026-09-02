@@ -34,10 +34,6 @@ use triblespace::prelude::*;
 /// `908A81B67AF50D568C3863E7D6708EEB`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("908A81B67AF50D568C3863E7D6708EEB");
 
-/// Exact name of the stopped legacy Repository branch consumed by migration.
-/// Native reads and writes never consult this coordinate.
-pub const LEGACY_BRANCH_NAME: &str = "discord";
-
 pub mod discord {
     use super::*;
 

@@ -14,10 +14,6 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-08.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("3714E5AF0ABF7E2E283FCF17FEC74D74");
 
-/// Exact pre-collection repository branch consumed only by the coordinated
-/// stopped-world cutover.
-pub const LEGACY_BRANCH_NAME: &str = "mail";
-
 // Every native id below was minted with `trible genid` for the recovered Mail
 // collection lineage on 2026-08-08; the invocation transcript is retained in
 // commit history. Its attribute literals predate encoding-derived anchor
@@ -120,7 +116,6 @@ pub const IMPORT_SENT: Id = id_hex!("E08FE75911353992E604DA7A4507AB56");
 // Legacy consumers which have not yet moved to Mail projections still use
 // these published names. They are source-vocabulary aliases, not native Mail
 // kinds, and can disappear with those consumers.
-pub const DEFAULT_BRANCH: &str = LEGACY_BRANCH_NAME;
 pub const KIND_MESSAGE: Id = LEGACY_KIND_MESSAGE;
 pub const KIND_SPAM: Id = LEGACY_KIND_SPAM;
 pub const KIND_DRAFT: Id = IMPORT_DRAFT;

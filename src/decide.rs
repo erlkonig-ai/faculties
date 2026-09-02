@@ -827,7 +827,7 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use crate::legacy_hint::open_scope;
+    use crate::collection_names::open_configured;
     use crate::schemas::decide::DEFAULT_SCOPE_ID;
     use crate::storage::{load_signer, open_pile_strict, publish_fragment};
     use crate::test_support::initialize_open_collection_fixture;
@@ -870,7 +870,8 @@ mod tests {
         fn view(&self) -> TestView {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+            let collection =
+                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
             let reader = pile.snapshot().unwrap();
             let (facts, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
             pile.close().unwrap();

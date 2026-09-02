@@ -15,9 +15,6 @@ use triblespace::prelude::*;
 /// `74897A5A9C573A8A17AD515F782951A2`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("74897A5A9C573A8A17AD515F782951A2");
 
-/// Exact stopped Repository branch consumed only by the additive cutover.
-pub const LEGACY_BRANCH_NAME: &str = "web";
-
 pub mod web_schema {
     use super::*;
 

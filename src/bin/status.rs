@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
@@ -101,8 +101,8 @@ impl StatusStorage<'_> {
 }
 
 fn load_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Catalogs> {
-    let status_collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
-    let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+    let status_collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let relations_collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
     let reader = pile
         .snapshot()
         .context("freeze shared Status/Relations store snapshot")?;
@@ -126,7 +126,7 @@ fn commit_status(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
         .context("commit authored Status event")
 }
@@ -368,7 +368,7 @@ mod tests {
     fn publish_relations(fixture: &Fixture, fragment: Fragment) {
         storage(fixture)
             .with_pile(|pile, signer| {
-                let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+                let collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
                 let reader = pile.snapshot()?;
                 let (current, _) = faculties::storage::read_fact_collection(collection, &reader)?;
                 relations::validate_catalog_union(&reader, &current, &fragment)?;
@@ -426,7 +426,8 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let local = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let foreign = SigningKey::from_bytes(&[0x84; 32]);
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &local).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, local.verifying_key()).unwrap();
         pile.commit(
             collection,
             &foreign,
@@ -441,7 +442,7 @@ mod tests {
                 let rows = status::load_status_rows(&catalogs.status)?;
                 assert!(rows.is_empty());
 
-                let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let store_snapshot = pile.snapshot()?;
                 assert!(collection.admitted(&store_snapshot)?.is_empty());
                 let discovered =

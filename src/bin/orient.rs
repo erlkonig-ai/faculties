@@ -4,7 +4,7 @@ use chrono::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
 use faculties::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
@@ -347,22 +347,25 @@ fn load_catalogs(
     signer: &SigningKey,
     include_habits: bool,
 ) -> Result<NativeCatalogLoad> {
-    let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
-    let mail_collection = open_scope(pile, MAIL_SCOPE_ID, signer)?;
+    let relations_collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+    let mail_collection = open_configured(pile, MAIL_SCOPE_ID, signer.verifying_key())?;
     // Teams participates in news but is deliberately not run through
     // `teams::validate_catalog` here: that reads every text payload and every
     // attachment blob, which is far too much work for a path that re-arms
     // after every turn. Orient only reads message identity, state and
     // authorship, all of which are structural.
-    let teams_collection = open_scope(pile, TEAMS_SCOPE_ID, signer)?;
-    let message_collection = open_scope(pile, MESSAGE_SCOPE_ID, signer)?;
-    let compass_collection = open_scope(pile, COMPASS_SCOPE_ID, signer)?;
-    let status_collection = open_scope(pile, STATUS_SCOPE_ID, signer)?;
+    let teams_collection = open_configured(pile, TEAMS_SCOPE_ID, signer.verifying_key())?;
+    let message_collection = open_configured(pile, MESSAGE_SCOPE_ID, signer.verifying_key())?;
+    let compass_collection = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+    let status_collection = open_configured(pile, STATUS_SCOPE_ID, signer.verifying_key())?;
     let habit_collection = include_habits
-        .then(|| open_scope(pile, HABIT_SCOPE_ID, signer))
+        .then(|| open_configured(pile, HABIT_SCOPE_ID, signer.verifying_key()))
         .transpose()?;
-    let checkpoint_collection =
-        open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
+    let checkpoint_collection = open_configured(
+        pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
+    )?;
     let reader = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
@@ -1468,7 +1471,11 @@ fn save_checkpoint(
 ) -> Result<()> {
     let (mut fragment, _) = orient_model::checkpoint_fragment(persona, view, clock::point_now()?)?;
     fragment += orient_model::seen_notes_fragment(persona, newly_observed);
-    let collection = open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(
+        pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
+    )?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Orient semantic checkpoint: {error}"))?;
     Ok(())
@@ -1547,7 +1554,11 @@ fn migrate_note_frontier(
     // appended after this commit are absent from Seen and wake normally.
     let selected = universe;
     let fragment = orient_model::seen_notes_fragment(persona, selected.iter().copied());
-    let collection = open_scope(pile, faculties::schemas::orient::DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(
+        pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
+    )?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Orient note-frontier migration: {error}"))?;
     Ok(MigrationOutcome {
@@ -2406,7 +2417,8 @@ fn cmd_wake(
     let signer = load_signer(pile, key)?;
     let mut storage = open_pile_strict(pile)?;
     let result = (|| {
-        let memory_collection = open_scope(&mut storage, MEMORY_SCOPE_ID, &signer)?;
+        let memory_collection =
+            open_configured(&mut storage, MEMORY_SCOPE_ID, signer.verifying_key())?;
         let memory_reader = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze Memory store snapshot: {error}"))?;

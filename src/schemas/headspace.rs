@@ -23,9 +23,6 @@ pub const DEFAULT_AUTHOR: &str = "agent";
 pub const DEFAULT_AUTHOR_ROLE: &str = "user";
 pub const DEFAULT_POLL_MS: u64 = 1;
 
-/// Exact historical Repository branch consumed by stopped-world migration.
-pub const LEGACY_BRANCH_NAME: &str = "config";
-
 /// Stable extrinsic scope for the one native Headspace collection.
 ///
 /// Minted with `trible genid` on 2026-08-08:

@@ -16,9 +16,6 @@
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-/// Exact historical repository branch consumed by the stopped-world cutover.
-pub const LEGACY_BRANCH_NAME: &str = "planner";
-
 /// Stable extrinsic scope of the Planner collection.
 ///
 /// Minted with `trible genid` on 2026-08-09:

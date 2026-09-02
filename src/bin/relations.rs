@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
@@ -291,7 +291,7 @@ impl RelationsStorage<'_> {
 
     fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Relations collection")?;
@@ -308,7 +308,7 @@ impl RelationsStorage<'_> {
         f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Relations collection")?;

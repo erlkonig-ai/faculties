@@ -25,9 +25,6 @@ use triblespace::prelude::*;
 /// `48179822F1000D8F82DF2C43AABD8C6D`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("48179822F1000D8F82DF2C43AABD8C6D");
 
-/// Name of the pre-collection Teams branch this scope replaced.
-pub const LEGACY_BRANCH_NAME: &str = "teams";
-
 pub const DEFAULT_DELTA_URL: &str =
     "https://graph.microsoft.com/v1.0/users/{user_id}/chats/getAllMessages/delta";
 

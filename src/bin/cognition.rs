@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use faculties::cognition;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use triblespace::core::repo::SnapshotSource;
@@ -40,7 +40,7 @@ enum Command {
 fn check(cli: &Cli) -> Result<()> {
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
     let mut pile = open_pile_strict(&cli.pile)?;
-    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let result = (|| {
         let store_snapshot = pile.snapshot().context("freeze Cognition store snapshot")?;
         let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)

@@ -14,9 +14,6 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-08.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("C6B9CAB355E18CD59AF913C870AA3FF8");
 
-/// Name of the pre-collection Decide branch this scope replaced.
-pub const LEGACY_BRANCH_NAME: &str = "decide";
-
 /// Exact marker on a stable random decision anchor.
 ///
 /// This retains the already-published meaning of `KIND_DECISION`.

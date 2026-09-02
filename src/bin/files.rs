@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::files as file_capability;
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
@@ -349,7 +349,7 @@ fn with_files_store<T>(
     let signer = load_signer(pile, None)?;
     let mut storage = open_pile_strict(pile)?;
     let result = (|| {
-        let collection = open_scope(&mut storage, DEFAULT_SCOPE_ID, &signer)?;
+        let collection = open_configured(&mut storage, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         f(&mut storage, collection, &signer)
     })();
     let close = storage.close();

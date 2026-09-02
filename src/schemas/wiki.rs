@@ -17,14 +17,6 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 /// collection-cutover lineage.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("5E2E291C8CD660400D807E916EDEAF1D");
 
-/// Exact name of the pre-collection repository branch.
-pub const LEGACY_BRANCH_NAME: &str = "wiki";
-
-/// Compatibility name for branch-era consumers which have not yet moved to
-/// the native Wiki collection. It is migration input vocabulary, not live
-/// collection identity.
-pub const WIKI_BRANCH_NAME: &str = LEGACY_BRANCH_NAME;
-
 pub const KIND_VERSION_ID: Id = id_hex!("1AA0310347EDFED7874E8BFECC6438CF");
 
 pub const TAG_ARCHIVED_ID: Id = id_hex!("480CB6A663C709478A26A8B49F366C3F");

@@ -10,9 +10,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::decide;
 use faculties::files;
-use faculties::legacy_hint::open_scope;
 use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
 use faculties::mail_pop;
 use faculties::relations;
@@ -192,10 +192,14 @@ impl Storage<'_> {
             let pile = pile
                 .as_mut()
                 .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-            let mail_collection = open_scope(pile, self.scopes.mail, &self.signer)?;
-            let files_collection = open_scope(pile, self.scopes.files, &self.signer)?;
-            let decide_collection = open_scope(pile, self.scopes.decide, &self.signer)?;
-            let relations_collection = open_scope(pile, self.scopes.relations, &self.signer)?;
+            let mail_collection =
+                open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
+            let files_collection =
+                open_configured(pile, self.scopes.files, self.signer.verifying_key())?;
+            let decide_collection =
+                open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
+            let relations_collection =
+                open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze shared Mail/Files/Decide/Relations store snapshot")?;
@@ -292,7 +296,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let collection = open_scope(pile, scope, &self.signer)?;
+        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
         pile.commit(collection, &self.signer, fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())

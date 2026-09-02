@@ -15,7 +15,7 @@ use faculties::storage::{load_signer, open_pile_strict};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
     chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_references, chunk_span_str,
@@ -171,7 +171,7 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Memory store snapshot")?;
             Self::load_memory_from_snapshot(collection, &store_snapshot)
         })();
@@ -184,9 +184,14 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let memory_collection =
+                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let embeddings_collection = if with_embeddings {
-                Some(open_scope(&mut pile, EMBEDDINGS_SCOPE_ID, &signer)?)
+                Some(open_configured(
+                    &mut pile,
+                    EMBEDDINGS_SCOPE_ID,
+                    signer.verifying_key(),
+                )?)
             } else {
                 None
             };
@@ -214,8 +219,10 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
-            let comb_collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let memory_collection =
+                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let comb_collection =
+                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze Memory/Comb store snapshot")?;
@@ -241,11 +248,18 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
-            let cognition_collection =
-                open_scope(&mut pile, cognition_schema::DEFAULT_SCOPE_ID, &signer)?;
-            let archive_collection =
-                open_scope(&mut pile, archive_schema::DEFAULT_SCOPE_ID, &signer)?;
+            let memory_collection =
+                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let cognition_collection = open_configured(
+                &mut pile,
+                cognition_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
+            let archive_collection = open_configured(
+                &mut pile,
+                archive_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze Memory/Cognition/Archive store snapshot")?;
@@ -285,7 +299,7 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, MEMORY_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze Memory mutation store snapshot")?;
@@ -303,7 +317,7 @@ impl MemoryStorage<'_> {
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_scope(&mut pile, EMBEDDINGS_SCOPE_ID, &signer)?;
+        let collection = open_configured(&mut pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
         let result = pile
             .commit(collection, &signer, fragment)
             .context("commit authored embedding observations")
@@ -316,7 +330,8 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let collection =
+                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze Comb mutation store snapshot")?;

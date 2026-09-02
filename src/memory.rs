@@ -444,7 +444,7 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use crate::legacy_hint::open_scope;
+    use crate::collection_names::open_configured;
     use crate::schemas::memory::DEFAULT_SCOPE_ID;
     use crate::storage::open_pile_strict;
     use crate::test_support::initialize_open_collection_fixture;
@@ -456,7 +456,7 @@ mod tests {
         pile: &mut triblespace::core::repo::pile::Pile,
         signer: &SigningKey,
     ) -> Collection<SimpleArchive> {
-        open_scope(pile, DEFAULT_SCOPE_ID, signer).unwrap()
+        open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap()
     }
 
     fn point(seconds: f64) -> IntervalValue {

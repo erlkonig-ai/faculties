@@ -38,7 +38,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::relations::{self, Head, ProfileInput};
 use faculties::schemas::linkedin;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
@@ -218,7 +218,7 @@ impl RelationsStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Relations collection")?;
@@ -276,7 +276,7 @@ impl RelationsStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
             let cover = collection.admitted(&store_snapshot)?;
             Ok(cover

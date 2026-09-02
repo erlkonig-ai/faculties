@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::planner::{
     self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
     read_text, EventDraft, EventRow, IntervalValue, PlannerCatalog, STATUS_CANCELLED,
@@ -140,7 +140,7 @@ impl PlannerStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Planner store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Planner collection")?;
@@ -184,7 +184,7 @@ impl PlannerStorage<'_> {
         let author = signer.verifying_key().to_bytes();
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
             let cover = collection.admitted(&store_snapshot)?;
             Ok(cover

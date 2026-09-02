@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::schemas::compass::{
     board, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
@@ -255,7 +255,7 @@ impl CompassStorage<'_> {
             let facts = view.facts();
             let reader = view.store_snapshot();
             let by = if let Some(persona) = persona {
-                let collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
+                let collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
                 let relation_reader = pile
                     .snapshot()
                     .context("freeze Relations store snapshot for Compass persona")?;

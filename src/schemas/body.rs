@@ -28,18 +28,6 @@ use triblespace::prelude::*;
 /// `7CF255AAA8D79CA997F991183611C6A5`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("7CF255AAA8D79CA997F991183611C6A5");
 
-/// Exact name of the pre-collection repository branch.
-///
-/// Native operations address [`DEFAULT_SCOPE_ID`]. This name is retained only
-/// as stopped-world migration input vocabulary.
-pub const BODY_BRANCH_NAME: &str = "body";
-
-/// Exact historical Body branch name retained for the stopped-world rewrite.
-pub const LEGACY_BODY_BRANCH_NAME: &str = BODY_BRANCH_NAME;
-
-/// Earlier branch containing the squashed pre-rename sensory history.
-pub const LEGACY_SENSES_BRANCH_NAME: &str = "senses";
-
 /// Tag for a deliberate capture (a frame, an audio clip, or a felt touch).
 pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");
 

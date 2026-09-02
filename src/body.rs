@@ -18,7 +18,7 @@ use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -530,7 +530,7 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Body collection")?;

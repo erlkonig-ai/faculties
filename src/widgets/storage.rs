@@ -28,7 +28,7 @@ use triblespace::core::trible::TribleSet;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
 use crate::schemas::blockdag::DEFAULT_SCOPE_ID as ARCHIVE_SCOPE_ID;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
@@ -658,7 +658,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
 
         let mut collections = Vec::new();
         for (scope, label) in materialization_scopes(sources) {
-            let collection = open_scope(&mut pile, scope, &signer)
+            let collection = open_configured(&mut pile, scope, signer.verifying_key())
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
             collections.push((scope, label, collection));
         }

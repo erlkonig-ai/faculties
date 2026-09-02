@@ -853,7 +853,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::legacy_hint::open_scope;
+    use crate::collection_names::open_configured;
     use crate::schemas::message::DEFAULT_SCOPE_ID;
     use crate::schemas::relations::{
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
@@ -1392,13 +1392,18 @@ mod tests {
         let relation_facts = relations_fragment.facts().clone();
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let relations_collection =
-            open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer).unwrap();
+        let relations_collection = open_configured(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
         pile.commit(relations_collection, &signer, relations_fragment)
             .unwrap();
 
         let team = signer.verifying_key();
-        let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let messages =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let (fragment, message_id) = message_fragment(
             sender,
             &Recipient::Person(recipient),

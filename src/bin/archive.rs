@@ -17,10 +17,10 @@ use faculties::archive_collection::{
 };
 use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
+use faculties::collection_names::open_configured;
 use faculties::comb::{
     self as comb_model, CombCatalog, CursorDraft, CursorResolution, CursorState,
 };
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::blockdag as archive_schema;
 use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
@@ -149,7 +149,8 @@ impl ArchiveStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+            let collection =
+                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
             let facts = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .map(|(facts, _)| facts)
@@ -972,7 +973,7 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
     let signer = load_signer(storage.pile, storage.key)?;
     let mut pile = open_pile_strict(storage.pile)?;
     let result = (|| {
-        let collection = open_scope(&mut pile, DEFAULT_COMB_SCOPE_ID, &signer)?;
+        let collection = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
         let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
         let current = faculties::storage::read_fact_collection(collection, &store_snapshot)
             .map(|(facts, _)| facts)

@@ -9,8 +9,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict};
@@ -190,7 +190,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let collection = open_scope(pile, scope, &self.signer)?;
+        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
         let store_snapshot = pile
             .snapshot()
             .with_context(|| format!("freeze {label} store snapshot"))?;
@@ -250,7 +250,7 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let collection = open_scope(pile, scope, &self.signer)?;
+        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
         pile.commit(collection, &self.signer, fragment)
             .with_context(|| format!("commit collection {scope:x}"))?;
         Ok(())

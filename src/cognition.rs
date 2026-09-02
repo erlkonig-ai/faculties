@@ -19,7 +19,7 @@ use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
@@ -119,7 +119,7 @@ pub fn publish_events(
     }
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let result = (|| {
         let store_snapshot = pile
             .snapshot()
@@ -520,7 +520,8 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
         validate_catalog(&store_snapshot, &facts).unwrap();

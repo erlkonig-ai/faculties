@@ -1092,7 +1092,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace::core::repo::pile::Pile;
 
-    use crate::legacy_hint::open_scope;
+    use crate::collection_names::open_configured;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
     fn test_id(byte: u8) -> Id {
@@ -1112,14 +1112,14 @@ mod tests {
     }
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileSnapshot) {
-        let collection = open_scope(pile, scope, signer).unwrap();
+        let collection = open_configured(pile, scope, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
         (facts, store_snapshot)
     }
 
     fn commit(pile: &mut Pile, scope: Id, signer: &SigningKey, fragment: Fragment) {
-        let collection = open_scope(pile, scope, signer).unwrap();
+        let collection = open_configured(pile, scope, signer.verifying_key()).unwrap();
         pile.commit(collection, signer, fragment).unwrap();
     }
 

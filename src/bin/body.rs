@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::body as body_model;
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
 use hifitime::efmt::consts::ISO8601;
@@ -438,7 +438,7 @@ impl BodyStorage<'_> {
 
     fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Body collection")?;
@@ -1125,7 +1125,8 @@ fn main() -> Result<()> {
             if keep {
                 let storage = require_storage(pile.as_deref(), key.as_deref())?;
                 storage.with_pile(|pile, signer| {
-                    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+                    let collection =
+                        open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                     let mut keep_touch =
                         |felt: &Felt| keep_felt(pile, collection, signer, felt, note.as_deref());
                     cmd_feel(Some(&mut keep_touch), &daemon, secs, loop_, respond)
@@ -1272,7 +1273,8 @@ mod tests {
 
         let first = intent_fragment("first", at_unix(1_750_000_000.0));
         let first_id = first.root().unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, first).unwrap();
         let before = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
         assert_eq!(

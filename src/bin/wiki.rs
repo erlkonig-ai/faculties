@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 #[cfg(feature = "local-embed")]
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
@@ -253,7 +253,7 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn scope_view(&self, scope: Id, label: &str) -> Result<CollectionView> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, scope, signer)?;
+            let collection = open_configured(pile, scope, signer.verifying_key())?;
             let store_snapshot = pile
                 .snapshot()
                 .with_context(|| format!("freeze {label} store snapshot"))?;
@@ -282,7 +282,7 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, scope, signer)?;
+            let collection = open_configured(pile, scope, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish native collection fragment")
         })
@@ -290,7 +290,8 @@ impl WikiStorage<'_> {
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer| {
-            let collection = open_scope(pile, schema::DEFAULT_SCOPE_ID, signer)?;
+            let collection =
+                open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish Wiki fragment")
         })
@@ -518,7 +519,7 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
 
 fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
     storage.with_pile(|pile, signer| {
-        let collection = open_scope(pile, FILES_SCOPE_ID, signer)?;
+        let collection = open_configured(pile, FILES_SCOPE_ID, signer.verifying_key())?;
         let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
         faculties::storage::read_fact_collection(collection, &store_snapshot)
             .map(|(facts, _)| facts)

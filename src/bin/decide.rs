@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict};
 use hifitime::Epoch;
@@ -131,7 +131,7 @@ impl DecideStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Decide store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize authored Decide collection")?;

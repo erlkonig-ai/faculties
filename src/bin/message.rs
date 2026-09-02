@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
-use faculties::legacy_hint::open_scope;
+use faculties::collection_names::open_configured;
 use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
@@ -101,8 +101,12 @@ impl MessageStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let relations_collection = open_scope(&mut pile, DEFAULT_RELATIONS_SCOPE_ID, &signer)?;
-            let messages = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let relations_collection = open_configured(
+                &mut pile,
+                DEFAULT_RELATIONS_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
+            let messages = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Message store snapshot")?;
             let (relations_facts, _) =
                 faculties::storage::read_fact_collection(relations_collection, &store_snapshot)

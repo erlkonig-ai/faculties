@@ -33,9 +33,9 @@ use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
+use faculties::collection_names::open_configured;
 use faculties::discord as discord_model;
 use faculties::files as file_capability;
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
 use faculties::storage::{load_signer, open_pile_strict};
@@ -168,7 +168,8 @@ impl DiscordStorage<'_> {
     fn preflight_write(&self) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).map(|_| ());
+        let result =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).map(|_| ());
         finish_pile(pile, result)
     }
 
@@ -179,7 +180,7 @@ impl DiscordStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Discord store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Discord collection")?;

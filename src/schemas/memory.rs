@@ -23,19 +23,12 @@ pub const DEFAULT_SCOPE_ID: Id = id_hex!("E2C3B4C4BE14218DE4B3EAC63EC1DEB5");
 /// `E12E0AF29345CA6D9C58A32B50BAC9D8`.
 pub const LEGACY_DAG_SCOPE_ID: Id = id_hex!("E12E0AF29345CA6D9C58A32B50BAC9D8");
 
-/// Historical input consumed only by the stopped-world additive cutover.
-/// Ordinary Memory readers and writers never resolve a named branch.
-pub const LEGACY_MEMORY_BRANCH_NAME: &str = "memory";
-
 /// Stable extrinsic scope of persona-scoped Comb cursor state.
 ///
 /// Minted with `trible genid` on 2026-08-08 in the canonical Memory/Comb
 /// collection lineage. Archive replay shares this scope; Archive facts never
 /// enter it.
 pub const DEFAULT_COMB_SCOPE_ID: Id = id_hex!("6CB9F473105A56504531486F14382F78");
-
-/// Historical branch name consumed only by stopped-world migrations.
-pub const LEGACY_COMB_BRANCH_NAME: &str = "comb-state";
 
 pub const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 

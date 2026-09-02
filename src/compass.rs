@@ -22,7 +22,7 @@ use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource}
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::legacy_hint::open_scope;
+use crate::collection_names::open_configured;
 use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
@@ -1032,7 +1032,7 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileSnapshot)> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
     let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Compass collection")?;
@@ -1046,7 +1046,7 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Compass collection")?;
@@ -1072,7 +1072,7 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let collection = open_scope(pile, DEFAULT_SCOPE_ID, signer)?;
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Compass collection fragment: {error}"))
 }

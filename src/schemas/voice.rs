@@ -29,9 +29,6 @@ use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
 use triblespace::prelude::*;
 
-/// Exact historical Repository branch consumed by stopped-world migration.
-pub const LEGACY_BRANCH_NAME: &str = "voice";
-
 /// Stable extrinsic scope of the one canonical Voice collection.
 ///
 /// Minted with `trible genid` on 2026-08-07 while the first collection-backed

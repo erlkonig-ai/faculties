@@ -18,9 +18,6 @@ use triblespace::prelude::*;
 /// snapshot-DAG ontology.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("B9566CF892C55CCB0E58411E1B18CD7F");
 
-/// Name of the pre-collection Compass branch this scope replaced.
-pub const LEGACY_BRANCH_NAME: &str = "compass";
-
 pub const KIND_GOAL_LABEL: &str = "goal";
 pub const KIND_STATUS_LABEL: &str = "status";
 pub const KIND_NOTE_LABEL: &str = "note";

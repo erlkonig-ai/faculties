@@ -27,8 +27,8 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, 
 use triblespace::prelude::*;
 
 use faculties::clock;
+use faculties::collection_names::open_configured;
 use faculties::files as file_capability;
-use faculties::legacy_hint::open_scope;
 use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
 use faculties::secrets::{self as secrets_model, storage as secrets_vaults};
@@ -472,7 +472,7 @@ impl TeamsStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer)?;
+            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot().context("freeze Teams store snapshot")?;
             let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
                 .context("materialize Teams collection")?;
@@ -4049,7 +4049,8 @@ mod tests {
         // old vault epoch itself was deliberately left behind.
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        let collection =
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, historical).unwrap();
         pile.close().unwrap();
 
