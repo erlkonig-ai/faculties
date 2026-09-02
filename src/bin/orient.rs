@@ -339,12 +339,13 @@ enum NativeCatalogLoad {
 
 /// Read every collection that contributes to Orient from one refreshed Pile.
 /// Collection history and record ordering stop at this boundary: callers see
-/// only their materialized set values.
+/// only their materialized set values. Exact materialization validates the
+/// resident archive bytes; typed query paths validate only the rows and
+/// payloads they actually consume.
 fn load_catalogs(
     pile: &mut Pile,
     signer: &SigningKey,
     include_habits: bool,
-    validate_whole_catalogs: bool,
 ) -> Result<NativeCatalogLoad> {
     let relations_collection = open_scope(pile, RELATIONS_SCOPE_ID, signer)?;
     let mail_collection = open_scope(pile, MAIL_SCOPE_ID, signer)?;
@@ -390,24 +391,6 @@ fn load_catalogs(
     };
     let (checkpoint_facts, checkpoint_cover) = coherent!(checkpoint_collection, "Orient");
 
-    if validate_whole_catalogs {
-        relations::validate_catalog(&reader, &relations_facts)
-            .map_err(|error| anyhow!("validate Relations collection: {error:#}"))?;
-        mail_model::validate_local_catalog(&reader, &mail_facts)
-            .map_err(|error| anyhow!("validate Mail collection: {error:#}"))?;
-        message::validate_catalog(&reader, &message_facts, &relations_facts)
-            .map_err(|error| anyhow!("validate Message collection: {error:#}"))?;
-        compass::validate_known_payloads(&reader, &compass_facts)
-            .map_err(|error| anyhow!("validate Compass collection: {error:#}"))?;
-        status::validate_catalog(&reader, &status_facts)
-            .map_err(|error| anyhow!("validate Status collection: {error:#}"))?;
-        if let Some(facts) = habit_facts.as_ref() {
-            habits::validate_catalog(&reader, facts)
-                .map_err(|error| anyhow!("validate Habit collection: {error:#}"))?;
-        }
-        orient_model::validate_catalog(&reader, &checkpoint_facts, &compass_facts)
-            .map_err(|error| anyhow!("validate Orient checkpoint collection: {error:#}"))?;
-    }
     let habits = habit_facts.unwrap_or_default();
 
     let compass_status = compass::status_register_collection(pile, signer.verifying_key())?
@@ -433,7 +416,7 @@ fn load_catalogs(
 }
 
 fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCatalogs> {
-    match load_catalogs(pile, signer, true, true)? {
+    match load_catalogs(pile, signer, true)? {
         NativeCatalogLoad::Coherent(catalogs) => Ok(catalogs),
         NativeCatalogLoad::Incomplete(incomplete) => Err(anyhow!(
             "physical collection cover is incomplete: {incomplete}"
@@ -441,15 +424,13 @@ fn load_native_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<NativeCa
     }
 }
 
-/// Load exactly the domains consulted by one non-blocking news check.
+/// Omit Habits for one non-blocking news check.
 ///
-/// The query paths validate the rows and payloads they actually interpret;
-/// running every faculty's whole-catalog audit here would validate unrelated
-/// history on every prompt. Exact collection materialization still withholds
-/// incomplete covers, while the maintained checkpoint index names the one
-/// canonical event row this poll must decode.
+/// Show and poll otherwise share the same exact, demand-validated collection
+/// observation. The maintained checkpoint index names the one canonical event
+/// row each path must decode.
 fn load_poll_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Option<NativeCatalogs>> {
-    match load_catalogs(pile, signer, false, false)? {
+    match load_catalogs(pile, signer, false)? {
         NativeCatalogLoad::Coherent(catalogs) => Ok(Some(catalogs)),
         NativeCatalogLoad::Incomplete(_) => Ok(None),
     }
@@ -1508,6 +1489,24 @@ fn require_seen_frontier(
     Ok((universe, observed))
 }
 
+fn save_show_checkpoint_if_needed(
+    pile: &mut Pile,
+    signer: &SigningKey,
+    catalogs: &NativeCatalogs,
+    persona: Id,
+    view: &orient_model::WatchedView,
+) -> Result<()> {
+    let Some(checkpoint) = latest_checkpoint_view(catalogs, persona)? else {
+        return save_checkpoint(pile, signer, persona, view, all_note_ids(&catalogs.compass));
+    };
+    let (universe, observed) = require_seen_frontier(catalogs, persona)?;
+    let newly_observed: BTreeSet<_> = universe.difference(&observed).copied().collect();
+    if &checkpoint != view || !newly_observed.is_empty() {
+        save_checkpoint(pile, signer, persona, view, newly_observed)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MigrationOutcome {
     checkpoint: Id,
@@ -1584,27 +1583,7 @@ fn cmd_show(
         let window_status = render_window_status(&catalogs)?;
         if let Some(persona_id) = persona_id {
             let view = load_watched_view(&catalogs, persona_id)?;
-            match latest_checkpoint_view(&catalogs, persona_id)? {
-                None => save_checkpoint(
-                    &mut pile,
-                    &signer,
-                    persona_id,
-                    &view,
-                    all_note_ids(&catalogs.compass),
-                )?,
-                Some(checkpoint) => {
-                    let (universe, observed) = require_seen_frontier(&catalogs, persona_id)?;
-                    if checkpoint != view || universe != observed {
-                        save_checkpoint(
-                            &mut pile,
-                            &signer,
-                            persona_id,
-                            &view,
-                            universe.difference(&observed).copied(),
-                        )?;
-                    }
-                }
-            }
+            save_show_checkpoint_if_needed(&mut pile, &signer, &catalogs, persona_id, &view)?;
         }
         Ok((messages, mail, goals, window_status))
     })();
@@ -2112,7 +2091,7 @@ fn load_wait_frame(
     persona_input: &str,
     now_secs: i64,
 ) -> Result<WaitFrameLoad> {
-    let catalogs = match load_catalogs(pile, signer, true, false)? {
+    let catalogs = match load_catalogs(pile, signer, true)? {
         NativeCatalogLoad::Incomplete(incomplete) => {
             return Ok(WaitFrameLoad::Pending(Some(incomplete)));
         }
@@ -2587,7 +2566,7 @@ mod tests {
     }
 
     fn load_wait_catalogs(pile: &mut Pile, signer: &SigningKey) -> NativeCatalogs {
-        match load_catalogs(pile, signer, true, false).unwrap() {
+        match load_catalogs(pile, signer, true).unwrap() {
             NativeCatalogLoad::Coherent(catalogs) => catalogs,
             NativeCatalogLoad::Incomplete(incomplete) => {
                 panic!("test collection cover is incomplete: {incomplete}")
@@ -3387,6 +3366,42 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_seen_note_does_not_make_show_recheckpoint() {
+        let fixture = TestPile::new();
+        let signer = fixture.signer.clone();
+        let persona = ufoid().id;
+        let missing_note = ufoid().id;
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let baseline = load_watched_view(&catalogs, persona).unwrap();
+        save_checkpoint(&mut pile, &signer, persona, &baseline, std::iter::empty()).unwrap();
+        commit_scope(
+            &mut pile,
+            &signer,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            orient_model::seen_notes_fragment(persona, [missing_note]),
+        );
+
+        let catalogs = load_native_catalogs(&mut pile, &signer).unwrap();
+        let current = load_watched_view(&catalogs, persona).unwrap();
+        assert_eq!(current, baseline);
+        let (universe, observed) = require_seen_frontier(&catalogs, persona).unwrap();
+        assert!(universe.is_empty());
+        assert_eq!(observed, BTreeSet::from([missing_note]));
+
+        let before = fs::metadata(&fixture.path).unwrap().len();
+        save_show_checkpoint_if_needed(&mut pile, &signer, &catalogs, persona, &current).unwrap();
+        save_show_checkpoint_if_needed(&mut pile, &signer, &catalogs, persona, &current).unwrap();
+        assert_eq!(
+            fs::metadata(&fixture.path).unwrap().len(),
+            before,
+            "an independently arriving Seen marker is not a reason to append a checkpoint",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn raw_persona_first_poll_survives_reload_without_a_relations_profile() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
@@ -3795,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_loader_preserves_news_and_peek_checkpoint_semantics() {
+    fn show_and_poll_loaders_share_news_and_checkpoint_semantics() {
         let fixture = TestPile::new();
         let signer = fixture.signer.clone();
         let persona = ufoid().id;
@@ -3820,15 +3835,15 @@ mod tests {
         );
         commit_scope(&mut pile, &signer, MESSAGE_SCOPE_ID, message_fragment);
 
-        let full = load_native_catalogs(&mut pile, &signer).unwrap();
+        let show = load_native_catalogs(&mut pile, &signer).unwrap();
         let poll = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
         assert_eq!(
             load_watched_view(&poll, persona).unwrap(),
-            load_watched_view(&full, persona).unwrap(),
+            load_watched_view(&show, persona).unwrap(),
         );
         assert_eq!(
             latest_checkpoint_view(&poll, persona).unwrap(),
-            latest_checkpoint_view(&full, persona).unwrap(),
+            latest_checkpoint_view(&show, persona).unwrap(),
         );
         assert_eq!(
             view_news(
@@ -4211,7 +4226,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_checkpoint_view_ignores_malformed_discarded_payload() {
+    fn show_and_poll_ignore_malformed_discarded_checkpoint_payload() {
         use faculties::schemas::orient::{checkpoint, KIND_CHECKPOINT_EVENT};
 
         let fixture = TestPile::new();
@@ -4242,13 +4257,18 @@ mod tests {
             malformed,
         );
 
-        let catalogs = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
+        let show = load_native_catalogs(&mut pile, &signer).unwrap();
+        let poll = load_poll_catalogs(&mut pile, &signer).unwrap().unwrap();
         assert_eq!(
-            latest_checkpoint_view(&catalogs, persona).unwrap(),
+            latest_checkpoint_view(&show, persona).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            latest_checkpoint_view(&poll, persona).unwrap(),
             Some(expected)
         );
-        let error = orient_model::load_checkpoint_events(&catalogs.reader, &catalogs.checkpoints)
-            .unwrap_err();
+        let error =
+            orient_model::load_checkpoint_events(&show.reader, &show.checkpoints).unwrap_err();
         assert!(
             format!("{error:#}").contains("parse Orient checkpoint view"),
             "{error:#}"

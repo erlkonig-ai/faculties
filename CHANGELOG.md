@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Orient validates the data it observes, not every historical row.** `show`,
+  `wait`, and `poll` still require exact resident collection covers and reject
+  malformed archive bytes, but typed query paths now decode only selected
+  payloads. A discarded malformed checkpoint therefore cannot poison every
+  future observation merely by remaining in the append-only history.
+
 - **A one-shot descriptor-authority migration re-seats ordinary faculty
   roots.** It registers each UTF-8-name, mandatory-authority descriptor,
   reuses the retired commits' exact data and metadata handles, and

@@ -595,9 +595,10 @@ where
 /// Capture Orient facts and attach the maintained checkpoint LWW index for
 /// that exact source cover, constructing missing derived artifacts if needed.
 ///
-/// Cross-collection validation of Seen note references remains the caller's
-/// responsibility through [`validate_catalog`], because the Compass frame is
-/// a separate exact collection observation.
+/// This materializes the collection and its index, not a closed-world read
+/// model: consumers validate selected checkpoint rows and payloads through
+/// [`load_checkpoint_event`]. Explicit whole-catalog and cross-collection
+/// audits remain available through [`validate_catalog`].
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -606,8 +607,6 @@ pub fn materialize_indexed_collection(
     let store_snapshot = pile.snapshot().context("freeze Orient store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Orient collection")?;
-    load_checkpoint_events(&store_snapshot, &facts)
-        .context("validate Orient checkpoint collection")?;
     let checkpoints = checkpoint_register_collection(pile, signer.verifying_key())?
         .ensure(pile, &cover)
         .map_err(|error| anyhow!("maintain Orient checkpoint register: {error}"))?;
@@ -754,6 +753,44 @@ mod tests {
             load_checkpoint_event(&reader, all.facts(), index.winner(persona).unwrap()).unwrap();
         assert_eq!(selected, full);
         assert_eq!(selected.view.goals_view, "latest");
+    }
+
+    #[test]
+    fn indexed_materialization_ignores_a_discarded_malformed_checkpoint_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orient.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[33; 32]);
+        let persona = Id::new([4; 16]).unwrap();
+
+        let mut fragment = Fragment::empty();
+        let malformed = fragment.put::<blobencodings::UTF8String, _>("not a checkpoint view");
+        fragment += entity! {
+            metadata::tag: &KIND_CHECKPOINT_EVENT,
+            checkpoint::persona: &persona,
+            checkpoint::view: malformed,
+            metadata::created_at: at(1.0),
+        };
+        let expected = WatchedView {
+            goals_view: "current".to_owned(),
+            ..WatchedView::default()
+        };
+        fragment += checkpoint_fragment(persona, &expected, at(2.0)).unwrap().0;
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_scope(&mut pile, DEFAULT_SCOPE_ID, &signer).unwrap();
+        pile.commit(collection, &signer, fragment).unwrap();
+
+        let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
+        let selected = snapshot.checkpoint_register().winner(persona).unwrap();
+        assert_eq!(
+            load_checkpoint_event(snapshot.store_snapshot(), snapshot.facts(), selected)
+                .unwrap()
+                .view,
+            expected,
+        );
+        assert!(load_checkpoint_events(snapshot.store_snapshot(), snapshot.facts()).is_err());
+        pile.close().unwrap();
     }
 
     fn validated_compass(persona: Id, note: Id) -> Fragment {
