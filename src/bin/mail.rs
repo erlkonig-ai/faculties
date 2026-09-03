@@ -1351,13 +1351,14 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let secrets_before = before
-            .secrets
-            .snapshot()
-            .vault(fixture.secret_vault)
-            .unwrap()
-            .facts()
-            .clone();
+        let secrets_before = vaults::secret_rows(
+            before
+                .secrets
+                .snapshot()
+                .vault(fixture.secret_vault)
+                .unwrap()
+                .facts(),
+        );
 
         account_set(
             &storage,
@@ -1376,13 +1377,15 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            after
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-            &secrets_before
+            vaults::secret_rows(
+                after
+                    .secrets
+                    .snapshot()
+                    .vault(fixture.secret_vault)
+                    .unwrap()
+                    .facts(),
+            ),
+            secrets_before
         );
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
             Head::Unique(id) => id,
@@ -1402,14 +1405,15 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let versions_before = before
-            .secrets
-            .snapshot()
-            .vault(fixture.secret_vault)
-            .unwrap()
-            .catalog()
-            .secrets
-            .len();
+        let versions_before = vaults::secret_rows(
+            before
+                .secrets
+                .snapshot()
+                .vault(fixture.secret_vault)
+                .unwrap()
+                .facts(),
+        )
+        .len();
 
         account_set(
             &storage,
@@ -1428,14 +1432,15 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            after
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .catalog()
-                .secrets
-                .len(),
+            vaults::secret_rows(
+                after
+                    .secrets
+                    .snapshot()
+                    .vault(fixture.secret_vault)
+                    .unwrap()
+                    .facts(),
+            )
+            .len(),
             versions_before + 1
         );
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
@@ -1463,16 +1468,17 @@ mod tests {
                 b"replacement password",
             )
             .unwrap();
-        let versions = storage
-            .views()
-            .unwrap()
-            .secrets
-            .snapshot()
-            .vault(fixture.secret_vault)
-            .unwrap()
-            .catalog()
-            .secrets
-            .len();
+        let views = storage.views().unwrap();
+        let versions = vaults::secret_rows(
+            views
+                .secrets
+                .snapshot()
+                .vault(fixture.secret_vault)
+                .unwrap()
+                .facts(),
+        )
+        .len();
+        drop(views);
 
         account_set(
             &storage,
@@ -1491,14 +1497,15 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            after
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .catalog()
-                .secrets
-                .len(),
+            vaults::secret_rows(
+                after
+                    .secrets
+                    .snapshot()
+                    .vault(fixture.secret_vault)
+                    .unwrap()
+                    .facts(),
+            )
+            .len(),
             versions
         );
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
@@ -1543,15 +1550,16 @@ mod tests {
     fn invalid_account_input_does_not_publish_the_staged_secret() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let secrets_before = storage
-            .views()
-            .unwrap()
-            .secrets
-            .snapshot()
-            .vault(fixture.secret_vault)
-            .unwrap()
-            .facts()
-            .clone();
+        let views = storage.views().unwrap();
+        let secrets_before = vaults::secret_rows(
+            views
+                .secrets
+                .snapshot()
+                .vault(fixture.secret_vault)
+                .unwrap()
+                .facts(),
+        );
+        drop(views);
 
         let error = account_set(
             &storage,
@@ -1570,13 +1578,15 @@ mod tests {
         assert!(format!("{error:#}").contains("account address"));
         let after = storage.views().unwrap();
         assert_eq!(
-            after
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-            &secrets_before
+            vaults::secret_rows(
+                after
+                    .secrets
+                    .snapshot()
+                    .vault(fixture.secret_vault)
+                    .unwrap()
+                    .facts(),
+            ),
+            secrets_before
         );
     }
 
