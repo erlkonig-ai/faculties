@@ -15,10 +15,10 @@ use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::planner::{
     self as planner_model, cancellation_fragment, event_fragment, note_fragment, read_text,
-    EventDraft, EventRow, IntervalValue, PlannerCatalog, TextHandle, STATUS_CANCELLED,
-    STATUS_CONFIRMED, TRANSP_OPAQUE,
+    EventDraft, EventRow, IntervalValue, TextHandle, STATUS_CANCELLED, STATUS_CONFIRMED,
+    STATUS_TENTATIVE, TRANSP_OPAQUE,
 };
-use faculties::schemas::planner::DEFAULT_SCOPE_ID;
+use faculties::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID};
 use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::Epoch;
 use rrule::{RRuleSet, Tz};
@@ -402,23 +402,142 @@ struct Occurrence {
     location: Option<String>,
 }
 
-fn rrule_occurrences(row: &EventRow, window: (Epoch, Epoch)) -> Result<Vec<(Epoch, Epoch)>> {
-    let (base_start, base_end) = unpack_interval(row.time);
+type EpochInterval = (Epoch, Epoch);
+
+/// The fields this command needs from one event. This is deliberately not a
+/// collection-wide read model: it lives only while that event's occurrences
+/// are derived.
+struct OccurrenceEvent {
+    id: Id,
+    summary: String,
+    time: EpochInterval,
+    rrule: Option<String>,
+    rdates: Vec<EpochInterval>,
+    exdates: Vec<EpochInterval>,
+    location: Option<String>,
+    status: String,
+}
+
+fn occurrence_event<P>(space: &P, id: Id) -> Option<OccurrenceEvent>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (
+            summary: String,
+            time: EpochInterval,
+            status: String,
+        ),
+        pattern!(space, [{ id @
+            metadata::tag: &KIND_EVENT_ID,
+            event::summary: ?summary,
+            event::time: ?time,
+            event::status: ?status,
+        }])
+    )
+    .find_map(|(summary, time, status)| {
+        if !matches!(
+            status.as_str(),
+            STATUS_CONFIRMED | STATUS_TENTATIVE | STATUS_CANCELLED
+        ) || epoch_to_chrono_utc(time.0).is_err()
+            || epoch_to_chrono_utc(time.1).is_err()
+        {
+            return None;
+        }
+        let rdates: Vec<EpochInterval> = find!(
+            value: EpochInterval,
+            pattern!(space, [{ id @ event::rdate: ?value }])
+        )
+        .filter(|(start, end)| {
+            epoch_to_chrono_utc(*start).is_ok() && epoch_to_chrono_utc(*end).is_ok()
+        })
+        .collect();
+        let exdates: Vec<EpochInterval> = find!(
+            value: EpochInterval,
+            pattern!(space, [{ id @ event::exdate: ?value }])
+        )
+        .filter(|(start, end)| {
+            epoch_to_chrono_utc(*start).is_ok() && epoch_to_chrono_utc(*end).is_ok()
+        })
+        .collect();
+        Some(OccurrenceEvent {
+            id,
+            summary,
+            time,
+            rrule: find!(
+                value: String,
+                pattern!(space, [{ id @ event::rrule: ?value }])
+            )
+            .next(),
+            rdates,
+            exdates,
+            location: find!(
+                value: String,
+                pattern!(space, [{ id @ event::location: ?value }])
+            )
+            .next(),
+            status,
+        })
+    })
+}
+
+fn interval_raw((start, end): EpochInterval) -> [u8; 32] {
+    make_interval(start, end).raw
+}
+
+fn is_excluded(row: &OccurrenceEvent, interval: EpochInterval) -> bool {
+    let interval = interval_raw(interval);
+    row.exdates
+        .iter()
+        .any(|excluded| interval_raw(*excluded) == interval)
+}
+
+fn overlaps((start, end): EpochInterval, (window_start, window_end): EpochInterval) -> bool {
+    !(end < window_start || start > window_end)
+}
+
+fn recurrence_set(row: &OccurrenceEvent) -> Option<RRuleSet> {
+    let rule = row.rrule.as_ref()?;
+    let (base_start, base_end) = row.time;
+    let duration = base_end - base_start;
+    let dtstart = epoch_to_chrono_utc(base_start)
+        .ok()?
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let combined = format!("DTSTART:{dtstart}\nRRULE:{rule}");
+    let mut set = combined.parse::<RRuleSet>().ok()?;
+
+    // Let `all(1)` step past exact exclusions for `next`. Recurrence DTSTARTs
+    // are serialized at whole-second precision above, so only equivalent
+    // whole-second intervals are safe to hand to rrule's timestamp-based
+    // EXDATE comparison. The exact interval check remains below as authority.
+    for &(start, end) in &row.exdates {
+        let start_utc = epoch_to_chrono_utc(start).ok()?;
+        if end - start == duration && start_utc.timestamp_subsec_nanos() == 0 {
+            set = set.exdate(start_utc.with_timezone(&Tz::UTC));
+        }
+    }
+    Some(set)
+}
+
+fn rrule_occurrences(row: &OccurrenceEvent, window: EpochInterval) -> Option<Vec<EpochInterval>> {
+    let (base_start, base_end) = row.time;
     let duration = base_end - base_start;
     let (window_start, window_end) = window;
     let mut occurrences = Vec::new();
 
-    if let Some(rule) = &row.rrule {
-        let dtstart = epoch_to_chrono_utc(base_start)?
-            .format("%Y%m%dT%H%M%SZ")
-            .to_string();
-        let combined = format!("DTSTART:{dtstart}\nRRULE:{rule}");
-        let set = combined
-            .parse::<RRuleSet>()
-            .with_context(|| format!("parse RRULE on event {}", fmt_id(row.id)))?;
-        let result = set
-            .after(epoch_to_chrono_utc(window_start)?.with_timezone(&Tz::UTC))
-            .before(epoch_to_chrono_utc(window_end)?.with_timezone(&Tz::UTC))
+    if row.rrule.is_some() {
+        let result = recurrence_set(row)?
+            .after(
+                epoch_to_chrono_utc(window_start)
+                    .ok()?
+                    .with_timezone(&Tz::UTC),
+            )
+            .before(
+                epoch_to_chrono_utc(window_end)
+                    .ok()?
+                    .with_timezone(&Tz::UTC),
+            )
             .all(10_000);
         occurrences.extend(result.dates.into_iter().map(|datetime| {
             let start = chrono_to_epoch(datetime.with_timezone(&Utc));
@@ -427,67 +546,136 @@ fn rrule_occurrences(row: &EventRow, window: (Epoch, Epoch)) -> Result<Vec<(Epoc
     } else {
         occurrences.push((base_start, base_end));
     }
-    occurrences.extend(row.rdates.iter().copied().map(unpack_interval));
-
-    let exclusions: BTreeSet<(i128, i128)> = row
-        .exdates
-        .iter()
-        .map(|value| value.try_from_inline().expect("validated EXDATE"))
-        .collect();
-    occurrences.retain(|(start, end)| {
-        let encoded: (i128, i128) = make_interval(*start, *end)
-            .try_from_inline()
-            .expect("valid occurrence interval");
-        !exclusions.contains(&encoded) && !(*end < window_start || *start > window_end)
-    });
-    occurrences.sort_by_key(|(start, end)| {
-        let encoded: (i128, i128) = make_interval(*start, *end)
-            .try_from_inline()
-            .expect("valid occurrence interval");
-        encoded
-    });
-    occurrences.dedup_by_key(|(start, end)| {
-        let encoded: (i128, i128) = make_interval(*start, *end)
-            .try_from_inline()
-            .expect("valid occurrence interval");
-        encoded
-    });
-    Ok(occurrences)
+    occurrences.extend(row.rdates.iter().copied());
+    occurrences.retain(|interval| !is_excluded(row, *interval) && overlaps(*interval, window));
+    occurrences.sort_by_key(|interval| interval_raw(*interval));
+    occurrences.dedup_by_key(|interval| interval_raw(*interval));
+    Some(occurrences)
 }
 
-fn collect_occurrences(
-    catalog: &PlannerCatalog,
-    window: (Epoch, Epoch),
-    show_cancelled: bool,
-) -> Result<Vec<Occurrence>> {
+fn make_occurrence(
+    row: &OccurrenceEvent,
+    cancelled: bool,
+    (start, end): EpochInterval,
+) -> Occurrence {
+    Occurrence {
+        event_id: row.id,
+        start,
+        end,
+        summary: row.summary.clone(),
+        status: if cancelled {
+            STATUS_CANCELLED.to_owned()
+        } else {
+            row.status.clone()
+        },
+        location: row.location.clone(),
+    }
+}
+
+fn occurrence_key(occurrence: &Occurrence) -> ([u8; 32], Id) {
+    (
+        interval_raw((occurrence.start, occurrence.end)),
+        occurrence.event_id,
+    )
+}
+
+fn collect_occurrences<P>(space: &P, window: EpochInterval, show_cancelled: bool) -> Vec<Occurrence>
+where
+    P: TriblePattern + ?Sized,
+{
     let mut occurrences = Vec::new();
-    for row in catalog.events.values() {
-        let cancelled = catalog.is_cancelled(row.id);
+    for event_id in find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
+    ) {
+        let Some(row) = occurrence_event(space, event_id) else {
+            continue;
+        };
+        let cancelled = planner_model::event_is_cancelled(space, row.id);
         if cancelled && !show_cancelled {
             continue;
         }
-        for (start, end) in rrule_occurrences(row, window)? {
-            occurrences.push(Occurrence {
-                event_id: row.id,
-                start,
-                end,
-                summary: row.summary.clone(),
-                status: if cancelled {
-                    STATUS_CANCELLED.to_owned()
-                } else {
-                    row.status.clone()
-                },
-                location: row.location.clone(),
-            });
+        let Some(event_occurrences) = rrule_occurrences(&row, window) else {
+            continue;
+        };
+        for interval in event_occurrences {
+            occurrences.push(make_occurrence(&row, cancelled, interval));
         }
     }
-    occurrences.sort_by_key(|occurrence| {
-        (
-            make_interval(occurrence.start, occurrence.end).raw,
-            occurrence.event_id,
-        )
-    });
-    Ok(occurrences)
+    occurrences.sort_by_key(occurrence_key);
+    occurrences
+}
+
+fn next_event_occurrence(row: &OccurrenceEvent, window: EpochInterval) -> Option<EpochInterval> {
+    let (window_start, window_end) = window;
+    let mut next = if row.rrule.is_some() {
+        let (base_start, base_end) = row.time;
+        let duration = base_end - base_start;
+        recurrence_set(row)?
+            .after(
+                epoch_to_chrono_utc(window_start)
+                    .ok()?
+                    .with_timezone(&Tz::UTC),
+            )
+            .before(
+                epoch_to_chrono_utc(window_end)
+                    .ok()?
+                    .with_timezone(&Tz::UTC),
+            )
+            .all(1)
+            .dates
+            .into_iter()
+            .next()
+            .map(|datetime| {
+                let start = chrono_to_epoch(datetime.with_timezone(&Utc));
+                (start, start + duration)
+            })
+    } else {
+        Some(row.time)
+    }
+    .filter(|interval| !is_excluded(row, *interval) && overlaps(*interval, window));
+
+    for &rdate in &row.rdates {
+        if is_excluded(row, rdate) || !overlaps(rdate, window) {
+            continue;
+        }
+        if next
+            .as_ref()
+            .is_none_or(|current| interval_raw(rdate) < interval_raw(*current))
+        {
+            next = Some(rdate);
+        }
+    }
+    next
+}
+
+fn next_occurrence<P>(space: &P, window: EpochInterval) -> Option<Occurrence>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut next = None;
+    for event_id in find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
+    ) {
+        let Some(row) = occurrence_event(space, event_id) else {
+            continue;
+        };
+        if planner_model::event_is_cancelled(space, row.id) {
+            continue;
+        }
+        let Some(interval) = next_event_occurrence(&row, window) else {
+            continue;
+        };
+        let candidate = make_occurrence(&row, false, interval);
+        if next
+            .as_ref()
+            .is_none_or(|current| occurrence_key(&candidate) < occurrence_key(current))
+        {
+            next = Some(candidate);
+        }
+    }
+    next
 }
 
 fn print_occurrences(occurrences: &[Occurrence]) -> Result<()> {
@@ -550,12 +738,11 @@ fn cmd_list(
         .map(chrono_to_epoch)
         .unwrap_or_else(|| Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0));
     storage.with_view(|loaded| {
-        let catalog = planner_model::load_catalog(&loaded.facts)?;
         print_occurrences(&collect_occurrences(
-            &catalog,
+            &loaded.facts,
             (start, end),
             show_cancelled,
-        )?)?;
+        ))?;
         Ok(())
     })
 }
@@ -585,8 +772,7 @@ fn local_day_window(days: i64) -> Result<(Epoch, Epoch)> {
 fn cmd_relative(storage: PlannerStorage<'_>, days: i64) -> Result<()> {
     let window = local_day_window(days)?;
     storage.with_view(|loaded| {
-        let catalog = planner_model::load_catalog(&loaded.facts)?;
-        print_occurrences(&collect_occurrences(&catalog, window, false)?)?;
+        print_occurrences(&collect_occurrences(&loaded.facts, window, false))?;
         Ok(())
     })
 }
@@ -595,14 +781,8 @@ fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
     let now = clock::now()?;
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
     storage.with_view(|loaded| {
-        let catalog = planner_model::load_catalog(&loaded.facts)?;
-        let occurrences = collect_occurrences(&catalog, (now, far), false)?;
-        let next: Vec<_> = occurrences
-            .into_iter()
-            .filter(|occurrence| occurrence.end >= now)
-            .take(1)
-            .collect();
-        print_occurrences(&next)?;
+        let next = next_occurrence(&loaded.facts, (now, far));
+        print_occurrences(next.as_ref().map_or(&[], std::slice::from_ref))?;
         Ok(())
     })
 }
@@ -956,6 +1136,8 @@ mod tests {
     use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use faculties::schemas::planner::{cancellation, KIND_CANCELLATION_ID, KIND_NOTE_ID};
+
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
@@ -1000,6 +1182,10 @@ mod tests {
         )
     }
 
+    fn fixture_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
     #[test]
     fn event_and_initial_note_publish_as_one_signed_mutation() {
         let directory = TestDirectory::new();
@@ -1023,9 +1209,21 @@ mod tests {
         assert_eq!(storage.commit_count().unwrap(), 1);
         storage
             .with_view(|loaded| {
-                let catalog = planner_model::load_catalog(&loaded.facts)?;
-                assert_eq!(catalog.events.len(), 1);
-                assert_eq!(catalog.notes.len(), 1);
+                assert!(planner_model::event(&loaded.facts, event).is_some());
+                assert_eq!(
+                    planner_model::notes_for_event(&loaded.facts, event).len(),
+                    1
+                );
+                let occurrences = collect_occurrences(
+                    &loaded.facts,
+                    (
+                        Epoch::from_unix_seconds(0.0),
+                        Epoch::from_unix_seconds(40.0),
+                    ),
+                    false,
+                );
+                assert_eq!(occurrences.len(), 1);
+                assert_eq!(occurrences[0].event_id, event);
                 Ok(())
             })
             .unwrap();
@@ -1150,10 +1348,160 @@ mod tests {
                     STATUS_CONFIRMED
                 );
                 assert!(planner_model::event_is_cancelled(&loaded.facts, event_id));
-                let catalog = planner_model::load_catalog(&loaded.facts)?;
-                assert_eq!(catalog.cancellations.len(), 1);
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn opaque_repeated_cancellation_edges_cancel_every_occurrence_target() {
+        let first = event_fragment(&fixture_draft("first@example", "first")).unwrap();
+        let first_id = first.root().unwrap();
+        let second = event_fragment(&fixture_draft("second@example", "second")).unwrap();
+        let second_id = second.root().unwrap();
+        let assertion = fixture_id(7);
+        let mut facts = first.into_facts();
+        facts += second.into_facts();
+        facts += entity! { ExclusiveId::force_ref(&assertion) @
+            metadata::tag: &KIND_CANCELLATION_ID,
+            cancellation::event: &first_id,
+        };
+        facts += entity! { ExclusiveId::force_ref(&assertion) @
+            cancellation::event: &second_id,
+        };
+
+        let window = (
+            Epoch::from_unix_seconds(0.0),
+            Epoch::from_unix_seconds(30.0),
+        );
+        assert!(collect_occurrences(&facts, window, false).is_empty());
+
+        let all = collect_occurrences(&facts, window, true);
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .all(|occurrence| occurrence.status == STATUS_CANCELLED));
+        assert_eq!(
+            all.iter()
+                .map(|occurrence| occurrence.event_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_id, second_id])
+        );
+    }
+
+    #[test]
+    fn occurrence_reads_ignore_notes_and_skip_unsupported_event_rows() {
+        let event = event_fragment(&fixture_draft("readable@example", "readable")).unwrap();
+        let event_id = event.root().unwrap();
+        let mut unsupported = fixture_draft("unsupported@example", "unsupported");
+        unsupported.rrule = Some("FREQ=NOTREAL".to_owned());
+        let unsupported = event_fragment(&unsupported).unwrap();
+        let note = note_fragment(
+            event_id,
+            "this belongs to show, not occurrence reads",
+            point_interval(Epoch::from_unix_seconds(30.0)),
+        )
+        .unwrap();
+        let mut facts = event.into_facts();
+        facts += unsupported.into_facts();
+        facts += note.into_facts();
+        let incomplete_note = fixture_id(8);
+        facts += entity! { ExclusiveId::force_ref(&incomplete_note) @
+            metadata::tag: &KIND_NOTE_ID,
+        };
+
+        let window = (
+            Epoch::from_unix_seconds(0.0),
+            Epoch::from_unix_seconds(30.0),
+        );
+        let occurrences = collect_occurrences(&facts, window, false);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].event_id, event_id);
+        assert_eq!(
+            next_occurrence(&facts, window)
+                .expect("readable event remains the next occurrence")
+                .event_id,
+            event_id
+        );
+    }
+
+    #[test]
+    fn next_compares_rrule_and_every_rdate_after_applying_exdates() {
+        let mut recurring = fixture_draft("recurring@example", "recurring");
+        recurring.time = make_interval(
+            Epoch::from_unix_seconds(0.0),
+            Epoch::from_unix_seconds(10.0),
+        );
+        recurring.rrule = Some("FREQ=DAILY;COUNT=3".to_owned());
+        recurring.rdates = BTreeSet::from([
+            make_interval(
+                Epoch::from_unix_seconds(50.0),
+                Epoch::from_unix_seconds(60.0),
+            ),
+            make_interval(
+                Epoch::from_unix_seconds(90_000.0),
+                Epoch::from_unix_seconds(90_010.0),
+            ),
+        ]);
+        recurring.exdates = BTreeSet::from([
+            recurring.time,
+            make_interval(
+                Epoch::from_unix_seconds(50.0),
+                Epoch::from_unix_seconds(60.0),
+            ),
+        ]);
+        let recurring = event_fragment(&recurring).unwrap();
+        let recurring_id = recurring.root().unwrap();
+
+        let mut later = fixture_draft("later@example", "later");
+        later.time = make_interval(
+            Epoch::from_unix_seconds(100_000.0),
+            Epoch::from_unix_seconds(100_010.0),
+        );
+        let later = event_fragment(&later).unwrap();
+        let mut facts = recurring.into_facts();
+        facts += later.into_facts();
+
+        // EXDATE must be inside the recurrence set before `all(1)`: otherwise
+        // it yields the excluded DTSTART and the later RDATE wins after the
+        // exact filter. The next unexcluded RRULE occurrence is one day later.
+        let next = next_occurrence(
+            &facts,
+            (
+                Epoch::from_unix_seconds(-1.0),
+                Epoch::from_unix_seconds(200_000.0),
+            ),
+        )
+        .expect("an unexcluded occurrence exists");
+        assert_eq!(next.event_id, recurring_id);
+        assert_eq!(next.start, Epoch::from_unix_seconds(86_400.0));
+        assert_eq!(next.end, Epoch::from_unix_seconds(86_410.0));
+
+        // The RDATE fold must inspect every value rather than assume query
+        // order. Put the winning value after a later one deliberately.
+        let mut row = occurrence_event(&facts, recurring_id).unwrap();
+        row.rdates = vec![
+            (
+                Epoch::from_unix_seconds(90_000.0),
+                Epoch::from_unix_seconds(90_010.0),
+            ),
+            (
+                Epoch::from_unix_seconds(100.0),
+                Epoch::from_unix_seconds(110.0),
+            ),
+        ];
+        assert_eq!(
+            next_event_occurrence(
+                &row,
+                (
+                    Epoch::from_unix_seconds(1.0),
+                    Epoch::from_unix_seconds(200_000.0),
+                ),
+            ),
+            Some((
+                Epoch::from_unix_seconds(100.0),
+                Epoch::from_unix_seconds(110.0),
+            ))
+        );
     }
 }

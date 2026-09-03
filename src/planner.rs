@@ -869,28 +869,21 @@ pub fn event_is_cancelled<P>(space: &P, event_id: Id) -> bool
 where
     P: TriblePattern + ?Sized,
 {
-    find!(
-        status: String,
-        pattern!(space, [{ event_id @ event::status: ?status }])
-    )
-    .any(|status| status == STATUS_CANCELLED)
-        || find!(
-            _assertion: Id,
-            pattern!(space, [{ ?_assertion @
-                metadata::tag: &KIND_CANCELLATION_ID,
-                cancellation::event: event_id,
-            }])
-        )
-        .next()
-        .is_some()
+    exists!(pattern!(space, [{ event_id @
+        event::status: STATUS_CANCELLED,
+    }])) || exists!(pattern!(space, [{ _?assertion @
+        metadata::tag: &KIND_CANCELLATION_ID,
+        cancellation::event: event_id,
+    }]))
 }
 
-/// Project the Planner ontology directly from any queryable fact view.
+/// Decode a bounded Planner fragment into its convenient import-time model.
 ///
-/// This is the ordinary open-world bulk read path used by calendar views. A
-/// record participates only when it inhabits the corresponding typed
-/// projection. Incomplete or undecodable records are skipped rather than
-/// making unrelated events unreadable.
+/// Ordinary collection readers query their typed projections directly. This
+/// bulk model remains for locally constructed or staged import fragments,
+/// where its input is bounded independently of collection history. A record
+/// participates only when it inhabits the corresponding typed projection;
+/// incomplete or undecodable records are skipped.
 pub fn load_catalog<P>(space: &P) -> Result<PlannerCatalog>
 where
     P: TriblePattern + ?Sized,
