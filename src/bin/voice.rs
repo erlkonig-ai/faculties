@@ -6,8 +6,8 @@
 //! (pose/look/feel/act); the voice is its own organ — synthesis (Qwen3-TTS via
 //! mary) plus output routing.
 //! New utterances and routing config live in one fixed native collection.
-//! Stopped-world migration validates historical records and reconstructs them
-//! under the current live ontology and intrinsic identities.
+//! Marker-free historical rows remain present but inert; ordinary reads query
+//! only complete decodable live records from its maintained fact archive.
 //!
 //! Two channels, each a hard contract, not a soft preference:
 //!   - `voice say <text>`   — the PRIVATE channel: in-ear / headphone only. If no
@@ -66,18 +66,15 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
 use faculties::collection_names::open_configured;
-use faculties::schemas::voice::{
-    route, CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD, KIND_ROUTE,
-};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::voice as voice_model;
-use hifitime::efmt::consts::ISO8601;
-use hifitime::efmt::Formatter;
-use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
@@ -190,38 +187,14 @@ enum Command {
     Devices,
 }
 
-// ── time / id helpers (mirrors body/headspace) ─────────────────────────────
+// ── time / id helpers ──────────────────────────────────────────────────────
 
 fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
     clock::point_now()
 }
 
-fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
-    lower.to_tai_duration().total_nanoseconds()
-}
-
-#[allow(dead_code)]
-fn format_time(tai_ns: i128) -> String {
-    const NANOS_PER_CENTURY: i128 = 3_155_760_000_000_000_000;
-    let centuries = (tai_ns / NANOS_PER_CENTURY) as i16;
-    let nanos = (tai_ns % NANOS_PER_CENTURY) as u64;
-    let dur = hifitime::Duration::from_parts(centuries, nanos);
-    let epoch = Epoch::from_tai_duration(dur);
-    Formatter::new(epoch, ISO8601).to_string()
-}
-
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
-}
-
-fn u256be_to_u64(value: U256) -> u64 {
-    let raw = value.raw;
-    if raw[..24].iter().any(|b| *b != 0) {
-        return u64::MAX;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().unwrap_or([0xFF; 8]);
-    u64::from_be_bytes(bytes)
 }
 
 fn http() -> reqwest::blocking::Client {
@@ -527,7 +500,7 @@ struct VoiceSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &'a ed25519_dalek::SigningKey,
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
@@ -537,19 +510,11 @@ impl VoiceSession<'_> {
         mut fragment: Fragment,
         description: &'static str,
     ) -> Result<CollectionCommit> {
-        voice_model::validate_candidate(&self.reader, &self.facts, &fragment)?;
-        let added = fragment.facts().clone();
+        voice_model::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: description });
-        let commit = self
-            .pile
+        self.pile
             .commit(self.collection, self.signer, fragment)
-            .context("commit Voice fragment")?;
-        self.facts += added;
-        self.reader = self
-            .pile
-            .snapshot()
-            .context("refresh Voice attachment snapshot")?;
-        Ok(commit)
+            .context("commit Voice fragment")
     }
 }
 
@@ -563,11 +528,19 @@ impl VoiceStorage<'_> {
         let result = (|| {
             let collection =
                 open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize Voice collection")?;
-            voice_model::validate_catalog(&store_snapshot, &facts)
-                .context("validate native Voice collection")?;
+            let maintained = FactCollection::new(&mut pile, collection)
+                .context("register maintained Voice fact collection")?;
+            let before = pile.snapshot().context("freeze Voice source snapshot")?;
+            let instant = clock::now()?;
+            let store_snapshot = maintained
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Voice fact collection")?;
+            drop(before);
+            let facts = store_snapshot
+                .collection_at(maintained.rank9(), instant)
+                .context("observe maintained Voice fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Voice fact collection")?;
             operation(&mut VoiceSession {
                 pile: &mut pile,
                 collection,
@@ -597,23 +570,12 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 /// is the LATEST generation only (a set replaces, it doesn't accumulate).
 /// Exact timestamp ties are unioned. Falls back to the baked-in defaults when
 /// the live projection holds no policy for the channel.
-fn load_route(space: &TribleSet, channel: &str) -> Result<Vec<String>> {
+fn load_route<P: TriblePattern>(space: &P, channel: &str) -> Result<Vec<String>> {
     // (set-generation key, priority, device) for this channel.
-    let mut rows: Vec<(i128, u64, String)> = Vec::new();
-    for (dev, prio, updated) in find!(
-        (d: String, p: U256, u: Inline<inlineencodings::NsTAIInterval>),
-        pattern!(space, [{
-            _?e @
-                metadata::tag: KIND_LIVE_RECORD,
-                metadata::tag: KIND_ROUTE,
-                route::channel: channel.to_string(),
-                route::device: ?d,
-                route::priority: ?p,
-                metadata::updated_at: ?u,
-        }])
-    ) {
-        rows.push((interval_key(updated), u256be_to_u64(prio), dev));
-    }
+    let rows: Vec<(i128, u64, String)> = voice_model::route_rows(space, channel)
+        .into_iter()
+        .map(|row| (row.updated_at.0, row.priority, row.device))
+        .collect();
     let Some(latest_gen) = rows.iter().map(|(k, _, _)| *k).max() else {
         let defaults = match channel {
             CHANNEL_SAY => DEFAULT_SAY_DEVICES,

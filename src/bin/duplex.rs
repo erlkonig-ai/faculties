@@ -1609,19 +1609,15 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     use triblespace::prelude::*;
 
     let stamp = clock::point_now()?;
-    let fragment = faculties::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
+    let mut fragment = faculties::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
     let result = (|| -> Result<()> {
-        let store_snapshot = pile.snapshot().context("freeze Voice store snapshot")?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .context("materialize the Voice collection")?;
-        faculties::voice::validate_candidate(&store_snapshot, &facts, &fragment)?;
-        let mut described = fragment.clone();
-        described.describe_with(entity! { metadata::description: "duplex spoke" });
-        pile.commit(collection, &signer, described)
+        faculties::voice::validate_staged_payloads(&mut fragment)?;
+        fragment.describe_with(entity! { metadata::description: "duplex spoke" });
+        pile.commit(collection, &signer, fragment)
             .context("commit the utterance")?;
         Ok(())
     })();
