@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-use triblespace::core::blob::{Blob, TryFromBlob};
+use triblespace::core::blob::Blob;
 use triblespace::core::collection::succinctarchive_union::{
     RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
@@ -40,7 +40,7 @@ use crate::collection_names::open_configured;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
 use triblespace::core::collection::{
-    CollectionDerive, CollectionMapping, CollectionRecord, CollectionStore,
+    CollectionDerive, CollectionMapping, CollectionMerge, CollectionRecord, CollectionStore,
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
@@ -1631,14 +1631,6 @@ mod tests {
             .unwrap()
     }
 
-    fn stored_descriptor<L: triblespace::core::collection::CollectionEncoding>(
-        reader: &PileSnapshot,
-        collection: Collection<L>,
-    ) -> Fragment {
-        let blob: Blob<SimpleArchive> = reader.get(collection.handle()).unwrap();
-        Fragment::from(TribleSet::try_from_blob(blob).unwrap())
-    }
-
     /// Initialize the durable signer used by the Archive fixture.
     fn initialize_archive_fixture(pile: &std::path::Path, key: &std::path::Path) -> SigningKey {
         initialize_signer(pile, Some(key)).unwrap()
@@ -2505,18 +2497,25 @@ mod tests {
         let block_commit = pile.commit(collection, &signer, block_element).unwrap();
         let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let descriptor = {
-            let reader = pile.snapshot().unwrap();
-            stored_descriptor(&reader, source)
-        };
-        // A merge names two states of the collection, and the commits that
-        // made them already put their bytes in the store, so it takes their
-        // data handles rather than blobs fetched back out.
-        let (_, union) = simplearchive_union::publish_merge(
+        let reader = pile.snapshot().unwrap();
+        let block: Blob<SimpleArchive> = reader
+            .get(Handle::<SimpleArchive>::from_hash(block_commit.data()))
+            .unwrap();
+        let remainder: Blob<SimpleArchive> = reader
+            .get(Handle::<SimpleArchive>::from_hash(remainder_commit.data()))
+            .unwrap();
+        let union = simplearchive_union::join(&block, &remainder).unwrap();
+        drop(reader);
+        let union_data =
+            Handle::<SimpleArchive>::to_hash(pile.put::<SimpleArchive, _>(union.clone()).unwrap());
+        CollectionStore::insert(
             &mut pile,
-            &descriptor,
-            block_commit.data(),
-            remainder_commit.data(),
+            CollectionRecord::Merge(CollectionMerge::new(
+                source.handle(),
+                block_commit.data(),
+                remainder_commit.data(),
+                union_data,
+            )),
         )
         .unwrap();
 
