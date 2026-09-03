@@ -22,7 +22,7 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-use crate::headspace::{self, Catalog, ConfigValue, ProfileValue, Resolution};
+use crate::headspace::{self, ConfigValue, ProfileValue, Resolution};
 use crate::message as message_model;
 use crate::relations::{self as relations_model, IdentityComponents, ProfileView};
 use crate::schemas::triage::{
@@ -1052,45 +1052,58 @@ fn budget_info(
     }
 }
 
-pub fn project_triage_headspace(catalog: &Catalog) -> TriageHeadspace {
-    let active_profile = catalog
-        .config
-        .settled_value("Headspace config")
-        .ok()
-        .flatten()
-        .and_then(|config| catalog.profiles.get(&config.active_profile))
-        .cloned();
-    match headspace::settled_active(catalog) {
-        Ok((config, profile)) => TriageHeadspace {
-            config: catalog.config.clone(),
-            active_profile,
-            persona_id: config.persona,
-            budget: Some(budget_info(
-                profile.context_window_tokens,
-                profile.max_output_tokens,
-                profile.context_safety_margin_tokens,
-                profile.chars_per_token,
-                config.system_prompt.len(),
-            )),
-        },
-        Err(_) => TriageHeadspace {
-            config: catalog.config.clone(),
-            active_profile,
-            persona_id: None,
-            budget: None,
-        },
-    }
-}
-
 pub fn project_headspace<P: TriblePattern>(
     headspace_view: SourceView<'_, P>,
     secrets: &SecretsSnapshot<PileSnapshot>,
 ) -> Result<TriageHeadspace> {
-    let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
-        .context("validate Headspace collection")?;
-    headspace::validate_secret_references(&catalog, secrets)
-        .context("validate exact Headspace Secrets references")?;
-    Ok(project_triage_headspace(&catalog))
+    let config = headspace::current_config(headspace_view.reader, headspace_view.facts)?;
+    let active_profile = config
+        .settled_value("Headspace config")
+        .ok()
+        .flatten()
+        .map(|config| {
+            headspace::current_profile(
+                headspace_view.reader,
+                headspace_view.facts,
+                config.active_profile,
+            )
+        })
+        .transpose()?;
+    headspace::validate_current_secret_references(&config, active_profile.iter(), secrets)
+        .context("validate current exact Headspace Secrets references")?;
+
+    let settled = config
+        .settled_value("Headspace config")
+        .ok()
+        .flatten()
+        .and_then(|config| {
+            active_profile
+                .as_ref()?
+                .settled_value(&format!("profile {:x}", config.active_profile))
+                .ok()
+                .flatten()
+                .map(|profile| (config, profile))
+        });
+    let (persona_id, budget) = settled
+        .map(|(config, profile)| {
+            (
+                config.persona,
+                Some(budget_info(
+                    profile.context_window_tokens,
+                    profile.max_output_tokens,
+                    profile.context_safety_margin_tokens,
+                    profile.chars_per_token,
+                    config.system_prompt.len(),
+                )),
+            )
+        })
+        .unwrap_or((None, None));
+    Ok(TriageHeadspace {
+        config,
+        active_profile,
+        persona_id,
+        budget,
+    })
 }
 
 pub fn relation_state<P: TriblePattern>(view: SourceView<'_, P>) -> Result<RelationState> {

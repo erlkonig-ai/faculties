@@ -1182,6 +1182,9 @@ mod tests {
 
     use faculties::headspace::{self, Resolution};
     use faculties::memory::{ChunkDraft, ChunkDraftContent};
+    use faculties::schemas::headspace::{
+        playground_config, KIND_CONFIG_ID, KIND_LIVE_RECORD, KIND_MODEL_PROFILE_ID,
+    };
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
     use faculties::storage::initialize_signer;
     use triblespace::core::metadata;
@@ -1266,6 +1269,45 @@ mod tests {
         .unwrap()
     }
 
+    fn extrinsic_headspace_fragment(anchor: Id, profile_id: Id, config_id: Id) -> Fragment {
+        let profile = headspace::default_profile(anchor, "extrinsic");
+        let config = headspace::default_config(anchor);
+        let mut fragment = headspace::profile_anchor_fragment(anchor);
+        let name = fragment.put(profile.name);
+        let left_model = fragment.put("left".to_owned());
+        let right_model = fragment.put("right".to_owned());
+        let base_url = fragment.put(profile.base_url);
+        fragment += entity! { ExclusiveId::force_ref(&profile_id) @
+            metadata::tag: &KIND_LIVE_RECORD,
+            metadata::tag: &KIND_MODEL_PROFILE_ID,
+            playground_config::model_profile_id: &anchor,
+            metadata::name: name,
+            playground_config::model_name: left_model,
+            playground_config::model_name: right_model,
+            playground_config::model_base_url: base_url,
+            playground_config::model_stream: 0_u64.to_inline(),
+            playground_config::model_context_window_tokens: profile.context_window_tokens.to_inline(),
+            playground_config::model_max_output_tokens: profile.max_output_tokens.to_inline(),
+            playground_config::model_context_safety_margin_tokens: profile.context_safety_margin_tokens.to_inline(),
+            playground_config::model_chars_per_token: profile.chars_per_token.to_inline(),
+        };
+        let system_prompt = fragment.put(config.system_prompt);
+        let author = fragment.put(config.author);
+        let author_role = fragment.put(config.author_role);
+        fragment += entity! { ExclusiveId::force_ref(&config_id) @
+            metadata::tag: &KIND_LIVE_RECORD,
+            metadata::tag: &KIND_CONFIG_ID,
+            playground_config::active_model_profile_id: &anchor,
+            playground_config::system_prompt: system_prompt,
+            playground_config::cognition_scope: &config.cognition_scope,
+            playground_config::author: author,
+            playground_config::author_role: author_role,
+            playground_config::poll_ms: config.poll_ms.to_inline(),
+            metadata::description: "an additive fact the reader does not model",
+        };
+        fragment
+    }
+
     #[test]
     fn memory_chunks_coexist() {
         let fixture = Fixture::new();
@@ -1316,7 +1358,30 @@ mod tests {
     }
 
     #[test]
-    fn missing_exact_headspace_secret_is_a_visible_catalog_error() {
+    fn headspace_projection_keeps_ids_opaque_and_scalar_multiplicity_visible() {
+        let fixture = Fixture::new();
+        let anchor = test_id(0x56);
+        let profile_id = test_id(0x57);
+        let config_id = test_id(0x58);
+        fixture.publish(
+            HEADSPACE_SCOPE_ID,
+            extrinsic_headspace_fragment(anchor, profile_id, config_id),
+        );
+
+        let (_, projected) = fixture.snapshot().headspace().unwrap();
+        assert!(matches!(
+            projected.config,
+            Resolution::Unique(ref snapshot) if snapshot.id == config_id
+        ));
+        assert!(matches!(
+            projected.active_profile,
+            Some(Resolution::Forked(ref variants))
+                if variants.len() == 2 && variants.iter().all(|snapshot| snapshot.id == profile_id)
+        ));
+    }
+
+    #[test]
+    fn missing_exact_headspace_secret_is_a_visible_current_state_error() {
         let fixture = Fixture::new();
         let anchor = test_id(0x61);
         let mut profile = headspace::default_profile(anchor, "private");
@@ -1334,6 +1399,33 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("missing exact model Secrets version"));
+    }
+
+    #[test]
+    fn retired_headspace_secret_reference_does_not_poison_current_state() {
+        let fixture = Fixture::new();
+        let anchor = test_id(0x63);
+        let mut historical = headspace::default_profile(anchor, "private");
+        historical.model_secret_version = Some(test_id(0x64));
+        let config = headspace::default_config(anchor);
+        let (genesis, historical_head, _) =
+            headspace::add_profile_fragment(&historical, &config, &[]).unwrap();
+        fixture.publish(HEADSPACE_SCOPE_ID, genesis);
+
+        let current = headspace::default_profile(anchor, "public");
+        fixture.publish(
+            HEADSPACE_SCOPE_ID,
+            headspace::profile_snapshot_fragment(&current, &[historical_head])
+                .unwrap()
+                .0,
+        );
+
+        let (_, projected) = fixture.snapshot().headspace().unwrap();
+        assert!(projected.is_settled());
+        assert!(matches!(
+            projected.active_profile,
+            Some(Resolution::Unique(_))
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Headspace has exactly two kinds of changing state: one global config track
 //! and one profile track per authored profile anchor. Every change is a
-//! complete intrinsic snapshot. `metadata::supersedes` carries lineage, set
+//! complete snapshot. `metadata::supersedes` carries lineage, set
 //! union preserves concurrent heads, and wall-clock time is absent from state
 //! and identity. If occurrence provenance later has a concrete consumer, it
 //! belongs outside these snapshots. This module is the sole projector used by
@@ -13,7 +13,9 @@
 //! secret labels remain discovery/display conveniences and never participate
 //! in runtime selection. Historical plaintext facts coexist in the same
 //! collection after migration, but lack the live marker and are semantically
-//! inert.
+//! inert. Ordinary consumers query current typed frontiers directly. The
+//! complete historical catalog remains only for reconciliation and strict
+//! migration boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,9 +89,7 @@ pub struct Snapshot<T> {
 ///
 /// `Agreed` retains every provenance head even though their complete values are
 /// equal. A successor must therefore use [`Self::head_ids`] rather than taking
-/// one representative. Exact-ontology failures are catalog-wide: [`project`]
-/// exposes them as `Catalog::config = Invalid` and no partial profile view,
-/// while [`project_result`] returns the error directly.
+/// one representative.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Resolution<T> {
     Missing,
@@ -132,7 +132,10 @@ impl<T> Resolution<T> {
     }
 }
 
-/// The complete shared projection consumed by every Headspace reader.
+/// Complete retained Headspace history for reconciliation and migration.
+///
+/// Ordinary readers should use [`current_config`], [`current_profile`], or
+/// [`current_profiles`] instead of materializing this historical domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Catalog {
     pub config: Resolution<ConfigValue>,
@@ -203,6 +206,400 @@ impl Catalog {
         }
         bail!("unknown Headspace snapshot {chosen:x}")
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CurrentProfileRow {
+    id: Id,
+    anchor: Id,
+    name: TextHandle,
+    model: TextHandle,
+    base_url: TextHandle,
+    stream: u64,
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    context_safety_margin_tokens: u64,
+    chars_per_token: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CurrentConfigRow {
+    id: Id,
+    active_profile: Id,
+    system_prompt: TextHandle,
+    cognition_scope: Id,
+    author: TextHandle,
+    author_role: TextHandle,
+    poll_ms: u64,
+}
+
+fn optional_variants<T: Copy + Ord>(values: impl IntoIterator<Item = T>) -> Vec<Option<T>> {
+    let values: BTreeSet<_> = values.into_iter().collect();
+    if values.is_empty() {
+        vec![None]
+    } else {
+        values.into_iter().map(Some).collect()
+    }
+}
+
+fn direct_predecessors<P>(facts: &P, id: Id) -> Vec<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    sorted_ids(find!(
+        predecessor: Id,
+        pattern!(facts, [{ id @ metadata::supersedes: ?predecessor }])
+    ))
+}
+
+/// Resolve one explicitly scoped observation-DAG frontier.
+///
+/// Only complete typed candidates participate. Incomplete rows, unknown
+/// schema generations, and cross-track edges are therefore inert rather than
+/// poisoning an open-world reader. Immediate edges suffice because every
+/// candidate named by another typed candidate is below the frontier.
+fn typed_frontier<P>(facts: &P, candidates: &BTreeSet<Id>) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut superseded = BTreeSet::new();
+    for successor in candidates {
+        superseded.extend(
+            find!(
+                predecessor: Id,
+                pattern!(facts, [{ successor @ metadata::supersedes: ?predecessor }])
+            )
+            .filter(|predecessor| candidates.contains(predecessor)),
+        );
+    }
+    candidates.difference(&superseded).copied().collect()
+}
+
+fn resolve_variants<T: Clone + Eq>(snapshots: Vec<Snapshot<T>>) -> Resolution<T> {
+    match snapshots.as_slice() {
+        [] => Resolution::Missing,
+        [snapshot] => Resolution::Unique(snapshot.clone()),
+        _ if snapshots
+            .iter()
+            .all(|snapshot| snapshot.value == snapshots[0].value) =>
+        {
+            Resolution::Agreed(snapshots)
+        }
+        _ => Resolution::Forked(snapshots),
+    }
+}
+
+fn current_profile_rows<P>(facts: &P, anchor: Id) -> BTreeSet<CurrentProfileRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (
+            id: Id,
+            name: TextHandle,
+            model: TextHandle,
+            base_url: TextHandle,
+            stream: u64,
+            context_window_tokens: u64,
+            max_output_tokens: u64,
+            context_safety_margin_tokens: u64,
+            chars_per_token: u64
+        ),
+        pattern!(facts, [{
+            ?id @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_MODEL_PROFILE_ID,
+                playground_config::model_profile_id: &anchor,
+                metadata::name: ?name,
+                playground_config::model_name: ?model,
+                playground_config::model_base_url: ?base_url,
+                playground_config::model_stream: ?stream,
+                playground_config::model_context_window_tokens: ?context_window_tokens,
+                playground_config::model_max_output_tokens: ?max_output_tokens,
+                playground_config::model_context_safety_margin_tokens: ?context_safety_margin_tokens,
+                playground_config::model_chars_per_token: ?chars_per_token,
+        }])
+    )
+    .filter_map(
+        |(
+            id,
+            name,
+            model,
+            base_url,
+            stream,
+            context_window_tokens,
+            max_output_tokens,
+            context_safety_margin_tokens,
+            chars_per_token,
+        )| {
+            (stream <= 1).then_some(CurrentProfileRow {
+                id,
+                anchor,
+                name,
+                model,
+                base_url,
+                stream,
+                context_window_tokens,
+                max_output_tokens,
+                context_safety_margin_tokens,
+                chars_per_token,
+            })
+        },
+    )
+    .collect()
+}
+
+/// Project the current typed state of one profile track.
+///
+/// Scalar multiplicity yields multiple interpretations instead of a hidden
+/// cardinality error or iterator-order winner. Additional facts are ignored,
+/// entity ids remain opaque, and only frontier payloads are read.
+pub fn current_profile<P>(
+    reader: &PileSnapshot,
+    facts: &P,
+    anchor: Id,
+) -> Result<Resolution<ProfileValue>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let rows = current_profile_rows(facts, anchor);
+    let candidates = rows.iter().map(|row| row.id).collect::<BTreeSet<_>>();
+    let heads = typed_frontier(facts, &candidates);
+    let mut snapshots = Vec::new();
+
+    for id in heads {
+        let predecessors = direct_predecessors(facts, id);
+        let model_secrets = optional_variants(find!(
+            value: Id,
+            pattern!(facts, [{ id @ playground_config::model_secret_version: ?value }])
+        ));
+        let reasoning_efforts = optional_variants(find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?value }])
+        ));
+        for row in rows.iter().filter(|row| row.id == id) {
+            let name = load_text_from(reader, row.name)?;
+            let model = load_text_from(reader, row.model)?;
+            let base_url = load_text_from(reader, row.base_url)?;
+            for model_secret_version in &model_secrets {
+                for reasoning_effort in &reasoning_efforts {
+                    let value = ProfileValue {
+                        anchor: row.anchor,
+                        name: name.clone(),
+                        model: model.clone(),
+                        base_url: base_url.clone(),
+                        model_secret_version: *model_secret_version,
+                        reasoning_effort: reasoning_effort
+                            .map(|handle| load_text_from(reader, handle))
+                            .transpose()?,
+                        stream: row.stream == 1,
+                        context_window_tokens: row.context_window_tokens,
+                        max_output_tokens: row.max_output_tokens,
+                        context_safety_margin_tokens: row.context_safety_margin_tokens,
+                        chars_per_token: row.chars_per_token,
+                    };
+                    let snapshot = Snapshot {
+                        id,
+                        value,
+                        predecessors: predecessors.clone(),
+                    };
+                    if !snapshots.contains(&snapshot) {
+                        snapshots.push(snapshot);
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolve_variants(snapshots))
+}
+
+/// Project every declared or typed profile track independently at its current
+/// frontier. This explicit roster result is for callers which actually need
+/// every profile; point readers should call [`current_profile`] instead.
+pub fn current_profiles<P>(
+    reader: &PileSnapshot,
+    facts: &P,
+) -> Result<BTreeMap<Id, Resolution<ProfileValue>>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let declared = find!(
+        anchor: Id,
+        pattern!(facts, [{
+            ?anchor @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_PROFILE_ANCHOR_ID,
+        }])
+    );
+    let referenced = find!(
+        anchor: Id,
+        pattern!(facts, [{
+            _?snapshot @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_MODEL_PROFILE_ID,
+                playground_config::model_profile_id: ?anchor,
+        }])
+    );
+    declared
+        .chain(referenced)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|anchor| current_profile(reader, facts, anchor).map(|profile| (anchor, profile)))
+        .collect()
+}
+
+fn current_config_rows<P>(facts: &P) -> BTreeSet<CurrentConfigRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (
+            id: Id,
+            active_profile: Id,
+            system_prompt: TextHandle,
+            cognition_scope: Id,
+            author: TextHandle,
+            author_role: TextHandle,
+            poll_ms: u64
+        ),
+        pattern!(facts, [{
+            ?id @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_CONFIG_ID,
+                playground_config::active_model_profile_id: ?active_profile,
+                playground_config::system_prompt: ?system_prompt,
+                playground_config::cognition_scope: ?cognition_scope,
+                playground_config::author: ?author,
+                playground_config::author_role: ?author_role,
+                playground_config::poll_ms: ?poll_ms,
+        }])
+    )
+    .map(
+        |(id, active_profile, system_prompt, cognition_scope, author, author_role, poll_ms)| {
+            CurrentConfigRow {
+                id,
+                active_profile,
+                system_prompt,
+                cognition_scope,
+                author,
+                author_role,
+                poll_ms,
+            }
+        },
+    )
+    .collect()
+}
+
+/// Project the global current Headspace configuration directly from typed
+/// rows. Only its explicit observation DAG chooses the frontier.
+pub fn current_config<P>(reader: &PileSnapshot, facts: &P) -> Result<Resolution<ConfigValue>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let rows = current_config_rows(facts);
+    let candidates = rows.iter().map(|row| row.id).collect::<BTreeSet<_>>();
+    let heads = typed_frontier(facts, &candidates);
+    let mut snapshots = Vec::new();
+
+    for id in heads {
+        let predecessors = direct_predecessors(facts, id);
+        let personas = optional_variants(find!(
+            value: Id,
+            pattern!(facts, [{ id @ playground_config::persona_id: ?value }])
+        ));
+        let tavily_secrets = optional_variants(find!(
+            value: Id,
+            pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?value }])
+        ));
+        let exa_secrets = optional_variants(find!(
+            value: Id,
+            pattern!(facts, [{ id @ playground_config::exa_secret_version: ?value }])
+        ));
+        let exec_cwds = optional_variants(find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?value }])
+        ));
+        let sandbox_profiles = optional_variants(find!(
+            value: Id,
+            pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?value }])
+        ));
+        for row in rows.iter().filter(|row| row.id == id) {
+            let system_prompt = load_text_from(reader, row.system_prompt)?;
+            let author = load_text_from(reader, row.author)?;
+            let author_role = load_text_from(reader, row.author_role)?;
+            for persona in &personas {
+                for tavily_secret_version in &tavily_secrets {
+                    for exa_secret_version in &exa_secrets {
+                        for exec_cwd in &exec_cwds {
+                            for exec_sandbox_profile in &sandbox_profiles {
+                                let value = ConfigValue {
+                                    active_profile: row.active_profile,
+                                    system_prompt: system_prompt.clone(),
+                                    cognition_scope: row.cognition_scope,
+                                    author: author.clone(),
+                                    author_role: author_role.clone(),
+                                    persona: *persona,
+                                    poll_ms: row.poll_ms,
+                                    tavily_secret_version: *tavily_secret_version,
+                                    exa_secret_version: *exa_secret_version,
+                                    exec_default_cwd: exec_cwd
+                                        .map(|handle| load_text_from(reader, handle))
+                                        .transpose()?,
+                                    exec_sandbox_profile: *exec_sandbox_profile,
+                                };
+                                let snapshot = Snapshot {
+                                    id,
+                                    value,
+                                    predecessors: predecessors.clone(),
+                                };
+                                if !snapshots.contains(&snapshot) {
+                                    snapshots.push(snapshot);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolve_variants(snapshots))
+}
+
+/// Validate only exact Secrets references visible at selected current
+/// frontiers. Historical snapshots remain irrelevant to ordinary reads.
+pub fn validate_current_secret_references<'a, R>(
+    config: &Resolution<ConfigValue>,
+    profiles: impl IntoIterator<Item = &'a Resolution<ProfileValue>>,
+    secrets: &SecretsSnapshot<R>,
+) -> Result<()> {
+    for snapshot in config.snapshots() {
+        for (role, secret) in [
+            ("Tavily", snapshot.value.tavily_secret_version),
+            ("Exa", snapshot.value.exa_secret_version),
+        ] {
+            if let Some(secret) = secret.filter(|secret| !secrets.contains(*secret)) {
+                bail!(
+                    "Headspace snapshot {:x} references missing exact {role} Secrets version {secret:x}",
+                    snapshot.id
+                );
+            }
+        }
+    }
+    for profile in profiles {
+        for snapshot in profile.snapshots() {
+            if let Some(secret) = snapshot
+                .value
+                .model_secret_version
+                .filter(|secret| !secrets.contains(*secret))
+            {
+                bail!(
+                    "Headspace snapshot {:x} references missing exact model Secrets version {secret:x}",
+                    snapshot.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolution_is_unique_value<T: Eq>(resolution: &Resolution<T>, intended: &T) -> bool {
@@ -881,11 +1278,11 @@ where
 
 /// Strictly validate one materialized import value.
 ///
-/// Ordinary reads deliberately use [`project_catalog`] instead: derived ids
-/// are opaque, and unknown additive facts are legal in the open-world model.
-/// This exact reconstruction remains only for explicit untrusted migration and
-/// import boundaries where the historical format itself is what is being
-/// checked.
+/// Ordinary reads deliberately use the direct current-state queries instead:
+/// derived ids are opaque, and unknown additive facts are legal in the
+/// open-world model. This exact reconstruction remains only for explicit
+/// untrusted migration and import boundaries where the historical format
+/// itself is what is being checked.
 fn parse_catalog_strict<Overlay>(
     reader: &PileSnapshot,
     overlay: Option<&Overlay>,
@@ -950,8 +1347,8 @@ pub fn validate_catalog_union(
     parse_catalog_strict(reader, Some(&overlay), &union)
 }
 
-/// Resolve the exact catalog. Structural or payload failure is represented as
-/// `Resolution::Invalid`, never as defaults or an implicit winner.
+/// Project complete retained history, representing structural or payload
+/// failure as `Resolution::Invalid` rather than choosing an implicit winner.
 pub fn project<P>(reader: &PileSnapshot, facts: &P) -> Catalog
 where
     P: TriblePattern + ?Sized,
@@ -959,6 +1356,7 @@ where
     project_result(reader, facts).unwrap_or_else(Catalog::invalid)
 }
 
+/// Project complete retained history for an explicit historical operation.
 pub fn project_result<P>(reader: &PileSnapshot, facts: &P) -> Result<Catalog>
 where
     P: TriblePattern + ?Sized,

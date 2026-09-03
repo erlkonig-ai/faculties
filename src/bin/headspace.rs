@@ -1,7 +1,7 @@
 //! headspace — fork-visible agent configuration backed by exact Secrets versions.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,7 +10,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::collection_names::open_configured;
-use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
+use faculties::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as vaults};
 use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
@@ -162,7 +162,7 @@ struct CollectionView {
 }
 
 struct Views {
-    catalog: Catalog,
+    headspace: CollectionView,
     secrets: vaults::VaultDiscovery,
 }
 
@@ -185,43 +185,46 @@ impl Storage<'_> {
         })
     }
 
-    fn materialize(&self, scope: Id, label: &str) -> Result<CollectionView> {
+    fn views(&self) -> Result<Views> {
         let mut pile = self.pile.borrow_mut();
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let source = open_configured(pile, scope, self.signer.verifying_key())?;
+        let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
         let collection = FactCollection::new(pile, source)
-            .with_context(|| format!("register maintained {label} fact collection"))?;
-        let instant = clock::now()?;
+            .context("register maintained Headspace fact collection")?;
+
+        // One frozen source watermark decides the exact Headspace support.
+        // Maintenance and Secrets discovery may append physical views, but
+        // cannot move that semantic boundary.
         let before = pile
             .snapshot()
-            .with_context(|| format!("freeze {label} source snapshot"))?;
-        let reader = collection
-            .maintain_at(pile, &before, instant)
-            .with_context(|| format!("maintain {label} fact collection"))?;
+            .context("freeze Headspace source snapshot")?;
+        let instant = clock::now()?;
+        let support = before
+            .collection_at(collection.source(), instant)
+            .context("observe resident Headspace collection")?
+            .support()
+            .clone();
         drop(before);
-        let facts = reader
-            .collection_at(collection.rank9(), instant)
-            .with_context(|| format!("observe maintained {label} fact collection"))?
-            .view::<FactArchive>()
-            .with_context(|| format!("attach maintained {label} fact collection"))?;
-        Ok(CollectionView { facts, reader })
-    }
+        drop(
+            collection
+                .maintain_exact(pile, &support)
+                .context("maintain Headspace fact collection")?,
+        );
 
-    fn views(&self) -> Result<Views> {
-        let headspace = self.materialize(DEFAULT_SCOPE_ID, "Headspace")?;
-        let secrets = {
-            let mut pile = self.pile.borrow_mut();
-            let pile = pile
-                .as_mut()
-                .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-            vaults::discover_local_vaults(pile, &self.signer)
-                .context("discover readable Secrets vaults")?
-        };
-        let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
-            .context("project Headspace collection")?;
-        Ok(Views { catalog, secrets })
+        let secrets = vaults::discover_local_vaults(pile, &self.signer)
+            .context("discover readable Secrets vaults")?;
+        // Attach Headspace through the same final immutable physical snapshot
+        // that backs every Secrets lookup in this view.
+        let reader = secrets.snapshot().store_snapshot().clone();
+        let facts = reader
+            .collection_exact(collection.rank9(), &support)
+            .context("attach maintained Headspace collection")?
+            .view::<FactArchive>()
+            .context("read maintained Headspace collection")?;
+        let headspace = CollectionView { facts, reader };
+        Ok(Views { headspace, secrets })
     }
 
     fn add_secret(&self, views: &Views, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
@@ -310,9 +313,9 @@ fn dispatch(storage: &Storage<'_>, command: &Command) -> Result<()> {
             } else {
                 None
             };
-            print_headspace(&views.catalog, opened.as_ref())
+            print_headspace(&views, opened.as_ref())
         }
-        Command::List => print_profile_list(&storage.views()?.catalog),
+        Command::List => print_profile_list(&storage.views()?),
         Command::Use { profile } => use_profile(storage, profile),
         Command::Add(args) => add_profile(storage, args),
         Command::Set { field, value } => set_profile_field(storage, *field, value),
@@ -325,32 +328,33 @@ fn dispatch(storage: &Storage<'_>, command: &Command) -> Result<()> {
     }
 }
 
-fn settled_config(catalog: &Catalog) -> Result<Option<&ConfigValue>> {
-    catalog.config.settled_value("Headspace config")
+fn settled_config(config: &Resolution<ConfigValue>) -> Result<Option<&ConfigValue>> {
+    config.settled_value("Headspace config")
 }
 
-fn require_profile(catalog: &Catalog, anchor: Id) -> Result<&ProfileValue> {
-    catalog
-        .profiles
-        .get(&anchor)
-        .ok_or_else(|| anyhow!("unknown profile {anchor:x}"))?
+fn require_profile(profile: &Resolution<ProfileValue>, anchor: Id) -> Result<&ProfileValue> {
+    profile
         .settled_value(&format!("profile {anchor:x}"))?
         .ok_or_else(|| anyhow!("profile {anchor:x} has no snapshot"))
 }
 
-fn resolve_profile_selector(catalog: &Catalog, raw: &str) -> Result<Id> {
+fn resolve_profile_selector(views: &Views, raw: &str) -> Result<Id> {
     if let Some(id) = Id::from_hex(raw.trim()) {
-        if catalog.profiles.contains_key(&id) {
-            return Ok(id);
-        }
-        bail!("unknown profile {id:x}");
+        let profile =
+            headspace::current_profile(&views.headspace.reader, &views.headspace.facts, id)?;
+        require_profile(&profile, id)?;
+        return Ok(id);
     }
     let needle = raw.trim().to_ascii_lowercase();
     let mut matches = Vec::new();
-    for (&anchor, resolution) in &catalog.profiles {
+    for (anchor, resolution) in
+        headspace::current_profiles(&views.headspace.reader, &views.headspace.facts)?
+    {
         let profile = match resolution {
-            Resolution::Unique(snapshot) => Some(&snapshot.value),
-            Resolution::Agreed(snapshots) => snapshots.first().map(|snapshot| &snapshot.value),
+            Resolution::Unique(snapshot) => Some(snapshot.value),
+            Resolution::Agreed(snapshots) => {
+                snapshots.first().map(|snapshot| snapshot.value.clone())
+            }
             Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
         };
         if profile.is_some_and(|profile| profile.name.to_ascii_lowercase() == needle) {
@@ -388,27 +392,38 @@ fn publish_headspace(storage: &Storage<'_>, fragment: Fragment, description: &st
 
 fn use_profile(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let views = storage.views()?;
-    let anchor = resolve_profile_selector(&views.catalog, selector)?;
-    require_profile(&views.catalog, anchor)?;
-    let existing = settled_config(&views.catalog)?;
+    let anchor = resolve_profile_selector(&views, selector)?;
+    let profile =
+        headspace::current_profile(&views.headspace.reader, &views.headspace.facts, anchor)?;
+    require_profile(&profile, anchor)?;
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let existing = settled_config(&config_resolution)?;
     if existing.is_some_and(|config| config.active_profile == anchor) {
-        return print_headspace(&views.catalog, None);
+        return print_headspace(&views, None);
     }
     let mut config = existing
         .cloned()
         .unwrap_or_else(|| headspace::default_config(anchor));
     config.active_profile = anchor;
-    let fragment =
-        headspace::config_snapshot_fragment(&config, &views.catalog.config.head_ids())?.0;
+    let fragment = headspace::config_snapshot_fragment(&config, &config_resolution.head_ids())?.0;
     publish_headspace(storage, fragment, "headspace: switch active profile")?;
     print_reloaded(storage)
 }
 
 fn add_profile(storage: &Storage<'_>, args: &AddArgs) -> Result<()> {
     let views = storage.views()?;
+    let config = headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
     let anchor = genid().id;
-    let mut profile = match settled_config(&views.catalog)? {
-        Some(config) => require_profile(&views.catalog, config.active_profile)?.clone(),
+    let mut profile = match settled_config(&config)? {
+        Some(config) => {
+            let active = headspace::current_profile(
+                &views.headspace.reader,
+                &views.headspace.facts,
+                config.active_profile,
+            )?;
+            require_profile(&active, config.active_profile)?.clone()
+        }
         None => headspace::default_profile(anchor, args.name.clone()),
     };
     profile.anchor = anchor;
@@ -442,21 +457,27 @@ fn add_profile(storage: &Storage<'_>, args: &AddArgs) -> Result<()> {
         profile.chars_per_token = value;
     }
 
-    let mut config = settled_config(&views.catalog)?
+    let mut next_config = settled_config(&config)?
         .cloned()
         .unwrap_or_else(|| headspace::default_config(anchor));
-    config.active_profile = anchor;
-    let fragment =
-        headspace::add_profile_fragment(&profile, &config, &views.catalog.config.head_ids())?.0;
+    next_config.active_profile = anchor;
+    let fragment = headspace::add_profile_fragment(&profile, &next_config, &config.head_ids())?.0;
     publish_headspace(storage, fragment, "headspace: add and activate profile")?;
     print_reloaded(storage)
 }
 
 fn set_profile_field(storage: &Storage<'_>, field: SetField, raw: &str) -> Result<()> {
     let views = storage.views()?;
-    let config = settled_config(&views.catalog)?
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let config = settled_config(&config_resolution)?
         .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
-    let current = require_profile(&views.catalog, config.active_profile)?;
+    let profile = headspace::current_profile(
+        &views.headspace.reader,
+        &views.headspace.facts,
+        config.active_profile,
+    )?;
+    let current = require_profile(&profile, config.active_profile)?;
     let mut changed = current.clone();
     match field {
         SetField::Model => changed.model = faculties::text_arg(raw, "model name")?,
@@ -484,34 +505,33 @@ fn set_profile_field(storage: &Storage<'_>, field: SetField, raw: &str) -> Resul
         }
     }
     if changed == *current {
-        return print_headspace(&views.catalog, None);
+        return print_headspace(&views, None);
     }
-    let fragment = headspace::profile_snapshot_fragment(
-        &changed,
-        &views.catalog.profiles[&config.active_profile].head_ids(),
-    )?
-    .0;
+    let fragment = headspace::profile_snapshot_fragment(&changed, &profile.head_ids())?.0;
     publish_headspace(storage, fragment, "headspace: update profile")?;
     print_reloaded(storage)
 }
 
 fn unset_profile_field(storage: &Storage<'_>, field: UnsetField) -> Result<()> {
     let views = storage.views()?;
-    let config = settled_config(&views.catalog)?
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let config = settled_config(&config_resolution)?
         .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
-    let current = require_profile(&views.catalog, config.active_profile)?;
+    let profile = headspace::current_profile(
+        &views.headspace.reader,
+        &views.headspace.facts,
+        config.active_profile,
+    )?;
+    let current = require_profile(&profile, config.active_profile)?;
     let mut changed = current.clone();
     match field {
         UnsetField::ReasoningEffort => changed.reasoning_effort = None,
     }
     if changed == *current {
-        return print_headspace(&views.catalog, None);
+        return print_headspace(&views, None);
     }
-    let fragment = headspace::profile_snapshot_fragment(
-        &changed,
-        &views.catalog.profiles[&config.active_profile].head_ids(),
-    )?
-    .0;
+    let fragment = headspace::profile_snapshot_fragment(&changed, &profile.head_ids())?.0;
     publish_headspace(storage, fragment, "headspace: unset profile field")?;
     print_reloaded(storage)
 }
@@ -534,11 +554,20 @@ struct SecretSuccessor {
 }
 
 fn secret_successor(
-    catalog: &Catalog,
+    views: &Views,
     role: SecretRole,
     replacement: Option<Id>,
 ) -> Result<SecretSuccessor> {
-    let (config, profile) = headspace::settled_active(catalog)?;
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let config = settled_config(&config_resolution)?
+        .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
+    let profile_resolution = headspace::current_profile(
+        &views.headspace.reader,
+        &views.headspace.facts,
+        config.active_profile,
+    )?;
+    let profile = require_profile(&profile_resolution, config.active_profile)?;
     match role {
         SecretRole::Model => {
             let mut changed = profile.clone();
@@ -547,7 +576,7 @@ fn secret_successor(
             Ok(SecretSuccessor {
                 fragment: headspace::profile_snapshot_fragment(
                     &changed,
-                    &catalog.profiles[&config.active_profile].head_ids(),
+                    &profile_resolution.head_ids(),
                 )?
                 .0,
                 current,
@@ -568,7 +597,7 @@ fn secret_successor(
             Ok(SecretSuccessor {
                 fragment: headspace::config_snapshot_fragment(
                     &changed,
-                    &catalog.config.head_ids(),
+                    &config_resolution.head_ids(),
                 )?
                 .0,
                 current,
@@ -579,7 +608,7 @@ fn secret_successor(
 
 fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> Result<()> {
     let views = storage.views()?;
-    let current = secret_successor(&views.catalog, role, None)?.current;
+    let current = secret_successor(&views, role, None)?.current;
     let explicit = args
         .version
         .as_deref()
@@ -592,7 +621,7 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
                 println!("{role:?} already references exact Secrets version {secret:x}");
                 return Ok(());
             }
-            let successor = secret_successor(&views.catalog, role, Some(secret))?;
+            let successor = secret_successor(&views, role, Some(secret))?;
             publish_headspace(
                 storage,
                 successor.fragment,
@@ -616,7 +645,13 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
                         anyhow!("--vault is required when the role has no predecessor version")
                     })?,
             };
-            let profile = headspace::settled_active(&views.catalog)?.0.active_profile;
+            let config =
+                headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+            let profile = settled_config(&config)?
+                .ok_or_else(|| {
+                    anyhow!("Headspace has no active configuration; add a profile first")
+                })?
+                .active_profile;
             let secret = storage.add_secret(
                 &views,
                 vault,
@@ -636,7 +671,7 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
             if !refreshed.secrets.snapshot().contains(secret) {
                 bail!("published exact Secrets version {secret:x} did not materialize");
             }
-            let successor = secret_successor(&refreshed.catalog, role, Some(secret))?;
+            let successor = secret_successor(&refreshed, role, Some(secret))?;
             publish_headspace(
                 storage,
                 successor.fragment,
@@ -651,7 +686,7 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
 
 fn unset_secret(storage: &Storage<'_>, role: SecretRole) -> Result<()> {
     let views = storage.views()?;
-    let successor = secret_successor(&views.catalog, role, None)?;
+    let successor = secret_successor(&views, role, None)?;
     if successor.current.is_none() {
         println!("{role:?} credential is already unset");
         return Ok(());
@@ -675,38 +710,73 @@ fn role_name(role: SecretRole) -> &'static str {
 
 fn reconcile(storage: &Storage<'_>, raw: &str) -> Result<()> {
     let views = storage.views()?;
-    let chosen = faculties::resolve_id_prefix(raw, views.catalog.snapshot_ids())?;
-    let Some((fragment, _)) = views.catalog.reconcile_fragment(chosen)? else {
-        return print_headspace(&views.catalog, None);
+    // Reconciliation alone explicitly projects arbitrary retained history;
+    // every ordinary read above asks only for its current typed frontier.
+    let history = headspace::project_result(&views.headspace.reader, &views.headspace.facts)
+        .context("project complete Headspace history for reconcile")?;
+    let chosen = faculties::resolve_id_prefix(raw, history.snapshot_ids())?;
+    let Some((fragment, _)) = history.reconcile_fragment(chosen)? else {
+        return print_headspace(&views, None);
     };
     publish_headspace(storage, fragment, "headspace: reconcile snapshot track")?;
     print_reloaded(storage)
 }
 
-fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<OpenedSecrets>> {
-    let (config, profile) = match headspace::settled_active(&views.catalog) {
-        Ok(value) => value,
-        Err(_) if matches!(views.catalog.config, Resolution::Missing) => return Ok(None),
-        Err(error) => return Err(error),
+fn open_secret_text(
+    storage: &Storage<'_>,
+    views: &Views,
+    secret: Option<Id>,
+    role: &str,
+) -> Result<Option<String>> {
+    let Some(secret) = secret else {
+        return Ok(None);
     };
+    let plaintext = views
+        .secrets
+        .snapshot()
+        .open(secret, &storage.signer)
+        .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
+    String::from_utf8(plaintext)
+        .with_context(|| format!("exact {role} Secrets version {secret:x} is not UTF-8"))
+        .map(Some)
+}
+
+fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<OpenedSecrets>> {
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let Some(config) = settled_config(&config_resolution)? else {
+        return Ok(None);
+    };
+    let profile_resolution = headspace::current_profile(
+        &views.headspace.reader,
+        &views.headspace.facts,
+        config.active_profile,
+    )?;
+    let profile = require_profile(&profile_resolution, config.active_profile)?;
     if profile.model_secret_version.is_none()
         && config.tavily_secret_version.is_none()
         && config.exa_secret_version.is_none()
     {
         return Ok(None);
     }
-    headspace::open_active_secrets(&views.catalog, views.secrets.snapshot(), &storage.signer)
-        .map(Some)
+    Ok(Some(OpenedSecrets {
+        model_api_key: open_secret_text(storage, views, profile.model_secret_version, "model")?,
+        tavily_api_key: open_secret_text(storage, views, config.tavily_secret_version, "Tavily")?,
+        exa_api_key: open_secret_text(storage, views, config.exa_secret_version, "Exa")?,
+    }))
 }
 
 fn print_reloaded(storage: &Storage<'_>) -> Result<()> {
     let views = storage.views()?;
-    print_headspace(&views.catalog, None)
+    print_headspace(&views, None)
 }
 
-fn print_headspace(catalog: &Catalog, opened: Option<&OpenedSecrets>) -> Result<()> {
+fn print_headspace(views: &Views, opened: Option<&OpenedSecrets>) -> Result<()> {
+    let config_resolution =
+        headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let profiles = headspace::current_profiles(&views.headspace.reader, &views.headspace.facts)?;
     println!("active:");
-    let Some(config) = settled_config(catalog)? else {
+    let Some(config) = settled_config(&config_resolution)? else {
         let profile = headspace::default_profile(Id::new([1; 16]).unwrap(), "default");
         print_profile(None, &profile, None);
         println!("  tavily_secret_version = null");
@@ -715,9 +785,12 @@ fn print_headspace(catalog: &Catalog, opened: Option<&OpenedSecrets>) -> Result<
         println!("  exa_api_key = null");
         println!();
         println!("profiles:");
-        return print_profile_list(catalog);
+        return print_profile_resolutions(&config_resolution, &profiles);
     };
-    let profile = require_profile(catalog, config.active_profile)?;
+    let profile = profiles
+        .get(&config.active_profile)
+        .ok_or_else(|| anyhow!("unknown profile {:x}", config.active_profile))?;
+    let profile = require_profile(profile, config.active_profile)?;
     print_profile(
         Some(config.active_profile),
         profile,
@@ -735,7 +808,7 @@ fn print_headspace(catalog: &Catalog, opened: Option<&OpenedSecrets>) -> Result<
     );
     println!();
     println!("profiles:");
-    print_profile_list(catalog)
+    print_profile_resolutions(&config_resolution, &profiles)
 }
 
 fn print_profile(anchor: Option<Id>, profile: &ProfileValue, opened: Option<&str>) {
@@ -787,15 +860,24 @@ fn print_secret_line(role: &str, version: Option<Id>, opened: Option<&str>) {
     );
 }
 
-fn print_profile_list(catalog: &Catalog) -> Result<()> {
-    let active = match &catalog.config {
+fn print_profile_list(views: &Views) -> Result<()> {
+    let config = headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
+    let profiles = headspace::current_profiles(&views.headspace.reader, &views.headspace.facts)?;
+    print_profile_resolutions(&config, &profiles)
+}
+
+fn print_profile_resolutions(
+    config: &Resolution<ConfigValue>,
+    profiles: &BTreeMap<Id, Resolution<ProfileValue>>,
+) -> Result<()> {
+    let active = match config {
         Resolution::Unique(snapshot) => Some(snapshot.value.active_profile),
         Resolution::Agreed(snapshots) => snapshots
             .first()
             .map(|snapshot| snapshot.value.active_profile),
         Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
     };
-    match &catalog.config {
+    match config {
         Resolution::Missing => println!("config\t<missing>"),
         Resolution::Unique(snapshot) => println!(
             "config\t{:x}\tactive={:x}",
@@ -823,7 +905,7 @@ fn print_profile_list(catalog: &Catalog) -> Result<()> {
     }
 
     let mut rows = Vec::new();
-    for (&anchor, resolution) in &catalog.profiles {
+    for (&anchor, resolution) in profiles {
         let marker = if active == Some(anchor) { '*' } else { ' ' };
         match resolution {
             Resolution::Unique(snapshot) => rows.push((
@@ -900,6 +982,7 @@ mod tests {
     use std::fs::File;
 
     use faculties::storage::{initialize_signer, open_pile_strict};
+    use triblespace::core::repo::StoreSnapshot;
     fn cli(pile: &Path, key: &Path, command: Command) -> Cli {
         Cli {
             pile: pile.to_owned(),
@@ -949,11 +1032,29 @@ mod tests {
     }
 
     #[test]
+    fn headspace_and_secrets_share_one_final_store_snapshot() {
+        let (_directory, pile, key) = fixture();
+        let (storage, views) = views(&pile, &key);
+        let secrets_reader = views.secrets.snapshot().store_snapshot();
+        assert!(views
+            .headspace
+            .reader
+            .changes_since(secrets_reader)
+            .is_empty());
+        assert!(secrets_reader
+            .changes_since(&views.headspace.reader)
+            .is_empty());
+        storage.close().unwrap();
+    }
+
+    #[test]
     fn add_use_and_idempotent_profile_set_advance_only_intended_tracks() {
         let (_directory, pile, key) = fixture();
         run(cli(&pile, &key, add("first"))).unwrap();
         let (storage, first) = views(&pile, &key);
-        let first_anchor = settled_config(&first.catalog)
+        let first_config =
+            headspace::current_config(&first.headspace.reader, &first.headspace.facts).unwrap();
+        let first_anchor = settled_config(&first_config)
             .unwrap()
             .unwrap()
             .active_profile;
@@ -978,7 +1079,11 @@ mod tests {
         ))
         .unwrap();
         let (storage, before) = views(&pile, &key);
-        let snapshots = before.catalog.snapshot_ids().len();
+        let snapshots =
+            headspace::project_result(&before.headspace.reader, &before.headspace.facts)
+                .unwrap()
+                .snapshot_ids()
+                .len();
         storage.close().unwrap();
 
         run(cli(
@@ -991,7 +1096,13 @@ mod tests {
         ))
         .unwrap();
         let (storage, after) = views(&pile, &key);
-        assert_eq!(after.catalog.snapshot_ids().len(), snapshots);
+        assert_eq!(
+            headspace::project_result(&after.headspace.reader, &after.headspace.facts)
+                .unwrap()
+                .snapshot_ids()
+                .len(),
+            snapshots
+        );
         storage.close().unwrap();
     }
 
@@ -1041,7 +1152,17 @@ mod tests {
         let (storage, repaired) = views(&pile, &key);
         assert_eq!(repaired.secrets.snapshot().vaults().len(), 1);
         assert!(repaired.secrets.snapshot().contains(version));
-        let (_, profile) = headspace::settled_active(&repaired.catalog).unwrap();
+        let config_resolution =
+            headspace::current_config(&repaired.headspace.reader, &repaired.headspace.facts)
+                .unwrap();
+        let config = settled_config(&config_resolution).unwrap().unwrap();
+        let profile_resolution = headspace::current_profile(
+            &repaired.headspace.reader,
+            &repaired.headspace.facts,
+            config.active_profile,
+        )
+        .unwrap();
+        let profile = require_profile(&profile_resolution, config.active_profile).unwrap();
         assert_eq!(profile.model_secret_version, Some(version));
         storage.close().unwrap();
 
@@ -1060,10 +1181,18 @@ mod tests {
         .unwrap();
         let (storage, replay) = views(&pile, &key);
         assert_eq!(replay.secrets.snapshot().vaults().len(), 1);
+        let config_resolution =
+            headspace::current_config(&replay.headspace.reader, &replay.headspace.facts).unwrap();
+        let config = settled_config(&config_resolution).unwrap().unwrap();
+        let profile_resolution = headspace::current_profile(
+            &replay.headspace.reader,
+            &replay.headspace.facts,
+            config.active_profile,
+        )
+        .unwrap();
         assert_eq!(
-            headspace::settled_active(&replay.catalog)
+            require_profile(&profile_resolution, config.active_profile)
                 .unwrap()
-                .1
                 .model_secret_version,
             Some(version)
         );

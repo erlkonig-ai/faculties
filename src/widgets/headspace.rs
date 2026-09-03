@@ -16,12 +16,12 @@
 //! panel.render(ctx, headspace_view, secrets_view);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::headspace::{self, ProfileValue, Resolution};
+use crate::headspace::{self, ConfigValue, ProfileValue, Resolution};
 use triblespace::core::id::Id;
 
 use super::storage::{DatasetRevision, DatasetView, SecretsView};
@@ -132,11 +132,17 @@ struct HeadspaceLive {
 impl HeadspaceLive {
     fn refresh(headspace_view: DatasetView<'_>, secrets_view: SecretsView<'_>) -> Self {
         let result = (|| {
-            let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
-                .map_err(|error| format!("Headspace collection: {error:#}"))?;
-            headspace::validate_secret_references(&catalog, secrets_view.snapshot)
-                .map_err(|error| format!("Headspace secret references: {error:#}"))?;
-            Ok::<_, String>((load_active_config(&catalog), load_profiles(&catalog)))
+            let config = headspace::current_config(headspace_view.reader, headspace_view.facts)
+                .map_err(|error| format!("Headspace config: {error:#}"))?;
+            let profiles = headspace::current_profiles(headspace_view.reader, headspace_view.facts)
+                .map_err(|error| format!("Headspace profiles: {error:#}"))?;
+            headspace::validate_current_secret_references(
+                &config,
+                profiles.values(),
+                secrets_view.snapshot,
+            )
+            .map_err(|error| format!("Headspace secret references: {error:#}"))?;
+            Ok::<_, String>((load_active_config(&config), load_profiles(&profiles)))
         })();
 
         let (active, profiles, diagnostic) = match result {
@@ -153,8 +159,8 @@ impl HeadspaceLive {
     }
 }
 
-fn load_active_config(catalog: &headspace::Catalog) -> ActiveConfig {
-    match &catalog.config {
+fn load_active_config(config: &Resolution<ConfigValue>) -> ActiveConfig {
+    match config {
         Resolution::Missing => ActiveConfig {
             resolution: Some("NO NATIVE CONFIG".to_owned()),
             ..ActiveConfig::default()
@@ -183,9 +189,9 @@ fn load_active_config(catalog: &headspace::Catalog) -> ActiveConfig {
     }
 }
 
-fn load_profiles(catalog: &headspace::Catalog) -> HashMap<Id, ModelProfile> {
+fn load_profiles(profiles: &BTreeMap<Id, Resolution<ProfileValue>>) -> HashMap<Id, ModelProfile> {
     let mut out = HashMap::new();
-    for (anchor, resolution) in &catalog.profiles {
+    for (anchor, resolution) in profiles {
         let profile = match resolution {
             Resolution::Unique(snapshot) => ModelProfile::from_value(&snapshot.value, None),
             Resolution::Agreed(snapshots) => snapshots
