@@ -278,16 +278,6 @@ impl OrientSource {
         Ok(support)
     }
 
-    fn attach_at(&self, snapshot: &PileSnapshot, instant: Epoch) -> Result<OrientFact> {
-        let collection = snapshot
-            .collection_at(self.facts.rank9(), instant)
-            .with_context(|| format!("observe {} Rank9 projection", self.label))?;
-        let view = collection
-            .view::<FactArchive>()
-            .with_context(|| format!("read {} Rank9 projection", self.label))?;
-        Ok(OrientFact { collection, view })
-    }
-
     fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
         let collection = snapshot
             .collection_exact(self.facts.rank9(), support)
@@ -361,6 +351,22 @@ struct OrientFacts {
     presentations: OrientFact,
 }
 
+/// Foundational supports selected at one immutable source watermark.
+///
+/// These coordinates are the denotational boundary of an Orient observation.
+/// A later store snapshot may contain more authored commits or independently
+/// maintained target nodes, but attachment must remain exact to this vector.
+struct OrientSupports {
+    messages: Support,
+    mail: Support,
+    teams: Support,
+    compass: Support,
+    relations: Support,
+    status: Support,
+    habits: Option<Support>,
+    presentations: Support,
+}
+
 /// One coherent semantic observation. Each source stays in its own resident
 /// target collection and Rank9 query view; shared vocabulary never turns those
 /// authority boundaries into an accidental global fact union.
@@ -399,22 +405,33 @@ fn maintain_sources_at(
     snapshot: &PileSnapshot,
     sources: &OrientSources,
     instant: Epoch,
-) -> Result<Support> {
-    sources.messages.maintain_at(pile, snapshot, instant)?;
-    sources.mail.maintain_at(pile, snapshot, instant)?;
-    sources.teams.maintain_at(pile, snapshot, instant)?;
-    let compass_support = sources.compass.maintain_at(pile, snapshot, instant)?;
-    sources.relations.maintain_at(pile, snapshot, instant)?;
-    sources.status.maintain_at(pile, snapshot, instant)?;
-    if let Some(source) = sources.habits.as_ref() {
-        source.maintain_at(pile, snapshot, instant)?;
-    }
-    sources.presentations.maintain_at(pile, snapshot, instant)?;
+) -> Result<OrientSupports> {
+    let messages = sources.messages.maintain_at(pile, snapshot, instant)?;
+    let mail = sources.mail.maintain_at(pile, snapshot, instant)?;
+    let teams = sources.teams.maintain_at(pile, snapshot, instant)?;
+    let compass = sources.compass.maintain_at(pile, snapshot, instant)?;
+    let relations = sources.relations.maintain_at(pile, snapshot, instant)?;
+    let status = sources.status.maintain_at(pile, snapshot, instant)?;
+    let habits = sources
+        .habits
+        .as_ref()
+        .map(|source| source.maintain_at(pile, snapshot, instant))
+        .transpose()?;
+    let presentations = sources.presentations.maintain_at(pile, snapshot, instant)?;
     drop(
-        pile.maintain_exact::<RegisterCoordinatesMapping>(sources.compass_status, &compass_support)
+        pile.maintain_exact::<RegisterCoordinatesMapping>(sources.compass_status, &compass)
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
-    Ok(compass_support)
+    Ok(OrientSupports {
+        messages,
+        mail,
+        teams,
+        compass,
+        relations,
+        status,
+        habits,
+        presentations,
+    })
 }
 
 /// Read every target collection as it actually exists at one immutable store
@@ -422,28 +439,35 @@ fn maintain_sources_at(
 fn observe_sources_at(
     snapshot: PileSnapshot,
     sources: &OrientSources,
-    compass_support: &Support,
+    supports: &OrientSupports,
     instant: Epoch,
 ) -> Result<OrientObservation> {
     let next_authorization_change = next_authorization_change_at(&snapshot, instant)
         .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
-    let messages = sources.messages.attach_at(&snapshot, instant)?;
-    let mail = sources.mail.attach_at(&snapshot, instant)?;
-    let teams = sources.teams.attach_at(&snapshot, instant)?;
+    let messages = sources
+        .messages
+        .attach_exact(&snapshot, &supports.messages)?;
+    let mail = sources.mail.attach_exact(&snapshot, &supports.mail)?;
+    let teams = sources.teams.attach_exact(&snapshot, &supports.teams)?;
     // Compass facts and their maintained LWW index are one logical query
     // substrate. Pin both to the same resident foundational support so a
     // concurrent maintainer cannot expose one half of a newer support here.
-    let compass = sources.compass.attach_exact(&snapshot, compass_support)?;
-    let relations = sources.relations.attach_at(&snapshot, instant)?;
-    let status = sources.status.attach_at(&snapshot, instant)?;
+    let compass = sources.compass.attach_exact(&snapshot, &supports.compass)?;
+    let relations = sources
+        .relations
+        .attach_exact(&snapshot, &supports.relations)?;
+    let status = sources.status.attach_exact(&snapshot, &supports.status)?;
     let habits = sources
         .habits
         .as_ref()
-        .map(|source| source.attach_at(&snapshot, instant))
+        .zip(supports.habits.as_ref())
+        .map(|(source, support)| source.attach_exact(&snapshot, support))
         .transpose()?;
-    let presentations = sources.presentations.attach_at(&snapshot, instant)?;
+    let presentations = sources
+        .presentations
+        .attach_exact(&snapshot, &supports.presentations)?;
     let compass_status = snapshot
-        .collection_exact(sources.compass_status, compass_support)
+        .collection_exact(sources.compass_status, &supports.compass)
         .map_err(|error| anyhow!("observe Compass status register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Compass status register: {error}"))?;
@@ -473,11 +497,11 @@ fn maintain_and_observe_sources_at(
     sources: &OrientSources,
     instant: Epoch,
 ) -> Result<OrientObservation> {
-    let compass_support = maintain_sources_at(pile, source_snapshot, sources, instant)?;
+    let supports = maintain_sources_at(pile, source_snapshot, sources, instant)?;
     let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
-    observe_sources_at(snapshot, sources, &compass_support, instant)
+    observe_sources_at(snapshot, sources, &supports, instant)
 }
 
 fn maintain_and_observe_sources(
@@ -3227,9 +3251,10 @@ mod tests {
             .support()
             .clone();
 
-        // This commit arrives after the wait watermark was frozen. Maintenance
-        // may append derived records, but it must neither incorporate this
-        // source future nor advance the caller's polling watermark past it.
+        // This commit arrives after the wait watermark was frozen. Another
+        // maintainer also realizes that newer support before this reader runs.
+        // The observation must still attach the exact support selected at its
+        // own source watermark, rather than re-selecting from the later target.
         let message_collection = sources.messages.facts.source();
         pile.commit(
             message_collection,
@@ -3237,6 +3262,14 @@ mod tests {
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
+        let future = pile.snapshot().unwrap();
+        drop(
+            sources
+                .messages
+                .facts
+                .maintain_at(&mut pile, &future, instant)
+                .unwrap(),
+        );
         let attempt = load_wait_frame(
             &mut pile,
             &sources,
