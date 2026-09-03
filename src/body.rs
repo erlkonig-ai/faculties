@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{
-    LwwIndex, LwwRegisterCollection, RegisterCoordinatesMapping,
+    LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
 };
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
@@ -105,7 +105,7 @@ impl BodySnapshot {
 pub fn intent_register_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
-) -> Result<LwwRegisterCollection>
+) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
@@ -116,7 +116,7 @@ where
         RegisterCoordinatesMapping::new(metadata::tag.id(), metadata::created_at.id()),
         crate::collection_names::private_policy(authority),
     )?;
-    Ok(LwwRegisterCollection::new(source, target))
+    Ok(target)
 }
 
 fn fmt_id(id: Id) -> String {
@@ -535,9 +535,15 @@ pub fn materialize_indexed_collection(
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Body collection")?;
     let catalog = validate_catalog(&store_snapshot, &facts).context("validate Body collection")?;
-    let intents = intent_register_collection(pile, signer.verifying_key())?
-        .ensure(pile, &cover)
+    let target = intent_register_collection(pile, signer.verifying_key())?;
+    let maintained = pile
+        .maintain_exact::<RegisterCoordinatesMapping>(target, &cover)
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
+    let intents = maintained
+        .collection_exact(target, &cover)
+        .map_err(|error| anyhow!("observe Body intent register: {error}"))?
+        .view::<LwwIndex>()
+        .map_err(|error| anyhow!("read Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,
         store_snapshot,
