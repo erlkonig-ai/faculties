@@ -2852,9 +2852,9 @@ fn cmd_wait(
                 continue;
             }
 
-            // A newer observation with a missing selected payload never
-            // replaces `current`. Time-driven Habit transitions therefore
-            // remain observable from the last fully readable frame.
+            // A newer observation awaiting required view input never replaces
+            // `current`. Time-driven Habit transitions therefore remain
+            // observable from the last fully readable frame.
             let current_habits = observe_habits_in_observation(&current, pile_path, now_secs)?;
             let habit_report =
                 render_habit_transitions(&habit_seen, &current_habits).unwrap_or_default();
@@ -3186,8 +3186,10 @@ mod tests {
             panic!("resident persona payload unexpectedly pending")
         };
 
-        let admitted_after = message_collection
-            .admitted_at(&frame.observation.snapshot, instant)
+        let resident_after = frame
+            .observation
+            .snapshot
+            .collection_at(message_collection, instant)
             .unwrap();
         assert_eq!(
             frame.observation.facts.messages.support(),
@@ -3195,7 +3197,7 @@ mod tests {
             "maintenance must derive only the source support resident at its input watermark",
         );
         assert_ne!(
-            &admitted_after, &expected_support,
+            resident_after.support(), &expected_support,
             "the later observation must contain the racing source commit without pretending its target was already derived",
         );
         assert_eq!(frame.observation.facts.messages.view().iter().count(), 0);
@@ -3261,6 +3263,34 @@ mod tests {
 
         let error = read_utf8(&snapshot, handle, "selected test body").unwrap_err();
         assert!(is_payload_pending(&error));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn a_missing_persona_preserves_the_wait_watermark() {
+        let fixture = TestPile::new();
+        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
+        let watermark = pile.snapshot().unwrap();
+        let instant = clock::now().unwrap();
+
+        let attempt = load_wait_frame(
+            &mut pile,
+            &sources,
+            watermark.clone(),
+            instant,
+            &fixture.path,
+            "not-yet-resident",
+        )
+        .unwrap();
+        let WaitFrameLoad::Pending(pending) = attempt else {
+            panic!("an absent persona unexpectedly produced a readable wait frame")
+        };
+        assert!(
+            pending.watermark.changes_since(&watermark).is_empty()
+                && watermark.changes_since(&pending.watermark).is_empty(),
+            "a pending production frame must preserve its input watermark",
+        );
         pile.close().unwrap();
     }
 

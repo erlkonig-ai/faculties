@@ -11,10 +11,11 @@ All notable changes to this project will be documented in this file.
   snapshot and advances the raw and Rank9 mappings over only the foundational
   support resident there; observation then attaches each target collection to
   one later immutable pile snapshot and reads exactly the support represented
-  by its resident target cover. Durable acknowledgement is the relational
+  by each resident target cover; Compass facts and status share one exact
+  resident support. Durable acknowledgement is the relational
   `Presented(persona, event)` set, and output is flushed before presentation is
-  recorded. Wait keeps its last readable view while a selected payload is
-  missing and retains the exact pre-maintenance pile snapshot as its polling
+  recorded. Wait keeps its last readable view while required view input is
+  unavailable and retains the exact pre-maintenance pile snapshot as its polling
   watermark, so maintenance writes cannot hide a concurrently arriving commit.
   Compass's maintained status
   register now inherits the configured source collection policy.
@@ -27,8 +28,9 @@ All notable changes to this project will be documented in this file.
   scan.
 
 - **Orient validates the data it observes, not every historical row.** `show`,
-  `wait`, and `poll` select the maximal resident target covers in one immutable
-  snapshot and typed query paths decode only selected payloads. A historical
+  `wait`, and `poll` select resident target covers in one immutable snapshot
+  (with Compass facts and status attached to one exact shared support), and
+  typed query paths decode only selected payloads. A historical
   row outside those typed views therefore cannot poison every future
   observation merely by remaining in the append-only history.
 
