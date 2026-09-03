@@ -1063,14 +1063,14 @@ where
                 bail!("block {id:x} cites missing predecessor {predecessor:x}");
             }
         }
-        let timestamp = one_optional(&block_timestamps, *id, "block timestamp")?;
-        if let Some(timestamp) = timestamp {
+        let timestamps = values_for(&block_timestamps, *id);
+        for timestamp in &timestamps {
             let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
                 anyhow!("block {id:x} has invalid timestamp interval: {error:?}")
             })?;
         }
         let parts = values_for(&block_parts, *id);
-        if parts.is_empty() && (!previous.is_empty() || timestamp.is_some()) {
+        if parts.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
             bail!(
                 "content-free block {id:x} is not the predecessor-free, timeless canonical bottom"
             );
@@ -1095,10 +1095,14 @@ where
         referenced_parts.extend(parts.iter().copied());
         let core = entity! { _ @
             schema::block::previous*: previous.iter(),
-            schema::block::timestamp?: timestamp,
             schema::block::contains*: parts.iter(),
         };
-        expected += ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "block")?;
+        let mut canonical = ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "block")?;
+        canonical += entity! { ExclusiveId::force_ref(id) @
+            schema::block::timestamp*: timestamps.iter(),
+        }
+        .into_facts();
+        expected += canonical;
         block_graph.insert(*id, previous);
     }
     validate_dag(&block_graph, "block DAG")?;
@@ -1893,14 +1897,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_timestamp_is_absence_not_a_sentinel() {
+    fn timestamp_is_a_repeatable_annotation_not_intrinsic_state() {
         let without = block([], None, one_part("same")).unwrap();
-        let with = block([], Some(instant(42.0)), one_part("same")).unwrap();
-        assert_ne!(without.root(), with.root());
+        let with_42 = block([], Some(instant(42.0)), one_part("same")).unwrap();
+        let with_43 = block([], Some(instant(43.0)), one_part("same")).unwrap();
+        assert_eq!(without.root(), with_42.root());
+        assert_eq!(without.root(), with_43.root());
         let root = without.root().unwrap();
         assert!(!exists!(pattern!(&without, [{
             root @ schema::block::timestamp: _?timestamp
         }])));
+
+        let mut observed_twice = with_42;
+        observed_twice += with_43;
+        validate_catalog_structure(&observed_twice.into_facts()).unwrap();
     }
 
     #[test]
