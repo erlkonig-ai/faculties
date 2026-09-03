@@ -198,10 +198,10 @@ impl TriageSnapshot {
         let secrets = vaults::discover_local_vaults(&mut pile, &signer)
             .context("discover readable Secrets vaults")?;
 
-        // Every ordinary fact query attaches through this one later snapshot.
-        let store_snapshot = pile
-            .snapshot()
-            .context("freeze maintained Triage snapshot")?;
+        // Secrets discovery already owns the one later immutable snapshot.
+        // Reuse it so facts, attachments, and credentials inhabit literally
+        // the same known-prefix observation.
+        let store_snapshot = secrets.snapshot().store_snapshot().clone();
         let mut collections = BTreeMap::new();
         for ((scope, label, facts), support) in registered.iter().zip(&supports) {
             let archive = store_snapshot

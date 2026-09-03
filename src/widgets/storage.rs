@@ -727,11 +727,16 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
             })
             .transpose()?;
 
-        // Maintenance returns snapshots per operation, but every attached
-        // viewer input is deliberately read through this one later snapshot.
-        let store_snapshot = pile
-            .snapshot()
-            .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?;
+        // Secrets discovery already owns the final immutable snapshot when it
+        // participates. Reuse it so all facts, attachments, and credentials
+        // inhabit literally one known-prefix observation. A viewer without
+        // Secrets freezes the same boundary itself.
+        let store_snapshot = match secrets.as_ref() {
+            Some(secrets) => secrets.discovery.snapshot().store_snapshot().clone(),
+            None => pile
+                .snapshot()
+                .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?,
+        };
 
         if let (Some(target), Some((_, support))) =
             (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
