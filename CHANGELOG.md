@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Orient reads maintained Succinct collection snapshots directly.** Messages,
+  Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations
+  remain separately admitted and queryable instead of being copied into one
+  temporary `TribleSet` or retained in a Rust catalog. Each observation freezes
+  foundational `Support`, maintains the raw and Rank9 mapping hops explicitly
+  over that same support, then attaches every target cover to one final
+  immutable pile snapshot. Durable acknowledgement is the relational
+  `Presented(persona, event)` set, and output is flushed before presentation is
+  recorded. Wait keeps its last coherent view through incomplete sync and uses
+  the exact admission snapshot as its change watermark, so maintenance writes
+  cannot hide a concurrently arriving commit. Compass's maintained status
+  register now inherits the configured source collection policy.
+
 - **Runtime collection opens no longer probe retired Repository history.**
   Every caller opens its configured native descriptor directly; the obsolete
   `legacy_hint` ancestry walk, branch-name table, and frozen compatibility

@@ -52,27 +52,28 @@ pub struct TargetDiscovery {
 }
 
 impl TargetDiscovery {
-    /// Valid self-signed commits targeting this collection, ordered by id.
+    /// Valid self-signed commits targeting this collection, in deterministic
+    /// store order.
     pub fn commits(&self) -> &[CollectionCommit] {
         &self.commits
     }
 
-    /// Structurally canonical merge claims inside this collection, ordered by
-    /// id. Their recipe has not been validated by this facade.
+    /// Structurally canonical merge claims inside this collection, in
+    /// deterministic store order. Their recipe has not been validated here.
     pub fn merges(&self) -> &[CollectionMerge] {
         &self.merges
     }
 
     /// Structurally canonical derive claims whose target is this collection,
-    /// ordered by id. Their recipe has not been validated by this facade.
+    /// in deterministic store order. Their recipe has not been validated here.
     pub fn derives(&self) -> &[CollectionDerive] {
         &self.derives
     }
 
     /// Invalid signed records observed during the same store enumeration.
     ///
-    /// Core diagnostics intentionally retain only record identity, so they
-    /// cannot be soundly scoped after signature verification fails. They are
+    /// Core diagnostics retain the exact structurally valid commit, so they
+    /// can still be scoped after signature verification fails. They are
     /// surfaced here rather than silently hidden from migration preflight.
     pub fn diagnostics(&self) -> &[CollectionRecordDiagnostic] {
         &self.diagnostics
@@ -218,8 +219,8 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
 /// The signer is loaded before the pile is touched. Facts become collection
 /// data, metafacts become signed commit metadata, and the fragment's shared
 /// blob store supplies attachments referenced by either channel. Publication
-/// is performed only by [`CollectionStoreExt::commit`], whose record identity
-/// makes exact replay idempotent.
+/// is performed only by [`CollectionStoreExt::commit`]; equality of its exact
+/// canonical record makes replay idempotent.
 pub fn publish_fragment(
     pile_path: &Path,
     key_path: Option<&Path>,
