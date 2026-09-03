@@ -8,7 +8,7 @@ use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -16,10 +16,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
@@ -233,7 +234,7 @@ fn human_size(bytes: u64) -> String {
 
 // ── query helpers ────────────────────────────────────────────────────────
 
-fn read_name<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Option<String> {
+fn read_name<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, eid: Id) -> Option<String> {
     let (h,) = find!(
         (h: TextHandle),
         pattern!(space, [{ eid @ file::name: ?h }])
@@ -243,7 +244,7 @@ fn read_name<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Option<
     Some(view.as_ref().to_string())
 }
 
-fn read_mime<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Option<String> {
+fn read_mime<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, eid: Id) -> Option<String> {
     let handle = file_capability::media_type_name_handle(space, eid)?;
     let view: View<str> = reader.get(handle).ok()?;
     Some(view.as_ref().to_string())
@@ -252,7 +253,7 @@ fn read_mime<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Option<
 /// If `eid` is a rasterized-PDF page entity, return its `(parent file id, page
 /// index label)`. Used by the 7b similarity display so a page hit reads back as
 /// "file X, page N" instead of a nameless entity.
-fn read_page(space: &TribleSet, eid: Id) -> Option<(Id, String)> {
+fn read_page<P: TriblePattern>(space: &P, eid: Id) -> Option<(Id, String)> {
     find!(
         (parent: Id, idx: String),
         pattern!(space, [{ eid @ metadata::tag: &KIND_PAGE, page::parent: ?parent, page::index: ?idx }])
@@ -260,7 +261,7 @@ fn read_page(space: &TribleSet, eid: Id) -> Option<(Id, String)> {
     .next()
 }
 
-fn content_handle_of(space: &TribleSet, eid: Id) -> Option<FileHandle> {
+fn content_handle_of<P: TriblePattern>(space: &P, eid: Id) -> Option<FileHandle> {
     find!(
         (h: FileHandle),
         pattern!(space, [{ eid @ file::content: ?h }])
@@ -269,28 +270,28 @@ fn content_handle_of(space: &TribleSet, eid: Id) -> Option<FileHandle> {
     .map(|(h,)| h)
 }
 
-fn is_file(space: &TribleSet, id: Id) -> bool {
+fn is_file<P: TriblePattern>(space: &P, id: Id) -> bool {
     exists!(
         (h: FileHandle),
         pattern!(space, [{ id @ metadata::tag: &KIND_FILE, file::content: ?h }])
     )
 }
 
-fn is_directory(space: &TribleSet, id: Id) -> bool {
+fn is_directory<P: TriblePattern>(space: &P, id: Id) -> bool {
     exists!(
         (c: Id),
         pattern!(space, [{ id @ metadata::tag: &KIND_DIRECTORY, file::children: ?c }])
     )
 }
 
-fn is_import(space: &TribleSet, id: Id) -> bool {
+fn is_import<P: TriblePattern>(space: &P, id: Id) -> bool {
     exists!(
         (r: Id),
         pattern!(space, [{ id @ metadata::tag: &KIND_IMPORT, file::root: ?r }])
     )
 }
 
-fn children_of(space: &TribleSet, id: Id) -> Vec<Id> {
+fn children_of<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
     find!(
         (c: Id),
         pattern!(space, [{ id @ file::children: ?c }])
@@ -299,7 +300,7 @@ fn children_of(space: &TribleSet, id: Id) -> Vec<Id> {
     .collect()
 }
 
-fn root_of(space: &TribleSet, id: Id) -> Option<Id> {
+fn root_of<P: TriblePattern>(space: &P, id: Id) -> Option<Id> {
     find!(
         (r: Id),
         pattern!(space, [{ id @ file::root: ?r }])
@@ -308,7 +309,7 @@ fn root_of(space: &TribleSet, id: Id) -> Option<Id> {
     .map(|(r,)| r)
 }
 
-fn imported_at_of(space: &TribleSet, eid: Id) -> Option<i128> {
+fn imported_at_of<P: TriblePattern>(space: &P, eid: Id) -> Option<i128> {
     find!(
         (ts: Inline<inlineencodings::NsTAIInterval>),
         pattern!(space, [{ eid @ file::imported_at: ?ts }])
@@ -317,7 +318,11 @@ fn imported_at_of(space: &TribleSet, eid: Id) -> Option<i128> {
     .map(|(ts,)| interval_key(ts))
 }
 
-fn source_path_of<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Option<String> {
+fn source_path_of<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    eid: Id,
+) -> Option<String> {
     let (h,) = find!(
         (h: TextHandle),
         pattern!(space, [{ eid @ file::source_path: ?h }])
@@ -327,7 +332,7 @@ fn source_path_of<R: BlobStoreGet>(space: &TribleSet, reader: &R, eid: Id) -> Op
     Some(view.as_ref().to_string())
 }
 
-fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
+fn tags_of<P: TriblePattern>(space: &P, eid: Id) -> Vec<String> {
     find!(
         t: String,
         pattern!(space, [{ eid @ file::tag: ?t }])
@@ -363,22 +368,31 @@ fn with_files_store<T>(
     }
 }
 
-/// Open one immutable materialized Files view for commands whose result or
-/// mutation depends on facts already present in the collection.
+/// Maintain and attach one immutable shard-preserving Files view for commands
+/// whose result or mutation depends on facts already present in the collection.
 fn with_files_view<T>(
     pile: &Path,
     f: impl FnOnce(
         &mut Pile,
         Collection<SimpleArchive>,
         &SigningKey,
-        &TribleSet,
+        &FactArchive,
         &PileSnapshot,
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(pile, |store, collection, signer| {
-        let reader = store.snapshot().context("freeze Files store snapshot")?;
-        let (space, _) = faculties::storage::read_fact_collection(collection, &reader)
-            .context("materialize Files collection")?;
+        let facts = FactCollection::new(store, collection)
+            .context("register maintained Files fact collection")?;
+        let before = store.snapshot().context("freeze Files source snapshot")?;
+        let instant = clock::now()?;
+        let reader = facts
+            .maintain_at(store, &before, instant)
+            .context("maintain Files fact collection")?;
+        let space = reader
+            .collection_at(facts.rank9(), instant)
+            .context("observe Files fact collection")?
+            .view::<FactArchive>()
+            .context("read Files fact collection")?;
         f(store, collection, signer, &space, &reader)
     })
 }
@@ -600,7 +614,9 @@ fn mm7b_embed_query(emb: &Mm7bEmbedderOpt, text: &str) -> Result<Vec<f32>> {
         return emb.embed_query(text);
     }
     #[cfg(not(all(feature = "local-embed", target_os = "macos")))]
-    bail!("`files similar --mm7b --text` needs the 7b embedder — rebuild with --features local-embed on macOS");
+    bail!(
+        "`files similar --mm7b --text` needs the 7b embedder — rebuild with --features local-embed on macOS"
+    );
 }
 
 // A tiny alias so the helper signatures above are the same with/without the
@@ -743,7 +759,7 @@ fn cmd_add(
     let mut embedder: Option<Box<dyn ImageEmbedder>> = None;
     let tree = build_tree(&abs_path, mime_override, &mut stats, &mut embedder)?;
     let root_id = tree.root().expect("tree has a root");
-    let root_content = content_handle_of(&tree, root_id);
+    let root_content = content_handle_of(tree.facts(), root_id);
 
     // Create import entity, spreading the tree into it.
     let ts = now_tai()?;
@@ -871,8 +887,8 @@ fn cmd_fetch(
     result
 }
 
-fn cmd_list(
-    space: &TribleSet,
+fn cmd_list<P: TriblePattern>(
+    space: &P,
     reader: &PileSnapshot,
     filter_tags: &[String],
     filter_mime: Option<&str>,
@@ -919,7 +935,7 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_resolve(space: &TribleSet, input: &str) -> Result<()> {
+fn cmd_resolve<P: TriblePattern>(space: &P, input: &str) -> Result<()> {
     // Batch mode: @path or @-
     if let Some(path) = input.strip_prefix('@') {
         let content = if path == "-" {
@@ -956,7 +972,7 @@ fn cmd_resolve(space: &TribleSet, input: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(space: &TribleSet, reader: &PileSnapshot, id: &str) -> Result<()> {
+fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
     if is_file(space, eid) {
@@ -1013,7 +1029,12 @@ fn cmd_show(space: &TribleSet, reader: &PileSnapshot, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(space: &TribleSet, reader: &PileSnapshot, id: &str, output: Option<&str>) -> Result<()> {
+fn cmd_get<P: TriblePattern>(
+    space: &P,
+    reader: &PileSnapshot,
+    id: &str,
+    output: Option<&str>,
+) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
     // For imports, follow to root.
@@ -1080,8 +1101,8 @@ fn cmd_get(space: &TribleSet, reader: &PileSnapshot, id: &str, output: Option<&s
     Ok(())
 }
 
-fn extract_tree<R: BlobStoreGet>(
-    space: &TribleSet,
+fn extract_tree<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
     reader: &R,
     id: Id,
     dest: &Path,
@@ -1109,11 +1130,11 @@ fn extract_tree<R: BlobStoreGet>(
     Ok(())
 }
 
-fn cmd_tag(
+fn cmd_tag<P: TriblePattern>(
     pile: &mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    space: &TribleSet,
+    space: &P,
     reader: &PileSnapshot,
     id: &str,
     tag_name: &str,
@@ -1135,7 +1156,7 @@ fn cmd_tag(
     Ok(())
 }
 
-fn cmd_search(space: &TribleSet, reader: &PileSnapshot, query: &str) -> Result<()> {
+fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -> Result<()> {
     let needle = query.to_lowercase();
     let mut hits: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
@@ -1175,7 +1196,7 @@ fn cmd_search(space: &TribleSet, reader: &PileSnapshot, query: &str) -> Result<(
     Ok(())
 }
 
-fn cmd_imports(space: &TribleSet, reader: &PileSnapshot) -> Result<()> {
+fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<()> {
     let mut imports: Vec<(i128, Id, Option<String>, Vec<String>)> = Vec::new();
 
     for (eid,) in find!(
@@ -1213,8 +1234,8 @@ fn cmd_imports(space: &TribleSet, reader: &PileSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tree(
-    space: &TribleSet,
+fn cmd_tree<P: TriblePattern>(
+    space: &P,
     reader: &PileSnapshot,
     id: &str,
     max_depth: Option<usize>,
@@ -1232,8 +1253,8 @@ fn cmd_tree(
     Ok(())
 }
 
-fn print_tree<R: BlobStoreGet>(
-    space: &TribleSet,
+fn print_tree<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
     reader: &R,
     id: Id,
     prefix: &str,
@@ -1290,7 +1311,12 @@ fn print_tree<R: BlobStoreGet>(
     }
 }
 
-fn cmd_diff(space: &TribleSet, reader: &PileSnapshot, left_id: &str, right_id: &str) -> Result<()> {
+fn cmd_diff<P: TriblePattern>(
+    space: &P,
+    reader: &PileSnapshot,
+    left_id: &str,
+    right_id: &str,
+) -> Result<()> {
     let resolve_root = |raw: &str| -> Result<Id> {
         let eid = file_capability::resolve_selector(space, raw)?;
         if is_import(space, eid) {
@@ -1335,8 +1361,8 @@ impl DiffStats {
     }
 }
 
-fn diff_tree<R: BlobStoreGet>(
-    space: &TribleSet,
+fn diff_tree<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
     reader: &R,
     left: Id,
     right: Id,
@@ -1419,7 +1445,11 @@ fn diff_tree<R: BlobStoreGet>(
     }
 }
 
-fn named_children<R: BlobStoreGet>(space: &TribleSet, reader: &R, id: Id) -> BTreeMap<String, Id> {
+fn named_children<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    id: Id,
+) -> BTreeMap<String, Id> {
     let mut map = BTreeMap::new();
     for cid in children_of(space, id) {
         let name = read_name(space, reader, cid).unwrap_or_else(|| fmt_id(cid));
@@ -1428,15 +1458,15 @@ fn named_children<R: BlobStoreGet>(space: &TribleSet, reader: &R, id: Id) -> BTr
     map
 }
 
-fn file_size<R: BlobStoreGet>(space: &TribleSet, reader: &R, id: Id) -> u64 {
+fn file_size<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, id: Id) -> u64 {
     content_handle_of(space, id)
         .and_then(|h| reader.get::<anybytes::Bytes, _>(h).ok())
         .map(|b| b.len() as u64)
         .unwrap_or(0)
 }
 
-fn print_diff_added<R: BlobStoreGet>(
-    space: &TribleSet,
+fn print_diff_added<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
     reader: &R,
     id: Id,
     path: &str,
@@ -1457,8 +1487,8 @@ fn print_diff_added<R: BlobStoreGet>(
     }
 }
 
-fn print_diff_removed<R: BlobStoreGet>(
-    space: &TribleSet,
+fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
     reader: &R,
     id: Id,
     path: &str,
@@ -1495,11 +1525,11 @@ fn read_embedding<R: BlobStoreGet>(reader: &R, h: EmbHandle) -> Result<Vec<f32>>
 /// path: both coexist. Idempotent — already-embedded files are skipped unless
 /// `--force`. Identical bytes (duplicate imports) are embedded once and the
 /// vector fanned out to every entity that shares the content.
-fn cmd_embed7b(
+fn cmd_embed7b<P: TriblePattern>(
     pile: &mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    space: &TribleSet,
+    space: &P,
     reader: &PileSnapshot,
     force: bool,
 ) -> Result<()> {
@@ -1589,7 +1619,11 @@ fn cmd_embed7b(
 
     println!(
         "7b-embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
-        if failed > 0 { format!(", {failed} failed") } else { String::new() },
+        if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        },
     );
     Ok(())
 }
@@ -1689,11 +1723,11 @@ fn which_pdftoppm() -> Option<PathBuf> {
 /// (derived from parent+index), so re-runs merge rather than duplicate. Unique
 /// PDF bytes are rendered+embedded once and the per-page vectors fan out to every
 /// file entity that shares the content.
-fn cmd_embed7b_pdf(
+fn cmd_embed7b_pdf<P: TriblePattern>(
     pile: &mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    space: &TribleSet,
+    space: &P,
     reader: &PileSnapshot,
     force: bool,
     dpi: u32,
@@ -1846,8 +1880,8 @@ fn cmd_embed7b_pdf(
 /// `--tag` filter is the hybrid join that separates real forms from mascots.
 /// With `mm7b`, the query and candidates live in the 3584-d nomic-7b space
 /// (`attr_mm7b::embedding`, populated by `files embed-7b`) instead of CLIP-512.
-fn cmd_similar(
-    space: &TribleSet,
+fn cmd_similar<P: TriblePattern>(
+    space: &P,
     reader: &PileSnapshot,
     id: Option<&str>,
     text: Option<&str>,
@@ -1945,8 +1979,8 @@ fn cmd_similar(
 /// Same shape as [`cmd_similar`] but over `attr_mm7b::embedding`: a text query
 /// is embedded with the 7b's query-side path (text→image recall), a file query
 /// reuses that file's stored 7b vector (image→image).
-fn cmd_similar_mm7b(
-    space: &TribleSet,
+fn cmd_similar_mm7b<P: TriblePattern>(
+    space: &P,
     reader: &PileSnapshot,
     id: Option<&str>,
     text: Option<&str>,
@@ -2365,7 +2399,12 @@ mod tests {
     fn empty_native_collection_opens_as_an_empty_catalog() {
         let test_pile = TestPile::new();
         with_files_view(&test_pile.path, |_, _, _, space, _reader| {
-            assert!(space.is_empty());
+            assert!(find!(
+                id: Id,
+                pattern!(space, [{ ?id @ metadata::tag: _?kind }])
+            )
+            .next()
+            .is_none());
             cmd_list(space, _reader, &[], None)
         })
         .unwrap();

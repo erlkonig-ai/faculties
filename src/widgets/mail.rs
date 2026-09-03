@@ -22,10 +22,10 @@ use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::trible::TribleSet;
 
 use crate::mail::{self, ProjectionDirection};
 use crate::relations::{self, ProfileInput, ProfileView};
+use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Color palette ────────────────────────────────────────────────────
@@ -173,7 +173,7 @@ impl MailLive {
     }
 }
 
-fn collect_mails(reader: &PileSnapshot, space: &TribleSet) -> (Vec<MailRow>, Vec<String>) {
+fn collect_mails(reader: &PileSnapshot, space: &FactArchive) -> (Vec<MailRow>, Vec<String>) {
     let mut mails = Vec::new();
     let mut diagnostics = Vec::new();
     for id in mail::projection_ids(space) {
@@ -193,7 +193,7 @@ fn collect_mails(reader: &PileSnapshot, space: &TribleSet) -> (Vec<MailRow>, Vec
     (mails, diagnostics)
 }
 
-fn projection_row(reader: &PileSnapshot, space: &TribleSet, id: Id) -> anyhow::Result<MailRow> {
+fn projection_row(reader: &PileSnapshot, space: &FactArchive, id: Id) -> anyhow::Result<MailRow> {
     let projection = mail::projection_view(reader, space, id)?;
     let direction = mail::projection_direction(space, projection.source)?;
     let parent_candidates = if projection.in_reply_to.is_empty() {
@@ -219,7 +219,7 @@ fn projection_row(reader: &PileSnapshot, space: &TribleSet, id: Id) -> anyhow::R
     })
 }
 
-fn draft_row(reader: &PileSnapshot, space: &TribleSet, id: Id) -> anyhow::Result<MailRow> {
+fn draft_row(reader: &PileSnapshot, space: &FactArchive, id: Id) -> anyhow::Result<MailRow> {
     let draft = mail::draft_value(space, id)?;
     let read_all = |handles: &[mail::TextHandle]| -> anyhow::Result<Vec<String>> {
         handles
@@ -335,7 +335,7 @@ fn flatten_threaded(mails: &[MailRow]) -> Vec<(usize, &MailRow)> {
 }
 
 fn build_people(
-    rspace: &TribleSet,
+    rspace: &FactArchive,
     reader: &PileSnapshot,
 ) -> (HashMap<String, Person>, Vec<String>) {
     let mut candidates = BTreeMap::<String, Vec<Person>>::new();

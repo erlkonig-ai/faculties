@@ -1,6 +1,6 @@
 //! Read-only GORBIE-embeddable viewer for the `memory` faculty.
 //!
-//! Memory chunks are immutable episodes. This widget projects the canonical
+//! Memory chunks are immutable episodes. This widget projects the maintained
 //! Memory collection and shows the most-recent N chunks as cards. Multiple
 //! tellings of the same moment coexist; presentation order does not choose a
 //! current truth.
@@ -10,7 +10,7 @@
 //!   and a `· N REFS` count when present;
 //! - paper body with the chunk's summary text (first lines visible,
 //!   the rest scrollable in-card);
-//! - footer line with the canonical chunk id and provenance markers
+//! - footer line with the opaque chunk id and provenance markers
 //!   (`☞ exec` / `☞ msg`) when the chunk is anchored to an exec
 //!   result or archived message.
 //!
@@ -22,6 +22,8 @@
 //! panel.render(ctx, memory_ws);
 //! ```
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use hifitime::Epoch;
 
@@ -29,12 +31,12 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use crate::memory::{self};
-use crate::memory_cover::{
-    all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_end_at,
-    chunk_references, chunk_start_at, chunk_summary_handle,
-};
+use crate::memory_cover::{chunk_about_archive_message, chunk_about_exec_result, chunk_references};
+use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 use triblespace::core::id::Id;
+use triblespace::core::metadata;
+use triblespace::prelude::*;
 
 /// How many of the most-recent chunks to keep in the rendered snapshot.
 /// Bounded so the widget stays responsive when a long-running agent
@@ -105,43 +107,76 @@ struct MemorySnapshot {
 // ── Snapshot ─────────────────────────────────────────────────────────
 
 impl MemorySnapshot {
-    fn refresh(dataset: DatasetView<'_>) -> Result<Self, String> {
-        // Use the domain validator even though StorageState normally admitted
-        // this exact snapshot already.  Keeping the widget boundary strict
-        // makes a directly embedded viewer surface malformed structure or
-        // missing payloads as a diagnostic instead of partially rendering it.
-        memory::validate_catalog(dataset.reader, dataset.facts)
-            .map_err(|error| format!("validate Memory collection: {error:#}"))?;
+    fn refresh(dataset: DatasetView<'_>) -> Self {
         let space = dataset.facts;
-        let mut ids = all_chunk_ids(space);
-        ids.sort_unstable();
         let mut chunks = Vec::new();
-        for id in ids {
-            let (start, _): (Epoch, Epoch) = chunk_start_at(space, id)
-                .ok_or_else(|| format!("Memory chunk {id:x} is missing start"))?
-                .try_from_inline()
-                .map_err(|error| format!("decode Memory chunk {id:x} start: {error:?}"))?;
-            let (end, _): (Epoch, Epoch) = chunk_end_at(space, id)
-                .ok_or_else(|| format!("Memory chunk {id:x} is missing end"))?
-                .try_from_inline()
-                .map_err(|error| format!("decode Memory chunk {id:x} end: {error:?}"))?;
-            let summary = match chunk_summary_handle(space, id) {
-                Some(handle) => memory::read_text(dataset.reader, handle)
-                    .map_err(|error| format!("read Memory chunk {id:x}: {error:#}"))?,
-                None => "Image memory".to_owned(),
+        for (id, start, end) in find!(
+            (
+                id: Id,
+                start: Inline<inlineencodings::NsTAIInterval>,
+                end: Inline<inlineencodings::NsTAIInterval>
+            ),
+            pattern!(space, [{
+                ?id @ metadata::tag: &KIND_CHUNK_ID,
+                ctx::start_at: ?start,
+                ctx::end_at: ?end,
+            }])
+        ) {
+            let Ok((start, _)): Result<(Epoch, Epoch), _> = start.try_from_inline() else {
+                continue;
             };
-            chunks.push(ChunkRow {
-                id,
-                start: epoch_to_chrono(start)
-                    .ok_or_else(|| format!("Memory chunk {id:x} start is outside viewer range"))?,
-                end: epoch_to_chrono(end)
-                    .ok_or_else(|| format!("Memory chunk {id:x} end is outside viewer range"))?,
-                summary,
-                reference_count: chunk_references(space, id).len(),
-                about_exec_result: chunk_about_exec_result(space, id),
-                about_archive_message: chunk_about_archive_message(space, id),
-            });
+            let Ok((end, _)): Result<(Epoch, Epoch), _> = end.try_from_inline() else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (epoch_to_chrono(start), epoch_to_chrono(end)) else {
+                continue;
+            };
+            if end < start {
+                continue;
+            }
+
+            let summary_handles: BTreeSet<memory::TextHandle> = find!(
+                handle: memory::TextHandle,
+                pattern!(space, [{ id @ ctx::summary: ?handle }])
+            )
+            .collect();
+            let summaries = if summary_handles.is_empty() {
+                vec!["Image memory".to_owned()]
+            } else {
+                summary_handles
+                    .into_iter()
+                    .map(|handle| {
+                        memory::read_text(dataset.reader, handle)
+                            .unwrap_or_else(|_| "[summary unavailable]".to_owned())
+                    })
+                    .collect()
+            };
+            for summary in summaries {
+                chunks.push(ChunkRow {
+                    id,
+                    start,
+                    end,
+                    summary,
+                    reference_count: chunk_references(space, id).len(),
+                    about_exec_result: chunk_about_exec_result(space, id),
+                    about_archive_message: chunk_about_archive_message(space, id),
+                });
+            }
         }
+        chunks.sort_by(|left, right| {
+            (left.id, left.start, left.end, &left.summary).cmp(&(
+                right.id,
+                right.start,
+                right.end,
+                &right.summary,
+            ))
+        });
+        chunks.dedup_by(|left, right| {
+            left.id == right.id
+                && left.start == right.start
+                && left.end == right.end
+                && left.summary == right.summary
+        });
         let total = chunks.len();
 
         // Newest-first is presentation only. The id tie-break makes equal
@@ -149,11 +184,11 @@ impl MemorySnapshot {
         chunks.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| a.id.cmp(&b.id)));
         chunks.truncate(MAX_CHUNKS);
 
-        Ok(MemorySnapshot {
+        MemorySnapshot {
             cached_revision: dataset.revision,
             chunks,
             total,
-        })
+        }
     }
 }
 
@@ -242,15 +277,11 @@ fn first_line(text: &str, max_chars: usize) -> String {
 
 pub struct MemoryViewer {
     snapshot: Option<MemorySnapshot>,
-    error: Option<(DatasetRevision, String)>,
 }
 
 impl Default for MemoryViewer {
     fn default() -> Self {
-        Self {
-            snapshot: None,
-            error: None,
-        }
+        Self { snapshot: None }
     }
 }
 
@@ -261,39 +292,14 @@ impl MemoryViewer {
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
         let need_refresh = match self.snapshot.as_ref() {
-            None => self
-                .error
-                .as_ref()
-                .is_none_or(|(revision, _)| *revision != dataset.revision),
+            None => true,
             Some(l) => l.cached_revision != dataset.revision,
         };
         if need_refresh {
-            match MemorySnapshot::refresh(dataset) {
-                Ok(snapshot) => {
-                    self.snapshot = Some(snapshot);
-                    self.error = None;
-                }
-                Err(error) => {
-                    self.snapshot = None;
-                    self.error = Some((dataset.revision, error));
-                }
-            }
+            self.snapshot = Some(MemorySnapshot::refresh(dataset));
         }
 
         ctx.section("Memory", |ctx| {
-            if let Some((_, error)) = self.error.as_ref() {
-                ctx.grid(|g| {
-                    g.full(|ctx| {
-                        ctx.ui_mut().label(
-                            egui::RichText::new(error)
-                                .monospace()
-                                .small()
-                                .color(egui::Color32::from_rgb(0xcc, 0x0a, 0x17)),
-                        );
-                    });
-                });
-                return;
-            }
             let Some(snapshot) = self.snapshot.as_ref() else {
                 return;
             };

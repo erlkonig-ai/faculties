@@ -36,10 +36,14 @@ use GORBIE::themes::colorhash;
 
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
+use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::*;
 
-use crate::files::{FilesCatalog, NodeRecord};
+use crate::files::{ContentHandle, NameHandle};
+use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Cap on the number of import cards rendered. Older imports remain
@@ -99,41 +103,78 @@ struct FilesLive {
     cached_revision: DatasetRevision,
     imports: Vec<ImportRow>,
     total: usize,
-    catalog: Option<FilesCatalog>,
-    diagnostic: Option<String>,
 }
 
 // ── Live snapshot ────────────────────────────────────────────────────
 
 impl FilesLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
-        match Self::load(dataset) {
-            Ok(live) => live,
-            Err(error) => FilesLive {
-                cached_revision: dataset.revision,
-                imports: Vec::new(),
-                total: 0,
-                catalog: None,
-                diagnostic: Some(format!("Files projection is invalid: {error:#}")),
-            },
+        let mut imports = Vec::new();
+        for (id, imported_at, source_path, root) in find!(
+            (
+                id: Id,
+                imported_at: Inline<NsTAIInterval>,
+                source_path: Inline<Handle<UTF8String>>,
+                root: Id
+            ),
+            pattern!(dataset.facts, [{
+                ?id @ metadata::tag: &KIND_IMPORT,
+                file::imported_at: ?imported_at,
+                file::source_path: ?source_path,
+                file::root: ?root,
+            }])
+        ) {
+            let Ok((imported_at, _)): Result<(Epoch, Epoch), _> = imported_at.try_from_inline()
+            else {
+                continue;
+            };
+            let Some(imported_at) = epoch_to_chrono(imported_at).ok() else {
+                continue;
+            };
+            let Ok(source_path): Result<anybytes::View<str>, _> = dataset.reader.get(source_path)
+            else {
+                continue;
+            };
+            let tags = find!(
+                value: Inline<ShortString>,
+                pattern!(dataset.facts, [{ id @ file::tag: ?value }])
+            )
+            .filter_map(|value| String::try_from_inline(&value).ok())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+            imports.push(ImportRow {
+                id,
+                imported_at,
+                source_path: source_path.to_string(),
+                root,
+                tags,
+                is_reimport: false,
+            });
         }
-    }
-
-    fn load(dataset: DatasetView<'_>) -> anyhow::Result<Self> {
-        let catalog = crate::files::load_catalog(dataset.reader, dataset.facts)?;
-        let mut imports = catalog
-            .imports()
-            .map(|record| {
-                Ok(ImportRow {
-                    id: record.id,
-                    imported_at: epoch_to_chrono(record.imported_at)?,
-                    source_path: record.source_path.clone(),
-                    root: record.root,
-                    tags: record.tags.clone(),
-                    is_reimport: false,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        imports.sort_by(|left, right| {
+            (
+                left.id,
+                left.imported_at,
+                &left.source_path,
+                left.root,
+                &left.tags,
+            )
+                .cmp(&(
+                    right.id,
+                    right.imported_at,
+                    &right.source_path,
+                    right.root,
+                    &right.tags,
+                ))
+        });
+        imports.dedup_by(|left, right| {
+            left.id == right.id
+                && left.imported_at == right.imported_at
+                && left.source_path == right.source_path
+                && left.root == right.root
+                && left.tags == right.tags
+        });
         let total = imports.len();
 
         // Re-import is a set property. No traversal order establishes which
@@ -150,19 +191,16 @@ impl FilesLive {
             row.is_reimport = duplicate_paths.contains(&row.source_path);
         }
 
-        // Time orders independent import cards for presentation only; it
-        // never arbitrates competing values because the catalog rejected
-        // those before this point.
+        // Time orders independent import projections for presentation only;
+        // repeated values remain separate rows above.
         imports.sort_by(|a, b| b.imported_at.cmp(&a.imported_at).then(b.id.cmp(&a.id)));
         imports.truncate(MAX_IMPORTS);
 
-        Ok(FilesLive {
+        FilesLive {
             cached_revision: dataset.revision,
             imports,
             total,
-            catalog: Some(catalog),
-            diagnostic: None,
-        })
+        }
     }
 }
 
@@ -280,10 +318,6 @@ impl FilesViewer {
             };
 
             ctx.grid(|g| {
-                if let Some(diagnostic) = &live.diagnostic {
-                    g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
-                    return;
-                }
                 let shown = live.imports.len();
                 let now = current_utc();
                 let newest_age = live
@@ -346,11 +380,7 @@ impl FilesViewer {
         });
 
         if let Some(root) = open_root {
-            if let Some(live) = self.live.as_ref() {
-                if let Some(catalog) = live.catalog.as_ref() {
-                    open_entity(dataset, catalog, root);
-                }
-            }
+            open_entity(dataset, root);
         }
     }
 }
@@ -360,13 +390,13 @@ impl FilesViewer {
 /// result — same flow the wiki widget uses for `files:` links, but
 /// extended to handle directory roots by recursing through
 /// `file::children`. Best-effort: errors log to stderr.
-fn open_entity(dataset: DatasetView<'_>, catalog: &FilesCatalog, entity_id: Id) {
+fn open_entity(dataset: DatasetView<'_>, entity_id: Id) {
     let tmp_dir = std::env::temp_dir().join("faculties-files");
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
         return;
     }
-    match extract_tree(dataset, catalog, entity_id, &tmp_dir, 0) {
+    match extract_tree(dataset, entity_id, &tmp_dir, 0) {
         Ok(path) => {
             eprintln!("[files] opening: {}", path.display());
             let _ = std::process::Command::new("open").arg(&path).spawn();
@@ -383,7 +413,6 @@ fn open_entity(dataset: DatasetView<'_>, catalog: &FilesCatalog, entity_id: Id) 
 /// but a corrupted pile shouldn't be able to hang the viewer.
 fn extract_tree(
     dataset: DatasetView<'_>,
-    catalog: &FilesCatalog,
     entity_id: Id,
     dest: &std::path::Path,
     depth: u32,
@@ -392,31 +421,65 @@ fn extract_tree(
         return Err(format!("max depth exceeded at {}", id_hex(entity_id)));
     }
 
-    match catalog
-        .node(entity_id)
-        .ok_or_else(|| format!("unknown Files node {}", id_hex(entity_id)))?
-    {
-        NodeRecord::File(file) => {
+    let files = find!(
+        (name: NameHandle, content: ContentHandle),
+        pattern!(dataset.facts, [{
+            entity_id @ metadata::tag: &KIND_FILE,
+            file::name: ?name,
+            file::content: ?content,
+        }])
+    )
+    .collect::<BTreeSet<_>>();
+    let directories = find!(
+        name: NameHandle,
+        pattern!(dataset.facts, [{
+            entity_id @ metadata::tag: &KIND_DIRECTORY,
+            file::name: ?name,
+        }])
+    )
+    .collect::<BTreeSet<_>>();
+
+    match (files.first().copied(), directories.first().copied()) {
+        (Some((name, content)), None) => {
+            let name: anybytes::View<str> = dataset
+                .reader
+                .get(name)
+                .map_err(|error| format!("get name for {}: {error:?}", id_hex(entity_id)))?;
             let blob: Blob<RawBytes> = dataset
                 .reader
-                .get(file.content)
-                .map_err(|e| format!("get blob for {}: {e:?}", file.name))?;
-            let path = dest.join(&file.name);
-            std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write {}: {e}", file.name))?;
+                .get(content)
+                .map_err(|error| format!("get blob for {}: {error:?}", name.as_ref()))?;
+            let name = crate::files::leaf_name(name.as_ref());
+            let path = dest.join(&name);
+            std::fs::write(&path, &*blob.bytes)
+                .map_err(|error| format!("write {name}: {error}"))?;
             Ok(path)
         }
-        NodeRecord::Directory(directory) => {
-            let dir = dest.join(&directory.name);
-            std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", directory.name))?;
-            for child in &directory.children {
-                // Residency and structure were validated atomically. A later
-                // OS write failure remains local to that child.
-                if let Err(e) = extract_tree(dataset, catalog, *child, &dir, depth + 1) {
+        (None, Some(name)) => {
+            let name: anybytes::View<str> = dataset
+                .reader
+                .get(name)
+                .map_err(|error| format!("get name for {}: {error:?}", id_hex(entity_id)))?;
+            let name = crate::files::leaf_name(name.as_ref());
+            let dir = dest.join(&name);
+            std::fs::create_dir_all(&dir).map_err(|error| format!("mkdir {name}: {error}"))?;
+            let children = find!(
+                child: Id,
+                pattern!(dataset.facts, [{ entity_id @ file::children: ?child }])
+            )
+            .collect::<BTreeSet<_>>();
+            for child in children {
+                if let Err(e) = extract_tree(dataset, child, &dir, depth + 1) {
                     eprintln!("[files] skipping child: {e}");
                 }
             }
             Ok(dir)
         }
+        (None, None) => Err(format!("unknown Files node {}", id_hex(entity_id))),
+        (Some(_), Some(_)) => Err(format!(
+            "Files node {} is both a file and directory",
+            id_hex(entity_id)
+        )),
     }
 }
 
@@ -590,27 +653,6 @@ fn render_tag_chip(ui: &mut egui::Ui, label: &str) {
                     .small()
                     .strong()
                     .color(text),
-            );
-        });
-}
-
-fn render_diagnostic(ui: &mut egui::Ui, diagnostic: &str) {
-    let color = ui.visuals().error_fg_color;
-    egui::Frame::NONE
-        .fill(egui::Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            28,
-        ))
-        .stroke(egui::Stroke::new(1.0, color))
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(diagnostic)
-                    .monospace()
-                    .small()
-                    .color(color),
             );
         });
 }

@@ -1,6 +1,6 @@
 //! Full-featured GORBIE-embeddable wiki viewer.
 //!
-//! Renders the canonical Wiki revision collection from a triblespace pile. The widget holds only
+//! Renders the maintained Wiki revision collection from a triblespace pile. The widget holds only
 //! UI state plus cached query results; the host passes a wiki dataset
 //! (and optionally a files dataset) at render time:
 //!
@@ -32,15 +32,18 @@ use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+use triblespace::prelude::*;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::schemas::files::{file as file_attrs, KIND_FILE};
 use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-use crate::wiki::{EntryRecord, RevisionRecord, WikiCatalog};
+use crate::wiki::{EntryRecord, RevisionRecord};
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Inline<Handle<UTF8String>>;
@@ -83,68 +86,53 @@ struct VisibleHead {
     fork_width: usize,
 }
 
-/// Cached canonical Wiki projection + file facts and revision markers.
-/// Rebuilt when either input dataset changes.
+/// The dataset revisions for which presentation caches were built.
 struct WikiLive {
-    catalog: WikiCatalog,
-    files_catalog: Option<crate::files::FilesCatalog>,
     cached_revision: DatasetRevision,
     files_cached_revision: Option<DatasetRevision>,
 }
 
 impl WikiLive {
-    /// Refresh cached fact spaces from the provided immutable dataset views.
+    /// Confirm that the maintained supersession order needed for frontiers is
+    /// attached to this exact immutable dataset view.
     fn refresh(wiki: DatasetView<'_>, files: Option<DatasetView<'_>>) -> Result<Self, String> {
-        let (files_catalog, files_cached_revision) = match files {
-            Some(files) => {
-                let catalog = crate::files::load_catalog(files.reader, files.facts)
-                    .map_err(|error| format!("validate Files collection for Wiki: {error:#}"))?;
-                (Some(catalog), Some(files.revision))
-            }
-            None => (None, None),
-        };
-
-        let observed = wiki
-            .observed_order(metadata::supersedes.id())
+        wiki.observed_order(metadata::supersedes.id())
             .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
         Ok(WikiLive {
-            // Storage normally admits this exact snapshot first, but the
-            // widget remains a safe embedding boundary on its own: structural
-            // corruption and missing text blobs become visible diagnostics.
-            catalog: crate::wiki::validate_catalog_with_order(wiki.reader, wiki.facts, observed)
-                .map_err(|error| format!("validate Wiki collection: {error:#}"))?,
-            files_catalog,
             cached_revision: wiki.revision,
-            files_cached_revision,
+            files_cached_revision: files.map(|files| files.revision),
         })
     }
 
-    fn text(&self, reader: &PileSnapshot, h: TextHandle) -> String {
+    fn text(reader: &PileSnapshot, h: TextHandle) -> String {
         crate::wiki::read_text(reader, h).unwrap_or_default()
     }
 
-    // ── canonical revision/entry projection ──────────────────────────
+    // ── maintained revision/entry projection ─────────────────────────
 
-    fn entry_key(entry: &EntryRecord) -> Id {
-        *entry
+    fn entry_key(entry: &EntryRecord) -> Option<Id> {
+        entry
             .roots
             .first()
-            .expect("validated Wiki entries always have a root")
+            .or_else(|| entry.members.first())
+            .copied()
     }
 
-    fn revision(&self, revision: Id) -> Option<&RevisionRecord> {
-        self.catalog.revisions.revision(revision)
+    fn revision<P: TriblePattern>(facts: &P, revision: Id) -> Option<RevisionRecord> {
+        crate::wiki::revision_records(facts, revision)
+            .into_iter()
+            .min_by_key(|row| (row.title, row.content, row.author, row.native))
     }
 
-    fn title(&self, wiki_reader: &PileSnapshot, revision: Id) -> String {
-        self.revision(revision)
-            .map(|row| self.text(wiki_reader, row.title))
+    fn title<P: TriblePattern>(facts: &P, wiki_reader: &PileSnapshot, revision: Id) -> String {
+        Self::revision(facts, revision)
+            .map(|row| Self::text(wiki_reader, row.title))
             .unwrap_or_default()
     }
 
-    fn content(&self, wiki_reader: &PileSnapshot, revision: Id) -> String {
-        self.revision(revision)
-            .map(|row| self.text(wiki_reader, row.content))
+    fn content<P: TriblePattern>(facts: &P, wiki_reader: &PileSnapshot, revision: Id) -> String {
+        Self::revision(facts, revision)
+            .map(|row| Self::text(wiki_reader, row.content))
             .unwrap_or_default()
     }
 
@@ -153,10 +141,23 @@ impl WikiLive {
     /// An archived/live fork keeps both heads visible: hiding the archived
     /// side would falsely present a resolved state. Entries whose complete
     /// frontier is archived are absent from the default graph.
-    fn projected_heads(catalog: &WikiCatalog) -> Vec<VisibleHead> {
+    fn projected_heads<P, O>(facts: &P, order: &O) -> Vec<VisibleHead>
+    where
+        P: TriblePattern,
+        O: triblespace::core::query::register::RegisterOrder + ?Sized,
+    {
         let mut heads = Vec::new();
-        for entry in catalog.revisions.list_entries() {
-            let entry_key = Self::entry_key(&entry);
+        for entry in crate::wiki::entries(facts, order) {
+            if entry
+                .frontier
+                .iter()
+                .all(|revision| revision.tags.contains(&TAG_ARCHIVED_ID))
+            {
+                continue;
+            }
+            let Some(entry_key) = Self::entry_key(&entry) else {
+                continue;
+            };
             let fork_width = entry.frontier.len();
             for revision in entry.frontier {
                 heads.push(VisibleHead {
@@ -170,59 +171,60 @@ impl WikiLive {
         heads
     }
 
-    fn visible_heads(&self, wiki_reader: &PileSnapshot) -> Vec<VisibleHead> {
-        let mut heads = Self::projected_heads(&self.catalog);
+    fn visible_heads(wiki: DatasetView<'_>) -> Vec<VisibleHead> {
+        let Some(order) = wiki.observed_order(metadata::supersedes.id()) else {
+            return Vec::new();
+        };
+        let mut heads = Self::projected_heads(wiki.facts, order);
         heads.sort_by(|left, right| {
-            self.title(wiki_reader, left.revision_id)
+            Self::title(wiki.facts, wiki.reader, left.revision_id)
                 .to_lowercase()
-                .cmp(&self.title(wiki_reader, right.revision_id).to_lowercase())
+                .cmp(&Self::title(wiki.facts, wiki.reader, right.revision_id).to_lowercase())
                 .then_with(|| left.entry_key.cmp(&right.entry_key))
                 .then_with(|| left.revision_id.cmp(&right.revision_id))
         });
         heads
     }
 
-    fn all_selectors(&self) -> BTreeSet<Id> {
-        self.catalog
-            .revisions
-            .revision_records()
-            .map(|revision| revision.id)
-            .collect()
+    fn all_selectors<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
+        crate::wiki::revision_ids(facts)
     }
 
     /// Resolve one full selector. A selector is a revision id or nothing.
-    fn resolve_catalog_selector(catalog: &WikiCatalog, selector: Id) -> Vec<Id> {
-        if catalog.revisions.revision(selector).is_some() {
+    fn resolve_selector<P: TriblePattern>(facts: &P, selector: Id) -> Vec<Id> {
+        if !crate::wiki::revision_records(facts, selector).is_empty() {
             vec![selector]
         } else {
             Vec::new()
         }
     }
 
-    fn resolve_selector(&self, selector: Id) -> Vec<Id> {
-        Self::resolve_catalog_selector(&self.catalog, selector)
-    }
-
     /// Resolve a selector as a live entry reference. Unlike an immutable
     /// revision link, this deliberately follows the selected revision's
     /// connected component to its complete current frontier.
-    fn resolve_catalog_entry_selector(catalog: &WikiCatalog, selector: Id) -> Vec<Id> {
+    fn resolve_entry_selector_with_order<P, O>(facts: &P, order: &O, selector: Id) -> Vec<Id>
+    where
+        P: TriblePattern,
+        O: triblespace::core::query::register::RegisterOrder + ?Sized,
+    {
         let mut heads = BTreeSet::new();
-        for revision in Self::resolve_catalog_selector(catalog, selector) {
-            if let Some(entry) = catalog.revisions.entry_containing(revision) {
+        for revision in Self::resolve_selector(facts, selector) {
+            if let Some(entry) = crate::wiki::entry(facts, order, revision) {
                 heads.extend(entry.frontier.iter().map(|head| head.id));
             }
         }
         heads.into_iter().collect()
     }
 
-    fn resolve_entry_selector(&self, selector: Id) -> Vec<Id> {
-        Self::resolve_catalog_entry_selector(&self.catalog, selector)
+    fn resolve_entry_selector(wiki: DatasetView<'_>, selector: Id) -> Vec<Id> {
+        wiki.observed_order(metadata::supersedes.id())
+            .map(|order| Self::resolve_entry_selector_with_order(wiki.facts, order, selector))
+            .unwrap_or_default()
     }
 
     /// Resolve a hex prefix to the set-valued result of its unique selector.
     /// No timestamp, fact order, or lowest-id winner resolves ambiguity.
-    fn resolve_prefix(&self, prefix: &str) -> Option<Vec<Id>> {
+    fn resolve_prefix<P: TriblePattern>(facts: &P, prefix: &str) -> Option<Vec<Id>> {
         let needle = prefix.trim().to_lowercase();
         if needle.is_empty()
             || needle.len() > 32
@@ -230,24 +232,23 @@ impl WikiLive {
         {
             return None;
         }
-        let mut matches = self
-            .all_selectors()
+        let mut matches = Self::all_selectors(facts)
             .into_iter()
             .filter(|id| format!("{id:x}").starts_with(&needle));
         let selector = matches.next()?;
         if matches.next().is_some() {
             return None;
         }
-        let resolved = self.resolve_selector(selector);
+        let resolved = Self::resolve_selector(facts, selector);
         (!resolved.is_empty()).then_some(resolved)
     }
 
     /// Resolve links parsed from immutable revision content.
-    fn links(&self, wiki_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
+    fn links<P: TriblePattern>(facts: &P, wiki_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
         let mut links = BTreeSet::new();
-        for raw in extract_link_targets(&self.content(wiki_reader, revision)) {
+        for raw in extract_link_targets(&Self::content(facts, wiki_reader, revision)) {
             if let Some(selector) = Id::from_hex(&raw) {
-                links.extend(self.resolve_selector(selector));
+                links.extend(Self::resolve_selector(facts, selector));
             }
         }
         links.into_iter().collect()
@@ -256,10 +257,13 @@ impl WikiLive {
     /// Convert a link's exact revision targets into the current entry
     /// frontiers used by the graph. This changes only graph topology; opening
     /// the link still shows every exact set-valued target.
-    fn graph_link_targets(&self, wiki_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
+    fn graph_link_targets(wiki: DatasetView<'_>, revision: Id) -> Vec<Id> {
+        let Some(order) = wiki.observed_order(metadata::supersedes.id()) else {
+            return Vec::new();
+        };
         let mut heads = BTreeSet::new();
-        for target in self.links(wiki_reader, revision) {
-            if let Some(entry) = self.catalog.revisions.entry_containing(target) {
+        for target in Self::links(wiki.facts, wiki.reader, revision) {
+            if let Some(entry) = crate::wiki::entry(wiki.facts, order, target) {
                 heads.extend(entry.frontier.iter().map(|head| head.id));
             }
         }
@@ -268,18 +272,67 @@ impl WikiLive {
 
     // ── file resolution ──────────────────────────────────────────────
 
-    /// Resolve a `files:<selector>` URL fragment through the canonical file
-    /// selector semantics. Shared bytes keep every filename variant in the
-    /// catalog; when there is no unique name, the content digest itself is the
-    /// neutral output name.
-    fn resolve_file(&self, hex: &str) -> Result<(FileHandle, String), String> {
-        let catalog = self
-            .files_catalog
-            .as_ref()
-            .ok_or_else(|| "no Files dataset available".to_owned())?;
-        let resolved = catalog
-            .resolve_file(hex)
+    /// Resolve one `files:<selector>` directly against the maintained Files
+    /// archive. Ambiguity is local to this explicit open action and never
+    /// invalidates unrelated file rows.
+    fn resolve_file(files: DatasetView<'_>, hex: &str) -> Result<(FileHandle, String), String> {
+        let reference = crate::files::resolve_reference(files.facts, hex)
             .map_err(|error| format!("resolve files:{hex}: {error:#}"))?;
+        let resolved = match reference {
+            crate::files::FileReference::Entity(id) => {
+                let candidates = find!(
+                    (content: FileHandle, name: crate::files::NameHandle),
+                    pattern!(files.facts, [{
+                        id @ metadata::tag: &KIND_FILE,
+                        file_attrs::content: ?content,
+                        file_attrs::name: ?name,
+                    }])
+                )
+                .collect::<BTreeSet<_>>();
+                let contents = candidates
+                    .iter()
+                    .map(|(content, _)| *content)
+                    .collect::<BTreeSet<_>>();
+                let content = match contents.len() {
+                    1 => *contents.first().expect("length checked"),
+                    0 => return Err(format!("files entity {id:x} is not a readable file")),
+                    count => {
+                        return Err(format!(
+                            "files entity {id:x} has {count} content projections"
+                        ));
+                    }
+                };
+                let names = candidates
+                    .into_iter()
+                    .filter(|(candidate, _)| *candidate == content)
+                    .filter_map(|(_, handle)| {
+                        let name: anybytes::View<str> = files.reader.get(handle).ok()?;
+                        Some(name.to_string())
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                crate::files::ResolvedFile { content, names }
+            }
+            crate::files::FileReference::Content(content) => {
+                let names = find!(
+                    name: crate::files::NameHandle,
+                    pattern!(files.facts, [{
+                        _?file @ metadata::tag: &KIND_FILE,
+                        file_attrs::content: &content,
+                        file_attrs::name: ?name,
+                    }])
+                )
+                .filter_map(|handle| {
+                    let name: anybytes::View<str> = files.reader.get(handle).ok()?;
+                    Some(name.to_string())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+                crate::files::ResolvedFile { content, names }
+            }
+        };
         let name = resolved_file_name(&resolved);
         Ok((resolved.content, name))
     }
@@ -287,12 +340,12 @@ impl WikiLive {
     /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&self, files_reader: Option<&PileSnapshot>, hex: &str) {
-        let Some(reader) = files_reader else {
+    fn open_file(files: Option<DatasetView<'_>>, hex: &str) {
+        let Some(files) = files else {
             eprintln!("[files] no files dataset available");
             return;
         };
-        let (handle, name) = match self.resolve_file(hex) {
+        let (handle, name) = match Self::resolve_file(files, hex) {
             Ok(resolved) => resolved,
             Err(error) => {
                 eprintln!("[files] {error}");
@@ -301,8 +354,10 @@ impl WikiLive {
         };
 
         let result = (|| -> Result<std::path::PathBuf, String> {
-            let blob: Blob<RawBytes> =
-                reader.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
+            let blob: Blob<RawBytes> = files
+                .reader
+                .get(handle)
+                .map_err(|e| format!("get blob: {e:?}"))?;
             let tmp_dir = std::env::temp_dir().join("faculties-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
             let path = tmp_dir.join(&name);
@@ -583,8 +638,8 @@ struct GraphNode {
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &WikiLive, wiki_reader: &PileSnapshot) -> Self {
-        let heads = live.visible_heads(wiki_reader);
+    fn from_wiki(wiki: DatasetView<'_>) -> Self {
+        let heads = WikiLive::visible_heads(wiki);
         let mut revision_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
 
@@ -592,7 +647,7 @@ impl WikiGraph {
         for (i, head) in heads.iter().enumerate() {
             let angle = (i as f32 / n) * std::f32::consts::TAU;
             let radius = 200.0 + n * 5.0;
-            let title = live.title(wiki_reader, head.revision_id);
+            let title = WikiLive::title(wiki.facts, wiki.reader, head.revision_id);
             revision_to_idx.insert(head.revision_id, i);
             let mut label = if title.is_empty() {
                 fmt_id(head.revision_id)
@@ -620,7 +675,7 @@ impl WikiGraph {
         let mut unresolved = 0usize;
         for head in &heads {
             let from = revision_to_idx[&head.revision_id];
-            for target in live.graph_link_targets(wiki_reader, head.revision_id) {
+            for target in WikiLive::graph_link_targets(wiki, head.revision_id) {
                 if let Some(&to) = revision_to_idx.get(&target) {
                     if from != to && seen.insert((from, to)) {
                         edges.push((from, to));
@@ -1287,8 +1342,7 @@ pub struct WikiViewer {
     search_miss: Option<String>,
     /// Rebuilt when the wiki or files dataset revision changes.
     live: Option<WikiLive>,
-    /// Strict projection failures are rendered instead of panicking or
-    /// falling back to legacy-shaped facts.
+    /// Missing maintained indexes are rendered instead of panicking.
     error: Option<((DatasetRevision, Option<DatasetRevision>), String)>,
     /// Lazily-initialized once `live` is populated (needs queries to
     /// build). Dropped whenever `live` is rebuilt.
@@ -1314,7 +1368,6 @@ impl WikiViewer {
         files_view: Option<DatasetView<'_>>,
     ) {
         let wiki_reader = wiki_view.reader;
-        let files_reader = files_view.map(|view| view.reader);
         ctx.section("Wiki", |ctx| {
         // Refresh cached spaces if either revision changed since the last frame.
         let wiki_revision = wiki_view.revision;
@@ -1348,10 +1401,9 @@ impl WikiViewer {
             return;
         }
 
-        let live = match self.live.as_ref() {
-            Some(l) => l,
-            None => return,
-        };
+        if self.live.is_none() {
+            return;
+        }
 
         // Search-bar UI is overlaid inside the graph viewport —
         // rendered after graph.show below using the viewport rect.
@@ -1359,7 +1411,7 @@ impl WikiViewer {
 
         // ── force-directed graph ─────────────────────────────────────
         if self.graph.is_none() {
-            self.graph = Some(WikiGraph::from_wiki(live, wiki_reader));
+            self.graph = Some(WikiGraph::from_wiki(wiki_view));
         }
         // Empty state when the Wiki collection has no live entries —
         // otherwise the graph is a blank canvas.
@@ -1520,13 +1572,13 @@ impl WikiViewer {
         if let Some(q) = submit_query {
             let is_hex = !q.is_empty() && q.chars().all(|c| c.is_ascii_hexdigit());
             let mut found = if is_hex {
-                live.resolve_prefix(&q).unwrap_or_default()
+                WikiLive::resolve_prefix(wiki_view.facts, &q).unwrap_or_default()
             } else {
                 let q_lower = q.to_lowercase();
-                live.visible_heads(wiki_reader)
+                WikiLive::visible_heads(wiki_view)
                     .into_iter()
                     .filter(|head| {
-                        live.title(wiki_reader, head.revision_id)
+                        WikiLive::title(wiki_view.facts, wiki_reader, head.revision_id)
                             .to_lowercase()
                             .contains(&q_lower)
                     })
@@ -1590,19 +1642,26 @@ impl WikiViewer {
             let mut revision_key = [0u8; 16];
             revision_key.copy_from_slice(revision_bytes);
 
-            let revision = live.revision(revision_id);
-            let entry = revision.and_then(|_| live.catalog.revisions.entry_containing(revision_id));
-            let title = live.title(wiki_reader, revision_id);
-            let content = live.content(wiki_reader, revision_id);
-            let entry_key = entry.map(WikiLive::entry_key).unwrap_or(revision_id);
+            let revision = WikiLive::revision(wiki_view.facts, revision_id);
+            let entry = revision.as_ref().and_then(|_| {
+                wiki_view
+                    .observed_order(metadata::supersedes.id())
+                    .and_then(|order| crate::wiki::entry(wiki_view.facts, order, revision_id))
+            });
+            let title = WikiLive::title(wiki_view.facts, wiki_reader, revision_id);
+            let content = WikiLive::content(wiki_view.facts, wiki_reader, revision_id);
+            let entry_key = entry
+                .as_ref()
+                .and_then(WikiLive::entry_key)
+                .unwrap_or(revision_id);
             let color = frag_color(entry_key);
-            let frontier_position = entry.and_then(|entry| {
+            let frontier_position = entry.as_ref().and_then(|entry| {
                 entry
                     .frontier
                     .iter()
                     .position(|head| head.id == revision_id)
             });
-            let state_label = match (entry, frontier_position) {
+            let state_label = match (entry.as_ref(), frontier_position) {
                 (Some(entry), Some(index)) if entry.frontier.len() > 1 => {
                     format!("FORK HEAD {}/{}", index + 1, entry.frontier.len())
                 }
@@ -1610,7 +1669,9 @@ impl WikiViewer {
                 (Some(_), None) => "HISTORICAL".to_owned(),
                 (None, _) => "MISSING".to_owned(),
             };
-            let archived = revision.is_some_and(|row| row.tags.contains(&TAG_ARCHIVED_ID));
+            let archived = revision
+                .as_ref()
+                .is_some_and(|row| row.tags.contains(&TAG_ARCHIVED_ID));
 
             ctx.push_id(revision_key, |ctx| {
                 let resp = ctx.float(|ctx| {
@@ -1719,9 +1780,9 @@ impl WikiViewer {
         }
         for (selector, follow_entry) in to_open_from_link {
             let mut revisions = if follow_entry {
-                live.resolve_entry_selector(selector)
+                WikiLive::resolve_entry_selector(wiki_view, selector)
             } else {
-                live.resolve_selector(selector)
+                WikiLive::resolve_selector(wiki_view.facts, selector)
             };
             if revisions.is_empty() {
                 revisions.push(selector);
@@ -1735,7 +1796,7 @@ impl WikiViewer {
             }
         }
         for hex in to_open_file {
-            live.open_file(files_reader, &hex);
+            WikiLive::open_file(files_view, &hex);
         }
         });
     }
@@ -1745,7 +1806,6 @@ impl WikiViewer {
 mod tests {
     use super::*;
 
-    use crate::schemas::files::file as file_attrs;
     use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
     use crate::wiki::{self, RevisionDraft};
     use ed25519_dalek::SigningKey;
@@ -1800,8 +1860,11 @@ mod tests {
             7.0,
         );
 
-        let catalog = wiki::load_catalog(fragment.facts()).unwrap();
-        let projected = WikiLive::projected_heads(&catalog);
+        let order = triblespace::core::query::register::ObservationOrder::new(
+            fragment.facts(),
+            metadata::supersedes.id(),
+        );
+        let projected = WikiLive::projected_heads(fragment.facts(), &order);
         let by_revision: BTreeMap<_, _> = projected
             .iter()
             .map(|head| (head.revision_id, *head))
@@ -1825,13 +1888,13 @@ mod tests {
         assert!(!by_revision[&live].archived);
         assert!(by_revision.contains_key(&independent));
         assert_eq!(
-            WikiLive::resolve_catalog_selector(&catalog, left),
+            WikiLive::resolve_selector(fragment.facts(), left),
             vec![left],
             "an intrinsic revision selector stays exact"
         );
 
         assert_eq!(
-            WikiLive::resolve_catalog_entry_selector(&catalog, base),
+            WikiLive::resolve_entry_selector_with_order(fragment.facts(), &order, base),
             vec![left, right],
             "an entry-qualified root selector follows the complete frontier"
         );
@@ -1880,18 +1943,17 @@ mod tests {
             metadata::created_at: at(2.0),
         };
 
-        let catalog = wiki::load_catalog(fragment.facts()).unwrap();
         assert_eq!(
-            WikiLive::resolve_catalog_selector(&catalog, first),
+            WikiLive::resolve_selector(fragment.facts(), first),
             vec![first],
             "a revision id still resolves to itself"
         );
         assert_eq!(
-            WikiLive::resolve_catalog_selector(&catalog, second),
+            WikiLive::resolve_selector(fragment.facts(), second),
             vec![second]
         );
         assert!(
-            WikiLive::resolve_catalog_selector(&catalog, fragment_id).is_empty(),
+            WikiLive::resolve_selector(fragment.facts(), fragment_id).is_empty(),
             "an anchor id resolves to nothing"
         );
     }

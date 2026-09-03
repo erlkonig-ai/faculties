@@ -1,15 +1,20 @@
-//! Canonical Planner records and strict collection read model.
+//! Canonical Planner records and open-world collection projections.
 //!
 //! An event is an immutable VEVENT-shaped record whose stable identity is the
 //! intrinsic pair `{ KIND_EVENT_ID, event::ical_uid }`.  Local cancellation is
 //! a separate intrinsic assertion.  This keeps cancellation monotone: set
 //! union can make an event cancelled, but can never accidentally resurrect it
 //! by choosing one of several scalar `status` values.
+//!
+//! Ordinary readers query the maintained fact archive directly and skip rows
+//! they cannot decode. Exact identity and fact-set checks remain isolated to
+//! explicit migration validation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
@@ -81,7 +86,7 @@ pub struct CancellationRow {
     pub event: Id,
 }
 
-/// Exact semantic projection of one Planner collection.
+/// Semantic projection of the Planner facts understood by this reader.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlannerCatalog {
     pub events: BTreeMap<Id, EventRow>,
@@ -442,7 +447,7 @@ fn native_event_status(space: &TribleSet, id: Id) -> Result<String> {
     exactly_one(id, "event::status", values)
 }
 
-fn load_event(space: &TribleSet, id: Id) -> Result<EventRow> {
+fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
     let row = EventRow {
         id,
         uid: exactly_one(
@@ -580,7 +585,7 @@ fn load_event(space: &TribleSet, id: Id) -> Result<EventRow> {
     Ok(row)
 }
 
-fn load_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
+fn load_validated_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
     let row = NoteRow {
         id,
         event: exactly_one(
@@ -630,7 +635,7 @@ fn load_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
     Ok(row)
 }
 
-fn load_cancellation(space: &TribleSet, id: Id) -> Result<CancellationRow> {
+fn load_validated_cancellation(space: &TribleSet, id: Id) -> Result<CancellationRow> {
     let row = CancellationRow {
         id,
         event: exactly_one(
@@ -673,17 +678,17 @@ fn load_cancellation(space: &TribleSet, id: Id) -> Result<CancellationRow> {
 /// in the live catalog. Once selected, a native entity is validated exactly
 /// apart from the two explicit legacy event residues handled above: creation
 /// observations and a shadowed scalar cancellation.
-pub fn load_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
+fn load_validated_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
     let event_ids = canonical_event_entities(space);
     let note_ids = canonical_note_entities(space);
     let cancellation_ids = canonical_cancellation_entities(space);
 
     let mut catalog = PlannerCatalog::default();
     for id in event_ids {
-        catalog.events.insert(id, load_event(space, id)?);
+        catalog.events.insert(id, load_validated_event(space, id)?);
     }
     for id in note_ids {
-        let row = load_note(space, id)?;
+        let row = load_validated_note(space, id)?;
         if !catalog.events.contains_key(&row.event) {
             bail!(
                 "planner note {} refers to missing event {}",
@@ -694,7 +699,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
         catalog.notes.insert(id, row);
     }
     for id in cancellation_ids {
-        let row = load_cancellation(space, id)?;
+        let row = load_validated_cancellation(space, id)?;
         if !catalog.events.contains_key(&row.event) {
             bail!(
                 "planner cancellation {} refers to missing event {}",
@@ -708,6 +713,232 @@ pub fn load_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
     Ok(catalog)
 }
 
+/// IDs of all events inhabiting the typed Planner projection.
+pub fn event_ids<P>(space: &P) -> Vec<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        id: Id,
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_EVENT_ID,
+            event::ical_uid: _?uid,
+            event::summary: _?summary,
+            event::time: _?time,
+            event::status: _?status,
+            event::transp: _?transp,
+        }])
+    )
+    .collect()
+}
+
+/// Project one event if all fields needed by this reader are present.
+///
+/// Unknown facts and unrelated extensions remain invisible. Where this
+/// version of the Planner model exposes a scalar field, the first value in
+/// pattern order is its deterministic presentation choice; strict
+/// stopped-world validation is reserved for migration boundaries.
+pub fn event<P>(space: &P, id: Id) -> Option<EventRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (
+            uid: TextHandle,
+            summary: String,
+            time: IntervalValue,
+            status: String,
+            transp: String,
+        ),
+        pattern!(space, [{ id @
+            metadata::tag: &KIND_EVENT_ID,
+            event::ical_uid: ?uid,
+            event::summary: ?summary,
+            event::time: ?time,
+            event::status: ?status,
+            event::transp: ?transp,
+        }])
+    )
+    .find_map(|(uid, summary, time, status, transp)| {
+        let row = EventRow {
+            id,
+            uid,
+            summary,
+            description: find!(
+                value: TextHandle,
+                pattern!(space, [{ id @ event::description: ?value }])
+            )
+            .next(),
+            time,
+            rrule: find!(
+                value: String,
+                pattern!(space, [{ id @ event::rrule: ?value }])
+            )
+            .next(),
+            rdates: find!(
+                value: IntervalValue,
+                pattern!(space, [{ id @ event::rdate: ?value }])
+            )
+            .collect(),
+            exdates: find!(
+                value: IntervalValue,
+                pattern!(space, [{ id @ event::exdate: ?value }])
+            )
+            .collect(),
+            location: find!(
+                value: String,
+                pattern!(space, [{ id @ event::location: ?value }])
+            )
+            .next(),
+            status,
+            transp,
+            attendees: find!(
+                value: Id,
+                pattern!(space, [{ id @ event::attendee: ?value }])
+            )
+            .collect(),
+            organizer: find!(
+                value: Id,
+                pattern!(space, [{ id @ event::organizer: ?value }])
+            )
+            .next(),
+            sequence: find!(
+                value: SequenceValue,
+                pattern!(space, [{ id @ event::sequence: ?value }])
+            )
+            .next(),
+        };
+        validate_event_values(&row).is_ok().then_some(row)
+    })
+}
+
+/// Every readable event carrying this exact UID attachment handle.
+pub fn events_with_uid<P>(space: &P, uid: TextHandle) -> Vec<EventRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        id: Id,
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_EVENT_ID,
+            event::ical_uid: uid,
+            event::summary: _?summary,
+            event::time: _?time,
+            event::status: _?status,
+            event::transp: _?transp,
+        }])
+    )
+    .filter_map(|id| event(space, id))
+    .collect()
+}
+
+/// Every readable note attached to one event.
+pub fn notes_for_event<P>(space: &P, event: Id) -> Vec<NoteRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (
+            id: Id,
+            text: TextHandle,
+            created_at: IntervalValue,
+        ),
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_NOTE_ID,
+            metadata::created_at: ?created_at,
+            note::note_about: event,
+            note::note_text: ?text,
+        }])
+    )
+    .filter_map(|(id, text, created_at)| {
+        validate_point("note creation time", created_at)
+            .is_ok()
+            .then_some(NoteRow {
+                id,
+                event,
+                text,
+                created_at,
+            })
+    })
+    .collect()
+}
+
+/// Whether the event has either an RFC cancellation status or a monotone
+/// local cancellation assertion.
+pub fn event_is_cancelled<P>(space: &P, event_id: Id) -> bool
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        status: String,
+        pattern!(space, [{ event_id @ event::status: ?status }])
+    )
+    .any(|status| status == STATUS_CANCELLED)
+        || find!(
+            _assertion: Id,
+            pattern!(space, [{ ?_assertion @
+                metadata::tag: &KIND_CANCELLATION_ID,
+                cancellation::event: event_id,
+            }])
+        )
+        .next()
+        .is_some()
+}
+
+/// Project the Planner ontology directly from any queryable fact view.
+///
+/// This is the ordinary open-world bulk read path used by calendar views. A
+/// record participates only when it inhabits the corresponding typed
+/// projection. Incomplete or undecodable records are skipped rather than
+/// making unrelated events unreadable.
+pub fn load_catalog<P>(space: &P) -> Result<PlannerCatalog>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut catalog = PlannerCatalog::default();
+    for id in event_ids(space) {
+        if let Some(row) = event(space, id) {
+            catalog.events.insert(id, row);
+        }
+    }
+    for (id, event, text, created_at) in find!(
+        (
+            id: Id,
+            event: Id,
+            text: TextHandle,
+            created_at: IntervalValue,
+        ),
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_NOTE_ID,
+            metadata::created_at: ?created_at,
+            note::note_about: ?event,
+            note::note_text: ?text,
+        }])
+    ) {
+        if validate_point("note creation time", created_at).is_ok() {
+            catalog.notes.entry(id).or_insert(NoteRow {
+                id,
+                event,
+                text,
+                created_at,
+            });
+        }
+    }
+    for (id, event) in find!(
+        (id: Id, event: Id),
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_CANCELLATION_ID,
+            cancellation::event: ?event,
+        }])
+    ) {
+        catalog
+            .cancellations
+            .entry(id)
+            .or_insert(CancellationRow { id, event });
+    }
+    Ok(catalog)
+}
+
 /// Strictly read a UTF8String attachment.
 pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
@@ -718,7 +949,7 @@ pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 /// payloads. Preserved legacy and unrelated generic collection facts are not
 /// part of this semantic view.
 pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<PlannerCatalog> {
-    let catalog = load_catalog(space)?;
+    let catalog = load_validated_catalog(space)?;
     for row in catalog.events.values() {
         let uid = read_text(reader, row.uid)
             .with_context(|| format!("read UID of planner event {}", fmt_id(row.id)))?;
@@ -736,9 +967,9 @@ pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<Plan
     Ok(catalog)
 }
 
-/// Validate a prospective fragment before any signed collection root is
-/// published. Singular conflicts are checked against the complete current
-/// union; staged attachments are checked from the fragment's own blob store.
+/// Strictly validate a prospective legacy-migration fragment against a frozen
+/// source union. Ordinary authored publication does not use this closed-world
+/// check; constructors establish the local fragment invariants directly.
 pub fn validate_candidate(
     reader: &PileSnapshot,
     current: &TribleSet,
@@ -769,7 +1000,7 @@ pub fn validate_candidate(
 
     let mut union = current.clone();
     union += fragment.facts().clone();
-    load_catalog(&union)
+    load_validated_catalog(&union)
 }
 
 #[cfg(test)]
@@ -844,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn competing_scalar_values_are_rejected_not_arbitrated() {
+    fn ordinary_projection_survives_extra_values_while_strict_validation_rejects_them() {
         let event = event_fragment(&draft("fork@example", "meeting")).unwrap();
         let event_id = event.root().unwrap();
         let mut facts = event.into_facts();
@@ -852,7 +1083,8 @@ mod tests {
             event::summary: "other",
         };
 
-        let error = load_catalog(&facts).unwrap_err();
+        assert!(load_catalog(&facts).unwrap().events.contains_key(&event_id));
+        let error = load_validated_catalog(&facts).unwrap_err();
         assert!(format!("{error:#}").contains("2 values for event::summary"));
     }
 
@@ -872,11 +1104,11 @@ mod tests {
     #[test]
     fn note_and_cancellation_must_reference_an_event_in_the_union() {
         let note = note_fragment(id(3), "orphan", interval(1, 1)).unwrap();
-        let note_error = load_catalog(note.facts()).unwrap_err();
+        let note_error = load_validated_catalog(note.facts()).unwrap_err();
         assert!(format!("{note_error:#}").contains("refers to missing event"));
 
         let cancellation = cancellation_fragment(id(4));
-        let cancellation_error = load_catalog(cancellation.facts()).unwrap_err();
+        let cancellation_error = load_validated_catalog(cancellation.facts()).unwrap_err();
         assert!(format!("{cancellation_error:#}").contains("refers to missing event"));
     }
 
@@ -904,7 +1136,7 @@ mod tests {
         };
         facts += entity! { ExclusiveId::force_ref(&KIND_EVENT_ID) @ metadata::tag: &id(11) };
 
-        let catalog = load_catalog(&facts).unwrap();
+        let catalog = load_validated_catalog(&facts).unwrap();
         assert_eq!(
             catalog.events.keys().copied().collect::<Vec<_>>(),
             vec![event_id]
@@ -915,7 +1147,8 @@ mod tests {
         let mut polluted = event_fragment(&draft("polluted@example", "canonical")).unwrap();
         let polluted_id = polluted.root().unwrap();
         polluted += entity! { ExclusiveId::force_ref(&polluted_id) @ metadata::tag: &id(12) };
-        let error = load_catalog(polluted.facts()).unwrap_err();
+        assert!(load_catalog(polluted.facts()).is_ok());
+        let error = load_validated_catalog(polluted.facts()).unwrap_err();
         assert!(format!("{error:#}").contains("outside its canonical immutable record"));
     }
 }

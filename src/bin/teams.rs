@@ -10,7 +10,7 @@ use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use faculties::storage::initialize_signer;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
@@ -381,14 +384,15 @@ struct TeamsStorage<'a> {
 
 #[derive(Clone)]
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
-    facts: TribleSet,
+    maintained: FactCollection,
+    facts: FactArchive,
     reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
     secrets: secrets_vaults::VaultDiscovery,
@@ -407,24 +411,85 @@ impl TeamsSession<'_> {
         mut fragment: Fragment,
         description: &'static str,
     ) -> Result<Option<CollectionCommit>> {
-        validate_candidate(&self.reader, &self.facts, &fragment)?;
-        let mut candidate = self.facts.clone();
-        candidate += fragment.facts().clone();
-        teams_core::validate_auth_secret_references(&candidate, self.secrets.snapshot())?;
-        if fragment.facts().difference(&self.facts).is_empty() {
-            return Ok(None);
+        // A page is one independently signed transaction: it may refer to
+        // earlier receipts, but it must carry its own message identity
+        // closure. This is a publication-boundary check over the staged
+        // member, not a validation pass over the maintained collection.
+        teams_core::validate_commit_fragment(fragment.facts())?;
+
+        // Evaluate state-dependent invariants over a shallow logical union of
+        // the frozen Rank9 view and this one staged member. No current facts
+        // are flattened back into a TribleSet.
+        let candidate = self.facts.with_segments([fragment.facts().into()]);
+        let auth_sources = teams_core::auth_profile_sources(fragment.facts());
+        teams_core::validate_auth_secret_references_for_sources(
+            &candidate,
+            self.secrets.snapshot(),
+            auth_sources,
+        )?;
+
+        let mut receipt_sources = find!(
+            source: Id,
+            pattern!(fragment.facts(), [{
+                _?receipt @
+                metadata::tag: teams::kind_coverage,
+                teams::source: ?source,
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        receipt_sources.extend(find!(
+            source: Id,
+            pattern!(fragment.facts(), [{
+                _?receipt @
+                metadata::tag: teams::kind_legacy_snapshot,
+                teams::source: ?source,
+            }])
+        ));
+        for source in receipt_sources {
+            // This pure projection exposes coverage forks and conflicting
+            // message versions without imposing an arrival order.
+            let _ = teams_core::current_message_states(&candidate, source)?;
         }
-        let added = fragment.facts().clone();
+
+        let context_sources = find!(
+            source: Id,
+            pattern!(fragment.facts(), [{
+                _?context @
+                metadata::tag: teams::kind_context,
+                teams::source: ?source,
+            }])
+        )
+        .collect::<BTreeSet<_>>();
+        for source in context_sources {
+            let context_heads = teams_core::context_head_ids(&candidate, source);
+            if context_heads.len() > 1 {
+                bail!(
+                    "Teams context head has {} values; refusing arbitrary selection",
+                    context_heads.len()
+                );
+            }
+        }
+
         fragment.describe_with(entity! { metadata::description: description });
         let commit = self
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("commit Teams fragment")?;
-        self.facts += added;
-        self.reader = self
+        let before = self
             .pile
             .snapshot()
-            .context("refresh Teams attachment snapshot")?;
+            .context("freeze Teams post-commit source snapshot")?;
+        let instant = clock::now()?;
+        self.reader = self
+            .maintained
+            .maintain_at(self.pile, &before, instant)
+            .context("maintain Teams fact collection after commit")?;
+        self.facts = self
+            .reader
+            .collection_at(self.maintained.rank9(), instant)
+            .context("observe maintained Teams fact collection after commit")?
+            .view::<FactArchive>()
+            .context("read maintained Teams fact collection after commit")?;
         Ok(Some(commit))
     }
 
@@ -473,15 +538,26 @@ impl TeamsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Teams store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize Teams collection")?;
-            validate_catalog(&store_snapshot, &facts).context("validate Teams collection")?;
+            let maintained = FactCollection::new(&mut pile, collection)
+                .context("register maintained Teams fact collection")?;
+            let before = pile
+                .snapshot()
+                .context("freeze Teams pre-maintenance snapshot")?;
+            let instant = clock::now()?;
+            let store_snapshot = maintained
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Teams fact collection")?;
+            let facts = store_snapshot
+                .collection_at(maintained.rank9(), instant)
+                .context("observe maintained Teams fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Teams fact collection")?;
             let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
                 .context("discover Secrets vaults for Teams")?;
             operation(&mut TeamsSession {
                 pile: &mut pile,
                 collection,
+                maintained,
                 facts,
                 reader: store_snapshot,
                 signer,
@@ -1228,11 +1304,14 @@ fn now_epoch_secs() -> Result<i64> {
     Ok(clock::now()?.to_unix_seconds() as i64)
 }
 
-fn load_context(
+fn load_context<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
-) -> Result<TeamsPresentationContext> {
+) -> Result<TeamsPresentationContext>
+where
+    P: TriblePattern,
+{
     let heads = current_context_head_ids(catalog, source_id);
     let Some(context_id) = one_optional(heads, "Teams presentation-context head")? else {
         return Ok(TeamsPresentationContext::default());
@@ -1481,15 +1560,21 @@ fn set_auth_profile(
     Ok(())
 }
 
-fn current_context_head_ids(catalog: &TribleSet, source_id: Id) -> BTreeSet<Id> {
+fn current_context_head_ids<P>(catalog: &P, source_id: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     teams_core::context_head_ids(catalog, source_id)
 }
 
-fn load_chat_map(
+fn load_chat_map<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
-) -> Result<HashMap<Id, String>> {
+) -> Result<HashMap<Id, String>>
+where
+    P: TriblePattern,
+{
     let mut map = HashMap::new();
     for (chat_id, handle) in find!(
         (chat: Id, chat_id: Inline<Handle<UTF8String>>),
@@ -1506,11 +1591,14 @@ fn load_chat_map(
     Ok(map)
 }
 
-fn load_message_external_map(
+fn load_message_external_map<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
-) -> Result<HashMap<Id, String>> {
+) -> Result<HashMap<Id, String>>
+where
+    P: TriblePattern,
+{
     let mut map = HashMap::new();
     for (message_id, handle) in find!(
         (message: Id, external: Inline<Handle<UTF8String>>),
@@ -1534,11 +1622,14 @@ fn load_message_external_map(
     Ok(map)
 }
 
-fn load_known_messages(
+fn load_known_messages<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
-) -> Result<Vec<KnownMessage>> {
+) -> Result<Vec<KnownMessage>>
+where
+    P: TriblePattern,
+{
     let mut known = BTreeSet::new();
     for (message_id, message_external, chat_id, chat_external) in find!(
         (
@@ -2355,7 +2446,10 @@ fn parse_attachment_reference(reference: &str) -> (Option<&str>, &str) {
     (None, reference)
 }
 
-fn current_messages(catalog: &TribleSet, source_id: Id) -> Result<Vec<ReadMessage>> {
+fn current_messages<P>(catalog: &P, source_id: Id) -> Result<Vec<ReadMessage>>
+where
+    P: TriblePattern,
+{
     let message_chats = find!(
         (message: Id, chat: Id),
         pattern!(catalog, [
@@ -2393,13 +2487,16 @@ fn current_messages(catalog: &TribleSet, source_id: Id) -> Result<Vec<ReadMessag
     Ok(result)
 }
 
-fn read_message_observation(
-    catalog: &TribleSet,
+fn read_message_observation<P>(
+    catalog: &P,
     message_id: Id,
     chat_id: Id,
     observation_id: Id,
     deleted: bool,
-) -> Result<ReadMessage> {
+) -> Result<ReadMessage>
+where
+    P: TriblePattern,
+{
     let created_at = one_optional(
         find!(
             created: Inline<NsTAIInterval>,
@@ -2658,13 +2755,16 @@ fn list_attachments(
     Ok(())
 }
 
-fn attachment_rows(
+fn attachment_rows<P>(
     _reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
     chat_filter: Option<&HashSet<Id>>,
     message_filter: Option<&HashSet<Id>>,
-) -> Result<Vec<AttachmentRow>> {
+) -> Result<Vec<AttachmentRow>>
+where
+    P: TriblePattern,
+{
     let mut rows = Vec::new();
     for message in current_messages(catalog, source_id)?
         .into_iter()
@@ -3163,11 +3263,14 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-fn coverage_head(
+fn coverage_head<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source_id: Id,
-) -> Result<Option<CoverageHead>> {
+) -> Result<Option<CoverageHead>>
+where
+    P: TriblePattern,
+{
     teams_core::coverage_head(reader, catalog, source_id)
 }
 
@@ -3500,27 +3603,6 @@ fn build_attachment_fragment(
         archive::attachment_size_bytes?: size,
     };
     Ok(fragment)
-}
-
-/// Validate a page against the state it would create before any dependency or
-/// signed COMMIT byte reaches the pile. This is deliberately stronger than
-/// validating the isolated fragment: append-only storage cannot repair a
-/// singular-field conflict or stale coverage fork after it has been signed.
-fn validate_candidate(
-    reader: &PileSnapshot,
-    catalog: &TribleSet,
-    fragment: &Fragment,
-) -> Result<()> {
-    teams_core::validate_candidate(reader, catalog, fragment)
-}
-
-#[cfg(test)]
-fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
-    teams_core::validate_commit_fragment(facts)
-}
-
-fn validate_catalog(reader: &PileSnapshot, catalog: &TribleSet) -> Result<()> {
-    teams_core::validate_catalog(reader, catalog)
 }
 
 fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<String>)> {
@@ -4679,7 +4761,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(validate_commit_fragment(fragment.facts()).is_err());
+        assert!(teams_core::validate_commit_fragment(fragment.facts()).is_err());
 
         fragment += coverage_fragment(
             source,
@@ -4691,7 +4773,7 @@ mod tests {
             observations,
         )
         .unwrap();
-        validate_commit_fragment(fragment.facts()).unwrap();
+        teams_core::validate_commit_fragment(fragment.facts()).unwrap();
     }
 
     #[test]

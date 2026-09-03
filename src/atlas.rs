@@ -1,14 +1,17 @@
-//! Canonical read model for the additive Atlas metadata catalog.
+//! Typed projections over the additive Atlas metadata collection.
 //!
 //! Atlas facts are schema evidence rather than mutable scalar state. Multiple
 //! names or descriptions therefore remain visible variants; a reader must not
-//! let hash-map insertion order manufacture one winning label.
+//! let query iteration order manufacture one winning label. Ordinary readers
+//! ask for the projection they need directly; the strict whole-value validator
+//! at the bottom of this module is reserved for explicit migration/tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};
 use triblespace::core::blob::Blob;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{UTF8String, WasmCode};
 use triblespace::prelude::inlineencodings::Handle;
@@ -32,26 +35,6 @@ impl AtlasEntry {
     /// A lossless compact label: every name variant participates.
     pub fn names_label(&self) -> String {
         self.names.join(" / ")
-    }
-}
-
-/// Deterministic, lossless projection of one complete Atlas value.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AtlasCatalog {
-    entries: BTreeMap<Id, AtlasEntry>,
-}
-
-impl AtlasCatalog {
-    pub fn entries(&self) -> impl ExactSizeIterator<Item = &AtlasEntry> {
-        self.entries.values()
-    }
-
-    pub fn entry(&self, id: Id) -> Option<&AtlasEntry> {
-        self.entries.get(&id)
-    }
-
-    pub fn names(&self, id: Id) -> Option<&[String]> {
-        self.entry(id).map(|entry| entry.names.as_slice())
     }
 }
 
@@ -114,13 +97,17 @@ pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -
     Ok(())
 }
 
-/// Load a lossless Atlas projection.
+/// Project every named Atlas entity needed by a list-style consumer.
 ///
 /// Names and descriptions are intentionally vectors. Atlas is additive and
 /// has no causal register that could justify collapsing several values to one.
-pub fn load_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<AtlasCatalog> {
-    validate_known_payloads(reader, facts)?;
-
+/// This is a typed query result, not an ambient catalog: unrelated and
+/// undecodable open-world facts do not participate.
+pub fn named_entries<R, P>(reader: &R, facts: &P) -> Result<Vec<AtlasEntry>>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
     let mut name_handles = BTreeMap::<Id, BTreeSet<TextHandle>>::new();
     for (id, handle) in find!(
         (id: Id, handle: TextHandle),
@@ -155,14 +142,9 @@ pub fn load_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<At
         members.entry(tag).or_default().insert(entity);
     }
 
-    let mut entries = BTreeMap::new();
+    let mut entries = Vec::with_capacity(name_handles.len());
     for (id, handles) in name_handles {
         let names = read_text_variants(reader, handles, "name", id)?;
-        // `name_handles` makes this unreachable for a valid blob store, but
-        // retain the invariant explicitly at the public model boundary.
-        if names.is_empty() {
-            anyhow::bail!("named Atlas entity {id:x} has no readable names");
-        }
         let descriptions = read_text_variants(
             reader,
             description_handles.remove(&id).unwrap_or_default(),
@@ -175,28 +157,97 @@ pub fn load_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<At
             "source module",
             id,
         )?;
-        entries.insert(
+        entries.push(AtlasEntry {
             id,
-            AtlasEntry {
-                id,
-                names,
-                descriptions,
-                source_modules,
-                tags: tags.remove(&id).unwrap_or_default().into_iter().collect(),
-                members: members
-                    .remove(&id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-            },
-        );
+            names,
+            descriptions,
+            source_modules,
+            tags: tags.remove(&id).unwrap_or_default().into_iter().collect(),
+            members: members
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        });
     }
-    Ok(AtlasCatalog { entries })
+    Ok(entries)
 }
 
-/// Validate one complete Atlas value without retaining its projection.
+/// Project one named Atlas entity without constructing the list projection.
+///
+/// `None` means this read type sees no name for `id`. Other facts on the same
+/// opaque id remain valid open-world data and are deliberately ignored.
+pub fn named_entry<R, P>(reader: &R, facts: &P, id: Id) -> Result<Option<AtlasEntry>>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
+    let names = read_text_variants(
+        reader,
+        find!(
+            handle: TextHandle,
+            pattern!(facts, [{ id @ metadata::name: ?handle }])
+        )
+        .collect(),
+        "name",
+        id,
+    )?;
+    if names.is_empty() {
+        return Ok(None);
+    }
+
+    let descriptions = read_text_variants(
+        reader,
+        find!(
+            handle: TextHandle,
+            pattern!(facts, [{ id @ metadata::description: ?handle }])
+        )
+        .collect(),
+        "description",
+        id,
+    )?;
+    let source_modules = read_text_variants(
+        reader,
+        find!(
+            handle: TextHandle,
+            pattern!(facts, [{ id @ metadata::source_module: ?handle }])
+        )
+        .collect(),
+        "source module",
+        id,
+    )?;
+    let tags = find!(
+        tag: Id,
+        pattern!(facts, [{ id @ metadata::tag: ?tag }])
+    )
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect();
+    let members = find!(
+        member: Id,
+        pattern!(facts, [{ ?member @ metadata::tag: id }])
+    )
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect();
+
+    Ok(Some(AtlasEntry {
+        id,
+        names,
+        descriptions,
+        source_modules,
+        tags,
+        members,
+    }))
+}
+
+/// Validate one explicit stopped-world Atlas candidate.
+///
+/// Normal readers must use [`named_entries`] or [`named_entry`] instead: this
+/// full scan exists only for migration and adversarial-boundary tests.
 pub fn validate_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<()> {
-    load_catalog(reader, facts).map(drop)
+    validate_known_payloads(reader, facts)?;
+    named_entries(reader, facts).map(drop)
 }
 
 #[cfg(test)]
@@ -224,8 +275,8 @@ mod tests {
 
         let mut blobs = fragment.blobs().clone();
         let reader = blobs.snapshot().unwrap();
-        let catalog = load_catalog(&reader, fragment.facts()).unwrap();
-        let entry = catalog.entry(id).unwrap();
+        let entries = named_entries(&reader, fragment.facts()).unwrap();
+        let entry = entries.iter().find(|entry| entry.id == id).unwrap();
 
         assert_eq!(entry.names, ["Alpha", "Beta"]);
         assert_eq!(
@@ -233,5 +284,30 @@ mod tests {
             ["First description", "Second description"]
         );
         assert_eq!(entry.members, [member]);
+
+        assert_eq!(
+            named_entry(&reader, fragment.facts(), id).unwrap(),
+            Some(entry.clone())
+        );
+    }
+
+    #[test]
+    fn ordinary_projection_ignores_unrequested_open_world_payloads() {
+        let named = Id::new([0x51; 16]).unwrap();
+        let unrelated = Id::new([0x52; 16]).unwrap();
+        let mut fragment = Fragment::empty();
+        let name = fragment.put::<UTF8String, _>("Readable".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&named) @ metadata::name: name };
+        fragment += entity! { ExclusiveId::force_ref(&unrelated) @
+            metadata::value_formatter: Inline::<Handle<WasmCode>>::new([0x53; 32]),
+        };
+
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.snapshot().unwrap();
+        let entries = named_entries(&reader, fragment.facts()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, named);
+        assert!(validate_catalog(&reader, fragment.facts()).is_err());
     }
 }

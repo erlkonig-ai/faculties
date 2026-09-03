@@ -11,14 +11,11 @@
 //! `--about` may choose one recollection among entries with the exact same
 //! temporal coverage, but cannot change which spans the cover refines.
 //!
-//! Callers hand this module canonical Memory and shared Embeddings collection
+//! Callers hand this module maintained Memory and shared Embeddings collection
 //! views frozen from one pile snapshot, plus the Memory attachment reader and
 //! parsed [`CoverOpts`]. The result is the cover text.
 
-use std::collections::HashMap;
-
-#[cfg(feature = "local-embed")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 #[cfg(feature = "local-embed")]
 use anyhow::anyhow;
@@ -26,6 +23,7 @@ use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -45,20 +43,23 @@ use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 // self-contained. memory.rs re-imports these via `use faculties::memory_cover::…`.
 // ---------------------------------------------------------------------------
 
-pub fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<UTF8String>>> {
-    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+pub fn chunk_summary_handle<P: TriblePattern>(
+    space: &P,
+    id: Id,
+) -> Option<Inline<Handle<UTF8String>>> {
+    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::summary: ?h }])).min()
 }
 
 /// The raw image bytes handle of a WORDLESS image memory chunk, if it is one.
 /// An image chunk has no `ctx::summary`; its content is the picture itself.
-pub fn chunk_image_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<RawBytes>>> {
-    find!(h: Inline<Handle<RawBytes>>, pattern!(space, [{ id @ ctx::image: ?h }])).next()
+pub fn chunk_image_handle<P: TriblePattern>(space: &P, id: Id) -> Option<Inline<Handle<RawBytes>>> {
+    find!(h: Inline<Handle<RawBytes>>, pattern!(space, [{ id @ ctx::image: ?h }])).min()
 }
 
 /// A chunk's `from..to` span as a string (or `?` if missing) — used to render
 /// a wordless image memory as `[image memory @ <span>]` everywhere a summary
 /// would otherwise print.
-pub fn chunk_span_str(space: &TribleSet, id: Id) -> String {
+pub fn chunk_span_str<P: TriblePattern>(space: &P, id: Id) -> String {
     match (chunk_start_at(space, id), chunk_end_at(space, id)) {
         (Some(s), Some(e)) => format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
         _ => "?".to_string(),
@@ -67,34 +68,43 @@ pub fn chunk_span_str(space: &TribleSet, id: Id) -> String {
 
 /// A chunk's lens-theme handle, if it is a thematic lens (not part of the
 /// chronological spine). Presence is what excludes it from the temporal cover.
-pub fn chunk_lens_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<UTF8String>>> {
-    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::lens: ?h }])).next()
+pub fn chunk_lens_handle<P: TriblePattern>(
+    space: &P,
+    id: Id,
+) -> Option<Inline<Handle<UTF8String>>> {
+    find!(h: Inline<Handle<UTF8String>>, pattern!(space, [{ id @ ctx::lens: ?h }])).min()
 }
 
-pub fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
-    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::start_at: ?v }])).next()
+pub fn chunk_start_at<P: TriblePattern>(space: &P, id: Id) -> Option<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::start_at: ?v }])).min()
 }
 
-pub fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
-    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
+pub fn chunk_end_at<P: TriblePattern>(space: &P, id: Id) -> Option<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).max()
 }
 
 /// What archive message this chunk is about, if any.
-pub fn chunk_about_archive_message(space: &TribleSet, id: Id) -> Option<Id> {
-    find!(v: Id, pattern!(space, [{ id @ ctx::about_archive_message: ?v }])).next()
+pub fn chunk_about_archive_message<P: TriblePattern>(space: &P, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_archive_message: ?v }])).min()
 }
 
 /// A chunk's extrinsic historical names. Annotation, never intrinsic state.
-pub fn chunk_aliases(space: &TribleSet, id: Id) -> Vec<Id> {
-    find!(v: Id, pattern!(space, [{ id @ metadata::anchor: ?v }])).collect()
+pub fn chunk_aliases<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
+    find!(v: Id, pattern!(space, [{ id @ metadata::anchor: ?v }]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
-pub fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
-    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
+pub fn all_chunk_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
-/// Outgoing contextual references of a canonical chunk, ordered by `start_at`.
-pub fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
+/// Outgoing contextual references of a chunk, ordered by `start_at`.
+pub fn chunk_references<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
     let mut children: Vec<Id> =
         find!(c: Id, pattern!(space, [{ id @ ctx::reference: ?c }])).collect();
     // Sort referenced chunks by their start_at time.
@@ -108,35 +118,35 @@ pub fn chunk_references(space: &TribleSet, id: Id) -> Vec<Id> {
 }
 
 /// The exec result this chunk is about, if it records one.
-pub fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
-    find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
+pub fn chunk_about_exec_result<P: TriblePattern>(space: &P, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).min()
 }
 
 /// Genuine creation/import observations for a chunk. These sit OUTSIDE
 /// intrinsic state -- they are additive provenance, so several may coexist and
 /// that multiplicity is returned rather than arbitrated.
-pub fn chunk_observed_at(space: &TribleSet, id: Id) -> Vec<Inline<NsTAIInterval>> {
-    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ metadata::created_at: ?v }])).collect()
+pub fn chunk_observed_at<P: TriblePattern>(space: &P, id: Id) -> Vec<Inline<NsTAIInterval>> {
+    find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ metadata::created_at: ?v }]))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// The stored shared-space embedding handle for a chunk, if it has been embedded.
 #[cfg(feature = "local-embed")]
-pub fn chunk_embedding_handle(
-    embeddings_space: &TribleSet,
+pub fn chunk_embedding_handle<P: TriblePattern>(
+    embeddings_space: &P,
     id: Id,
 ) -> Result<Option<Inline<Handle<Embedding768>>>> {
-    let mut handles: BTreeSet<_> = find!(
+    let handles: BTreeSet<_> = find!(
         h: Inline<Handle<Embedding768>>,
         pattern!(embeddings_space, [{ id @ embeddings::attr::embedding: ?h }])
     )
     .collect();
-    if handles.len() > 1 {
-        bail!(
-            "shared Embeddings collection has {} observations for Memory chunk {id:x}; expected at most one",
-            handles.len()
-        );
-    }
-    Ok(handles.pop_first())
+    // Embeddings are additive observations. Older callers consume one vector,
+    // so arbitrate deterministically instead of imposing scalar cardinality on
+    // the open-world relation. Richer scorers may inspect every observation.
+    Ok(handles.first().copied())
 }
 
 // ---------------------------------------------------------------------------
@@ -193,21 +203,27 @@ pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 // cover helpers
 // ---------------------------------------------------------------------------
 
-/// Load every canonical Memory chunk as `(start_key, end_key, id)`.
-/// Chunks missing a start/end interval are skipped. Shared by `list` and `check`.
-pub fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
-    let mut spans = Vec::new();
-    for id in all_chunk_ids(space) {
-        // Thematic lenses are a parallel weave, not part of the chronological
-        // spine — exclude them so a wide lens can't hijack the containment tree.
-        if chunk_lens_handle(space, id).is_some() {
-            continue;
-        }
-        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
-            continue;
-        };
-        spans.push((interval_key(s), interval_key(e), id));
-    }
+/// Project every usable Memory span as `(start_key, end_key, id)`.
+///
+/// Start/end observations remain additive: the raw projected tuple is the
+/// identity, so another typed value adds another span instead of invalidating
+/// or silently rewriting an entity. Incomplete and backwards ranges simply do
+/// not inhabit the view this renderer can use.
+pub fn collect_chunk_spans<P: TriblePattern>(space: &P) -> Vec<(i128, i128, Id)> {
+    let mut spans: Vec<_> = find!(
+        (id: Id, start: Inline<NsTAIInterval>, end: Inline<NsTAIInterval>),
+        pattern!(space, [{
+            ?id @ metadata::tag: &KIND_CHUNK_ID,
+            ctx::start_at: ?start,
+            ctx::end_at: ?end,
+        }])
+    )
+    .filter(|(id, _, _)| chunk_lens_handle(space, *id).is_none())
+    .map(|(id, start, end)| (interval_key(start), interval_key(end), id))
+    .filter(|(start, end, _)| start <= end)
+    .collect();
+    spans.sort_unstable();
+    spans.dedup();
     spans
 }
 
@@ -219,9 +235,9 @@ pub const IMAGE_CHUNK_CHAR_COST: usize = 64;
 /// Character-cost of a chunk (its budget weight), loaded lazily and cached by
 /// span index. Cost is the summary's exact character count, so the budget and
 /// the per-chunk weights are in the same, unambiguous CHARACTER units.
-pub fn context_chunk_cost<B: BlobStoreGet>(
+pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     ws: &B,
-    space: &TribleSet,
+    space: &P,
     spans: &[(i128, i128, Id)],
     cache: &mut [Option<usize>],
     i: usize,
@@ -251,12 +267,12 @@ pub fn context_chunk_cost<B: BlobStoreGet>(
 /// matched cluster. Override per call with `--sim-threshold <f>`.
 pub const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
 
-/// Rebuild the exact lexical view from the frozen canonical Memory facts.
+/// Rebuild the exact lexical view from the frozen maintained Memory facts.
 /// BM25 is query-time machinery, not durable journal state: there is no stale
 /// index entity to arbitrate and every text journal entry visible in `space`
 /// participates in this one scored postings walk.
-pub fn lexical_relevance_scores<B: BlobStoreGet>(
-    space: &TribleSet,
+pub fn lexical_relevance_scores<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
     reader: &B,
     query: &str,
 ) -> Result<HashMap<Id, f32>> {
@@ -282,12 +298,17 @@ pub fn lexical_relevance_scores<B: BlobStoreGet>(
 /// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
 /// (BM25). Both are non-negative. The scores choose between recollections with
 /// identical temporal coverage; they never participate in structural refinement.
-pub fn about_relevance_scores<B: BlobStoreGet>(
-    space: &TribleSet,
-    embeddings_space: &TribleSet,
+pub fn about_relevance_scores<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
     reader: &B,
     query: &str,
-) -> Result<HashMap<Id, f32>> {
+) -> Result<HashMap<Id, f32>>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
     #[cfg(feature = "local-embed")]
     {
         if let Some(scores) = semantic_about_scores(space, embeddings_space, reader, query)? {
@@ -304,12 +325,17 @@ pub fn about_relevance_scores<B: BlobStoreGet>(
 /// BM25). Negative cosines clamp to 0 so "unrelated" is uniform (matching
 /// BM25's non-negative scores).
 #[cfg(feature = "local-embed")]
-pub fn semantic_about_scores<B: BlobStoreGet>(
-    space: &TribleSet,
-    embeddings_space: &TribleSet,
+pub fn semantic_about_scores<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
     reader: &B,
     query: &str,
-) -> Result<Option<HashMap<Id, f32>>> {
+) -> Result<Option<HashMap<Id, f32>>>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
     let mut handles: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
     for chunk in all_chunk_ids(space) {
         if let Some(h) = chunk_embedding_handle(embeddings_space, chunk)? {
@@ -351,13 +377,18 @@ pub fn semantic_about_scores<B: BlobStoreGet>(
 /// `universe` is the exact set of chunks that can appear in the cover (all
 /// chronological, non-lens chunks selected by `collect_chunk_spans`), so the unscorable
 /// warning never lists chunks that could never surface anyway.
-pub fn eligibility_scores<B: BlobStoreGet>(
-    space: &TribleSet,
-    embeddings_space: &TribleSet,
+pub fn eligibility_scores<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
     reader: &B,
     query: &str,
     universe: &[Id],
-) -> Result<(HashMap<Id, f32>, Vec<Id>)> {
+) -> Result<(HashMap<Id, f32>, Vec<Id>)>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
     #[cfg(feature = "local-embed")]
     {
         if let Some(res) =
@@ -387,13 +418,18 @@ pub fn eligibility_scores<B: BlobStoreGet>(
 /// embedding remain unscorable, so the caller keeps them fail-open and warns.
 /// Returns `None` when no chunk is embedded at all (pure lexical fallback).
 #[cfg(feature = "local-embed")]
-pub fn semantic_eligibility_scores<B: BlobStoreGet>(
-    space: &TribleSet,
-    embeddings_space: &TribleSet,
+pub fn semantic_eligibility_scores<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
     reader: &B,
     query: &str,
     universe: &[Id],
-) -> Result<Option<(HashMap<Id, f32>, Vec<Id>)>> {
+) -> Result<Option<(HashMap<Id, f32>, Vec<Id>)>>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
     let mut embedded: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
     let mut unembedded: Vec<Id> = Vec::new();
     for &chunk in universe {
@@ -476,7 +512,7 @@ impl CoverOpts {
     }
 }
 
-/// Render the context-cover text from canonical Memory and shared Embeddings
+/// Render the context-cover text from maintained Memory and shared Embeddings
 /// views, using `reader` for their attachment blobs. The result is the
 /// antichain cover over all temporal memory positions, coarse → fine, fit to
 /// `opts.budget_chars` characters.
@@ -571,9 +607,9 @@ fn recollection_classes(
 /// Conservative charge of one structural position. A contextual substitution
 /// must not change whether a split fits, so the whole equivalence class is
 /// charged at its largest member rather than at the currently selected prose.
-fn recollection_class_cost<B: BlobStoreGet>(
+fn recollection_class_cost<B: BlobStoreGet, P: TriblePattern>(
     reader: &B,
-    space: &TribleSet,
+    space: &P,
     raw_spans: &[(i128, i128, Id)],
     raw_costs: &mut [Option<usize>],
     classes: &[Vec<usize>],
@@ -668,8 +704,8 @@ impl CoverHeadroom {
 }
 
 /// Compute [`CoverHeadroom`] without rendering a cover.
-pub fn cover_headroom<B: BlobStoreGet>(
-    space: &TribleSet,
+pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
     ws: &B,
     budget_chars: usize,
 ) -> Result<CoverHeadroom> {
@@ -743,12 +779,17 @@ fn refinement_pool(budget_chars: usize, floor_chars: usize) -> usize {
     budget_chars.saturating_sub(floor_chars) / quantum * quantum
 }
 
-pub fn render_cover<B: BlobStoreGet>(
-    space: &TribleSet,
-    embeddings_space: &TribleSet,
+pub fn render_cover<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
     reader: &B,
     opts: &CoverOpts,
-) -> Result<String> {
+) -> Result<String>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
     use std::fmt::Write as _;
 
     let budget_chars = opts.budget_chars;
@@ -1177,6 +1218,34 @@ mod headroom_tests {
     }
 
     #[test]
+    fn span_projection_keeps_additive_typed_observations() {
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let start_0 = point(0.0);
+        let start_10 = point(10.0);
+        let end_20 = point(20.0);
+        let end_30 = point(30.0);
+        let expected = vec![
+            (interval_key(start_0), interval_key(end_20), A),
+            (interval_key(start_0), interval_key(end_30), A),
+            (interval_key(start_10), interval_key(end_20), A),
+            (interval_key(start_10), interval_key(end_30), A),
+        ];
+        let facts = entity! {
+            ExclusiveId::force_ref(&A) @
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::start_at: start_0,
+            ctx::start_at: start_10,
+            ctx::end_at: end_20,
+            ctx::end_at: end_30,
+        };
+
+        assert_eq!(collect_chunk_spans(facts.facts()), expected);
+    }
+
+    #[test]
     fn recollection_classes_ignore_input_order() {
         let original = [(0, 100, C), (0, 100, A), (10, 20, B)];
         for permutation in [
@@ -1259,7 +1328,7 @@ mod headroom_tests {
 
     #[cfg(feature = "local-embed")]
     #[test]
-    fn competing_shared_embedding_observations_are_ambiguous() {
+    fn competing_shared_embedding_observations_are_arbitrated_deterministically() {
         let chunk = Id::new([0x61; 16]).unwrap();
         let mut fragment = Fragment::empty();
         let first = fragment.put::<Embedding768, _>(vec![0.0; 768]);
@@ -1269,8 +1338,10 @@ mod headroom_tests {
             embeddings::attr::embedding: first,
             embeddings::attr::embedding: second,
         };
-        let error = chunk_embedding_handle(fragment.facts(), chunk).unwrap_err();
-        assert!(error.to_string().contains("expected at most one"));
+        let selected = chunk_embedding_handle(fragment.facts(), chunk)
+            .unwrap()
+            .expect("one additive observation is selected");
+        assert_eq!(selected, first.min(second));
     }
 
     /// The pool is a whole number of quanta, so it is a CONSTANT while the

@@ -2957,39 +2957,45 @@ fn cmd_wake(
     let signer = load_signer(pile_path, key)?;
     let mut storage = open_pile_strict(pile_path)?;
     let result = (|| {
-        // Orient's situation sources stay separate maintained Succinct views.
-        // Memory-cover and Wiki rendering still cross their older public APIs,
-        // which currently accept TribleSet read models; contain that adaptation
-        // here instead of flattening the situation sources into one mini-store.
+        // Register every descriptor before freezing the one source watermark.
+        // Maintenance may append derived lattice nodes; all reads attach only
+        // after that work, from one later immutable pile snapshot.
         let sources = OrientSources::open(&mut storage, &signer, false)?;
-        let memory_collection =
-            open_configured(&mut storage, MEMORY_SCOPE_ID, signer.verifying_key())?;
-        let memory_reader = storage
-            .snapshot()
-            .map_err(|error| anyhow!("freeze Memory store snapshot: {error}"))?;
-        let (memory_facts, _) =
-            faculties::storage::read_fact_collection(memory_collection, &memory_reader)
-                .context("read Memory collection")?;
+        let memory_source = open_configured(&mut storage, MEMORY_SCOPE_ID, signer.verifying_key())?;
+        let memory_collection = FactCollection::new(&mut storage, memory_source)
+            .context("register maintained Memory collection")?;
         let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
             .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
-        let observation = maintain_and_observe_sources(&mut storage, &sources)?;
+        let instant = clock::now()?;
+        let source_snapshot = storage
+            .snapshot()
+            .map_err(|error| anyhow!("freeze shared wake source snapshot: {error}"))?;
+        drop(
+            memory_collection
+                .maintain_at(&mut storage, &source_snapshot, instant)
+                .context("maintain Memory collection")?,
+        );
+        let observation =
+            maintain_and_observe_sources_at(&mut storage, &source_snapshot, &sources, instant)?;
+        drop(source_snapshot);
+        let memory_facts = observation
+            .snapshot
+            .collection_at(memory_collection.rank9(), instant)
+            .context("observe maintained Memory collection")?
+            .view::<FactArchive>()
+            .context("attach maintained Memory collection")?;
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
             .transpose()?;
 
-        // `render_cover` reads the collection directly. This used to build the
-        // whole MemoryCatalog first and keep only `node_ids()`, to filter out
-        // preserved random-id legacy rows — of which there are ZERO on the live
-        // pile (measured 2026-09-01: 5,404 tagged, 5,404 canonical). It cost
-        // ~1.2 s of a ~10.4 s `orient wake` to hide nothing, and `memory_cover`
-        // never touched the catalog in the first place. Removed alongside the
-        // identical gate in `bin/memory.rs`; if legacy rows ever surface they
-        // are superseded explicitly rather than hidden by re-derived ids.
+        // Plain wake never consults Embeddings. The maintained Memory archive
+        // remains shard-backed and is queried directly; opaque historical ids
+        // are ordinary additive journal members.
         let cover = render_cover(
             &memory_facts,
             &TribleSet::new(),
-            &memory_reader,
+            &observation.snapshot,
             &CoverOpts::plain(chars),
         )?;
 

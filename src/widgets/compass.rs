@@ -26,7 +26,6 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::View;
@@ -38,6 +37,7 @@ use crate::schemas::compass::{
     board as compass, interval_key, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID,
     KIND_NOTE_ID,
 };
+use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 /// Handle to a long-string blob (titles, notes).
@@ -160,16 +160,14 @@ struct NoteRow {
 
 // ── Cached compass query state ───────────────────────────────────────
 
-/// Holds a cached fact space for the compass dataset plus its semantic revision.
+/// Holds the semantic revision currently reflected by the UI state.
 struct CompassLive {
-    space: TribleSet,
     cached_revision: DatasetRevision,
 }
 
 impl CompassLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
         Self {
-            space: dataset.facts.clone(),
             cached_revision: dataset.revision,
         }
     }
@@ -189,7 +187,7 @@ impl CompassLive {
     fn notes_for(&self, dataset: DatasetView<'_>, goal_id: Id) -> Vec<NoteRow> {
         let mut raw: Vec<(Id, TextHandle, (i128, i128))> = find!(
             (event: Id, note_handle: TextHandle, ts: (i128, i128)),
-            pattern!(&self.space, [{
+            pattern!(dataset.facts, [{
                 ?event @
                 metadata::tag: &KIND_NOTE_ID,
                 compass::task: &goal_id,
@@ -216,7 +214,7 @@ impl CompassLive {
 /// Goals whose parent isn't in the lane are treated as roots; the
 /// caller has already sorted the lane in display order so the
 /// children-by-parent buckets inherit that order.
-fn order_rows(lane_ids: Vec<Id>, space: &TribleSet) -> Vec<(Id, usize)> {
+fn order_rows(lane_ids: Vec<Id>, space: &FactArchive) -> Vec<(Id, usize)> {
     let ids: HashSet<Id> = lane_ids.iter().copied().collect();
     let mut children: HashMap<Id, Vec<Id>> = HashMap::new();
     let mut has_visible_parent: HashSet<Id> = HashSet::new();
@@ -282,7 +280,7 @@ fn order_rows(lane_ids: Vec<Id>, space: &TribleSet) -> Vec<(Id, usize)> {
 /// case-insensitive (caller lowercases). Each piece is a per-goal query
 /// — single-digit µs each per JP's measurement.
 fn goal_matches_search(
-    space: &TribleSet,
+    space: &FactArchive,
     dataset: DatasetView<'_>,
     goal_id: Id,
     needle: &str,
@@ -327,7 +325,7 @@ fn goal_matches_search(
 fn produce_items(
     axis: SortAxis,
     goals: Vec<(Id, String, i128)>,
-    space: &TribleSet,
+    space: &FactArchive,
 ) -> Vec<RenderItem> {
     let mut sorted = goals;
     // Most-recently-changed first across all axes; this is the
@@ -472,7 +470,7 @@ impl CompassBoard {
         // status. The storage boundary attached this index for the exact same
         // source cover; equal timestamps resolve by event id without doing
         // the identity/order joins again here.
-        let space = &live.space;
+        let space = dataset.facts;
         let status_register = dataset
             .lww_register(compass::status_of.id(), metadata::created_at.id())
             .expect("Compass datasets carry their maintained status register");
@@ -539,9 +537,9 @@ impl CompassBoard {
         let expanded_goal = &mut self.expanded_goal;
         let collapsed = &mut self.collapsed;
         let axis_ref = &mut self.axis;
-        // Borrow the live tribleset so renderers can run on-the-spot
+        // Borrow the live fact archive so renderers can run on-the-spot
         // queries instead of reading hydrated row fields.
-        let space = &live.space;
+        let space = dataset.facts;
 
         ctx.section("Compass", |ctx| {
             // Header: total + per-status breakdown as small colored
@@ -702,7 +700,7 @@ fn render_goal_card(
     goal_id: Id,
     status: &str,
     depth: usize,
-    space: &TribleSet,
+    space: &FactArchive,
     dataset: DatasetView<'_>,
     expanded_goal: &mut Option<Id>,
     expanded_notes: Option<&(Id, Vec<NoteRow>)>,

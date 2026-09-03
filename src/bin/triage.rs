@@ -5,23 +5,19 @@
 //! faculty collections it needs from that same snapshot under each
 //! collection's explicit admission policy.
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
-use faculties::cognition as cognition_model;
+use faculties::clock;
 use faculties::memory::{self as memory_model};
 use faculties::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
     chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
     chunk_start_at, chunk_summary_handle,
 };
-use faculties::message as message_model;
-use faculties::relations as relations_model;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
 use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
@@ -29,7 +25,7 @@ use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
 use faculties::secrets::storage::{self as vaults, VaultDiscovery};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -38,11 +34,11 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::repo::memoryrepo::MemoryRepo;
+use triblespace::core::collection::{CollectionSnapshotExt, Support};
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -129,12 +125,12 @@ enum Command {
 
 /// One canonical collection value observed through the frozen pile prefix.
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 impl CollectionView {
-    fn source(&self) -> SourceView<'_> {
+    fn source(&self) -> SourceView<'_, FactArchive> {
         SourceView {
             facts: &self.facts,
             reader: &self.reader,
@@ -145,10 +141,10 @@ impl CollectionView {
 /// One immutable pile world plus one explicit local signing identity.
 struct TriageSnapshot {
     pile_path: PathBuf,
-    pile: RefCell<Option<Pile>>,
-    signer: SigningKey,
+    pile: Option<Pile>,
     store_snapshot: PileSnapshot,
-    collections: std::collections::BTreeMap<Id, Collection<SimpleArchive>>,
+    collections: BTreeMap<Id, FactArchive>,
+    secrets: VaultDiscovery,
 }
 
 impl TriageSnapshot {
@@ -157,64 +153,80 @@ impl TriageSnapshot {
         // new identity, create a pile, or admit somebody else's COMMITs.
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
         let mut pile = open_pile_strict(&cli.pile)?;
+        let mut registered = Vec::new();
+        for (scope, label) in [
+            (COGNITION_SCOPE_ID, "Cognition"),
+            (HEADSPACE_SCOPE_ID, "Headspace"),
+            (MEMORY_SCOPE_ID, "Memory"),
+            (RELATIONS_SCOPE_ID, "Relations"),
+            (MESSAGE_SCOPE_ID, "Message"),
+        ] {
+            let source = faculties::collection_names::open_configured(
+                &mut pile,
+                scope,
+                signer.verifying_key(),
+            )
+            .with_context(|| format!("register {label} collection"))?;
+            let facts = FactCollection::new(&mut pile, source)
+                .with_context(|| format!("register maintained {label} collection"))?;
+            registered.push((scope, label, facts));
+        }
+
+        // One immutable watermark chooses every source's resident support.
+        let before = pile
+            .snapshot()
+            .context("freeze pre-maintenance Triage snapshot")?;
+        let instant = clock::now()?;
+        let supports = registered
+            .iter()
+            .map(|(_, label, facts)| {
+                before
+                    .collection_at(facts.source(), instant)
+                    .with_context(|| format!("observe resident {label} collection"))
+                    .map(|snapshot| snapshot.support().clone())
+            })
+            .collect::<Result<Vec<Support>>>()?;
+        drop(before);
+
+        for ((_, label, facts), support) in registered.iter().zip(&supports) {
+            drop(
+                facts
+                    .maintain_exact(&mut pile, support)
+                    .with_context(|| format!("maintain {label} fact archive"))?,
+            );
+        }
+        let secrets = vaults::discover_local_vaults(&mut pile, &signer)
+            .context("discover readable Secrets vaults")?;
+
+        // Every ordinary fact query attaches through this one later snapshot.
         let store_snapshot = pile
             .snapshot()
-            .context("freeze Triage native store snapshot")?;
-        let mut registry = MemoryRepo::default();
-        let mut collections = std::collections::BTreeMap::new();
-        for scope in [
-            COGNITION_SCOPE_ID,
-            HEADSPACE_SCOPE_ID,
-            MEMORY_SCOPE_ID,
-            RELATIONS_SCOPE_ID,
-            MESSAGE_SCOPE_ID,
-        ] {
-            let collection = match faculties::collection_names::configured_handle(scope)? {
-                Some(handle) => faculties::collection_names::open_exact_in(
-                    &store_snapshot,
-                    scope,
-                    signer.verifying_key(),
-                    handle,
-                )?,
-                None => {
-                    faculties::collection_names::open(&mut registry, scope, signer.verifying_key())
-                        .with_context(|| {
-                            format!(
-                                "register {} collection",
-                                faculties::collection_names::require_name(scope)
-                            )
-                        })?
-                }
-            };
-            collections.insert(scope, collection);
+            .context("freeze maintained Triage snapshot")?;
+        let mut collections = BTreeMap::new();
+        for ((scope, label, facts), support) in registered.iter().zip(&supports) {
+            let archive = store_snapshot
+                .collection_exact(facts.rank9(), support)
+                .with_context(|| format!("attach maintained {label} collection"))?
+                .view::<FactArchive>()
+                .with_context(|| format!("read maintained {label} collection"))?;
+            collections.insert(*scope, archive);
         }
+
         Ok(Self {
             pile_path: cli.pile.clone(),
-            pile: RefCell::new(Some(pile)),
-            signer,
+            pile: Some(pile),
             store_snapshot,
             collections,
+            secrets,
         })
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
-        let collection = self
+        let facts = self
             .collections
             .get(&scope)
-            .copied()
-            .with_context(|| format!("{label} collection was not registered in snapshot"))?;
-        let facts = if self
-            .store_snapshot
-            .metadata(collection.handle())
-            .with_context(|| format!("inspect {label} collection descriptor"))?
-            .is_some()
-        {
-            faculties::storage::read_fact_collection(collection, &self.store_snapshot)
-                .map(|(facts, _)| facts)
-                .with_context(|| format!("materialize {label} collection"))?
-        } else {
-            TribleSet::new()
-        };
+            .cloned()
+            .with_context(|| format!("{label} collection was not attached in snapshot"))?;
         Ok(CollectionView {
             facts,
             reader: self.store_snapshot.clone(),
@@ -222,50 +234,33 @@ impl TriageSnapshot {
     }
 
     fn cognition(&self) -> Result<CollectionView> {
-        let view = self.view(COGNITION_SCOPE_ID, "Cognition")?;
-        cognition_model::validate_catalog(&view.reader, &view.facts)
-            .context("validate Cognition collection")?;
-        Ok(view)
+        self.view(COGNITION_SCOPE_ID, "Cognition")
     }
 
     fn headspace(&self) -> Result<(CollectionView, TriageHeadspace)> {
-        let secrets = self.secrets()?;
+        let secrets = self.secrets();
         let view = self.view(HEADSPACE_SCOPE_ID, "Headspace")?;
         let projected = triage_model::project_headspace(view.source(), secrets.snapshot())?;
         Ok((view, projected))
     }
 
-    fn secrets(&self) -> Result<VaultDiscovery> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Triage snapshot is already closed"))?;
-        vaults::discover_local_vaults(pile, &self.signer)
-            .context("discover readable Secrets vaults")
+    fn secrets(&self) -> &VaultDiscovery {
+        &self.secrets
     }
 
     fn memory(&self) -> Result<CollectionView> {
-        let view = self.view(MEMORY_SCOPE_ID, "Memory")?;
-        memory_model::validate_catalog(&view.reader, &view.facts)
-            .context("validate Memory collection")?;
-        Ok(view)
+        self.view(MEMORY_SCOPE_ID, "Memory")
     }
 
     fn relations(&self) -> Result<CollectionView> {
-        let view = self.view(RELATIONS_SCOPE_ID, "Relations")?;
-        relations_model::validate_catalog(&view.reader, &view.facts)
-            .context("validate Relations collection")?;
-        Ok(view)
+        self.view(RELATIONS_SCOPE_ID, "Relations")
     }
 
-    fn messages(&self, relations: &CollectionView) -> Result<CollectionView> {
-        let view = self.view(MESSAGE_SCOPE_ID, "Message")?;
-        message_model::validate_catalog(&view.reader, &view.facts, &relations.facts)
-            .context("validate Message collection")?;
-        Ok(view)
+    fn messages(&self) -> Result<CollectionView> {
+        self.view(MESSAGE_SCOPE_ID, "Message")
     }
 
-    fn close(self, result: Result<()>) -> Result<()> {
+    fn close(mut self, result: Result<()>) -> Result<()> {
         let close = self.close_inner();
         match (result, close) {
             (Ok(()), Ok(())) => Ok(()),
@@ -276,8 +271,8 @@ impl TriageSnapshot {
         }
     }
 
-    fn close_inner(&self) -> Result<()> {
-        let Some(pile) = self.pile.borrow_mut().take() else {
+    fn close_inner(&mut self) -> Result<()> {
+        let Some(pile) = self.pile.take() else {
             return Ok(());
         };
         pile.close()
@@ -405,18 +400,6 @@ fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
     Ok(view.to_string())
 }
 
-fn at_most_one<T>(entity: Id, field: &str, values: Vec<T>) -> Result<Option<T>> {
-    let count = values.len();
-    let mut values = values.into_iter();
-    match (values.next(), count) {
-        (None, 0) => Ok(None),
-        (Some(value), 1) => Ok(Some(value)),
-        _ => bail!(
-            "Cognition entity {entity:x} has {count} values for {field}; expected at most one"
-        ),
-    }
-}
-
 fn cmd_scan(
     cli: &Cli,
     snapshot: &TriageSnapshot,
@@ -426,9 +409,9 @@ fn cmd_scan(
 ) -> Result<()> {
     let cognition = snapshot.cognition()?;
     let headspace_view = snapshot.view(HEADSPACE_SCOPE_ID, "Headspace")?;
-    let secrets = snapshot.secrets()?;
+    let secrets = snapshot.secrets();
     let relations = snapshot.relations()?;
-    let messages = snapshot.messages(&relations)?;
+    let messages = snapshot.messages()?;
     let now = now_key()?;
     let stale_ns = stale_min.max(0) as i128 * 60 * 1_000_000_000;
     let report = triage_model::project_scan(
@@ -449,7 +432,6 @@ fn cmd_scan(
 
     println!("Triage scan");
     println!("- pile: {}", cli.pile.display());
-    println!("- Cognition facts: {}", cognition.facts.len());
     let config_heads = report.headspace.config_heads();
     let active_profile_heads = report.headspace.active_profile_heads();
     if let Some(error) = report.headspace.unsettled_reason() {
@@ -564,7 +546,6 @@ fn cmd_loops(snapshot: &TriageSnapshot, recent: usize, min_repeat: usize) -> Res
     let report = build_loop_report(&state, recent, min_repeat);
     let now = now_key()?;
     println!("Triage loops");
-    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- recent attempts: {}", report.recent.len());
     if let Some(head) = &report.contiguous_head {
         println!(
@@ -712,7 +693,6 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     let rows = build_timeline_rows(&exec_state, &model_state, &reason_state, recent);
     let now = now_key()?;
     println!("Triage timeline");
-    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- rows: {}", rows.len());
     println!();
     for row in rows {
@@ -726,7 +706,7 @@ fn cmd_timeline(snapshot: &TriageSnapshot, recent: usize) -> Result<()> {
     Ok(())
 }
 
-fn chunk_text(reader: &PileSnapshot, space: &TribleSet, id: Id) -> Result<String> {
+fn chunk_text<P: TriblePattern>(reader: &PileSnapshot, space: &P, id: Id) -> Result<String> {
     if let Some(handle) = chunk_summary_handle(space, id) {
         return memory_model::read_text(reader, handle);
     }
@@ -739,7 +719,7 @@ fn chunk_text(reader: &PileSnapshot, space: &TribleSet, id: Id) -> Result<String
     Ok(String::new())
 }
 
-fn format_span(space: &TribleSet, id: Id) -> String {
+fn format_span<P: TriblePattern>(space: &P, id: Id) -> String {
     let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
         return "?".to_string();
     };
@@ -770,7 +750,6 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
         0.0
     };
     println!("Memory cover");
-    println!("- Memory facts: {}", memory.facts.len());
     println!("- chunks: {}", chunk_ids.len());
     println!();
     println!("Budget");
@@ -806,7 +785,7 @@ fn cmd_cover(snapshot: &TriageSnapshot, full: bool) -> Result<()> {
     Ok(())
 }
 
-fn matching_memory_nodes(space: &TribleSet, prefix: &str) -> BTreeSet<Id> {
+fn matching_memory_nodes<P: TriblePattern>(space: &P, prefix: &str) -> BTreeSet<Id> {
     let prefix = prefix.trim().to_ascii_uppercase();
     let mut matches: BTreeSet<Id> = BTreeSet::new();
     for id in all_chunk_ids(space) {
@@ -895,9 +874,9 @@ fn select_request(state: &ExecState, turn: usize) -> Result<&ExecRequestRow> {
     })
 }
 
-fn contexts_for_turn(
+fn contexts_for_turn<P: TriblePattern>(
     reader: &PileSnapshot,
-    space: &TribleSet,
+    space: &P,
     exec_state: &ExecState,
     request: Id,
 ) -> Result<Vec<ContextCandidate>> {
@@ -913,13 +892,9 @@ fn contexts_for_turn(
     }
     let mut contexts = Vec::new();
     for (result, thought) in pairs {
-        let handle = at_most_one(
-            thought,
-            "cog::context",
+        for handle in
             find!(value: TextHandle, pattern!(space, [{ thought @ cog::context: ?value }]))
-                .collect(),
-        )?;
-        if let Some(handle) = handle {
+        {
             let json = read_text(reader, handle)?;
             let messages = serde_json::from_str(&json)
                 .with_context(|| format!("parse context JSON for thought {thought:x}"))?;
@@ -984,7 +959,6 @@ fn cmd_turn(snapshot: &TriageSnapshot, turn: usize, full: bool) -> Result<()> {
     let request = select_request(&exec_state, turn)?;
     let now = now_key()?;
     println!("Turn #{turn}");
-    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- request: {}", fmt_id(request.id));
     println!(
         "- requested: {} ({})",
@@ -1129,7 +1103,6 @@ fn cmd_context(snapshot: &TriageSnapshot, turn: usize, full: bool, raw: bool) ->
         return Ok(());
     }
     println!("Contexts for turn #{turn} [{}]", fmt_id(request.id));
-    println!("- Cognition facts: {}", cognition.facts.len());
     println!("- command: {}", truncate_single_line(&request.command, 60));
     println!("- candidates: {}", contexts.len());
     for candidate in contexts {
@@ -1302,7 +1275,6 @@ mod tests {
         fixture.publish(MEMORY_SCOPE_ID, right);
 
         let view = fixture.snapshot().memory().unwrap();
-        assert!(!view.facts.is_empty());
         let ids: BTreeSet<Id> = all_chunk_ids(&view.facts).into_iter().collect();
         assert_eq!(ids, BTreeSet::from([left_id, right_id]));
     }
@@ -1365,18 +1337,22 @@ mod tests {
     }
 
     #[test]
-    fn read_snapshot_never_appends_to_the_pile() {
+    fn maintained_snapshot_is_idempotent_after_first_open() {
         let fixture = Fixture::new();
         fixture.publish(
             COGNITION_SCOPE_ID,
             exec_request(test_id(0x71), "read only", 10.0),
         );
-        let before = std::fs::metadata(&fixture.pile).unwrap().len();
         let snapshot = fixture.snapshot();
         snapshot.cognition().unwrap();
         snapshot.close(Ok(())).unwrap();
-        let after = std::fs::metadata(&fixture.pile).unwrap().len();
-        assert_eq!(after, before);
+        let maintained = std::fs::metadata(&fixture.pile).unwrap().len();
+
+        let snapshot = fixture.snapshot();
+        snapshot.cognition().unwrap();
+        snapshot.close(Ok(())).unwrap();
+        let reopened = std::fs::metadata(&fixture.pile).unwrap().len();
+        assert_eq!(reopened, maintained);
     }
 
     #[test]

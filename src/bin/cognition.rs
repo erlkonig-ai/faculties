@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand};
 use faculties::cognition;
 use faculties::collection_names::open_configured;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::collection::CollectionSnapshotExt;
 use triblespace::core::repo::SnapshotSource;
 
 #[derive(Parser)]
@@ -40,15 +41,33 @@ enum Command {
 fn check(cli: &Cli) -> Result<()> {
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
     let mut pile = open_pile_strict(&cli.pile)?;
-    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let collection = FactCollection::new(&mut pile, source)
+        .context("register maintained Cognition fact collection")?;
     let result = (|| {
-        let store_snapshot = pile.snapshot().context("freeze Cognition store snapshot")?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .context("materialize native Cognition collection")?;
-        cognition::validate_catalog(&store_snapshot, &facts)?;
+        let instant = faculties::clock::now()?;
+        let before = pile
+            .snapshot()
+            .context("freeze Cognition source snapshot")?;
+        drop(
+            collection
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Cognition fact collection")?,
+        );
+        drop(before);
+
+        let snapshot = pile
+            .snapshot()
+            .context("freeze maintained Cognition snapshot")?;
+        let facts = snapshot
+            .collection_at(collection.rank9(), instant)
+            .context("observe Cognition Rank9 collection")?
+            .view::<FactArchive>()
+            .context("read Cognition Rank9 collection")?;
+        cognition::validate_archive(&snapshot, &facts)?;
         println!(
             "Cognition scope {DEFAULT_SCOPE_ID:X}: {} facts validated",
-            facts.len()
+            facts.iter().count()
         );
         Ok(())
     })();

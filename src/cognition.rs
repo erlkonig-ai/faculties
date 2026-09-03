@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
@@ -24,7 +25,7 @@ use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
 use crate::schemas::triage::{cog, context, exec, model_chat, KIND_EXEC_RESULT_ID};
-use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict, FactArchive};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -105,9 +106,10 @@ pub fn publish_event(
 
 /// Publish a command's complete event sequence with one pile lifetime.
 ///
-/// Each event remains its own independently transferable commit. The whole
-/// prospective union is preflighted before the first append, so multi-event
-/// commands cannot partially publish because their later event is invalid.
+/// Each event remains its own independently transferable commit. Every event
+/// is validated before the first append, so a later invalid event cannot make
+/// a multi-event command partially publish. Ambient history is deliberately
+/// absent from this publication-unit invariant.
 pub fn publish_events(
     pile_path: &Path,
     key_path: Option<&Path>,
@@ -120,29 +122,13 @@ pub fn publish_events(
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let result = (|| {
-        let store_snapshot = pile
-            .snapshot()
-            .context("freeze native Cognition store snapshot")?;
-        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
-            .context("read native Cognition collection")?;
-        let staged = fragments
-            .iter()
-            .fold(Fragment::empty(), |mut all, fragment| {
-                all += fragment.clone();
-                all
-            });
-        validate_candidate(&store_snapshot, &facts, &staged)
-            .context("preflight authored Cognition events")?;
-        drop(store_snapshot);
-        fragments
-            .into_iter()
-            .map(|fragment| {
-                pile.commit(collection, &signer, fragment)
-                    .context("commit authored Cognition event")
-            })
-            .collect()
-    })();
+    let result = fragments
+        .into_iter()
+        .map(|fragment| {
+            pile.commit(collection, &signer, fragment)
+                .context("commit authored Cognition event")
+        })
+        .collect();
     finish_pile(pile, result)
 }
 
@@ -151,7 +137,7 @@ pub fn publish_events(
 /// this is the publication-unit invariant which makes an event independently
 /// transferable and recoverable.
 pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
-    validate_singleton_fields(fragment.facts())?;
+    validate_singleton_fields(fragment.facts().iter().copied())?;
     let facts = fragment.facts().clone();
     let metafacts = fragment.metafacts().clone();
     let mut local = fragment.clone();
@@ -159,8 +145,8 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
         .blobs_mut()
         .snapshot()
         .context("snapshot self-contained Cognition event attachments")?;
-    validate_payloads_in_store(&reader, &facts)?;
-    validate_payloads_in_store(&reader, &metafacts)?;
+    validate_payloads_in_store(&reader, facts.iter().copied())?;
+    validate_payloads_in_store(&reader, metafacts.iter().copied())?;
     Ok(())
 }
 
@@ -168,8 +154,15 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
 /// Cognition value. Unknown facts remain legal: Cognition is intentionally a
 /// shared event ledger, and independent producers may extend its ontology.
 pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    validate_singleton_fields(facts)?;
-    validate_payloads(reader, None::<&PileSnapshot>, facts)
+    validate_singleton_fields(facts.iter().copied())?;
+    validate_payloads(reader, None::<&PileSnapshot>, facts.iter().copied())
+}
+
+/// Explicitly validate a maintained Cognition archive without flattening its
+/// physical shards into a second fact store.
+pub fn validate_archive(reader: &PileSnapshot, facts: &FactArchive) -> Result<()> {
+    validate_singleton_fields(facts.iter())?;
+    validate_payloads(reader, None::<&PileSnapshot>, facts.iter())
 }
 
 /// Validate the union which a publication would create, including payloads
@@ -181,29 +174,32 @@ pub fn validate_candidate(
 ) -> Result<()> {
     let mut union = current.clone();
     union += fragment.facts().clone();
-    validate_singleton_fields(&union)?;
+    validate_singleton_fields(union.iter().copied())?;
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
         .snapshot()
         .context("snapshot staged Cognition attachments")?;
-    validate_payloads(reader, Some(&overlay), &union)
+    validate_payloads(reader, Some(&overlay), union.iter().copied())
 }
 
 /// Strict payload validation used while projecting each frozen legacy delta.
 /// This is crate-visible so the stopped-world migration can fail on a missing
 /// typed attachment rather than silently relying on conservative reachability.
 pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    validate_payloads(reader, None::<&PileSnapshot>, facts)
+    validate_payloads(reader, None::<&PileSnapshot>, facts.iter().copied())
 }
 
 /// Exec results whose completion point lies in the inclusive interval,
 /// ordered chronologically. Raw projected tuple identity is preserved.
-pub fn exec_results_in_range(
-    facts: &TribleSet,
+pub fn exec_results_in_range<P>(
+    facts: &P,
     query_start: Epoch,
     query_end: Epoch,
-) -> Vec<(Id, IntervalValue)> {
+) -> Vec<(Id, IntervalValue)>
+where
+    P: TriblePattern + ?Sized,
+{
     let start = query_start.to_tai_duration().total_nanoseconds();
     let end = query_end.to_tai_duration().total_nanoseconds();
     let mut results: Vec<_> = find!(
@@ -298,7 +294,7 @@ fn singleton_field(attribute: Id) -> Option<&'static str> {
     Some(field)
 }
 
-fn validate_singleton_fields(facts: &TribleSet) -> Result<()> {
+fn validate_singleton_fields(facts: impl IntoIterator<Item = Trible>) -> Result<()> {
     let mut seen = BTreeMap::<(Id, Id), [u8; 32]>::new();
     for fact in facts {
         let entity = *fact.e();
@@ -386,7 +382,7 @@ fn raw_blob_field(attribute: Id) -> Option<&'static str> {
 fn validate_payloads<Overlay>(
     reader: &PileSnapshot,
     overlay: Option<&Overlay>,
-    facts: &TribleSet,
+    facts: impl IntoIterator<Item = Trible>,
 ) -> Result<()>
 where
     Overlay: BlobStoreGet + BlobStoreMeta,
@@ -407,7 +403,10 @@ where
     Ok(())
 }
 
-fn validate_payloads_in_store<Store>(store: &Store, facts: &TribleSet) -> Result<()>
+fn validate_payloads_in_store<Store>(
+    store: &Store,
+    facts: impl IntoIterator<Item = Trible>,
+) -> Result<()>
 where
     Store: BlobStoreGet,
 {
@@ -482,8 +481,9 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 mod tests {
     use std::fs::File;
 
-    use crate::storage::load_signer;
+    use crate::storage::{load_signer, FactCollection};
     use crate::test_support::initialize_open_collection_fixture;
+    use triblespace::core::collection::CollectionSnapshotExt;
 
     use super::*;
 
@@ -520,14 +520,22 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
-        validate_catalog(&store_snapshot, &facts).unwrap();
-        assert_eq!(facts, event.into_facts());
+        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = FactCollection::new(&mut pile, source).unwrap();
+        let instant = crate::clock::now().unwrap();
+        let before = pile.snapshot().unwrap();
+        drop(collection.maintain_at(&mut pile, &before, instant).unwrap());
+        drop(before);
+        let snapshot = pile.snapshot().unwrap();
+        let facts = snapshot
+            .collection_at(collection.rank9(), instant)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        validate_archive(&snapshot, &facts).unwrap();
+        assert_eq!(facts.iter().collect::<TribleSet>(), event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));
-        drop(store_snapshot);
+        drop(snapshot);
         pile.close().unwrap();
     }
 
@@ -573,7 +581,7 @@ mod tests {
             reason::text: Inline::new([8; 32]),
         }
         .into_facts();
-        let error = validate_singleton_fields(&facts).unwrap_err();
+        let error = validate_singleton_fields(facts.iter().copied()).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting reason::text"));
     }
 

@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
-use triblespace::macros::{entity, find, pattern};
+use triblespace::macros::{entity, exists, find, pattern};
 use triblespace::prelude::*;
 
 use crate::schemas::decide::{
@@ -259,27 +259,17 @@ pub fn resolution_fragment(
     Ok((fragment, id))
 }
 
-fn exactly_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
-    let count = values.len();
-    if count != 1 {
-        bail!("Decide entity {entity:x} has {count} values for {field}; expected exactly one");
-    }
-    Ok(values.into_iter().next().unwrap())
-}
-
-fn at_most_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    let count = values.len();
-    if count > 1 {
-        bail!("Decide entity {entity:x} has {count} values for {field}; expected at most one");
-    }
-    Ok(values.into_iter().next())
-}
-
-pub fn decision_anchors(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn decision_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_DECISION }])).collect()
 }
 
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
 }
 
@@ -287,111 +277,151 @@ fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
 /// native ontology. Legacy random-id pro/con rows deliberately do not; an
 /// additive cutover can therefore retain them as provenance without making
 /// them part of the live Decide view.
-fn canonical_factor_ids(facts: &TribleSet) -> BTreeSet<Id> {
-    ids_of_kind(facts, KIND_PRO)
-        .union(&ids_of_kind(facts, KIND_CON))
-        .copied()
-        .filter(|id| {
-            facts
-                .iter()
-                .any(|fact| fact.e() == id && fact.a() == &factor::occurrence.id())
-        })
-        .collect()
+fn canonical_factor_ids<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
+    find!(
+        id: Id,
+        and!(
+            or!(
+                pattern!(facts, [{ ?id @ metadata::tag: &KIND_PRO }]),
+                pattern!(facts, [{ ?id @ metadata::tag: &KIND_CON }]),
+            ),
+            pattern!(facts, [{ ?id @ factor::occurrence: _?occurrence }]),
+        )
+    )
+    .collect()
 }
 
-pub fn decision_genesis(facts: &TribleSet, id: Id) -> Result<DecisionGenesis> {
+/// Read one decodable genesis projection.
+///
+/// Extra open-world facts do not invalidate the entity. If foreign additive
+/// facts provide several typed scalar projections, the byte-smallest one is
+/// selected deterministically rather than imposing collection-wide
+/// cardinality in Rust.
+pub fn decision_genesis<P>(facts: &P, id: Id) -> Result<DecisionGenesis>
+where
+    P: TriblePattern,
+{
+    let (decision, title, created_at) = find!(
+        (decision: Id, title: TextHandle, created_at: IntervalValue),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_DECISION_GENESIS,
+            decide::of: ?decision,
+            metadata::name: ?title,
+            metadata::created_at: ?created_at,
+        }])
+    )
+    .min()
+    .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable genesis projection"))?;
     Ok(DecisionGenesis {
         id,
-        decision: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ decide::of: ?value }])).collect(),
-            id,
-            "decide::of",
-        )?,
-        title: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ metadata::name: ?value }])).collect(),
-            id,
-            "metadata::name",
-        )?,
-        context: at_most_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ metadata::description: ?value }]))
-                .collect(),
-            id,
-            "metadata::description",
-        )?,
-        about: at_most_one(
-            find!(value: Id, pattern!(facts, [{ id @ decide::about: ?value }])).collect(),
-            id,
-            "decide::about",
-        )?,
-        created_at: exactly_one(
-            find!(value: IntervalValue, pattern!(facts, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-            id,
-            "metadata::created_at",
-        )?,
+        decision,
+        title,
+        context: find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ metadata::description: ?value }])
+        )
+        .min(),
+        about: find!(value: Id, pattern!(facts, [{ id @ decide::about: ?value }])).min(),
+        created_at,
     })
 }
 
-pub fn genesis_for_decision(facts: &TribleSet, decision_id: Id) -> Result<Option<DecisionGenesis>> {
-    let ids: Vec<Id> = find!(
+pub fn genesis_for_decision<P>(facts: &P, decision_id: Id) -> Result<Option<DecisionGenesis>>
+where
+    P: TriblePattern,
+{
+    find!(
         id: Id,
-        pattern!(facts, [{ ?id @ metadata::tag: &KIND_DECISION_GENESIS, decide::of: &decision_id }])
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_DECISION_GENESIS,
+            decide::of: &decision_id,
+            metadata::name: _?title,
+            metadata::created_at: _?created_at,
+        }])
     )
-    .collect();
-    match ids.as_slice() {
-        [] => Ok(None),
-        [id] => Ok(Some(decision_genesis(facts, *id)?)),
-        _ => bail!("decision {decision_id:x} has {} genesis records", ids.len()),
-    }
+    .min()
+    .map(|id| decision_genesis(facts, id))
+    .transpose()
 }
 
-pub fn factor_record(facts: &TribleSet, id: Id) -> Result<FactorRecord> {
+pub fn factor_record<P>(facts: &P, id: Id) -> Result<FactorRecord>
+where
+    P: TriblePattern,
+{
     let pro = find!(
-        value: Id,
-        pattern!(facts, [{ id @ metadata::tag: ?value }])
+        (occurrence: Id, decision: Id, text: TextHandle, created_at: IntervalValue),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_PRO,
+            factor::occurrence: ?occurrence,
+            factor::about_decision: ?decision,
+            metadata::name: ?text,
+            metadata::created_at: ?created_at,
+        }])
     )
-    .any(|value| value == KIND_PRO);
+    .map(|(occurrence, decision, text, created_at)| {
+        (FactorSide::Pro, occurrence, decision, text, created_at)
+    });
     let con = find!(
-        value: Id,
-        pattern!(facts, [{ id @ metadata::tag: ?value }])
+        (occurrence: Id, decision: Id, text: TextHandle, created_at: IntervalValue),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_CON,
+            factor::occurrence: ?occurrence,
+            factor::about_decision: ?decision,
+            metadata::name: ?text,
+            metadata::created_at: ?created_at,
+        }])
     )
-    .any(|value| value == KIND_CON);
-    let side = match (pro, con) {
-        (true, false) => FactorSide::Pro,
-        (false, true) => FactorSide::Con,
-        _ => bail!("factor {id:x} must have exactly one pro/con side marker"),
-    };
+    .map(|(occurrence, decision, text, created_at)| {
+        (FactorSide::Con, occurrence, decision, text, created_at)
+    });
+    let (side, occurrence, decision, text, created_at) = pro
+        .chain(con)
+        .min_by(|left, right| {
+            left.0
+                .kind()
+                .cmp(&right.0.kind())
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.4.cmp(&right.4))
+        })
+        .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable factor projection"))?;
     Ok(FactorRecord {
         id,
-        occurrence: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ factor::occurrence: ?value }])).collect(),
-            id,
-            "factor::occurrence",
-        )?,
-        decision: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ factor::about_decision: ?value }])).collect(),
-            id,
-            "factor::about_decision",
-        )?,
+        occurrence,
+        decision,
         side,
-        text: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ metadata::name: ?value }])).collect(),
-            id,
-            "metadata::name",
-        )?,
-        created_at: exactly_one(
-            find!(value: IntervalValue, pattern!(facts, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-            id,
-            "metadata::created_at",
-        )?,
+        text,
+        created_at,
     })
 }
 
-pub fn factors_for_decision(facts: &TribleSet, decision_id: Id) -> Result<Vec<FactorRecord>> {
-    let mut records = canonical_factor_ids(facts)
+pub fn factors_for_decision<P>(facts: &P, decision_id: Id) -> Result<Vec<FactorRecord>>
+where
+    P: TriblePattern,
+{
+    let ids: BTreeSet<Id> = find!(
+        id: Id,
+        and!(
+            or!(
+                pattern!(facts, [{ ?id @ metadata::tag: &KIND_PRO }]),
+                pattern!(facts, [{ ?id @ metadata::tag: &KIND_CON }]),
+            ),
+            pattern!(facts, [{ ?id @
+                factor::occurrence: _?occurrence,
+                factor::about_decision: &decision_id,
+                metadata::name: _?text,
+                metadata::created_at: _?created_at,
+            }]),
+        )
+    )
+    .collect();
+    let mut records = ids
         .into_iter()
-        .map(|id| validate_factor_intrinsic(facts, id))
+        .map(|id| factor_record(facts, id))
         .filter_map(|record| match record {
             Ok(record) if record.decision == decision_id => Some(Ok(record)),
             Ok(_) => None,
@@ -402,29 +432,32 @@ pub fn factors_for_decision(facts: &TribleSet, decision_id: Id) -> Result<Vec<Fa
     Ok(records)
 }
 
-pub fn resolution_snapshot(facts: &TribleSet, id: Id) -> Result<ResolutionSnapshot> {
+pub fn resolution_snapshot<P>(facts: &P, id: Id) -> Result<ResolutionSnapshot>
+where
+    P: TriblePattern,
+{
+    let (decision, outcome, forced, finished_at) = find!(
+        (decision: Id, outcome: TextHandle, forced: bool, finished_at: IntervalValue),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_RESOLUTION_SNAPSHOT,
+            resolution::of: ?decision,
+            decide::outcome: ?outcome,
+            resolution::forced: ?forced,
+            metadata::finished_at: ?finished_at,
+        }])
+    )
+    .min()
+    .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable resolution projection"))?;
     Ok(ResolutionSnapshot {
         id,
-        decision: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ resolution::of: ?value }])).collect(),
-            id,
-            "resolution::of",
-        )?,
-        outcome: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ decide::outcome: ?value }])).collect(),
-            id,
-            "decide::outcome",
-        )?,
-        result: at_most_one(
-            find!(value: Id, pattern!(facts, [{ id @ resolution::result: ?value }])).collect(),
-            id,
-            "resolution::result",
-        )?,
-        forced: exactly_one(
-            find!(value: bool, pattern!(facts, [{ id @ resolution::forced: ?value }])).collect(),
-            id,
-            "resolution::forced",
-        )?,
+        decision,
+        outcome,
+        result: find!(
+            value: Id,
+            pattern!(facts, [{ id @ resolution::result: ?value }])
+        )
+        .min(),
+        forced,
         evidence: sorted_ids(find!(
             value: Id,
             pattern!(facts, [{ id @ resolution::evidence: ?value }])
@@ -433,12 +466,7 @@ pub fn resolution_snapshot(facts: &TribleSet, id: Id) -> Result<ResolutionSnapsh
             value: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?value }])
         )),
-        finished_at: exactly_one(
-            find!(value: IntervalValue, pattern!(facts, [{ id @ metadata::finished_at: ?value }]))
-                .collect(),
-            id,
-            "metadata::finished_at",
-        )?,
+        finished_at,
     })
 }
 
@@ -453,14 +481,7 @@ fn ensure_intrinsic(id: Id, record: Fragment, label: &str) -> Result<TribleSet> 
 }
 
 fn validate_factor_intrinsic(facts: &TribleSet, id: Id) -> Result<FactorRecord> {
-    let record = factor_record(facts, id)?;
-    if !decision_anchors(facts).contains(&record.decision) {
-        bail!(
-            "factor {id:x} names undeclared decision {:x}",
-            record.decision
-        );
-    }
-    point_interval(record.created_at, "factor creation time")?;
+    let record = validate_factor_semantics(facts, id)?;
     ensure_intrinsic(
         id,
         factor_record_fragment(
@@ -475,28 +496,60 @@ fn validate_factor_intrinsic(facts: &TribleSet, id: Id) -> Result<FactorRecord> 
     Ok(record)
 }
 
+fn validate_factor_semantics<P>(facts: &P, id: Id) -> Result<FactorRecord>
+where
+    P: TriblePattern,
+{
+    let record = factor_record(facts, id)?;
+    if !exists!(pattern!(facts, [{
+        record.decision @ metadata::tag: &KIND_DECISION
+    }])) {
+        bail!(
+            "factor {id:x} names undeclared decision {:x}",
+            record.decision
+        );
+    }
+    point_interval(record.created_at, "factor creation time")?;
+    Ok(record)
+}
+
 /// Validate one resolution in isolation from head selection. This keeps the
 /// fork-visible resolver honest even when a caller has not first run whole-
 /// catalog validation.
 fn validate_resolution_snapshot_intrinsic(facts: &TribleSet, id: Id) -> Result<ResolutionSnapshot> {
+    let snapshot = validate_resolution_snapshot_semantics(facts, id)?;
+    ensure_intrinsic(
+        id,
+        resolution_record_fragment(&snapshot),
+        "resolution snapshot",
+    )?;
+    Ok(snapshot)
+}
+
+/// Validate only the relations which affect the observable resolution state.
+///
+/// This deliberately does not recompute an intrinsic id or compare an entity's
+/// complete fact set. Those checks belong to explicit migration/test
+/// validation; ordinary readers consume the decodable open-world projection.
+fn validate_resolution_snapshot_semantics<P>(facts: &P, id: Id) -> Result<ResolutionSnapshot>
+where
+    P: TriblePattern,
+{
     let snapshot = resolution_snapshot(facts, id)?;
-    if !decision_anchors(facts).contains(&snapshot.decision) {
+    if !exists!(pattern!(facts, [{
+        snapshot.decision @ metadata::tag: &KIND_DECISION
+    }])) {
         bail!(
             "resolution {id:x} names undeclared decision {:x}",
             snapshot.decision
         );
     }
     point_interval(snapshot.finished_at, "resolution finish time")?;
-    ensure_intrinsic(
-        id,
-        resolution_record_fragment(&snapshot),
-        "resolution snapshot",
-    )?;
 
     let mut has_pro = false;
     let mut has_con = false;
     for evidence in &snapshot.evidence {
-        let factor = validate_factor_intrinsic(facts, *evidence)
+        let factor = validate_factor_semantics(facts, *evidence)
             .with_context(|| format!("validate evidence {evidence:x} for resolution {id:x}"))?;
         if factor.decision != snapshot.decision {
             bail!("resolution {id:x} cites evidence from another decision");
@@ -561,12 +614,18 @@ fn dag_heads(nodes: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
         .collect())
 }
 
-fn resolution_result(facts: &TribleSet, decision_id: Id) -> Result<Resolution> {
+fn resolution_result<P>(facts: &P, decision_id: Id) -> Result<Resolution>
+where
+    P: TriblePattern,
+{
     let ids: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @
             metadata::tag: &KIND_RESOLUTION_SNAPSHOT,
             resolution::of: &decision_id,
+            decide::outcome: _?outcome,
+            resolution::forced: _?forced,
+            metadata::finished_at: _?finished_at,
         }])
     )
     .collect();
@@ -576,7 +635,7 @@ fn resolution_result(facts: &TribleSet, decision_id: Id) -> Result<Resolution> {
     let mut snapshots = BTreeMap::new();
     let mut graph = BTreeMap::new();
     for id in ids {
-        let snapshot = validate_resolution_snapshot_intrinsic(facts, id)?;
+        let snapshot = validate_resolution_snapshot_semantics(facts, id)?;
         graph.insert(id, snapshot.predecessors.clone());
         snapshots.insert(id, snapshot);
     }
@@ -608,7 +667,10 @@ fn resolution_result(facts: &TribleSet, decision_id: Id) -> Result<Resolution> {
     }
 }
 
-pub fn resolution(facts: &TribleSet, decision_id: Id) -> Resolution {
+pub fn resolution<P>(facts: &P, decision_id: Id) -> Resolution
+where
+    P: TriblePattern,
+{
     resolution_result(facts, decision_id)
         .unwrap_or_else(|error| Resolution::Invalid(format!("{error:#}")))
 }

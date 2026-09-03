@@ -25,6 +25,7 @@
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::storage::FactArchive;
 use crate::triage::{
     self as triage_model, PatternSummary, QueueCounts, ScanOptions, ScanReport, ScanSources,
     SourceView, UnreadMessages, UnreadUnavailable,
@@ -163,7 +164,7 @@ struct TriageLive {
     suggestions: Vec<String>,
 }
 
-fn source_view<'a>(view: DatasetView<'a>) -> SourceView<'a> {
+fn source_view<'a>(view: DatasetView<'a>) -> SourceView<'a, FactArchive> {
     SourceView {
         facts: view.facts,
         reader: view.reader,

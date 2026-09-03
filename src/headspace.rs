@@ -21,6 +21,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{entity, find, pattern};
@@ -416,7 +417,10 @@ fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     values
 }
 
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
 }
 
@@ -434,7 +438,10 @@ pub fn active_facts(facts: &TribleSet) -> TribleSet {
         .collect()
 }
 
-fn raw_profile(facts: &TribleSet, id: Id) -> Result<RawProfileSnapshot> {
+fn raw_profile<P>(facts: &P, id: Id) -> Result<RawProfileSnapshot>
+where
+    P: TriblePattern + ?Sized,
+{
     Ok(RawProfileSnapshot {
         anchor: exactly_one(
             find!(v: Id, pattern!(facts, [{ id @ playground_config::model_profile_id: ?v }]))
@@ -500,7 +507,10 @@ fn raw_profile(facts: &TribleSet, id: Id) -> Result<RawProfileSnapshot> {
     })
 }
 
-fn raw_config(facts: &TribleSet, id: Id) -> Result<RawConfigSnapshot> {
+fn raw_config<P>(facts: &P, id: Id) -> Result<RawConfigSnapshot>
+where
+    P: TriblePattern + ?Sized,
+{
     Ok(RawConfigSnapshot {
         active_profile: exactly_one(
             find!(v: Id, pattern!(facts, [{ id @ playground_config::active_model_profile_id: ?v }])).collect(),
@@ -630,10 +640,23 @@ fn dag_heads(nodes: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
     Ok(heads)
 }
 
-fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
-    let anchors = ids_of_kind(facts, KIND_PROFILE_ANCHOR_ID);
-    let profile_ids = ids_of_kind(facts, KIND_MODEL_PROFILE_ID);
-    let config_ids = ids_of_kind(facts, KIND_CONFIG_ID);
+fn project_structure<P>(facts: &P) -> Result<RawCatalog>
+where
+    P: TriblePattern + ?Sized,
+{
+    let live = ids_of_kind(facts, KIND_LIVE_RECORD);
+    let anchors = ids_of_kind(facts, KIND_PROFILE_ANCHOR_ID)
+        .intersection(&live)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let profile_ids = ids_of_kind(facts, KIND_MODEL_PROFILE_ID)
+        .intersection(&live)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let config_ids = ids_of_kind(facts, KIND_CONFIG_ID)
+        .intersection(&live)
+        .copied()
+        .collect::<BTreeSet<_>>();
     if let Some(id) = anchors.intersection(&profile_ids).next() {
         bail!("Headspace entity {id:x} is both an anchor and profile snapshot");
     }
@@ -754,20 +777,16 @@ where
     load_text_from(reader, handle)
 }
 
-fn parse_catalog<Overlay>(
+fn project_catalog<P, Overlay>(
     reader: &PileSnapshot,
     overlay: Option<&Overlay>,
-    facts: &TribleSet,
+    facts: &P,
 ) -> Result<Catalog>
 where
+    P: TriblePattern + ?Sized,
     Overlay: BlobStoreGet + BlobStoreMeta,
 {
-    let facts = active_facts(facts);
-    let raw = validate_structure(&facts)?;
-    let mut expected = TribleSet::new();
-    for &anchor in raw.profile_heads.keys() {
-        expected += profile_anchor_fragment(anchor);
-    }
+    let raw = project_structure(facts)?;
     let mut profile_snapshots = BTreeMap::new();
     let mut profiles_by_anchor: BTreeMap<Id, BTreeMap<Id, Snapshot<ProfileValue>>> =
         BTreeMap::new();
@@ -804,11 +823,6 @@ where
             )?,
             chars_per_token: count_u64(snapshot.chars_per_token, id, "model_chars_per_token")?,
         };
-        let (canonical, canonical_id) = profile_snapshot_fragment(&value, &snapshot.predecessors)?;
-        if id != canonical_id {
-            bail!("profile snapshot {id:x} does not match intrinsic root {canonical_id:x}");
-        }
-        expected += canonical.into_facts();
         let snapshot = Snapshot {
             id,
             value,
@@ -839,11 +853,6 @@ where
                 .transpose()?,
             exec_sandbox_profile: snapshot.exec_sandbox_profile,
         };
-        let (canonical, canonical_id) = config_snapshot_fragment(&value, &snapshot.predecessors)?;
-        if id != canonical_id {
-            bail!("config snapshot {id:x} does not match intrinsic root {canonical_id:x}");
-        }
-        expected += canonical.into_facts();
         config_snapshots.insert(
             id,
             Snapshot {
@@ -851,14 +860,6 @@ where
                 value,
                 predecessors: snapshot.predecessors.clone(),
             },
-        );
-    }
-
-    if expected != facts {
-        let missing = expected.difference(&facts).len();
-        let unexpected = facts.difference(&expected).len();
-        bail!(
-            "Headspace catalog is not an exact canonical ontology ({missing} missing, {unexpected} unexpected facts)"
         );
     }
 
@@ -878,11 +879,58 @@ where
     })
 }
 
+/// Strictly validate one materialized import value.
+///
+/// Ordinary reads deliberately use [`project_catalog`] instead: derived ids
+/// are opaque, and unknown additive facts are legal in the open-world model.
+/// This exact reconstruction remains only for explicit untrusted migration and
+/// import boundaries where the historical format itself is what is being
+/// checked.
+fn parse_catalog_strict<Overlay>(
+    reader: &PileSnapshot,
+    overlay: Option<&Overlay>,
+    facts: &TribleSet,
+) -> Result<Catalog>
+where
+    Overlay: BlobStoreGet + BlobStoreMeta,
+{
+    let facts = active_facts(facts);
+    let catalog = project_catalog(reader, overlay, &facts)?;
+    let mut expected = TribleSet::new();
+    for &anchor in catalog.profiles.keys() {
+        expected += profile_anchor_fragment(anchor);
+    }
+    for (&id, snapshot) in &catalog.profile_snapshots {
+        let (canonical, canonical_id) =
+            profile_snapshot_fragment(&snapshot.value, &snapshot.predecessors)?;
+        if id != canonical_id {
+            bail!("profile snapshot {id:x} does not match intrinsic root {canonical_id:x}");
+        }
+        expected += canonical.into_facts();
+    }
+    for (&id, snapshot) in &catalog.config_snapshots {
+        let (canonical, canonical_id) =
+            config_snapshot_fragment(&snapshot.value, &snapshot.predecessors)?;
+        if id != canonical_id {
+            bail!("config snapshot {id:x} does not match intrinsic root {canonical_id:x}");
+        }
+        expected += canonical.into_facts();
+    }
+    if expected != facts {
+        let missing = expected.difference(&facts).len();
+        let unexpected = facts.difference(&expected).len();
+        bail!(
+            "Headspace import is not an exact canonical ontology ({missing} missing, {unexpected} unexpected facts)"
+        );
+    }
+    Ok(catalog)
+}
+
 /// Validate one exact materialized Headspace collection. Forks are valid;
 /// malformed records, wrong-track lineage, cycles, and missing payloads are
 /// not.
 pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    parse_catalog(reader, None::<&PileSnapshot>, facts).map(drop)
+    parse_catalog_strict(reader, None::<&PileSnapshot>, facts).map(drop)
 }
 
 /// Preflight the exact set union publication would create, including staged
@@ -899,17 +947,23 @@ pub fn validate_catalog_union(
         .blobs_mut()
         .snapshot()
         .expect("MemoryBlobStore reader creation is infallible");
-    parse_catalog(reader, Some(&overlay), &union)
+    parse_catalog_strict(reader, Some(&overlay), &union)
 }
 
 /// Resolve the exact catalog. Structural or payload failure is represented as
 /// `Resolution::Invalid`, never as defaults or an implicit winner.
-pub fn project(reader: &PileSnapshot, facts: &TribleSet) -> Catalog {
+pub fn project<P>(reader: &PileSnapshot, facts: &P) -> Catalog
+where
+    P: TriblePattern + ?Sized,
+{
     project_result(reader, facts).unwrap_or_else(Catalog::invalid)
 }
 
-pub fn project_result(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
-    parse_catalog(reader, None::<&PileSnapshot>, facts)
+pub fn project_result<P>(reader: &PileSnapshot, facts: &P) -> Result<Catalog>
+where
+    P: TriblePattern + ?Sized,
+{
+    project_catalog(reader, None::<&PileSnapshot>, facts)
 }
 
 /// Require every exact credential reference in every native snapshot to name
@@ -998,7 +1052,6 @@ pub fn open_active_secrets<R: BlobStoreGet>(
     secrets: &SecretsSnapshot<R>,
     signing_key: &SigningKey,
 ) -> Result<OpenedSecrets> {
-    validate_secret_references(headspace, secrets)?;
     let (config, profile) = settled_active(headspace)?;
     Ok(OpenedSecrets {
         model_api_key: open_utf8_secret(
@@ -1090,11 +1143,13 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::SigningKey;
+    use triblespace::core::collection::CollectionSnapshotExt;
     use triblespace::core::repo::pile::Pile;
 
     use crate::collection_names::open_configured;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
+    use crate::storage::{FactArchive, FactCollection};
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1111,11 +1166,19 @@ mod tests {
         pile
     }
 
-    fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (TribleSet, PileSnapshot) {
-        let collection = open_configured(pile, scope, signer.verifying_key()).unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
-        (facts, store_snapshot)
+    fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (FactArchive, PileSnapshot) {
+        let source = open_configured(pile, scope, signer.verifying_key()).unwrap();
+        let collection = FactCollection::new(pile, source).unwrap();
+        let instant = crate::clock::now().unwrap();
+        let before = pile.snapshot().unwrap();
+        let reader = collection.maintain_at(pile, &before, instant).unwrap();
+        drop(before);
+        let facts = reader
+            .collection_at(collection.rank9(), instant)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        (facts, reader)
     }
 
     fn commit(pile: &mut Pile, scope: Id, signer: &SigningKey, fragment: Fragment) {
@@ -1354,13 +1417,17 @@ mod tests {
         let signer = SigningKey::from_bytes(&[0x62; 32]);
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, legacy.clone());
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        assert!(legacy.facts().iter().all(|fact| facts.contains(fact)));
+        let materialized = facts.iter().collect::<TribleSet>();
+        assert!(legacy
+            .facts()
+            .iter()
+            .all(|fact| materialized.contains(fact)));
         let catalog = project_result(&reader, &facts).unwrap();
         assert!(matches!(catalog.config, Resolution::Missing));
         assert!(catalog.profiles.is_empty());
 
         let graft = entity! { legacy_id @ metadata::tag: &KIND_LIVE_RECORD };
-        let error = validate_catalog_union(&reader, &facts, &graft).unwrap_err();
+        let error = validate_catalog_union(&reader, &materialized, &graft).unwrap_err();
         assert!(
             format!("{error:#}").contains("expected exactly one")
                 || format!("{error:#}").contains("exact canonical ontology")

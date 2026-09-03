@@ -2,31 +2,30 @@
 //!
 //! Widgets consume borrowed [`DatasetView`] values through a keyed
 //! [`WidgetContext`]. `StorageState` owns the currently loaded snapshot and the
-//! top-bar path selector and has no write path. Every source is materialized
-//! from its fixed V4 descriptor-handle collection under the pile's durable
+//! top-bar path selector. Every source is observed through a maintained
+//! Rank9-accelerated Succinct view derived from its fixed V4 descriptor-handle
+//! collection under the pile's durable
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
-//! not participate in this boundary. The interactive viewer loads the full
-//! catalog; focused capture binaries request only their source dependency
-//! closure. Loading may ensure deterministic derived indexes for the exact
-//! admitted cover; those unsigned artifacts are cache exhaust, not an
-//! authoritative write path. Most sources are fixed descriptor-handle
-//! collections. Secrets is deliberately different: it is the aggregate of
-//! exact vault epochs for which the pile signer has one verified exact `READ`
-//! capability.
+//! not participate in this boundary. The interactive viewer loads all sources;
+//! focused capture binaries request only their source dependency
+//! closure. Loading may maintain deterministic derived views for the exact
+//! resident source support observed before work begins; those unsigned
+//! artifacts are cache exhaust, not authoritative writes. Most sources are
+//! fixed descriptor-handle collections. Secrets is deliberately different: it
+//! is the aggregate of exact vault epochs for which the pile signer has one
+//! verified exact `READ` capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::lww_register::{LwwIndex, RegisterCoordinatesMapping};
 use triblespace::core::collection::observed_union::{ObserveStatesMapping, ObservedIndex};
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
+    CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
-use triblespace::core::trible::TribleSet;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
@@ -48,7 +47,7 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as vaults, SecretsSnapshot};
-use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 
 /// Stable logical input requested by a widget.
 ///
@@ -101,16 +100,13 @@ impl SourceKey {
         Self::Wiki,
     ];
 
-    /// Logical inputs that must accompany this source for rendering or
-    /// validation. Storage layout stays out of this relation: the transitive
-    /// closure is computed over semantic source keys and scopes are deduplicated
-    /// only afterwards.
+    /// Logical inputs that must accompany this source for rendering. Storage
+    /// layout stays out of this relation: the transitive closure is computed
+    /// over semantic source keys and scopes are deduplicated only afterwards.
     fn dependencies(self) -> &'static [Self] {
         match self {
             Self::Headspace => &[Self::Secrets],
-            Self::Mail => &[Self::Files, Self::Decide, Self::Relations, Self::Secrets],
-            Self::Messages | Self::Planner | Self::Status => &[Self::Relations],
-            Self::Teams => &[Self::Secrets],
+            Self::Mail | Self::Messages | Self::Planner | Self::Status => &[Self::Relations],
             Self::Triage => &[
                 Self::Headspace,
                 Self::Secrets,
@@ -136,28 +132,22 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 /// Opaque cache identity for one logical dataset view.
 ///
 /// Widgets compare revisions for equality; the storage backend owns their
-/// construction. The digest combines the canonical descriptor handle with an
-/// opaque in-process fingerprint of the materialized fact set. It is a widget
-/// cache token, not a durable collection record or an authorization proof.
+/// construction. The digest combines the foundational descriptor handle with
+/// its exact resident support. It is a widget cache token, not a durable
+/// collection record or an authorization proof, and physical Succinct
+/// compaction cannot perturb it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DatasetRevision([u8; 32]);
 
 impl DatasetRevision {
-    fn from_collection(collection: CollectionHandle, facts: &TribleSet) -> Self {
+    fn from_collection(collection: CollectionHandle, support: &Support) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.dataset-revision.v1");
+        hasher.update(b"faculties.viewer.dataset-revision.v2");
         hasher.update(&collection.raw);
-        match facts.fingerprint().as_u128() {
-            Some(fingerprint) => {
-                hasher.update(&[1]);
-                hasher.update(&fingerprint.to_le_bytes());
-            }
-            None => {
-                hasher.update(&[0]);
-                hasher.update(&[0; 16]);
-            }
+        for member in support.members() {
+            hasher.update(&member.raw);
         }
-        hasher.update(&(facts.len() as u128).to_le_bytes());
+        hasher.update(&(support.len() as u128).to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 
@@ -189,9 +179,9 @@ impl DatasetRevision {
 }
 
 /// Borrowed immutable input for one widget dataset.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct DatasetView<'a> {
-    pub facts: &'a TribleSet,
+    pub facts: &'a FactArchive,
     pub reader: &'a PileSnapshot,
     pub revision: DatasetRevision,
     lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
@@ -247,9 +237,8 @@ pub struct SecretsView<'a> {
     pub revision: DatasetRevision,
 }
 
-#[derive(Clone, Debug)]
 struct LoadedDataset {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
     revision: DatasetRevision,
     lww_registers: BTreeMap<(Id, Id), LwwIndex>,
@@ -259,12 +248,13 @@ struct LoadedDataset {
 impl LoadedDataset {
     fn new(
         collection: CollectionHandle,
-        facts: TribleSet,
+        facts: FactArchive,
+        support: &Support,
         reader: PileSnapshot,
         lww_registers: BTreeMap<(Id, Id), LwwIndex>,
         observed_orders: BTreeMap<Id, ObservedIndex>,
     ) -> Self {
-        let revision = DatasetRevision::from_collection(collection, &facts);
+        let revision = DatasetRevision::from_collection(collection, support);
         Self {
             facts,
             reader,
@@ -290,7 +280,7 @@ struct LoadedSecrets {
     revision: DatasetRevision,
 }
 
-struct LoadedCatalog {
+struct LoadedInputs {
     datasets: BTreeMap<SourceKey, LoadedDataset>,
     secrets: Option<LoadedSecrets>,
 }
@@ -410,7 +400,7 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
     },
 ];
 
-fn materialization_scopes(sources: &BTreeSet<SourceKey>) -> Vec<(Id, &'static str)> {
+fn collection_scopes(sources: &BTreeSet<SourceKey>) -> Vec<(Id, &'static str)> {
     let mut scopes: Vec<_> = COLLECTION_SOURCE_CATALOG
         .iter()
         .filter(|source| sources.contains(&source.key))
@@ -439,7 +429,7 @@ pub struct StorageState {
 }
 
 impl StorageState {
-    /// Stash a pile path for lazy full-catalog loading. No I/O happens here,
+    /// Stash a pile path for lazy all-source loading. No I/O happens here,
     /// which keeps eager notebook-state construction cheap.
     pub fn new(pile_path: impl Into<PathBuf>) -> Self {
         Self::with_sources(pile_path, SourceKey::ALL)
@@ -448,9 +438,9 @@ impl StorageState {
     /// Stash a pile path for lazy, source-scoped loading.
     ///
     /// The requested semantic inputs are expanded through their declarative
-    /// dependency closure. Only those collection scopes are materialized and
-    /// validated; consumers can observe the requested keys and their logical
-    /// dependencies, but never unrelated keys that happen to share a scope.
+    /// dependency closure. Only those collection scopes are maintained;
+    /// consumers can observe the requested keys and their logical dependencies,
+    /// but never unrelated keys that happen to share a scope.
     pub fn for_sources(
         pile_path: impl Into<PathBuf>,
         sources: impl IntoIterator<Item = SourceKey>,
@@ -522,10 +512,10 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match load_consistent_catalog(&self.pile_path, &self.sources) {
-            Ok((catalog, stamp)) => {
-                self.datasets = Some(catalog.datasets);
-                self.secrets = catalog.secrets;
+        match load_consistent_inputs(&self.pile_path, &self.sources) {
+            Ok((inputs, stamp)) => {
+                self.datasets = Some(inputs.datasets);
+                self.secrets = inputs.secrets;
                 self.stamp = Some(stamp);
                 self.error = None;
             }
@@ -630,16 +620,16 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     })
 }
 
-fn load_consistent_catalog(
+fn load_consistent_inputs(
     path: &Path,
     sources: &BTreeSet<SourceKey>,
-) -> Result<(LoadedCatalog, FileStamp), String> {
+) -> Result<(LoadedInputs, FileStamp), String> {
     for _ in 0..2 {
         let before = file_stamp(path)?;
-        let datasets = load_catalog(path, sources)?;
+        let inputs = load_inputs(path, sources)?;
         let after = file_stamp(path)?;
         if before == after {
-            return Ok((datasets, after));
+            return Ok((inputs, after));
         }
     }
     Err(format!(
@@ -648,40 +638,105 @@ fn load_consistent_catalog(
     ))
 }
 
-fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCatalog, String> {
+fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
     let signer = load_signer(path, None)
         .map_err(|error| format!("load durable collection signer: {error:#}"))?;
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, (Collection<SimpleArchive>, TribleSet, Support)>::new();
+        let mut by_scope = BTreeMap::<Id, (FactCollection, Support)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
         let mut collections = Vec::new();
-        for (scope, label) in materialization_scopes(sources) {
-            let collection = open_configured(&mut pile, scope, signer.verifying_key())
+        for (scope, label) in collection_scopes(sources) {
+            let source = open_configured(&mut pile, scope, signer.verifying_key())
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
+            let collection = FactCollection::new(&mut pile, source)
+                .map_err(|error| format!("register maintained {label} collection: {error:#}"))?;
             collections.push((scope, label, collection));
         }
-        let store_snapshot = pile
+
+        let compass_register = sources
+            .contains(&SourceKey::Compass)
+            .then(|| {
+                crate::compass::status_register_collection(&mut pile, signer.verifying_key())
+                    .map_err(|error| format!("register Compass status collection: {error:#}"))
+            })
+            .transpose()?;
+        let wiki_observations = sources
+            .contains(&SourceKey::Wiki)
+            .then(|| {
+                crate::wiki::observed_collection(&mut pile, signer.verifying_key())
+                    .map_err(|error| format!("register Wiki observation collection: {error:#}"))
+            })
+            .transpose()?;
+
+        // All source supports come from one immutable pre-work watermark.
+        let before = pile
             .snapshot()
-            .map_err(|error| format!("freeze viewer store snapshot: {error}"))?;
+            .map_err(|error| format!("freeze pre-maintenance viewer snapshot: {error}"))?;
+        let instant = triblespace::core::clock::epoch_now();
         for (scope, label, collection) in collections {
-            let (facts, support) =
-                crate::storage::read_fact_collection(collection, &store_snapshot)
-                    .map_err(|error| format!("materialize {label} collection: {error:#}"))?;
-            by_scope.insert(scope, (collection, facts, support));
+            let support = before
+                .collection_at(collection.source(), instant)
+                .map_err(|error| format!("observe resident {label} collection: {error:#}"))?
+                .support()
+                .clone();
+            by_scope.insert(scope, (collection, support));
+        }
+        drop(before);
+
+        for (scope, (collection, support)) in &by_scope {
+            let label = COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|source| source.scope == *scope)
+                .expect("every maintained viewer scope has a source label")
+                .label;
+            drop(
+                collection
+                    .maintain_exact(&mut pile, support)
+                    .map_err(|error| format!("maintain {label} fact archive: {error:#}"))?,
+            );
         }
 
-        if let Some((_, _, support)) = by_scope.get(&COMPASS_SCOPE_ID) {
-            let target =
-                crate::compass::status_register_collection(&mut pile, signer.verifying_key())
-                    .map_err(|error| format!("register Compass status collection: {error:#}"))?;
-            let maintained = pile
-                .maintain_exact::<RegisterCoordinatesMapping>(target, support)
-                .map_err(|error| format!("maintain Compass status register: {error}"))?;
-            let index = maintained
+        if let (Some(target), Some((_, support))) =
+            (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
+        {
+            drop(
+                pile.maintain_exact::<RegisterCoordinatesMapping>(target, support)
+                    .map_err(|error| format!("maintain Compass status register: {error}"))?,
+            );
+        }
+
+        if let (Some(target), Some((_, support))) =
+            (wiki_observations, by_scope.get(&WIKI_SCOPE_ID))
+        {
+            drop(
+                pile.maintain_exact::<ObserveStatesMapping>(target, support)
+                    .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
+            );
+        }
+
+        let secrets = sources
+            .contains(&SourceKey::Secrets)
+            .then(|| {
+                vaults::discover_local_vaults(&mut pile, &signer)
+                    .map(LoadedSecrets::new)
+                    .map_err(|error| format!("discover readable Secrets vaults: {error:#}"))
+            })
+            .transpose()?;
+
+        // Maintenance returns snapshots per operation, but every attached
+        // viewer input is deliberately read through this one later snapshot.
+        let store_snapshot = pile
+            .snapshot()
+            .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?;
+
+        if let (Some(target), Some((_, support))) =
+            (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
+        {
+            let index = store_snapshot
                 .collection_exact(target, support)
                 .map_err(|error| format!("attach Compass status register: {error}"))?
                 .view::<LwwIndex>()
@@ -695,13 +750,10 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
             );
         }
 
-        if let Some((_, _, support)) = by_scope.get(&WIKI_SCOPE_ID) {
-            let target = crate::wiki::observed_collection(&mut pile, signer.verifying_key())
-                .map_err(|error| format!("register Wiki observation collection: {error:#}"))?;
-            let maintained = pile
-                .maintain_exact::<ObserveStatesMapping>(target, support)
-                .map_err(|error| format!("maintain Wiki supersession index: {error}"))?;
-            let index = maintained
+        if let (Some(target), Some((_, support))) =
+            (wiki_observations, by_scope.get(&WIKI_SCOPE_ID))
+        {
+            let index = store_snapshot
                 .collection_exact(target, support)
                 .map_err(|error| format!("attach Wiki supersession index: {error}"))?
                 .view::<ObservedIndex>()
@@ -712,30 +764,31 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                 .insert(triblespace::core::metadata::supersedes.id(), index);
         }
 
-        let secrets = sources
-            .contains(&SourceKey::Secrets)
-            .then(|| {
-                vaults::discover_local_vaults(&mut pile, &signer)
-                    .map(LoadedSecrets::new)
-                    .map_err(|error| format!("discover readable Secrets vaults: {error:#}"))
-            })
-            .transpose()?;
-
-        validate_catalog(
-            &store_snapshot,
-            &by_scope,
-            &observed_by_scope,
-            sources,
-            secrets.as_ref().map(|loaded| loaded.discovery.snapshot()),
-        )?;
+        let mut facts_by_scope = BTreeMap::new();
+        for (scope, (collection, support)) in &by_scope {
+            let label = COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|source| source.scope == *scope)
+                .expect("every maintained viewer scope has a source label")
+                .label;
+            let facts = store_snapshot
+                .collection_exact(collection.rank9(), support)
+                .map_err(|error| format!("attach maintained {label} collection: {error}"))?
+                .view::<FactArchive>()
+                .map_err(|error| format!("read maintained {label} collection: {error}"))?;
+            facts_by_scope.insert(*scope, facts);
+        }
 
         let datasets = COLLECTION_SOURCE_CATALOG
             .iter()
             .filter(|source| sources.contains(&source.key))
             .map(|source| {
-                let (collection, facts, _) = by_scope
+                let (collection, support) = by_scope
                     .get(&source.scope)
-                    .expect("every fixed viewer scope was materialized");
+                    .expect("every fixed viewer scope was maintained");
+                let facts = facts_by_scope
+                    .get(&source.scope)
+                    .expect("every maintained viewer scope was attached");
                 let lww_registers = lww_by_scope.get(&source.scope).cloned().unwrap_or_default();
                 let observed_orders = observed_by_scope
                     .get(&source.scope)
@@ -744,8 +797,9 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                 (
                     source.key,
                     LoadedDataset::new(
-                        collection.handle(),
+                        collection.source().handle(),
                         facts.clone(),
+                        support,
                         store_snapshot.clone(),
                         lww_registers,
                         observed_orders,
@@ -753,7 +807,7 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
                 )
             })
             .collect();
-        Ok(LoadedCatalog { datasets, secrets })
+        Ok(LoadedInputs { datasets, secrets })
     })();
 
     let closed = pile.close().map_err(|error| format!("close pile: {error}"));
@@ -763,137 +817,6 @@ fn load_catalog(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedCata
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(close_error)) => Err(format!("{error}; {close_error}")),
     }
-}
-
-fn validate_catalog(
-    reader: &PileSnapshot,
-    by_scope: &BTreeMap<Id, (Collection<SimpleArchive>, TribleSet, Support)>,
-    observed_by_scope: &BTreeMap<Id, BTreeMap<Id, ObservedIndex>>,
-    sources: &BTreeSet<SourceKey>,
-    secrets: Option<&SecretsSnapshot<PileSnapshot>>,
-) -> Result<(), String> {
-    let facts = |source: SourceKey| {
-        let scope = COLLECTION_SOURCE_CATALOG
-            .iter()
-            .find(|candidate| candidate.key == source)
-            .expect("every source key has a fixed collection scope")
-            .scope;
-        &by_scope
-            .get(&scope)
-            .expect("validator scope was materialized")
-            .1
-    };
-
-    if sources.contains(&SourceKey::Archive) {
-        match crate::blockdag::validate_catalog(reader, facts(SourceKey::Archive))
-            .map_err(|error| format!("validate Archive collection: {error:#}"))?
-        {
-            crate::blockdag::CatalogValidation::Accepted => {}
-            crate::blockdag::CatalogValidation::Pending { missing } => {
-                return Err(format!(
-                    "validate Archive collection: {} attachment blob(s) are missing",
-                    missing.len()
-                ));
-            }
-            crate::blockdag::CatalogValidation::Rejected(error) => {
-                return Err(format!("validate Archive collection: {error}"));
-            }
-        }
-    }
-    if sources.contains(&SourceKey::Atlas) {
-        crate::atlas::validate_catalog(reader, facts(SourceKey::Atlas))
-            .map_err(|error| format!("validate Atlas collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Compass) {
-        crate::compass::validate_known_payloads(reader, facts(SourceKey::Compass))
-            .map_err(|error| format!("validate Compass collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Decide) {
-        crate::decide::validate_catalog(reader, facts(SourceKey::Decide))
-            .map_err(|error| format!("validate Decide collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Discord) {
-        crate::discord::validate_catalog(reader, facts(SourceKey::Discord))
-            .map_err(|error| format!("validate Discord collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Files) {
-        crate::files::validate_catalog(reader, facts(SourceKey::Files))
-            .map_err(|error| format!("validate Files collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Headspace) {
-        let headspace = crate::headspace::project_result(reader, facts(SourceKey::Headspace))
-            .map_err(|error| format!("validate Headspace collection: {error:#}"))?;
-        crate::headspace::validate_secret_references(
-            &headspace,
-            secrets.expect("Headspace source closure includes Secrets"),
-        )
-        .map_err(|error| format!("validate Headspace secret references: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Relations) {
-        crate::relations::validate_catalog(reader, facts(SourceKey::Relations))
-            .map_err(|error| format!("validate Relations collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Messages) {
-        crate::message::validate_catalog(
-            reader,
-            facts(SourceKey::Messages),
-            facts(SourceKey::Relations),
-        )
-        .map_err(|error| format!("validate Messages collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Memory) {
-        crate::memory::validate_catalog(reader, facts(SourceKey::Memory))
-            .map_err(|error| format!("validate Memory collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Planner) {
-        crate::planner::validate_catalog(reader, facts(SourceKey::Planner))
-            .map_err(|error| format!("validate Planner collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Status) {
-        crate::status::validate_catalog(reader, facts(SourceKey::Status))
-            .map_err(|error| format!("validate Status collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Teams) {
-        crate::teams::validate_catalog(reader, facts(SourceKey::Teams))
-            .map_err(|error| format!("validate Teams collection: {error:#}"))?;
-        crate::teams::validate_auth_secret_references(
-            facts(SourceKey::Teams),
-            secrets.expect("Teams source closure includes Secrets"),
-        )
-        .map_err(|error| format!("validate Teams secret references: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Wiki) {
-        let observed = observed_by_scope
-            .get(&WIKI_SCOPE_ID)
-            .and_then(|orders| orders.get(&triblespace::core::metadata::supersedes.id()))
-            .ok_or_else(|| {
-                "validate Wiki collection: maintained supersession index missing".to_owned()
-            })?;
-        crate::wiki::validate_catalog_with_order(reader, facts(SourceKey::Wiki), observed)
-            .map_err(|error| format!("validate Wiki collection: {error:#}"))?;
-    }
-    if sources.contains(&SourceKey::Reason) || sources.contains(&SourceKey::Triage) {
-        let source = if sources.contains(&SourceKey::Reason) {
-            SourceKey::Reason
-        } else {
-            SourceKey::Triage
-        };
-        crate::cognition::validate_catalog(reader, facts(source))
-            .map_err(|error| format!("validate Cognition collection: {error:#}"))?;
-    }
-
-    if sources.contains(&SourceKey::Mail) {
-        crate::mail::validate_catalog(
-            reader,
-            facts(SourceKey::Mail),
-            facts(SourceKey::Files),
-            facts(SourceKey::Decide),
-            facts(SourceKey::Relations),
-            secrets.expect("Mail source closure includes Secrets"),
-        )
-        .map_err(|error| format!("validate Mail collection: {error:#}"))?;
-    }
-    Ok(())
 }
 
 fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, message: &str, color: egui::Color32) {
@@ -1009,6 +932,7 @@ mod tests {
         .unwrap();
         let text: View<str> = view.reader.get(text).unwrap();
         assert_eq!(&*text, "read only");
+        assert_eq!(view.facts.segment_count(), 1);
         let settled_length = std::fs::metadata(&path).unwrap().len();
         assert!(settled_length >= length);
         let _ = storage.context();
@@ -1059,7 +983,7 @@ mod tests {
         let reason = context.dataset(SourceKey::Reason).unwrap();
         let triage = context.dataset(SourceKey::Triage).unwrap();
         assert_eq!(reason.revision, triage.revision);
-        assert_eq!(reason.facts, triage.facts);
+        assert!(reason.facts.iter().eq(triage.facts.iter()));
     }
 
     #[test]
@@ -1086,13 +1010,7 @@ mod tests {
     fn source_dependencies_expand_transitively() {
         assert_eq!(
             source_closure([SourceKey::Mail]),
-            BTreeSet::from([
-                SourceKey::Decide,
-                SourceKey::Files,
-                SourceKey::Mail,
-                SourceKey::Relations,
-                SourceKey::Secrets,
-            ])
+            BTreeSet::from([SourceKey::Mail, SourceKey::Relations])
         );
         assert_eq!(
             source_closure([SourceKey::Headspace]),
@@ -1100,7 +1018,7 @@ mod tests {
         );
         assert_eq!(
             source_closure([SourceKey::Teams]),
-            BTreeSet::from([SourceKey::Secrets, SourceKey::Teams])
+            BTreeSet::from([SourceKey::Teams])
         );
         for source in [SourceKey::Messages, SourceKey::Planner, SourceKey::Status] {
             assert_eq!(
@@ -1182,7 +1100,7 @@ mod tests {
 
         let sources = source_closure([SourceKey::Reason, SourceKey::Triage]);
         assert_eq!(
-            materialization_scopes(&sources)
+            collection_scopes(&sources)
                 .into_iter()
                 .filter(|(scope, _)| *scope == COGNITION_SCOPE_ID)
                 .count(),
@@ -1194,11 +1112,11 @@ mod tests {
         let reason = context.dataset(SourceKey::Reason).unwrap();
         let triage = context.dataset(SourceKey::Triage).unwrap();
         assert_eq!(reason.revision, triage.revision);
-        assert_eq!(reason.facts, triage.facts);
+        assert!(reason.facts.iter().eq(triage.facts.iter()));
     }
 
     #[test]
-    fn unrelated_malformed_source_does_not_break_narrow_load_but_full_load_rejects_it() {
+    fn malformed_source_facts_do_not_block_ordinary_source_attachment() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("malformed-unrelated.pile");
         create_pile(&path);
@@ -1213,8 +1131,10 @@ mod tests {
         assert!(narrow.error().is_none());
 
         let mut full = StorageState::new(&path);
-        assert!(full.context().dataset(SourceKey::Reason).is_none());
-        assert!(full.error().unwrap().contains("Status"));
+        let context = full.context();
+        assert!(context.dataset(SourceKey::Reason).is_some());
+        assert!(context.dataset(SourceKey::Status).is_some());
+        assert!(full.error().is_none());
     }
 
     #[test]

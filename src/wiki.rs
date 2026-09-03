@@ -20,6 +20,7 @@ use triblespace::core::collection::observed_union::{
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
@@ -30,6 +31,7 @@ use crate::schemas::wiki::{
     revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
     KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
 };
+use crate::storage::{FactArchive, FactCollection};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
@@ -179,21 +181,17 @@ pub struct WikiCatalog {
     pub author_keys: BTreeMap<Id, PublicKeyValue>,
 }
 
-/// One coherent Wiki source snapshot and its exact maintained observation order.
-///
-/// Facts, cover, and reader are captured by one collection observation. The
-/// observed-set projection is then attached for exactly that source cover;
-/// its unsigned artifacts are cache exhaust and never additional authority.
-pub struct WikiSnapshot {
-    facts: TribleSet,
+/// One coherent, shard-preserving Wiki query snapshot and its exact maintained
+/// observation order.
+pub struct WikiQuerySnapshot {
+    facts: FactArchive,
     store_snapshot: PileSnapshot,
     observed: ObservedIndex,
-    catalog: WikiCatalog,
 }
 
-impl WikiSnapshot {
-    /// Materialized facts admitted by this exact snapshot.
-    pub fn facts(&self) -> &TribleSet {
+impl WikiQuerySnapshot {
+    /// Shard-preserving facts admitted by this exact snapshot.
+    pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
@@ -207,12 +205,38 @@ impl WikiSnapshot {
         &self.observed
     }
 
-    /// Strict Wiki read model resolved through the maintained observation order.
+    /// Consume the coherent snapshot into its query substrate and indexes.
+    pub fn into_parts(self) -> (FactArchive, PileSnapshot, ObservedIndex) {
+        (self.facts, self.store_snapshot, self.observed)
+    }
+}
+
+/// Strict detached Wiki projection retained for migrations and import
+/// preflight. Ordinary readers use [`WikiQuerySnapshot`] instead.
+pub struct WikiSnapshot {
+    facts: TribleSet,
+    store_snapshot: PileSnapshot,
+    observed: ObservedIndex,
+    catalog: WikiCatalog,
+}
+
+impl WikiSnapshot {
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    pub fn store_snapshot(&self) -> &PileSnapshot {
+        &self.store_snapshot
+    }
+
+    pub fn observed(&self) -> &ObservedIndex {
+        &self.observed
+    }
+
     pub fn catalog(&self) -> &WikiCatalog {
         &self.catalog
     }
 
-    /// Consume the coherent snapshot into its application-facing parts.
     pub fn into_parts(self) -> (TribleSet, PileSnapshot, ObservedIndex, WikiCatalog) {
         (self.facts, self.store_snapshot, self.observed, self.catalog)
     }
@@ -246,12 +270,12 @@ pub struct RevisionDraft {
     pub authored_at: IntervalValue,
 }
 
-fn ids_of_kind(space: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &kind }])).collect()
 }
 
-fn id_values(
-    space: &TribleSet,
+fn id_values<P: TriblePattern>(
+    space: &P,
     entity: Id,
     attribute: &Attribute<inlineencodings::GenId>,
 ) -> BTreeSet<Id> {
@@ -262,8 +286,8 @@ fn id_values(
     .collect()
 }
 
-fn text_values(
-    space: &TribleSet,
+fn text_values<P: TriblePattern>(
+    space: &P,
     entity: Id,
     attribute: &Attribute<inlineencodings::Handle<blobencodings::UTF8String>>,
 ) -> BTreeSet<TextHandle> {
@@ -274,8 +298,8 @@ fn text_values(
     .collect()
 }
 
-fn interval_values(
-    space: &TribleSet,
+fn interval_values<P: TriblePattern>(
+    space: &P,
     entity: Id,
     attribute: &Attribute<inlineencodings::NsTAIInterval>,
 ) -> BTreeSet<IntervalValue> {
@@ -314,6 +338,244 @@ fn require_point(field: &str, value: IntervalValue) -> Result<()> {
         bail!("{field} must be a point interval");
     }
     Ok(())
+}
+
+/// Every queryable Wiki revision id.
+///
+/// This is a typed projection, not a catalog load: incomplete or undecodable
+/// rows simply do not satisfy either revision pattern. Native revisions need
+/// their author relation; preserved legacy versions do not.
+pub fn revision_ids<P: TriblePattern>(space: &P) -> BTreeSet<Id> {
+    let native = find!(
+        id: Id,
+        pattern!(space, [{
+            ?id @ metadata::tag: &KIND_REVISION,
+            attrs::title: _?title,
+            attrs::content: _?content,
+            attrs::author: _?author,
+        }])
+    );
+    let legacy = find!(
+        id: Id,
+        pattern!(space, [{
+            ?id @ metadata::tag: &KIND_VERSION_ID,
+            attrs::title: _?title,
+            attrs::content: _?content,
+        }])
+    );
+    native.chain(legacy).collect()
+}
+
+fn optional_values<T: Copy + Ord>(values: BTreeSet<T>) -> Vec<Option<T>> {
+    if values.is_empty() {
+        vec![None]
+    } else {
+        values.into_iter().map(Some).collect()
+    }
+}
+
+fn query_authorships<P: TriblePattern>(space: &P, revision: Id) -> Vec<AuthorshipRecord> {
+    let ids: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(space, [{
+            ?id @ metadata::tag: &KIND_AUTHORSHIP,
+            attrs::revision: &revision,
+        }])
+    )
+    .collect();
+    let mut records = Vec::new();
+    for id in ids {
+        let authors = optional_values(id_values(space, id, &attrs::author));
+        let times = optional_values(interval_values(space, id, &metadata::created_at));
+        for author in &authors {
+            for authored_at in &times {
+                records.push(AuthorshipRecord {
+                    id,
+                    author: *author,
+                    authored_at: *authored_at,
+                });
+            }
+        }
+    }
+    records.sort_by_key(|record| (record.id, record.author, record.authored_at));
+    records
+}
+
+/// Project every typed interpretation of one Wiki revision directly from a
+/// query substrate.
+///
+/// Scalar multiplicity is kept visible as multiple projections rather than
+/// rejected collection-wide or settled by iterator order. Set-valued tags,
+/// predecessors, legacy timestamps, and authorship observations remain sets.
+pub fn revision_records<P: TriblePattern>(space: &P, id: Id) -> Vec<RevisionRecord> {
+    let title_content: BTreeSet<(TextHandle, TextHandle)> = find!(
+        (title: TextHandle, content: TextHandle),
+        pattern!(space, [{ id @ attrs::title: ?title, attrs::content: ?content }])
+    )
+    .collect();
+    if title_content.is_empty() {
+        return Vec::new();
+    }
+
+    let mut tags = id_values(space, id, &metadata::tag);
+    tags.remove(&KIND_REVISION);
+    tags.remove(&KIND_VERSION_ID);
+    let supersedes = id_values(space, id, &metadata::supersedes);
+    let authorships = query_authorships(space, id);
+    let legacy_created_at = interval_values(space, id, &metadata::created_at);
+    let authors = id_values(space, id, &attrs::author);
+    let native = exists!(
+        (),
+        pattern!(space, [{ id @ metadata::tag: &KIND_REVISION }])
+    );
+    let legacy = exists!(
+        (),
+        pattern!(space, [{ id @ metadata::tag: &KIND_VERSION_ID }])
+    );
+    let mut records = Vec::new();
+
+    if native {
+        for (title, content) in &title_content {
+            for author in &authors {
+                records.push(RevisionRecord {
+                    id,
+                    title: *title,
+                    content: *content,
+                    tags: tags.clone(),
+                    supersedes: supersedes.clone(),
+                    author: Some(*author),
+                    native: true,
+                    legacy_created_at: BTreeSet::new(),
+                    authorships: authorships.clone(),
+                });
+            }
+        }
+    }
+    if legacy {
+        for (title, content) in &title_content {
+            for author in optional_values(authors.clone()) {
+                records.push(RevisionRecord {
+                    id,
+                    title: *title,
+                    content: *content,
+                    tags: tags.clone(),
+                    supersedes: supersedes.clone(),
+                    author,
+                    native: false,
+                    legacy_created_at: legacy_created_at.clone(),
+                    authorships: authorships.clone(),
+                });
+            }
+        }
+    }
+    records
+}
+
+fn adjacent_revisions<P: TriblePattern>(space: &P, revision: Id) -> BTreeSet<Id> {
+    let predecessors = find!(
+        id: Id,
+        pattern!(space, [{ revision @ metadata::supersedes: ?id }])
+    );
+    let successors = find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::supersedes: &revision }])
+    );
+    predecessors
+        .chain(successors)
+        .filter(|id| !revision_records(space, *id).is_empty())
+        .collect()
+}
+
+/// The connected revision entry containing `seed`, projected at the point of
+/// use. Only the supersession relation is traversed; no whole-Wiki catalog is
+/// constructed.
+pub fn entry<P, O>(space: &P, order: &O, seed: Id) -> Option<EntryRecord>
+where
+    P: TriblePattern,
+    O: RegisterOrder + ?Sized,
+{
+    if revision_records(space, seed).is_empty() {
+        return None;
+    }
+    let mut members = BTreeSet::from([seed]);
+    let mut pending = vec![seed];
+    while let Some(current) = pending.pop() {
+        for adjacent in adjacent_revisions(space, current) {
+            if members.insert(adjacent) {
+                pending.push(adjacent);
+            }
+        }
+    }
+    let roots = members
+        .iter()
+        .copied()
+        .filter(|id| id_values(space, *id, &metadata::supersedes).is_disjoint(&members))
+        .collect();
+    let frontier = resolve(order, members.iter().copied())
+        .into_iter()
+        .flat_map(|id| revision_records(space, id))
+        .collect();
+    Some(EntryRecord {
+        roots,
+        members: members.into_iter().collect(),
+        frontier,
+    })
+}
+
+/// Every connected Wiki entry, discovered from typed revision rows and
+/// projected independently. This is intended only for commands whose answer
+/// genuinely ranges over the whole Wiki (list, search, audits, export).
+pub fn entries<P, O>(space: &P, order: &O) -> Vec<EntryRecord>
+where
+    P: TriblePattern,
+    O: RegisterOrder + ?Sized,
+{
+    let mut remaining = revision_ids(space);
+    let mut entries = Vec::new();
+    while let Some(seed) = remaining.pop_first() {
+        if let Some(entry) = entry(space, order, seed) {
+            for member in &entry.members {
+                remaining.remove(member);
+            }
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|entry| entry.roots.first().copied());
+    entries
+}
+
+/// Causal history for one already-scoped entry, dependencies first.
+pub fn entry_history<P: TriblePattern>(space: &P, entry: &EntryRecord) -> Vec<RevisionRecord> {
+    let members: BTreeSet<Id> = entry.members.iter().copied().collect();
+    let mut emitted = BTreeSet::new();
+    let mut output = Vec::new();
+    while emitted.len() < members.len() {
+        let mut ready: Vec<Id> = members
+            .iter()
+            .copied()
+            .filter(|id| !emitted.contains(id))
+            .filter(|id| {
+                id_values(space, *id, &metadata::supersedes)
+                    .intersection(&members)
+                    .all(|predecessor| emitted.contains(predecessor))
+            })
+            .collect();
+        ready.sort_by_key(|id| {
+            let authored_at = revision_records(space, *id)
+                .into_iter()
+                .filter_map(|record| record.authored_at().map(|value| value.raw))
+                .min();
+            (authored_at, *id)
+        });
+        if ready.is_empty() {
+            break;
+        }
+        for id in ready {
+            emitted.insert(id);
+            output.extend(revision_records(space, id));
+        }
+    }
+    output
 }
 
 fn entity_fact_index(space: &TribleSet) -> BTreeMap<Id, TribleSet> {
@@ -940,6 +1202,31 @@ pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) ->
     }
 }
 
+/// Display every name asserted for a tag directly from a query substrate.
+/// Multiplicity stays visible instead of becoming a collection-wide error or
+/// an iteration-order winner.
+pub fn tag_display_name_from_facts<P: TriblePattern>(
+    facts: &P,
+    reader: &PileSnapshot,
+    id: Id,
+) -> Result<String> {
+    let mut names = BTreeSet::new();
+    for handle in find!(
+        handle: TextHandle,
+        pattern!(facts, [{ id @ metadata::name: ?handle }])
+    ) {
+        names.insert(read_text(reader, handle)?);
+    }
+    Ok(if names.is_empty() {
+        TAG_SPECS
+            .iter()
+            .find_map(|(known, label)| (*known == id).then_some((*label).to_owned()))
+            .unwrap_or_else(|| format!("{id:x}"))
+    } else {
+        names.into_iter().collect::<Vec<_>>().join(" / ")
+    })
+}
+
 /// One current state of an entry, with its content-derived link targets.
 #[derive(Clone, Debug)]
 pub struct FrontierState {
@@ -996,8 +1283,12 @@ pub struct FrontierModel {
 }
 
 impl FrontierModel {
-    pub fn load(catalog: &WikiCatalog, reader: &PileSnapshot, facts: &TribleSet) -> Result<Self> {
-        let records = catalog.revisions.all_entries();
+    pub fn load<P, O>(reader: &PileSnapshot, facts: &P, order: &O) -> Result<Self>
+    where
+        P: TriblePattern,
+        O: RegisterOrder + ?Sized,
+    {
+        let records = entries(facts, order);
         let mut entries = Vec::with_capacity(records.len());
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
 
@@ -1010,7 +1301,7 @@ impl FrontierModel {
                 let tags = revision
                     .tags
                     .iter()
-                    .map(|tag| tag_display_name(catalog, reader, *tag))
+                    .map(|tag| tag_display_name_from_facts(facts, reader, *tag))
                     .collect::<Result<BTreeSet<_>>>()?;
                 let links = extract_link_targets(&content)
                     .into_iter()
@@ -1042,15 +1333,23 @@ impl FrontierModel {
         for (id, _) in TAG_SPECS {
             kinds.insert(id, OtherKind::Tag);
         }
-        for id in catalog.tag_names.keys() {
-            kinds.insert(*id, OtherKind::Tag);
+        for id in find!(
+            id: Id,
+            pattern!(facts, [{ ?id @ metadata::name: _?name }])
+        ) {
+            kinds.insert(id, OtherKind::Tag);
         }
-        for id in catalog.author_keys.keys() {
-            kinds.insert(*id, OtherKind::Author);
+        for id in find!(
+            id: Id,
+            pattern!(facts, [{ ?id @ attestation::signed_by: _?key }])
+        ) {
+            kinds.insert(id, OtherKind::Author);
         }
-        for record in catalog.revisions.revision_records() {
-            for authorship in &record.authorships {
-                kinds.insert(authorship.id, OtherKind::Authorship);
+        for id in revision_ids(facts) {
+            for record in revision_records(facts, id) {
+                for authorship in &record.authorships {
+                    kinds.insert(authorship.id, OtherKind::Authorship);
+                }
             }
         }
 
@@ -1179,8 +1478,8 @@ impl FrontierModel {
     /// The anchor is no longer a SELECTOR, but its facts were never removed —
     /// the store is append-only — so a reference written before the cutover can
     /// still be told apart from one that never had a target.
-    fn index_anchors(
-        facts: &TribleSet,
+    fn index_anchors<P: TriblePattern>(
+        facts: &P,
         selectors: &BTreeMap<Id, BTreeSet<usize>>,
     ) -> BTreeMap<Id, BTreeSet<usize>> {
         let mut anchors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
@@ -1297,14 +1596,57 @@ pub fn materialize_collection(
     Ok((facts, store_snapshot))
 }
 
-/// Capture and validate one durable Wiki snapshot with its exact maintained
-/// supersession index.
+/// Capture one durable Wiki snapshot with shard-preserving facts and its exact
+/// maintained supersession index.
 ///
-/// The source facts, exact cover, and attachment reader come from one
-/// [`SnapshotSource::snapshot`] observation. Index maintenance happens
-/// only afterward and is attached to
-/// that exact cover, so it cannot change which authoritative commits this
-/// read admits even if newer commits arrive concurrently.
+/// One pre-maintenance snapshot chooses the foundational support. Both fact
+/// derivation hops and the supersession projection are maintained for exactly
+/// that support, then attached through one later immutable snapshot. Normal
+/// reads therefore never flatten the collection or validate a closed-world
+/// catalog before asking their actual query.
+pub fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let facts = FactCollection::new(pile, collection)
+        .context("register maintained Wiki fact collection")?;
+    let target = observed_collection(pile, signer.verifying_key())?;
+    let before = pile.snapshot().context("freeze Wiki source snapshot")?;
+    let instant = crate::clock::now()?;
+    let support = before
+        .collection_at(collection, instant)
+        .context("observe resident Wiki source collection")?
+        .support()
+        .clone();
+    drop(
+        facts
+            .maintain_exact(pile, &support)
+            .context("maintain Wiki fact collection")?,
+    );
+    let store_snapshot = pile
+        .maintain_exact::<ObserveStatesMapping>(target, &support)
+        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
+    let facts = store_snapshot
+        .collection_exact(facts.rank9(), &support)
+        .context("observe Wiki fact collection")?
+        .view::<FactArchive>()
+        .context("read Wiki fact collection")?;
+    let observed = store_snapshot
+        .collection_exact(target, &support)
+        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+        .view::<ObservedIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
+    Ok(WikiQuerySnapshot {
+        facts,
+        store_snapshot,
+        observed,
+    })
+}
+
+/// Strictly project and validate a complete Wiki snapshot.
+///
+/// This remains an explicit migration/import boundary for callers that need a
+/// closed-world diagnostic oracle. It is deliberately not the ordinary query
+/// path; normal commands use [`query_snapshot`] and query its [`FactArchive`]
+/// directly.
 pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1934,8 +2276,8 @@ mod tests {
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = validate_catalog(&reader, &facts).unwrap();
-        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let model = FrontierModel::load(&reader, &facts, &order).unwrap();
 
         let index_of = |target: Id| match model.resolve(target) {
             LinkResolution::Unique(index) => index,
@@ -2020,8 +2362,8 @@ mod tests {
         )
         .unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = validate_catalog(&reader, &facts).unwrap();
-        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let model = FrontierModel::load(&reader, &facts, &order).unwrap();
         let audit = model.audit();
         assert_eq!(audit.live, 1, "the citation resolves");
         assert_eq!(audit.incoming, vec![0], "but not as an incoming reference");
@@ -2068,8 +2410,8 @@ mod tests {
         // Exactly what `wiki links` and `wiki check` do, and nothing else.
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = validate_catalog(&reader, &facts).unwrap();
-        let model = FrontierModel::load(&catalog, &reader, &facts).unwrap();
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let model = FrontierModel::load(&reader, &facts, &order).unwrap();
         let audit = model.audit();
         let _ = model.unreferenced(&audit);
         pile.close().unwrap();

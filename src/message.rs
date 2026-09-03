@@ -1,15 +1,16 @@
 //! Shared collection-native Message model and semantics.
 //!
 //! This module is the single semantic boundary used by the Message CLI and by
-//! observers such as Orient. It owns exact envelope/read validation, typed
-//! recipient selection, intrinsic envelope/read identity, and delivery against
-//! frozen Relations group snapshots. Presentation and command workflows stay
-//! in the binaries.
+//! observers such as Orient. It owns typed envelope/read queries, explicit
+//! import validation, recipient selection, intrinsic write construction, and
+//! delivery against frozen Relations group snapshots. Presentation and command
+//! workflows stay in the binaries.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::{find, pattern};
@@ -185,13 +186,10 @@ fn blocking_ids(outcome: &SelectorOutcome) -> Vec<Id> {
     }
 }
 
-pub fn resolve_person<Store>(
-    reader: &Store,
-    facts: &TribleSet,
-    input: &str,
-) -> Result<SelectorOutcome>
+pub fn resolve_person<Store, P>(reader: &Store, facts: &P, input: &str) -> Result<SelectorOutcome>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     relations::resolve_person(reader, facts, input, false)
 }
@@ -203,13 +201,14 @@ where
 /// only on a candidate that is genuinely in the running. `relations`
 /// disqualifies retired people before it reports their fork state, so a dead
 /// legacy anchor sharing a group's name can no longer veto the group.
-pub fn resolve_recipient<Store>(
+pub fn resolve_recipient<Store, P>(
     reader: &Store,
-    facts: &TribleSet,
+    facts: &P,
     input: &str,
 ) -> Result<RecipientOutcome>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let person = relations::resolve_person(reader, facts, input, false)?;
     let group = relations::resolve_group(reader, facts, input)?;
@@ -446,14 +445,122 @@ fn require_exact_native_entity(
     Ok(())
 }
 
-/// Load only self-authenticating intrinsic Message envelopes.
+/// Query every decodable Message envelope projection.
+///
+/// Entity ids are opaque and additional facts are open-world annotations. A
+/// typed pattern therefore selects the fields this reader understands without
+/// reconstructing an intrinsic id or scanning the entity's complete fact set.
+pub fn load_message_rows<P>(facts: &P) -> Result<Vec<MessageRow>>
+where
+    P: TriblePattern,
+{
+    let mut cores: Vec<(Id, Id, Id, TextHandle, IntervalValue)> = find!(
+        (id: Id, from: Id, to: Id, body: TextHandle, created_at: IntervalValue),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_MESSAGE_ID,
+            local::from: ?from,
+            local::to: ?to,
+            local::body: ?body,
+            metadata::created_at: ?created_at,
+        }])
+    )
+    .collect();
+    cores.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.raw.cmp(&right.3.raw))
+            .then_with(|| left.4.raw.cmp(&right.4.raw))
+    });
+    cores.dedup();
+
+    let mut rows = Vec::new();
+    for (id, from, to, body, created_at) in cores {
+        let mut snapshots: Vec<Option<Id>> = find!(
+            snapshot: Id,
+            pattern!(facts, [{ id @ local::group_snapshot: ?snapshot }])
+        )
+        .map(Some)
+        .collect();
+        if snapshots.is_empty() {
+            snapshots.push(None);
+        } else {
+            snapshots.sort_unstable();
+            snapshots.dedup();
+        }
+        let mut bases: Vec<Option<Id>> = find!(
+            basis: Id,
+            pattern!(facts, [{ id @ local::group_snapshot_basis: ?basis }])
+        )
+        .map(Some)
+        .collect();
+        if bases.is_empty() {
+            bases.push(None);
+        } else {
+            bases.sort_unstable();
+            bases.dedup();
+        }
+        for group_snapshot in &snapshots {
+            for group_snapshot_basis in &bases {
+                rows.push(MessageRow {
+                    id,
+                    from,
+                    to,
+                    body,
+                    created_at,
+                    group_snapshot: *group_snapshot,
+                    group_snapshot_basis: *group_snapshot_basis,
+                });
+            }
+        }
+    }
+    rows.sort_unstable_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.from.cmp(&right.from))
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.body.raw.cmp(&right.body.raw))
+            .then_with(|| left.created_at.raw.cmp(&right.created_at.raw))
+            .then_with(|| left.group_snapshot.cmp(&right.group_snapshot))
+            .then_with(|| left.group_snapshot_basis.cmp(&right.group_snapshot_basis))
+    });
+    rows.dedup();
+    Ok(rows)
+}
+
+/// Query every decodable `(message, reader)` acknowledgement projection.
+pub fn load_read_rows<P>(facts: &P) -> Result<Vec<ReadRow>>
+where
+    P: TriblePattern,
+{
+    let rows: BTreeSet<(Id, Id, Id)> = find!(
+        (id: Id, message: Id, reader: Id),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_READ_ID,
+            local::about_message: ?message,
+            local::reader: ?reader,
+        }])
+    )
+    .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(id, message, reader)| ReadRow {
+            id,
+            message,
+            reader,
+        })
+        .collect())
+}
+
+/// Validate only self-authenticating intrinsic Message envelopes.
 ///
 /// A native collection may also retain arbitrary authored legacy facts. A
 /// random-id legacy entity can carry the same tag and field vocabulary, but it
 /// is not a native envelope unless its id authenticates one complete canonical
 /// projection. Once selected, its complete entity fact set must be the exact
 /// immutable envelope.
-pub fn load_message_rows(facts: &TribleSet) -> Result<Vec<MessageRow>> {
+fn validated_message_rows(facts: &TribleSet) -> Result<Vec<MessageRow>> {
     let ids = sorted_ids(find!(
         id: Id,
         pattern!(facts, [{ ?id @ metadata::tag: &KIND_MESSAGE_ID }])
@@ -523,13 +630,13 @@ pub fn load_message_rows(facts: &TribleSet) -> Result<Vec<MessageRow>> {
         .collect()
 }
 
-/// Load only self-authenticating intrinsic `(message, reader)` markers.
+/// Validate only self-authenticating intrinsic `(message, reader)` markers.
 ///
 /// Historical random-id read occurrences remain inert even though their tag
 /// and relationship attributes are retained in the same generic collection.
 /// A selected marker must contain exactly its intrinsic core plus any number
 /// of additive `read_at` observations.
-pub fn load_read_rows(facts: &TribleSet) -> Result<Vec<ReadRow>> {
+fn validated_read_rows(facts: &TribleSet) -> Result<Vec<ReadRow>> {
     let ids = sorted_ids(find!(
         id: Id,
         pattern!(facts, [{ ?id @ metadata::tag: &KIND_READ_ID }])
@@ -575,9 +682,11 @@ pub fn load_read_rows(facts: &TribleSet) -> Result<Vec<ReadRow>> {
         .collect()
 }
 
-/// Project canonical read markers with their complete additive observation
-/// sets. Marker discovery and exactness remain owned by [`load_read_rows`].
-pub fn load_read_receipts(facts: &TribleSet) -> Result<Vec<ReadReceiptRow>> {
+/// Project decodable read markers with their complete additive observations.
+pub fn load_read_receipts<P>(facts: &P) -> Result<Vec<ReadReceiptRow>>
+where
+    P: TriblePattern,
+{
     load_read_rows(facts)?
         .into_iter()
         .map(|marker| {
@@ -597,8 +706,8 @@ pub fn load_read_receipts(facts: &TribleSet) -> Result<Vec<ReadReceiptRow>> {
 }
 
 fn validate_structure(facts: &TribleSet, relation_facts: &TribleSet) -> Result<Vec<TextHandle>> {
-    let messages = load_message_rows(facts)?;
-    let reads = load_read_rows(facts)?;
+    let messages = validated_message_rows(facts)?;
+    let reads = validated_read_rows(facts)?;
     let message_rows: BTreeMap<Id, MessageRow> =
         messages.iter().map(|row| (row.id, *row)).collect();
     let people = relations::person_anchors(relation_facts);
@@ -778,7 +887,10 @@ pub fn validate_catalog_union(
     Ok(union)
 }
 
-pub fn resolve_message_id(facts: &TribleSet, prefix: &str) -> Result<Id> {
+pub fn resolve_message_id<P>(facts: &P, prefix: &str) -> Result<Id>
+where
+    P: TriblePattern,
+{
     let candidates: BTreeSet<Id> = load_message_rows(facts)?
         .into_iter()
         .map(|row| row.id)
@@ -790,21 +902,32 @@ pub fn resolve_message_id(facts: &TribleSet, prefix: &str) -> Result<Id> {
     Ok(id)
 }
 
-pub fn row_by_id(facts: &TribleSet, id: Id) -> Result<MessageRow> {
+pub fn row_by_id<P>(facts: &P, id: Id) -> Result<MessageRow>
+where
+    P: TriblePattern,
+{
     load_message_rows(facts)?
         .into_iter()
         .find(|row| row.id == id)
-        .ok_or_else(|| anyhow!("message {} disappeared from validated catalog", fmt_id(id)))
+        .ok_or_else(|| {
+            anyhow!(
+                "message {} has no decodable envelope projection",
+                fmt_id(id)
+            )
+        })
 }
 
 /// Decide frozen-snapshot inbox membership with settled same-person equality.
 /// The exact sender and recipient anchors remain untouched for attribution.
-pub fn is_inbox_message(
+pub fn is_inbox_message<P>(
     row: &MessageRow,
     reader: Id,
-    relation_facts: &TribleSet,
+    relation_facts: &P,
     identities: &IdentityComponents,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    P: TriblePattern,
+{
     if identities.equivalent(row.from, reader)? {
         return Ok(false);
     }
@@ -858,10 +981,10 @@ mod tests {
     use crate::schemas::relations::{
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
     };
-    use crate::storage::{discover_target, open_pile_strict};
+    use crate::storage::{discover_target, open_pile_strict, FactArchive, FactCollection};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
-    use triblespace::core::collection::CollectionStoreExt;
+    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1244,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn native_views_ignore_preserved_legacy_entities_and_unrelated_facts() {
+    fn typed_views_accept_opaque_ids_and_ignore_unrelated_facts() {
         let sender = test_id(0x48);
         let recipient = test_id(0x49);
         let mut relation_facts = TribleSet::new();
@@ -1290,22 +1413,25 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|row| row.id)
-                .collect::<Vec<_>>(),
-            vec![message]
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([message, legacy_message])
         );
         assert_eq!(
             load_read_rows(&facts)
                 .unwrap()
                 .into_iter()
                 .map(|row| row.id)
-                .collect::<Vec<_>>(),
-            vec![read]
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([read, legacy_read])
         );
         assert_eq!(
             resolve_message_id(&facts, &fmt_id(message)).unwrap(),
             message
         );
-        assert!(resolve_message_id(&facts, &fmt_id(legacy_message)).is_err());
+        assert_eq!(
+            resolve_message_id(&facts, &fmt_id(legacy_message)).unwrap(),
+            legacy_message
+        );
         validate_structure(&facts, &relation_facts).unwrap();
 
         facts += entity! { ExclusiveId::force_ref(&read) @
@@ -1404,6 +1530,7 @@ mod tests {
         let team = signer.verifying_key();
         let messages =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let messages = FactCollection::new(&mut pile, messages).unwrap();
         let (fragment, message_id) = message_fragment(
             sender,
             &Recipient::Person(recipient),
@@ -1414,8 +1541,10 @@ mod tests {
         validate_catalog_union(&reader, &TribleSet::new(), &fragment, &relation_facts).unwrap();
         drop(reader);
 
-        let first = pile.commit(messages, &signer, fragment.clone()).unwrap();
-        let second = pile.commit(messages, &signer, fragment).unwrap();
+        let first = pile
+            .commit(messages.source(), &signer, fragment.clone())
+            .unwrap();
+        let second = pile.commit(messages.source(), &signer, fragment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             discover_target(&mut pile, DEFAULT_SCOPE_ID, team)
@@ -1424,12 +1553,19 @@ mod tests {
                 .len(),
             1
         );
+        let before = pile.snapshot().unwrap();
+        let instant = crate::clock::now().unwrap();
+        drop(messages.maintain_at(&mut pile, &before, instant).unwrap());
         let store_snapshot = pile.snapshot().unwrap();
-        let (message_facts, _) =
-            crate::storage::read_fact_collection(messages, &store_snapshot).unwrap();
-        validate_catalog(&store_snapshot, &message_facts, &relation_facts).unwrap();
+        let observed = store_snapshot
+            .collection_at(messages.rank9(), instant)
+            .unwrap();
+        let message_facts = observed.view::<FactArchive>().unwrap();
         assert_eq!(load_message_rows(&message_facts).unwrap()[0].id, message_id);
+        drop(message_facts);
+        drop(observed);
         drop(store_snapshot);
+        drop(before);
         pile.close().unwrap();
     }
 

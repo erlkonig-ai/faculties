@@ -4,7 +4,7 @@
 //! frozen-snapshot delivery semantics live in [`faculties::message`]. This
 //! binary only orchestrates collection access and presents commands.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -15,9 +15,9 @@ use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
@@ -78,84 +78,48 @@ enum Command {
     },
 }
 
-#[derive(Clone, Copy)]
 struct MessageStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    pile: &'a mut Pile,
+    signer: &'a SigningKey,
+    collection: Collection<SimpleArchive>,
+    messages: &'a FactArchive,
+    relations: &'a FactArchive,
+    reader: &'a PileSnapshot,
 }
 
 impl MessageStorage<'_> {
-    /// Open the pile once, materialize both fixed collections under the same
-    /// durable authority, run one operation, and close explicitly.
     fn with_views<T>(
         &self,
-        operation: impl FnOnce(
-            &mut Pile,
-            &SigningKey,
-            Collection<SimpleArchive>,
-            &TribleSet,
-            &TribleSet,
-            &PileSnapshot,
-        ) -> Result<T>,
+        operation: impl FnOnce(&FactArchive, &FactArchive, &PileSnapshot) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let relations_collection = open_configured(
-                &mut pile,
-                DEFAULT_RELATIONS_SCOPE_ID,
-                signer.verifying_key(),
-            )?;
-            let messages = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Message store snapshot")?;
-            let (relations_facts, _) =
-                faculties::storage::read_fact_collection(relations_collection, &store_snapshot)
-                    .context("materialize authored Relations collection")?;
-            relations::validate_catalog(&store_snapshot, &relations_facts)
-                .context("validate authored Relations collection")?;
-            let (message_facts, _) =
-                faculties::storage::read_fact_collection(messages, &store_snapshot)
-                    .context("materialize authored Message collection")?;
-            message::validate_catalog(&store_snapshot, &message_facts, &relations_facts)
-                .context("validate authored Message collection")?;
-            operation(
-                &mut pile,
-                &signer,
-                messages,
-                &message_facts,
-                &relations_facts,
-                &store_snapshot,
-            )
-        })();
-        finish_pile(pile, result)
+        operation(self.messages, self.relations, self.reader)
     }
 
     fn with_view<T>(
         &self,
-        operation: impl FnOnce(&TribleSet, &TribleSet, &PileSnapshot) -> Result<T>,
+        operation: impl FnOnce(&FactArchive, &FactArchive, &PileSnapshot) -> Result<T>,
     ) -> Result<T> {
-        self.with_views(|_, _, _, messages, relations, reader| {
-            operation(messages, relations, reader)
-        })
+        self.with_views(operation)
     }
 
-    /// Validate and publish at most one complete immutable fragment.
+    /// Publish at most one locally constructed typed fragment.
     fn update<T>(
-        &self,
+        &mut self,
         description: &'static str,
-        operation: impl FnOnce(&TribleSet, &TribleSet, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
+        operation: impl FnOnce(
+            &FactArchive,
+            &FactArchive,
+            &PileSnapshot,
+        ) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_views(|pile, signer, collection, messages, relations, reader| {
-            let (fragment, value) = operation(messages, relations, reader)?;
-            if let Some(mut fragment) = fragment {
-                message::validate_catalog_union(reader, messages, &fragment, relations)
-                    .context("preflight authored Message union")?;
-                fragment.describe_with(entity! { metadata::description: description });
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Message fragment")?;
-            }
-            Ok(value)
-        })
+        let (fragment, value) = operation(self.messages, self.relations, self.reader)?;
+        if let Some(mut fragment) = fragment {
+            fragment.describe_with(entity! { metadata::description: description });
+            self.pile
+                .commit(self.collection, self.signer, fragment)
+                .context("commit authored Message fragment")?;
+        }
+        Ok(value)
     }
 }
 
@@ -215,12 +179,12 @@ fn render_list_body(text: &str) -> String {
     text.replace('\r', "").replace('\n', "\\n")
 }
 
-fn person_label(reader: &PileSnapshot, facts: &TribleSet, person: Id) -> Result<String> {
+fn person_label(reader: &PileSnapshot, facts: &FactArchive, person: Id) -> Result<String> {
     let profile = relations::current_profile(facts, person)?;
     Ok(relations::profile_input(reader, &profile)?.label)
 }
 
-fn recipient_label(reader: &PileSnapshot, facts: &TribleSet, row: &MessageRow) -> Result<String> {
+fn recipient_label(reader: &PileSnapshot, facts: &FactArchive, row: &MessageRow) -> Result<String> {
     match row.group_snapshot {
         None => person_label(reader, facts, row.to),
         Some(snapshot) => {
@@ -230,7 +194,12 @@ fn recipient_label(reader: &PileSnapshot, facts: &TribleSet, row: &MessageRow) -
     }
 }
 
-fn cmd_send(storage: MessageStorage<'_>, text: String, from: String, to: String) -> Result<()> {
+fn cmd_send(
+    storage: &mut MessageStorage<'_>,
+    text: String,
+    from: String,
+    to: String,
+) -> Result<()> {
     if text.trim().is_empty() {
         bail!("message text is empty");
     }
@@ -254,7 +223,7 @@ fn cmd_send(storage: MessageStorage<'_>, text: String, from: String, to: String)
     Ok(())
 }
 
-fn cmd_ack(storage: MessageStorage<'_>, id: String, by: String) -> Result<()> {
+fn cmd_ack(storage: &mut MessageStorage<'_>, id: String, by: String) -> Result<()> {
     let (message_id, reader_id, already_read) = storage.update(
         "local message read",
         |message_facts, relation_facts, reader| {
@@ -295,7 +264,7 @@ fn cmd_ack(storage: MessageStorage<'_>, id: String, by: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ack_all(storage: MessageStorage<'_>, by: String, from: Option<String>) -> Result<()> {
+fn cmd_ack_all(storage: &mut MessageStorage<'_>, by: String, from: Option<String>) -> Result<()> {
     let (reader_id, count) = storage.update(
         "local messages bulk read",
         |message_facts, relation_facts, reader| {
@@ -341,7 +310,12 @@ fn cmd_ack_all(storage: MessageStorage<'_>, by: String, from: Option<String>) ->
     Ok(())
 }
 
-fn cmd_list(storage: MessageStorage<'_>, reader: String, unread: bool, limit: usize) -> Result<()> {
+fn cmd_list(
+    storage: &mut MessageStorage<'_>,
+    reader: String,
+    unread: bool,
+    limit: usize,
+) -> Result<()> {
     storage.with_view(|message_facts, relation_facts, blob_reader| {
         let reader_id = message::resolve_person(blob_reader, relation_facts, &reader)?
             .require_unique("active person", &reader)?;
@@ -408,30 +382,84 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let storage = MessageStorage {
-        pile: &cli.pile,
-        key: cli.key.as_deref(),
-    };
-    match command {
-        Command::Send { to, text, from } => {
-            let Some(from) = from
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-            else {
-                bail!(
-                    "no sender: set $PERSONA or pass --from <person>\n\
-                     usage: message send <TO> <TEXT> [--from <PERSON>]"
-                );
-            };
-            let text = faculties::text_arg(&text, "message text")?;
-            cmd_send(storage, text, from, to)
+    let signer = load_signer(&cli.pile, cli.key.as_deref())?;
+    let mut pile = open_pile_strict(&cli.pile)?;
+    let result = (|| {
+        // Register every descriptor before freezing the one shared source
+        // boundary used by both maintenance operations.
+        let relations_source = open_configured(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            signer.verifying_key(),
+        )?;
+        let message_source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        let relations = FactCollection::new(&mut pile, relations_source)
+            .context("register maintained Relations fact collection")?;
+        let messages = FactCollection::new(&mut pile, message_source)
+            .context("register maintained Message fact collection")?;
+        let before = pile
+            .snapshot()
+            .context("freeze shared Message pre-maintenance snapshot")?;
+        let instant = clock::now()?;
+        drop(
+            relations
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Relations fact collection")?,
+        );
+        drop(
+            messages
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Message fact collection")?,
+        );
+
+        // Both query views and every attachment read share this one later
+        // immutable boundary.
+        let reader = pile
+            .snapshot()
+            .context("freeze maintained Message snapshot")?;
+        let relation_collection = reader
+            .collection_at(relations.rank9(), instant)
+            .context("observe Relations Rank9 projection")?;
+        let relation_facts = relation_collection
+            .view::<FactArchive>()
+            .context("read Relations Rank9 projection")?;
+        let message_collection = reader
+            .collection_at(messages.rank9(), instant)
+            .context("observe Message Rank9 projection")?;
+        let message_facts = message_collection
+            .view::<FactArchive>()
+            .context("read Message Rank9 projection")?;
+        let mut storage = MessageStorage {
+            pile: &mut pile,
+            signer: &signer,
+            collection: messages.source(),
+            messages: &message_facts,
+            relations: &relation_facts,
+            reader: &reader,
+        };
+
+        match command {
+            Command::Send { to, text, from } => {
+                let Some(from) = from
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                else {
+                    bail!(
+                        "no sender: set $PERSONA or pass --from <person>\n\
+                         usage: message send <TO> <TEXT> [--from <PERSON>]"
+                    );
+                };
+                let text = faculties::text_arg(&text, "message text")?;
+                cmd_send(&mut storage, text, from, to)
+            }
+            Command::List {
+                reader,
+                unread,
+                limit,
+            } => cmd_list(&mut storage, reader, unread, limit),
+            Command::Ack { id, by } => cmd_ack(&mut storage, id, by),
+            Command::AckAll { by, from } => cmd_ack_all(&mut storage, by, from),
         }
-        Command::List {
-            reader,
-            unread,
-            limit,
-        } => cmd_list(storage, reader, unread, limit),
-        Command::Ack { id, by } => cmd_ack(storage, id, by),
-        Command::AckAll { by, from } => cmd_ack_all(storage, by, from),
-    }
+    })();
+    finish_pile(pile, result)
 }

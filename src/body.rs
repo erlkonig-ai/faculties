@@ -1,9 +1,10 @@
-//! Canonical Body records and strict collection read model.
+//! Canonical Body records and maintained collection views.
 //!
 //! Body is an immutable log of deliberate captures and sparse VLA intents.
-//! Every record is intrinsically identified by its complete semantic row.  A
-//! reader therefore rejects partial records, scalar conflicts, unknown
-//! vocabulary, and identities derived under an obsolete hashing epoch.
+//! Writers construct intrinsically identified records. Ordinary readers query
+//! the decodable rows they need from a shard-preserving Succinct view; the
+//! stricter whole-fragment validators below remain explicit migration and test
+//! tools rather than a gate in front of every read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,12 +15,14 @@ use triblespace::core::collection::lww_register::{
 };
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
+use crate::storage::{FactArchive, FactCollection};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -48,28 +51,27 @@ pub struct IntentRow {
     pub text: TextHandle,
 }
 
-/// Exact semantic projection of one Body collection.
+/// Strict whole-fragment projection used by migrations and tests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BodyCatalog {
     pub captures: BTreeMap<Id, CaptureRow>,
     pub intents: BTreeMap<Id, IntentRow>,
 }
 
-/// One coherent Body source snapshot plus its maintained intent register.
+/// One coherent Body fact view plus its maintained intent register.
 ///
-/// Facts, exact cover, and the attachment reader are captured by one
-/// collection observation. The maintained index is then attached for exactly
-/// that source cover; it is cache exhaust, never additional authority.
+/// Facts, exact support, and the attachment reader come from one immutable
+/// post-maintenance store snapshot. The index is attached for exactly the same
+/// support; it is cache exhaust, never additional authority.
 pub struct BodySnapshot {
-    facts: TribleSet,
+    facts: FactArchive,
     store_snapshot: PileSnapshot,
-    catalog: BodyCatalog,
     intents: LwwIndex,
 }
 
 impl BodySnapshot {
     /// Materialized facts admitted by this exact source cover.
-    pub fn facts(&self) -> &TribleSet {
+    pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
@@ -78,19 +80,14 @@ impl BodySnapshot {
         &self.store_snapshot
     }
 
-    /// Strictly validated Body ontology for this snapshot.
-    pub fn catalog(&self) -> &BodyCatalog {
-        &self.catalog
-    }
-
     /// Maintained order for the Body intent register.
     pub fn intent_register(&self) -> &LwwIndex {
         &self.intents
     }
 
-    /// Consume the coherent snapshot into facts, store snapshot, catalog, and index.
-    pub fn into_parts(self) -> (TribleSet, PileSnapshot, BodyCatalog, LwwIndex) {
-        (self.facts, self.store_snapshot, self.catalog, self.intents)
+    /// Consume the coherent snapshot into facts, store snapshot, and index.
+    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwIndex) {
+        (self.facts, self.store_snapshot, self.intents)
     }
 }
 
@@ -111,10 +108,17 @@ where
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
+    let snapshot = store
+        .snapshot()
+        .context("freeze Body source policy snapshot")?;
+    let policy = source
+        .policy(&snapshot)
+        .context("read Body source collection policy")?;
+    drop(snapshot);
     let target = store.derive(
         source,
         RegisterCoordinatesMapping::new(metadata::tag.id(), metadata::created_at.id()),
-        crate::collection_names::private_policy(authority),
+        policy,
     )?;
     Ok(target)
 }
@@ -239,7 +243,7 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
     Ok(())
 }
 
-pub fn decode_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
+pub fn decode_capture<P: TriblePattern>(space: &P, id: Id) -> Result<CaptureRow> {
     let row = CaptureRow {
         id,
         created_at: exactly_one(
@@ -319,7 +323,7 @@ pub fn decode_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
     Ok(row)
 }
 
-pub fn decode_intent(space: &TribleSet, id: Id) -> Result<IntentRow> {
+pub fn decode_intent<P: TriblePattern>(space: &P, id: Id) -> Result<IntentRow> {
     let row = IntentRow {
         id,
         created_at: exactly_one(
@@ -501,27 +505,34 @@ pub fn validate_candidate(
     Ok(catalog)
 }
 
-/// Select the latest validated intent through the exact maintained register.
+/// Project the latest decodable intent through the exact maintained register.
 ///
-/// The catalog remains the authority for record shape and payload identity;
-/// the index only answers which intrinsic event wins the already-established
-/// total order.
-pub fn latest_intent<'a>(
-    catalog: &'a BodyCatalog,
+/// The index answers which event wins the established total order; the typed
+/// query then asks only for the fields this reader understands. If foreign
+/// facts add several decodable spellings, their byte-smallest tuple is chosen
+/// deterministically rather than turning unrelated history into a global
+/// validation failure.
+pub fn latest_intent<P: TriblePattern>(
+    facts: &P,
     register: &LwwIndex,
-) -> Result<Option<&'a IntentRow>> {
+) -> Result<Option<IntentRow>> {
     let Some(id) = register.winner(KIND_INTENT) else {
-        if catalog.intents.is_empty() {
-            return Ok(None);
-        }
-        bail!(
-            "maintained Body intent register has no winner for {} validated intent(s)",
-            catalog.intents.len()
-        );
+        return Ok(None);
     };
-    catalog.intents.get(&id).map(Some).ok_or_else(|| {
-        anyhow!("maintained Body intent register selected {id:x}, which is not a validated intent")
+    Ok(find!(
+        (created_at: IntervalValue, text: TextHandle),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_INTENT,
+            metadata::created_at: ?created_at,
+            intent::text: ?text,
+        }])
+    )
+    .map(|(created_at, text)| IntentRow {
+        id,
+        created_at,
+        text,
     })
+    .min_by_key(|row| (row.created_at, row.text)))
 }
 
 /// Capture Body facts and attach the maintained intent LWW index for that
@@ -530,24 +541,41 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
-    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
-        .context("read Body collection")?;
-    let catalog = validate_catalog(&store_snapshot, &facts).context("validate Body collection")?;
+    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let collection =
+        FactCollection::new(pile, source).context("register maintained Body fact collection")?;
     let target = intent_register_collection(pile, signer.verifying_key())?;
-    let maintained = pile
-        .maintain_exact::<RegisterCoordinatesMapping>(target, &cover)
+
+    let before = pile.snapshot().context("freeze Body source snapshot")?;
+    let instant = triblespace::core::clock::epoch_now();
+    let support = before
+        .collection_at(source, instant)
+        .context("observe resident Body collection")?
+        .support()
+        .clone();
+    drop(before);
+
+    drop(
+        collection
+            .maintain_exact(pile, &support)
+            .context("maintain Body fact collection")?,
+    );
+    let store_snapshot = pile
+        .maintain_exact::<RegisterCoordinatesMapping>(target, &support)
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
-    let intents = maintained
-        .collection_exact(target, &cover)
+    let facts = store_snapshot
+        .collection_exact(collection.rank9(), &support)
+        .context("observe maintained Body fact collection")?
+        .view::<FactArchive>()
+        .context("read maintained Body fact collection")?;
+    let intents = store_snapshot
+        .collection_exact(target, &support)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Body intent register: {error}"))?;
     Ok(BodySnapshot {
         facts,
         store_snapshot,
-        catalog,
         intents,
     })
 }

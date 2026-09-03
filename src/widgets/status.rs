@@ -26,10 +26,10 @@ use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::trible::TribleSet;
 
 use crate::relations::{self as native_relations, Head};
 use crate::status as native_status;
+use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── Palette ──────────────────────────────────────────────────────────
@@ -78,10 +78,6 @@ struct StatusLive {
 impl StatusLive {
     fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
         let relations_cached_revision = relations.map(|relations| relations.revision);
-        let empty_relations = TribleSet::new();
-        let relations_facts = relations
-            .map(|relations| relations.facts)
-            .unwrap_or(&empty_relations);
         let latest = native_status::latest_per_window(
             native_status::load_status_rows(view.facts)
                 .expect("Viewer storage exposed an invalid Status collection"),
@@ -96,7 +92,11 @@ impl StatusLive {
                     (at_ns, row.event),
                     WindowStatus {
                         window: row.window,
-                        name: native_window_label(view.reader, relations_facts, row.window),
+                        name: relations
+                            .map(|relations| {
+                                native_window_label(view.reader, relations.facts, row.window)
+                            })
+                            .unwrap_or_else(|| id_hex(row.window)),
                         text: native_status::read_text(view.reader, row.text)
                             .expect("validated Status text is resident"),
                         at_ns,
@@ -123,7 +123,7 @@ impl StatusLive {
     }
 }
 
-fn native_window_label(reader: &PileSnapshot, facts: &TribleSet, window: Id) -> String {
+fn native_window_label(reader: &PileSnapshot, facts: &FactArchive, window: Id) -> String {
     if !native_relations::person_anchors(facts).contains(&window) {
         return id_hex(window);
     }

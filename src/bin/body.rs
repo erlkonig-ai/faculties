@@ -25,7 +25,9 @@ use faculties::body as body_model;
 use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
-use faculties::storage::{load_signer, open_pile_strict, publish_fragment};
+use faculties::storage::{
+    load_signer, open_pile_strict, publish_fragment, FactArchive, FactCollection,
+};
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -35,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
@@ -436,12 +438,21 @@ impl BodyStorage<'_> {
         }
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
+    fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Body store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize Body collection")?;
+            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection = FactCollection::new(pile, source)
+                .context("register maintained Body fact collection")?;
+            let before = pile.snapshot().context("freeze Body source snapshot")?;
+            let instant = triblespace::core::clock::epoch_now();
+            let store_snapshot = collection
+                .maintain_at(pile, &before, instant)
+                .context("maintain Body fact collection")?;
+            let facts = store_snapshot
+                .collection_at(collection.rank9(), instant)
+                .context("observe maintained Body fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Body fact collection")?;
             f(&facts, &store_snapshot)
         })
     }
@@ -675,7 +686,10 @@ fn intent_fragment(text: &str, created: Inline<inlineencodings::NsTAIInterval>) 
 }
 
 #[cfg(test)]
-fn latest_intent_jit(space: &TribleSet) -> Option<(i128, Id, TextHandle)> {
+fn latest_intent_jit<P>(space: &P) -> Option<(i128, Id, TextHandle)>
+where
+    P: TriblePattern,
+{
     let mut best: Option<(i128, Id, TextHandle)> = None;
     for (intent_id, handle, created) in find!(
         (i: Id, h: TextHandle, t: Inline<inlineencodings::NsTAIInterval>),
@@ -699,8 +713,7 @@ fn latest_intent_jit(space: &TribleSet) -> Option<(i128, Id, TextHandle)> {
 }
 
 fn latest_intent(snapshot: &body_model::BodySnapshot) -> Result<Option<(i128, Id, String)>> {
-    let Some(row) = body_model::latest_intent(snapshot.catalog(), snapshot.intent_register())?
-    else {
+    let Some(row) = body_model::latest_intent(snapshot.facts(), snapshot.intent_register())? else {
         return Ok(None);
     };
     let text: View<str> = snapshot
@@ -1254,7 +1267,10 @@ mod tests {
                 };
                 assert_eq!(jit_id, expected_id);
                 assert_eq!(selected_id, expected_id);
-                assert_eq!(snapshot.catalog().intents[&selected_id].text, jit_handle);
+                assert_eq!(
+                    body_model::decode_intent(snapshot.facts(), selected_id)?.text,
+                    jit_handle
+                );
                 assert_eq!(selected_text, expected_text);
                 Ok(())
             })
@@ -1278,7 +1294,7 @@ mod tests {
         pile.commit(collection, &signer, first).unwrap();
         let before = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
         assert_eq!(
-            body_model::latest_intent(before.catalog(), before.intent_register())
+            body_model::latest_intent(before.facts(), before.intent_register())
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1291,7 +1307,7 @@ mod tests {
         let after = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
 
         assert_eq!(
-            body_model::latest_intent(before.catalog(), before.intent_register())
+            body_model::latest_intent(before.facts(), before.intent_register())
                 .unwrap()
                 .unwrap()
                 .id,
@@ -1299,7 +1315,7 @@ mod tests {
             "the older snapshot must not borrow a later cover's register"
         );
         assert_eq!(
-            body_model::latest_intent(after.catalog(), after.intent_register())
+            body_model::latest_intent(after.facts(), after.intent_register())
                 .unwrap()
                 .unwrap()
                 .id,

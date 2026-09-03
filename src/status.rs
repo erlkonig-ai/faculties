@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList};
 use triblespace::prelude::*;
 
@@ -80,9 +81,8 @@ pub fn status_fragment(window: Id, text: &str, at: IntervalValue) -> Result<Frag
 /// multi-valued scalar fields rather than allowing query iteration order to
 /// choose one.
 ///
-/// This is crate-visible for the stopped-world legacy validator. Ordinary
-/// readers use [`load_status_rows`], which selects only intrinsic records and
-/// thereby leaves preserved legacy facts inert.
+/// This is retained for explicit stopped-world validation. Ordinary readers
+/// use [`load_status_rows`] and ask only for the fields their projection needs.
 pub fn load_tagged_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
     let events: BTreeSet<Id> = find!(
         event: Id,
@@ -130,17 +130,31 @@ pub fn load_tagged_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
         .collect()
 }
 
-/// Project the canonical intrinsic Status events from a generic collection.
+/// Project every complete Status event through one typed declarative query.
 ///
-/// A migrated collection may also contain the exact legacy random-id records
-/// that attest its history. Those records remain queryable as facts, but are
-/// not Status events in the native view. Identity is therefore the selector:
-/// only a row whose entity is the intrinsic id of its own tuple is returned.
-pub fn load_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
-    Ok(load_tagged_status_rows(facts)?
-        .into_iter()
-        .filter(|row| status_record(row.window, row.text, row.at).root() == Some(row.event))
-        .collect())
+/// Missing or undecodable fields simply do not inhabit this read type.
+/// Repeated fields retain their open-world bag semantics instead of making an
+/// unrelated historical row poison every ordinary Status observation.
+pub fn load_status_rows<P>(facts: &P) -> Result<Vec<StatusRow>>
+where
+    P: TriblePattern + ?Sized,
+{
+    Ok(find!(
+        (event: Id, window: Id, text: TextHandle, at: IntervalValue),
+        pattern!(facts, [{ ?event @
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status::window: ?window,
+            status::text: ?text,
+            metadata::created_at: ?at,
+        }])
+    )
+    .map(|(event, window, text, at)| StatusRow {
+        event,
+        window,
+        text,
+        at,
+    })
+    .collect())
 }
 
 /// Canonical ordering coordinate for one immutable event.
@@ -393,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_legacy_and_unrelated_facts_but_rejects_malformed_canonical_events() {
+    fn typed_reads_ignore_unrelated_facts_while_explicit_validation_remains_strict() {
         let mut storage = MemoryRepo::default();
         let text: TextHandle = storage.put("legacy".to_owned()).unwrap();
         let reader = storage.snapshot().unwrap();
@@ -405,7 +419,7 @@ mod tests {
             metadata::created_at: at(40.0),
         };
         validate_catalog(&reader, random.facts()).unwrap();
-        assert!(load_status_rows(random.facts()).unwrap().is_empty());
+        assert_eq!(load_status_rows(random.facts()).unwrap().len(), 1);
 
         let mut extra = status_record(id(6), text, at(41.0));
         let event = extra.root().unwrap();

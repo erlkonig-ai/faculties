@@ -26,7 +26,7 @@
 //! panel.render(ctx, planner_view, relations_view);
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{
@@ -285,19 +285,16 @@ impl PlannerLive {
 }
 
 fn collect_events(view: DatasetView<'_>) -> (Vec<EventRow>, Vec<String>) {
-    let catalog = match planner_model::validate_catalog(view.reader, view.facts) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            return (
-                Vec::new(),
-                vec![format!("Planner catalog is invalid: {error:#}")],
-            );
-        }
-    };
     let mut diagnostics = Vec::new();
     let mut events = Vec::new();
 
-    for row in catalog.events.values() {
+    let event_ids = planner_model::event_ids(view.facts)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for event_id in event_ids {
+        let Some(row) = planner_model::event(view.facts, event_id) else {
+            continue;
+        };
         let (start, end): (Epoch, Epoch) = match row.time.try_from_inline() {
             Ok(interval) => interval,
             Err(error) => {
@@ -323,7 +320,7 @@ fn collect_events(view: DatasetView<'_>) -> (Vec<EventRow>, Vec<String>) {
             continue;
         };
 
-        let mut notes: Vec<_> = catalog.notes_for(row.id).collect();
+        let mut notes = planner_model::notes_for_event(view.facts, row.id);
         notes.sort_by(|left, right| {
             left.created_at
                 .raw
@@ -351,7 +348,7 @@ fn collect_events(view: DatasetView<'_>) -> (Vec<EventRow>, Vec<String>) {
             start,
             end,
             location: row.location.clone(),
-            status: if catalog.is_cancelled(row.id) {
+            status: if planner_model::event_is_cancelled(view.facts, row.id) {
                 EventStatus::Cancelled
             } else {
                 EventStatus::parse(&row.status)

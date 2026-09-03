@@ -11,7 +11,6 @@ use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::collection_names::open_configured;
-use faculties::decide;
 use faculties::files;
 use faculties::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
 use faculties::mail_pop;
@@ -21,12 +20,13 @@ use faculties::schemas::{
     relations as relations_schema,
 };
 use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
@@ -155,7 +155,7 @@ impl Scopes {
 }
 
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
@@ -200,21 +200,60 @@ impl Storage<'_> {
                 open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
             let relations_collection =
                 open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
+            let mail = FactCollection::new(pile, mail_collection)
+                .context("register maintained Mail fact collection")?;
+            let files = FactCollection::new(pile, files_collection)
+                .context("register maintained Files fact collection")?;
+            let decide = FactCollection::new(pile, decide_collection)
+                .context("register maintained Decide fact collection")?;
+            let relations = FactCollection::new(pile, relations_collection)
+                .context("register maintained Relations fact collection")?;
+            let before = pile
+                .snapshot()
+                .context("freeze shared Mail pre-maintenance snapshot")?;
+            let instant = clock::now()?;
+            drop(
+                mail.maintain_at(pile, &before, instant)
+                    .context("maintain Mail fact collection")?,
+            );
+            drop(
+                files
+                    .maintain_at(pile, &before, instant)
+                    .context("maintain Files fact collection")?,
+            );
+            drop(
+                decide
+                    .maintain_at(pile, &before, instant)
+                    .context("maintain Decide fact collection")?,
+            );
+            drop(
+                relations
+                    .maintain_at(pile, &before, instant)
+                    .context("maintain Relations fact collection")?,
+            );
             let store_snapshot = pile
                 .snapshot()
-                .context("freeze shared Mail/Files/Decide/Relations store snapshot")?;
-            let (mail_facts, _) =
-                faculties::storage::read_fact_collection(mail_collection, &store_snapshot)
-                    .context("materialize Mail collection")?;
-            let (files_facts, _) =
-                faculties::storage::read_fact_collection(files_collection, &store_snapshot)
-                    .context("materialize Files collection")?;
-            let (decide_facts, _) =
-                faculties::storage::read_fact_collection(decide_collection, &store_snapshot)
-                    .context("materialize Decide collection")?;
-            let (relations_facts, _) =
-                faculties::storage::read_fact_collection(relations_collection, &store_snapshot)
-                    .context("materialize Relations collection")?;
+                .context("freeze shared maintained Mail snapshot")?;
+            let mail_facts = store_snapshot
+                .collection_at(mail.rank9(), instant)
+                .context("observe maintained Mail fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Mail fact collection")?;
+            let files_facts = store_snapshot
+                .collection_at(files.rank9(), instant)
+                .context("observe maintained Files fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Files fact collection")?;
+            let decide_facts = store_snapshot
+                .collection_at(decide.rank9(), instant)
+                .context("observe maintained Decide fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Decide fact collection")?;
+            let relations_facts = store_snapshot
+                .collection_at(relations.rank9(), instant)
+                .context("observe maintained Relations fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Relations fact collection")?;
             (
                 mail_facts,
                 files_facts,
@@ -231,7 +270,7 @@ impl Storage<'_> {
             vaults::discover_local_vaults(&mut *pile, &self.signer)
                 .context("discover local Secrets vault epochs")?
         };
-        let views = Views {
+        Ok(Views {
             mail: CollectionView {
                 facts: mail_facts,
                 reader: store_snapshot.clone(),
@@ -249,21 +288,7 @@ impl Storage<'_> {
                 reader: store_snapshot,
             },
             secrets,
-        };
-        decide::validate_catalog(&views.decide.reader, &views.decide.facts)
-            .context("validate Decide collection")?;
-        relations::validate_catalog(&views.relations.reader, &views.relations.facts)
-            .context("validate Relations collection")?;
-        mail::validate_catalog(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            views.secrets.snapshot(),
-        )
-        .context("validate Mail collection")?;
-        Ok(views)
+        })
     }
 
     fn add_secret(&self, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
@@ -381,7 +406,10 @@ fn resolve_account(views: &Views, input: &str) -> Result<Id> {
     }
 }
 
-fn resolve_draft(facts: &TribleSet, input: &str) -> Result<Id> {
+fn resolve_draft<P>(facts: &P, input: &str) -> Result<Id>
+where
+    P: TriblePattern,
+{
     let candidates: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
@@ -390,12 +418,18 @@ fn resolve_draft(facts: &TribleSet, input: &str) -> Result<Id> {
     faculties::resolve_id_prefix(input, candidates)
 }
 
-fn wire_candidates(facts: &TribleSet) -> BTreeSet<Id> {
+fn wire_candidates<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &mail_schema::KIND_WIRE_MESSAGE }]))
         .collect()
 }
 
-fn resolve_wire(facts: &TribleSet, input: &str) -> Result<Id> {
+fn resolve_wire<P>(facts: &P, input: &str) -> Result<Id>
+where
+    P: TriblePattern,
+{
     faculties::resolve_id_prefix(input, wire_candidates(facts))
 }
 
@@ -503,15 +537,6 @@ fn account_set(
     let mut fragment = Fragment::empty();
     let (config_fragment, config_id) = mail::account_config_fragment(anchor, input)?;
     fragment += config_fragment;
-    mail::validate_catalog_union(
-        &views.mail.reader,
-        &views.mail.facts,
-        &fragment,
-        &views.files.facts,
-        &views.decide.facts,
-        &views.relations.facts,
-        views.secrets.snapshot(),
-    )?;
     storage.publish(
         storage.scopes.mail,
         fragment,
@@ -604,23 +629,6 @@ fn create_draft(
         references,
         created_at: point_now()?,
     })?;
-    let mut files_union = views.files.facts.clone();
-    files_union += files_fragment.facts().clone();
-    let decide_union =
-        decide::validate_catalog_union(&views.decide.reader, &views.decide.facts, &draft.decide)?;
-    let mut blob_overlay = files_fragment.clone();
-    blob_overlay += draft.decide.clone();
-    blob_overlay += draft.mail.clone();
-    mail::validate_catalog_union_with_blobs(
-        &views.mail.reader,
-        &views.mail.facts,
-        &draft.mail,
-        &blob_overlay,
-        &files_union,
-        &decide_union,
-        &views.relations.facts,
-        views.secrets.snapshot(),
-    )?;
     if !files_fragment.facts().is_empty() {
         storage.publish(
             storage.scopes.files,
@@ -838,8 +846,6 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
         &views.mail.facts,
         &views.files.facts,
         &views.decide.facts,
-        &views.relations.facts,
-        views.secrets.snapshot(),
         SendAttemptInput {
             draft: draft_id,
             config: account.config,
@@ -853,8 +859,6 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
         },
     )?;
     let attempt_id = prepared.attempt_id();
-    let mut files_union = views.files.facts.clone();
-    files_union += prepared.outgoing_files().facts().clone();
     // Any Files evidence needed by the post-effect outgoing projection is
     // durable before SMTP. Most drafts reuse already-published file values.
     if !prepared.outgoing_files().facts().is_empty() {
@@ -884,19 +888,6 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
             )
         },
         |fragment| {
-            let after_attempt = storage.views()?;
-            let mut blob_overlay = prepared.outgoing_files().clone();
-            blob_overlay += fragment.clone();
-            mail::validate_catalog_union_with_blobs(
-                &after_attempt.mail.reader,
-                &after_attempt.mail.facts,
-                fragment,
-                &blob_overlay,
-                &files_union,
-                &after_attempt.decide.facts,
-                &after_attempt.relations.facts,
-                after_attempt.secrets.snapshot(),
-            )?;
             storage.publish(
                 storage.scopes.mail,
                 fragment.clone(),
@@ -970,15 +961,6 @@ fn cmd_read(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let wire = resolve_wire(&views.mail.facts, selector)?;
     let reader = relation_persona(&views)?;
     let (fragment, id) = mail::read_observation_fragment(wire, reader);
-    mail::validate_catalog_union(
-        &views.mail.reader,
-        &views.mail.facts,
-        &fragment,
-        &views.files.facts,
-        &views.decide.facts,
-        &views.relations.facts,
-        views.secrets.snapshot(),
-    )?;
     storage.publish(storage.scopes.mail, fragment, "mail: read observation")?;
     println!("Read {} ({})", fmt_id(wire), fmt_id(id));
     Ok(())
@@ -1052,41 +1034,27 @@ fn cmd_search(storage: &Storage<'_>, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn fragment_is_materialized(facts: &TribleSet, fragment: &Fragment) -> bool {
-    fragment.facts().iter().all(|fact| facts.contains(fact))
+#[cfg(test)]
+fn fragment_is_materialized(facts: &FactArchive, fragment: &Fragment) -> bool {
+    fragment
+        .facts()
+        .iter()
+        .all(|expected| facts.iter().any(|actual| &actual == expected))
 }
 
-fn publish_pop_publication_with<V, P>(
+fn publish_pop_publication_with<P>(
     publication: &mail::SourcePublication,
     scopes: Scopes,
-    mut materialize: V,
     mut publish: P,
 ) -> Result<()>
 where
-    V: FnMut() -> Result<Views>,
     P: FnMut(Id, Fragment, &str) -> Result<()>,
 {
-    // First prove the prospective cross-scope state while both fragments and
-    // all of their attachment blobs are still available in memory.
-    let before = materialize()?;
-    let mut prospective_files = before.files.facts.clone();
-    prospective_files += publication.files.facts().clone();
-    let mut blob_overlay = publication.files.clone();
-    blob_overlay += publication.mail.clone();
-    mail::validate_catalog_union_with_blobs(
-        &before.mail.reader,
-        &before.mail.facts,
-        &publication.mail,
-        &blob_overlay,
-        &prospective_files,
-        &before.decide.facts,
-        &before.relations.facts,
-        before.secrets.snapshot(),
-    )?;
-
-    if !publication.files.facts().is_empty()
-        && !fragment_is_materialized(&before.files.facts, &publication.files)
-    {
+    // Both fragments were constructed locally by typed APIs. Publish Files
+    // before Mail so every referenced attachment blob is durable before the
+    // source observation that names it. Replaying either intrinsic fragment
+    // is harmless and needs no derived-id lookup against the current union.
+    if !publication.files.facts().is_empty() {
         publish(
             scopes.files,
             publication.files.clone(),
@@ -1094,37 +1062,12 @@ where
         )?;
     }
 
-    // A PileSnapshot is an immutable snapshot. Take another reader from the
-    // same open Pile after Files so exact validation sees both its facts and
-    // newly appended attachment blobs.
-    let after_files = materialize()?;
-    if !fragment_is_materialized(&after_files.files.facts, &publication.files) {
-        bail!("published POP attachment evidence did not materialize");
-    }
-    mail::validate_catalog_union(
-        &after_files.mail.reader,
-        &after_files.mail.facts,
-        &publication.mail,
-        &after_files.files.facts,
-        &after_files.decide.facts,
-        &after_files.relations.facts,
-        after_files.secrets.snapshot(),
-    )?;
-    if fragment_is_materialized(&after_files.mail.facts, &publication.mail) {
-        return Ok(());
-    }
     publish(
         scopes.mail,
         publication.mail.clone(),
         "mail: POP source evidence and parser projection",
     )?;
 
-    // Only a fully rematerialized, exactly validated Mail observation lets
-    // drain_pop proceed to DELE.
-    let after_mail = materialize()?;
-    if !fragment_is_materialized(&after_mail.mail.facts, &publication.mail) {
-        bail!("published POP mail evidence did not materialize");
-    }
     Ok(())
 }
 
@@ -1171,7 +1114,6 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
             publish_pop_publication_with(
                 publication,
                 storage.scopes,
-                || storage.views(),
                 |scope, fragment, description| storage.publish(scope, fragment, description),
             )?;
             fetched += 1;
@@ -1521,7 +1463,7 @@ mod tests {
                 .credential,
             credential
         );
-        let mail_after_first_repair = after.mail.facts.clone();
+        let mail_after_first_repair = after.mail.facts.iter().collect::<Vec<_>>();
         drop(after);
         account_set(
             &storage,
@@ -1537,7 +1479,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(storage.views().unwrap().mail.facts, mail_after_first_repair);
+        assert_eq!(
+            storage
+                .views()
+                .unwrap()
+                .mail
+                .facts
+                .iter()
+                .collect::<Vec<_>>(),
+            mail_after_first_repair
+        );
     }
 
     #[test]
@@ -1858,7 +1809,6 @@ mod tests {
         publish_pop_publication_with(
             publication,
             storage.scopes,
-            || storage.views(),
             |scope, fragment, description| {
                 let label = if scope == storage.scopes.files {
                     "files"
@@ -1891,7 +1841,6 @@ mod tests {
         publish_pop_publication_with(
             &publication,
             storage.scopes,
-            || storage.views(),
             |scope, fragment, description| storage.publish(scope, fragment, description),
         )
         .unwrap();
@@ -2007,7 +1956,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             state.borrow().events,
-            ["uidl", "retr:2", "mail", "dele:2", "quit"]
+            ["uidl", "retr:2", "files", "mail", "dele:2", "quit"]
         );
         assert_eq!(state.borrow().committed, [2]);
     }

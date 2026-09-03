@@ -1,12 +1,21 @@
 //! Work with pull-based standing intentions in one fixed native collection.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
 use faculties::clock;
-use faculties::habits::{self, Catalog, DeclaredState, Habit, State};
+use faculties::collection_names::open_configured;
+use faculties::habits::{self, DeclaredState, Habit, State};
 use faculties::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
+};
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -79,12 +88,83 @@ enum Command {
     Check,
 }
 
+/// One command-scoped view over the maintained Habit relation.
+struct HabitSession<'a> {
+    pile: &'a mut Pile,
+    collection: Collection<SimpleArchive>,
+    signer: &'a SigningKey,
+    facts: FactArchive,
+    reader: PileSnapshot,
+}
+
+impl HabitSession<'_> {
+    fn commit(&mut self, fragment: Fragment) -> Result<CollectionCommit> {
+        self.pile
+            .commit(self.collection, self.signer, fragment)
+            .context("commit Habit fragment")
+    }
+}
+
+fn with_habits<T>(
+    pile_path: &Path,
+    key_path: Option<&Path>,
+    operation: impl FnOnce(&mut HabitSession<'_>) -> Result<T>,
+) -> Result<T> {
+    let signer = load_signer(pile_path, key_path)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        let maintained = FactCollection::new(&mut pile, collection)
+            .context("register maintained Habit fact collection")?;
+        let before = pile.snapshot().context("freeze Habit source snapshot")?;
+        let instant = clock::now()?;
+        let reader = maintained
+            .maintain_at(&mut pile, &before, instant)
+            .context("maintain Habit fact collection")?;
+        drop(before);
+        let facts = reader
+            .collection_at(maintained.rank9(), instant)
+            .context("observe maintained Habit fact collection")?
+            .view::<FactArchive>()
+            .context("read maintained Habit fact collection")?;
+        operation(&mut HabitSession {
+            pile: &mut pile,
+            collection,
+            signer: &signer,
+            facts,
+            reader,
+        })
+    })();
+    match (result, pile.close()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(anyhow!("close Habit pile: {error}")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Habit pile also failed: {close_error}")))
+        }
+    }
+}
+
 fn id_list(habits: &[&Habit]) -> String {
     habits
         .iter()
-        .map(|habit| format!("{:x}", habit.id))
+        .map(|habit| habit.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| format!("{id:x}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn unique_projection<'a>(definitions: Vec<&'a Habit>, id: Id) -> Result<&'a Habit> {
+    match definitions.as_slice() {
+        [habit] => Ok(*habit),
+        [] => bail!("no Habit definition {id:x}"),
+        many => bail!(
+            "Habit {id:x} has {} complete projections; its modeled fields are ambiguous",
+            many.len()
+        ),
+    }
 }
 
 /// Resolve a command-line selector to exactly one live definition.
@@ -95,11 +175,15 @@ fn id_list(habits: &[&Habit]) -> String {
 /// by picking one. Picking one is the distributed bug: which definition a name
 /// resolves to would then depend on which facts this window happens to have
 /// observed, and two windows would disagree while each was locally correct.
-fn select_live_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Habit> {
+fn select_live_habit<'a>(
+    definitions: &'a [Habit],
+    superseded: &BTreeSet<Id>,
+    selector: &str,
+) -> Result<&'a Habit> {
     let selector = selector.trim();
-    let live: Vec<_> = catalog
-        .live()
-        .into_iter()
+    let live: Vec<_> = definitions
+        .iter()
+        .filter(|habit| !superseded.contains(&habit.id))
         .filter(|habit| habit.label.eq_ignore_ascii_case(selector))
         .collect();
     match live.as_slice() {
@@ -112,23 +196,23 @@ fn select_live_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Hab
         ),
     }
 
-    let id =
-        faculties::resolve_id_prefix(selector, catalog.live().into_iter().map(|habit| habit.id))
-            .map_err(|error| anyhow!("no Habit labelled {selector:?}, and {error}"))?;
-    let habit = catalog
-        .habit(id)
-        .ok_or_else(|| anyhow!("no live Habit {id:x}"))?;
-    if catalog.is_superseded(id) {
+    let ids: BTreeSet<_> = definitions.iter().map(|habit| habit.id).collect();
+    let id = faculties::resolve_id_prefix(selector, ids)
+        .map_err(|error| anyhow!("no Habit labelled {selector:?}, and {error}"))?;
+    if superseded.contains(&id) {
         bail!("Habit {id:x} is superseded history and cannot be mutated");
     }
-    Ok(habit)
+    unique_projection(
+        definitions.iter().filter(|habit| habit.id == id).collect(),
+        id,
+    )
 }
 
 /// Resolve any definition, including superseded history, for inspection.
-fn select_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Habit> {
+fn select_habit<'a>(definitions: &'a [Habit], selector: &str) -> Result<&'a Habit> {
     let selector = selector.trim();
-    let labelled: Vec<_> = catalog
-        .habits()
+    let labelled: Vec<_> = definitions
+        .iter()
         .filter(|habit| habit.label.eq_ignore_ascii_case(selector))
         .collect();
     match labelled.as_slice() {
@@ -141,11 +225,13 @@ fn select_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Habit> {
         ),
     }
 
-    let id = faculties::resolve_id_prefix(selector, catalog.habits().map(|habit| habit.id))
+    let ids: BTreeSet<_> = definitions.iter().map(|habit| habit.id).collect();
+    let id = faculties::resolve_id_prefix(selector, ids)
         .map_err(|error| anyhow!("no Habit labelled {selector:?}, and {error}"))?;
-    catalog
-        .habit(id)
-        .ok_or_else(|| anyhow!("no Habit definition {id:x}"))
+    unique_projection(
+        definitions.iter().filter(|habit| habit.id == id).collect(),
+        id,
+    )
 }
 
 /// Resolve one revision predecessor by intrinsic id or id prefix.
@@ -153,8 +239,9 @@ fn select_habit<'a>(catalog: &'a Catalog, selector: &str) -> Result<&'a Habit> {
 /// A full id deliberately need not be present in this partial view. The model
 /// permits a successor to arrive before the definition it retires; once that
 /// predecessor arrives, the already-authored edge retires it monotonically.
-fn resolve_predecessor(catalog: &Catalog, selector: &str) -> Result<Id> {
-    faculties::resolve_id_prefix(selector, catalog.habits().map(|habit| habit.id))
+fn resolve_predecessor(definitions: &[Habit], selector: &str) -> Result<Id> {
+    let ids: BTreeSet<_> = definitions.iter().map(|habit| habit.id).collect();
+    faculties::resolve_id_prefix(selector, ids)
         .map_err(|error| anyhow!("invalid superseded Habit id {selector:?}: {error}"))
 }
 
@@ -206,44 +293,47 @@ fn cmd_add(
     let cooldown = Condition::parse(when.trim())
         .map_err(anyhow::Error::msg)?
         .cooldown_secs;
-    let catalog = habits::read_catalog(pile, key)?;
-    let mut retiring = supersedes
-        .iter()
-        .map(|selector| resolve_predecessor(&catalog, selector))
-        .collect::<Result<Vec<_>>>()?;
-    retiring.sort_unstable();
-    retiring.dedup();
-    let (fragment, id) = habits::habit_fragment(label, when, nudge, script, &retiring)?;
-    if catalog.habit(id).is_some() {
-        println!("Habit already present [{id:x}]");
-        return Ok(());
-    }
-    habits::publish(pile, key, fragment)?;
-    println!("added {parsed_label} [{id:x}] · cooldown {cooldown}s{carried}");
-    for retired in &retiring {
-        println!("  supersedes [{retired:x}]");
-    }
+    with_habits(pile, key, |session| {
+        let definitions = habits::definitions(&session.reader, &session.facts)?;
+        let superseded = habits::superseded_definition_ids(&session.facts);
+        let mut retiring = supersedes
+            .iter()
+            .map(|selector| resolve_predecessor(&definitions, selector))
+            .collect::<Result<Vec<_>>>()?;
+        retiring.sort_unstable();
+        retiring.dedup();
+        let (fragment, id) = habits::habit_fragment(label, when, nudge, script, &retiring)?;
+        if definitions.iter().any(|habit| habit.id == id) {
+            println!("Habit already present [{id:x}]");
+            return Ok(());
+        }
+        session.commit(fragment)?;
+        println!("added {parsed_label} [{id:x}] · cooldown {cooldown}s{carried}");
+        for retired in &retiring {
+            println!("  supersedes [{retired:x}]");
+        }
 
-    // A shared label is legal and sometimes correct — two windows may have
-    // authored the same intention independently. Say so rather than refusing:
-    // the label is not a key, and nothing here may retire a definition the
-    // author did not name.
-    let sharing: Vec<_> = catalog
-        .live()
-        .into_iter()
-        .filter(|habit| {
-            habit.label.eq_ignore_ascii_case(&parsed_label) && !retiring.contains(&habit.id)
-        })
-        .collect();
-    if !sharing.is_empty() {
-        println!(
-            "  note: {} other live Habit(s) share this label and remain live: {}",
-            sharing.len(),
-            id_list(&sharing)
-        );
-        println!("        add `--supersedes <id>` if this revision replaces one.");
-    }
-    Ok(())
+        // A shared label is legal and sometimes correct — two windows may
+        // have authored the same intention independently. Say so rather than
+        // refusing: the label is not a key, and nothing here may retire a
+        // definition the author did not name.
+        let sharing: Vec<_> = definitions
+            .iter()
+            .filter(|habit| !superseded.contains(&habit.id))
+            .filter(|habit| {
+                habit.label.eq_ignore_ascii_case(&parsed_label) && !retiring.contains(&habit.id)
+            })
+            .collect();
+        if !sharing.is_empty() {
+            println!(
+                "  note: {} other live Habit(s) share this label and remain live: {}",
+                sharing.len(),
+                id_list(&sharing)
+            );
+            println!("        add `--supersedes <id>` if this revision replaces one.");
+        }
+        Ok(())
+    })
 }
 
 fn state_detail(state: &State) -> Option<String> {
@@ -262,139 +352,150 @@ fn state_detail(state: &State) -> Option<String> {
 }
 
 fn cmd_list(pile: &Path, key: Option<&Path>, only_due: bool) -> Result<()> {
-    let catalog = habits::read_catalog(pile, key)?;
-    let now = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
-    let at = habits::evaluation_dir(pile);
-    let mut shown = 0usize;
-    let mut unevaluable = 0usize;
-    for row in catalog.rows()? {
-        let state = habits::evaluate(&row, now, &at);
-        if only_due {
-            if state.is_due() {
-                shown += 1;
-                println!("{}: {}", row.label, row.nudge);
-            } else if let Some(detail) = state_detail(&state) {
-                // An intention whose state could not be decided is reported,
-                // never filtered. A habit that quietly stops firing is the one
-                // failure nobody notices.
-                unevaluable += 1;
-                eprintln!(
-                    "{} [{:x}] {}: {detail}",
-                    row.label,
-                    row.id,
-                    state.word().to_ascii_lowercase()
-                );
-            }
-            continue;
-        }
-        shown += 1;
-        let last = row
-            .last_done()
-            .map(|done| format!("{}h ago", now.saturating_sub(done).max(0) / 3_600))
-            .unwrap_or_else(|| "never".to_owned());
-        let carried = row
-            .script
-            .as_ref()
-            .map(|script| format!("  script:{}", script.short_digest()))
-            .unwrap_or_default();
-        println!(
-            "{:<22} {:<9} done {:<12} {}{carried} [{:x}]",
-            row.label,
-            state.word(),
-            last,
-            row.condition,
-            row.id,
-        );
-        if let Some(detail) = state_detail(&state) {
-            println!("{:<22}   {detail}", "");
-        }
-    }
-    if shown == 0 {
-        println!(
-            "{}",
+    with_habits(pile, key, |session| {
+        let now = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
+        let at = habits::evaluation_dir(pile);
+        let mut shown = 0usize;
+        let mut unevaluable = 0usize;
+        for row in habits::rows(&session.reader, &session.facts)? {
+            let state = habits::evaluate(&row, now, &at);
             if only_due {
-                "nothing due"
-            } else {
-                "no habits yet"
+                if state.is_due() {
+                    shown += 1;
+                    println!("{}: {}", row.label, row.nudge);
+                } else if let Some(detail) = state_detail(&state) {
+                    // An intention whose state could not be decided is
+                    // reported, never filtered. A habit that quietly stops
+                    // firing is the one failure nobody notices.
+                    unevaluable += 1;
+                    eprintln!(
+                        "{} [{:x}] {}: {detail}",
+                        row.label,
+                        row.id,
+                        state.word().to_ascii_lowercase()
+                    );
+                }
+                continue;
             }
-        );
-    }
-    if !only_due {
-        // Superseded revisions stay in the collection as history. Say how many
-        // rather than listing them, so the live view is the default view.
-        let retired = catalog.habits().count() - catalog.live().len();
-        if retired > 0 {
-            println!("({retired} superseded revision(s) not shown)");
+            shown += 1;
+            let last = row
+                .last_done()
+                .map(|done| format!("{}h ago", now.saturating_sub(done).max(0) / 3_600))
+                .unwrap_or_else(|| "never".to_owned());
+            let carried = row
+                .script
+                .as_ref()
+                .map(|script| format!("  script:{}", script.short_digest()))
+                .unwrap_or_default();
+            println!(
+                "{:<22} {:<9} done {:<12} {}{carried} [{:x}]",
+                row.label,
+                state.word(),
+                last,
+                row.condition,
+                row.id,
+            );
+            if let Some(detail) = state_detail(&state) {
+                println!("{:<22}   {detail}", "");
+            }
         }
-    }
-    if unevaluable > 0 {
-        bail!("{unevaluable} standing intention(s) could not be evaluated (see above)");
-    }
-    Ok(())
+        if shown == 0 {
+            println!(
+                "{}",
+                if only_due {
+                    "nothing due"
+                } else {
+                    "no habits yet"
+                }
+            );
+        }
+        if !only_due {
+            // Superseded revisions stay in the collection as history. Say how
+            // many rather than listing them, so the live view is the default.
+            let ids = habits::definition_ids(&session.facts);
+            let superseded = habits::superseded_definition_ids(&session.facts);
+            let retired = ids.intersection(&superseded).count();
+            if retired > 0 {
+                println!("({retired} superseded revision(s) not shown)");
+            }
+        }
+        if unevaluable > 0 {
+            bail!("{unevaluable} standing intention(s) could not be evaluated (see above)");
+        }
+        Ok(())
+    })
 }
 
 fn cmd_show(pile: &Path, key: Option<&Path>, selector: &str) -> Result<()> {
-    let catalog = habits::read_catalog(pile, key)?;
-    let habit = select_habit(&catalog, selector)?;
-    println!("label:       {}", habit.label);
-    println!("id:          {:x}", habit.id);
-    println!(
-        "definition:  {}",
-        if catalog.is_superseded(habit.id) {
-            "superseded"
-        } else {
-            "live"
-        }
-    );
-    println!("condition:   {}", habit.condition);
-    println!("nudge:\n{}", habit.nudge);
-    match &habit.script {
-        Some(script) => println!(
-            "script:      {} ({} bytes, carried in the pile)",
-            script.digest(),
-            script.bytes.len()
-        ),
-        None => println!("script:      none"),
-    }
-    if habit.supersedes.is_empty() {
-        println!("supersedes:  none");
-    } else {
+    with_habits(pile, key, |session| {
+        let definitions = habits::definitions(&session.reader, &session.facts)?;
+        let habit = select_habit(&definitions, selector)?;
+        println!("label:       {}", habit.label);
+        println!("id:          {:x}", habit.id);
         println!(
-            "supersedes:  {}",
-            habit
-                .supersedes
-                .iter()
-                .map(|id| format!("{id:x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "definition:  {}",
+            if habits::is_superseded(&session.facts, habit.id) {
+                "superseded"
+            } else {
+                "live"
+            }
         );
-    }
-    Ok(())
+        println!("condition:   {}", habit.condition);
+        println!("nudge:\n{}", habit.nudge);
+        match &habit.script {
+            Some(script) => println!(
+                "script:      {} ({} bytes, carried in the pile)",
+                script.digest(),
+                script.bytes.len()
+            ),
+            None => println!("script:      none"),
+        }
+        if habit.supersedes.is_empty() {
+            println!("supersedes:  none");
+        } else {
+            println!(
+                "supersedes:  {}",
+                habit
+                    .supersedes
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
+    })
 }
 
 fn cmd_done(pile: &Path, key: Option<&Path>, label: &str) -> Result<()> {
-    let catalog = habits::read_catalog(pile, key)?;
-    let habit = select_live_habit(&catalog, label)?;
-    let (fragment, occurrence) = habits::completion_fragment(habit.id, clock::point_now()?)?;
-    habits::publish(pile, key, fragment)?;
-    println!("done {} [{occurrence:x}]", habit.label);
-    Ok(())
+    with_habits(pile, key, |session| {
+        let definitions = habits::definitions(&session.reader, &session.facts)?;
+        let superseded = habits::superseded_definition_ids(&session.facts);
+        let habit = select_live_habit(&definitions, &superseded, label)?.clone();
+        let (fragment, occurrence) = habits::completion_fragment(habit.id, clock::point_now()?)?;
+        session.commit(fragment)?;
+        println!("done {} [{occurrence:x}]", habit.label);
+        Ok(())
+    })
 }
 
 fn cmd_state(pile: &Path, key: Option<&Path>, label: &str, desired: DeclaredState) -> Result<()> {
-    let catalog = habits::read_catalog(pile, key)?;
-    let habit = select_live_habit(&catalog, label)?;
-    let activation = catalog.activation(habit.id)?;
-    if activation.declared() == Some(desired) {
-        println!("{} already {}", habit.label, desired.as_str());
-        return Ok(());
-    }
-    let predecessors = activation.head_ids();
-    let (fragment, assertion) =
-        habits::state_fragment(habit.id, desired, &predecessors, clock::point_now()?)?;
-    habits::publish(pile, key, fragment)?;
-    println!("{} {} [{assertion:x}]", desired.as_str(), habit.label);
-    Ok(())
+    with_habits(pile, key, |session| {
+        let definitions = habits::definitions(&session.reader, &session.facts)?;
+        let superseded = habits::superseded_definition_ids(&session.facts);
+        let habit = select_live_habit(&definitions, &superseded, label)?.clone();
+        let activation = habits::activation(&session.facts, habit.id)?;
+        if activation.declared() == Some(desired) {
+            println!("{} already {}", habit.label, desired.as_str());
+            return Ok(());
+        }
+        let predecessors = activation.head_ids();
+        let (fragment, assertion) =
+            habits::state_fragment(habit.id, desired, &predecessors, clock::point_now()?)?;
+        session.commit(fragment)?;
+        println!("{} {} [{assertion:x}]", desired.as_str(), habit.label);
+        Ok(())
+    })
 }
 
 fn main() -> Result<()> {
@@ -431,7 +532,7 @@ fn main() -> Result<()> {
             cmd_state(&cli.pile, cli.key.as_deref(), &label, DeclaredState::Active)
         }
         Some(Command::Check) => {
-            let catalog = habits::read_catalog(&cli.pile, cli.key.as_deref())?;
+            let catalog = habits::read_catalog_strict(&cli.pile, cli.key.as_deref())?;
             println!(
                 "Habit collection {} (scope {DEFAULT_SCOPE_ID:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions validated",
                 hex::encode_upper(
@@ -482,34 +583,43 @@ mod tests {
             habits::habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
         habits::publish(&pile, Some(&key), successor).unwrap();
 
-        let catalog = habits::read_catalog(&pile, Some(&key)).unwrap();
+        let (definitions, superseded) = with_habits(&pile, Some(&key), |session| {
+            Ok((
+                habits::definitions(&session.reader, &session.facts)?,
+                habits::superseded_definition_ids(&session.facts),
+            ))
+        })
+        .unwrap();
         assert_eq!(
-            select_live_habit(&catalog, "sweep").unwrap().id,
+            select_live_habit(&definitions, &superseded, "sweep")
+                .unwrap()
+                .id,
             successor_id
         );
-        let error = select_live_habit(&catalog, &format!("{original_id:x}")).unwrap_err();
+        let error =
+            select_live_habit(&definitions, &superseded, &format!("{original_id:x}")).unwrap_err();
         assert!(
             error.to_string().contains("superseded history"),
             "{error:#}"
         );
         assert_eq!(
-            select_habit(&catalog, &format!("{original_id:x}"))
+            select_habit(&definitions, &format!("{original_id:x}"))
                 .unwrap()
                 .id,
             original_id
         );
-        let error = select_habit(&catalog, "sweep").unwrap_err();
+        let error = select_habit(&definitions, "sweep").unwrap_err();
         assert!(error.to_string().contains("2 Habit revisions"), "{error:#}");
     }
 
     #[test]
     fn a_full_unseen_id_is_a_valid_revision_predecessor() {
-        let catalog = Catalog::default();
+        let definitions = Vec::new();
         let unseen = Id::new([0xA5; 16]).unwrap();
         assert_eq!(
-            resolve_predecessor(&catalog, &format!("{unseen:x}")).unwrap(),
+            resolve_predecessor(&definitions, &format!("{unseen:x}")).unwrap(),
             unseen
         );
-        assert!(resolve_predecessor(&catalog, "a5a5").is_err());
+        assert!(resolve_predecessor(&definitions, "a5a5").is_err());
     }
 }

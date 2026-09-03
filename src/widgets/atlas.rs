@@ -76,9 +76,8 @@ struct AtlasLive {
 
 impl AtlasLive {
     fn refresh(dataset: DatasetView<'_>) -> Self {
-        match crate::atlas::load_catalog(dataset.reader, dataset.facts) {
-            Ok(catalog) => {
-                let mut entries = catalog.entries().cloned().collect::<Vec<_>>();
+        match crate::atlas::named_entries(dataset.reader, dataset.facts) {
+            Ok(mut entries) => {
                 entries.sort_by(|left, right| {
                     atlas_sort_key(left)
                         .cmp(&atlas_sort_key(right))
@@ -99,7 +98,7 @@ impl AtlasLive {
                 cached_revision: dataset.revision,
                 entries: Vec::new(),
                 names_by_id: BTreeMap::new(),
-                diagnostic: Some(format!("Atlas projection is invalid: {error:#}")),
+                diagnostic: Some(format!("Atlas query failed: {error:#}")),
             },
         }
     }

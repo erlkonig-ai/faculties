@@ -11,7 +11,7 @@ use faculties::schemas::memory::{
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
 use faculties::schemas::{blockdag as archive_schema, cognition as cognition_schema};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
@@ -25,18 +25,16 @@ use faculties::memory_cover::{
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
-use faculties::{
-    blockdag::{self, CatalogValidation},
-    clock, cognition as cognition_model, comb as comb_model, memory as memory_model,
-};
+use faculties::{clock, cognition as cognition_model, comb as comb_model, memory as memory_model};
 use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::{RawBytes, SimpleArchive, UTF8String};
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -86,7 +84,7 @@ struct MemoryStorage<'a> {
 }
 
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
@@ -96,7 +94,7 @@ struct LoadedMemory {
 
 struct LoadedContext {
     memory: LoadedMemory,
-    embeddings: CollectionView,
+    embeddings: Option<CollectionView>,
 }
 
 struct LoadedComb {
@@ -111,14 +109,21 @@ struct LoadedProvenance {
 }
 
 impl MemoryStorage<'_> {
-    fn materialize_collection(
-        collection: Collection<SimpleArchive>,
+    fn attach_collection(
+        collection: FactCollection,
         store_snapshot: &PileSnapshot,
+        instant: Epoch,
         label: &str,
-    ) -> Result<TribleSet> {
-        faculties::storage::read_fact_collection(collection, store_snapshot)
-            .map(|(facts, _)| facts)
-            .with_context(|| format!("materialize authored {label} collection"))
+    ) -> Result<CollectionView> {
+        let facts = store_snapshot
+            .collection_at(collection.rank9(), instant)
+            .with_context(|| format!("observe maintained {label} collection"))?
+            .view::<FactArchive>()
+            .with_context(|| format!("attach maintained {label} collection"))?;
+        Ok(CollectionView {
+            facts,
+            reader: store_snapshot.clone(),
+        })
     }
 
     fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
@@ -134,46 +139,34 @@ impl MemoryStorage<'_> {
     }
 
     fn load_memory_from_snapshot(
-        collection: Collection<SimpleArchive>,
+        collection: FactCollection,
         store_snapshot: &PileSnapshot,
+        instant: Epoch,
     ) -> Result<LoadedMemory> {
-        // Read the collection. That is the whole gate.
-        //
-        // This used to build the entire MemoryCatalog and then keep exactly one
-        // thing from it — `node_ids()` — to filter out preserved random-id
-        // legacy rows. MEASURED 2026-09-01 on the live pile: there are ZERO such
-        // rows. 5,404 chunks tagged, 5,404 canonical, 0 legacy. The filter had
-        // been re-deriving an intrinsic id for every chunk on every read to hide
-        // nothing at all, at 1.274 s against 83 ms to materialise the collection
-        // it was filtering and 204 us for the one query that returns the same ids.
-        //
-        // It was not always vacuous: the cutover three days earlier did preserve
-        // legacy rows beside their intrinsic shadows, and this guarded against
-        // them. Then the journal was rebuilt as its own collection, constructed
-        // canonical, where the condition cannot arise by construction — and a
-        // guard with nothing to catch is indistinguishable from a guard that
-        // works, right up until you count.
-        //
-        // If legacy rows ever DO surface, they are not hidden by re-deriving ids
-        // (JP: "IDs, including derived IDs, are opaque"); they are superseded
-        // explicitly through `metadata::supersedes`, the same mechanism anything
-        // else is hidden by, so the reason travels with the record.
-        let facts = Self::materialize_collection(collection, store_snapshot, "Memory")?;
-        let memory = CollectionView {
-            facts,
-            reader: store_snapshot.clone(),
-        };
+        let memory = Self::attach_collection(collection, store_snapshot, instant, "Memory")?;
         Ok(LoadedMemory { memory })
     }
 
-    /// Freeze canonical Memory alone for ordinary commands.
+    /// Freeze maintained Memory alone for ordinary commands.
     fn load(&self) -> Result<LoadedMemory> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Memory store snapshot")?;
-            Self::load_memory_from_snapshot(collection, &store_snapshot)
+            let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let collection = FactCollection::new(&mut pile, source)
+                .context("register maintained Memory collection")?;
+            let instant = clock::now()?;
+            let before = pile.snapshot().context("freeze Memory source snapshot")?;
+            drop(
+                collection
+                    .maintain_at(&mut pile, &before, instant)
+                    .context("maintain Memory collection")?,
+            );
+            drop(before);
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze maintained Memory snapshot")?;
+            Self::load_memory_from_snapshot(collection, &store_snapshot, instant)
         })();
         Self::finish_pile(pile, result)
     }
@@ -184,31 +177,52 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection =
+            let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let memory_collection = FactCollection::new(&mut pile, memory_source)
+                .context("register maintained Memory collection")?;
             let embeddings_collection = if with_embeddings {
-                Some(open_configured(
-                    &mut pile,
-                    EMBEDDINGS_SCOPE_ID,
-                    signer.verifying_key(),
-                )?)
+                let source =
+                    open_configured(&mut pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
+                Some(
+                    FactCollection::new(&mut pile, source)
+                        .context("register maintained shared Embeddings collection")?,
+                )
             } else {
                 None
             };
+            let instant = clock::now()?;
+            let before = pile
+                .snapshot()
+                .context("freeze Memory/Embeddings source snapshot")?;
+            drop(
+                memory_collection
+                    .maintain_at(&mut pile, &before, instant)
+                    .context("maintain Memory collection")?,
+            );
+            if let Some(collection) = embeddings_collection {
+                drop(
+                    collection
+                        .maintain_at(&mut pile, &before, instant)
+                        .context("maintain shared Embeddings collection")?,
+                );
+            }
+            drop(before);
             let store_snapshot = pile
                 .snapshot()
-                .context("freeze Memory/Embeddings store snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            let facts = embeddings_collection
+                .context("freeze maintained Memory/Embeddings snapshot")?;
+            let memory =
+                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
+            let embeddings = embeddings_collection
                 .map(|collection| {
-                    Self::materialize_collection(collection, &store_snapshot, "shared Embeddings")
+                    Self::attach_collection(
+                        collection,
+                        &store_snapshot,
+                        instant,
+                        "shared Embeddings",
+                    )
                 })
-                .transpose()?
-                .unwrap_or_default();
-            let embeddings = CollectionView {
-                facts,
-                reader: store_snapshot,
-            };
+                .transpose()?;
             Ok(LoadedContext { memory, embeddings })
         })();
         Self::finish_pile(pile, result)
@@ -219,21 +233,32 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection =
+            let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let memory_collection = FactCollection::new(&mut pile, memory_source)
+                .context("register maintained Memory collection")?;
             let comb_collection =
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            let instant = clock::now()?;
+            let before = pile
+                .snapshot()
+                .context("freeze Memory/Comb source snapshot")?;
+            let (comb_facts, _) =
+                faculties::storage::read_fact_collection(comb_collection, &before)
+                    .context("read legacy Comb collection")?;
+            drop(
+                memory_collection
+                    .maintain_at(&mut pile, &before, instant)
+                    .context("maintain Memory collection")?,
+            );
+            drop(before);
             let store_snapshot = pile
                 .snapshot()
-                .context("freeze Memory/Comb store snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            let facts = Self::materialize_collection(comb_collection, &store_snapshot, "Comb")?;
-            let comb = CollectionView {
-                facts,
-                reader: store_snapshot,
-            };
+                .context("freeze maintained Memory/Comb snapshot")?;
+            let memory =
+                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
             let comb_catalog =
-                comb_model::load_catalog(&comb.facts).context("validate Comb collection")?;
+                comb_model::load_catalog(&comb_facts).context("validate Comb collection")?;
             Ok(LoadedComb {
                 memory,
                 comb_catalog,
@@ -248,68 +273,72 @@ impl MemoryStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let memory_collection =
+            let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let cognition_collection = open_configured(
+            let cognition_source = open_configured(
                 &mut pile,
                 cognition_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )?;
-            let archive_collection = open_configured(
+            let archive_source = open_configured(
                 &mut pile,
                 archive_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )?;
+            let memory_collection = FactCollection::new(&mut pile, memory_source)
+                .context("register maintained Memory collection")?;
+            let cognition_collection = FactCollection::new(&mut pile, cognition_source)
+                .context("register maintained Cognition collection")?;
+            let archive_collection = FactCollection::new(&mut pile, archive_source)
+                .context("register maintained Archive collection")?;
+            let instant = clock::now()?;
+            let before = pile
+                .snapshot()
+                .context("freeze Memory/Cognition/Archive source snapshot")?;
+            for (collection, label) in [
+                (memory_collection, "Memory"),
+                (cognition_collection, "Cognition"),
+                (archive_collection, "Archive"),
+            ] {
+                drop(
+                    collection
+                        .maintain_at(&mut pile, &before, instant)
+                        .with_context(|| format!("maintain {label} collection"))?,
+                );
+            }
+            drop(before);
             let store_snapshot = pile
                 .snapshot()
-                .context("freeze Memory/Cognition/Archive store snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            let cognition_facts =
-                Self::materialize_collection(cognition_collection, &store_snapshot, "Cognition")?;
-            let archive_facts =
-                Self::materialize_collection(archive_collection, &store_snapshot, "Archive")?;
-            match blockdag::validate_catalog(&store_snapshot, &archive_facts)
-                .context("validate Archive collection for Memory provenance")?
-            {
-                CatalogValidation::Accepted => {}
-                CatalogValidation::Pending { missing } => bail!(
-                    "Archive collection is missing {} attachment blob(s)",
-                    missing.len()
-                ),
-                CatalogValidation::Rejected(reason) => {
-                    bail!("Archive collection is invalid: {reason}")
-                }
-            }
+                .context("freeze maintained Memory/Cognition/Archive snapshot")?;
+            let memory =
+                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
             Ok(LoadedProvenance {
                 memory,
-                cognition: CollectionView {
-                    facts: cognition_facts,
-                    reader: store_snapshot.clone(),
-                },
-                archive: CollectionView {
-                    facts: archive_facts,
-                    reader: store_snapshot,
-                },
+                cognition: Self::attach_collection(
+                    cognition_collection,
+                    &store_snapshot,
+                    instant,
+                    "Cognition",
+                )?,
+                archive: Self::attach_collection(
+                    archive_collection,
+                    &store_snapshot,
+                    instant,
+                    "Archive",
+                )?,
             })
         })();
         Self::finish_pile(pile, result)
     }
 
-    fn publish_memory(&self, _loaded: &LoadedMemory, fragment: Fragment) -> Result<()> {
+    fn publish_memory(&self, fragment: Fragment) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze Memory mutation store snapshot")?;
-            let current = Self::materialize_collection(collection, &store_snapshot, "Memory")?;
-            memory_model::validate_candidate(&store_snapshot, &current, &fragment)
-                .context("validate Memory mutation")?;
-            pile.commit(collection, &signer, fragment)
-                .context("commit authored Memory fragment")?;
-            Ok(())
-        })();
+        let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+        let result = pile
+            .commit(collection, &signer, fragment)
+            .context("commit authored Memory fragment")
+            .map(|_| ());
         Self::finish_pile(pile, result)
     }
 
@@ -325,33 +354,24 @@ impl MemoryStorage<'_> {
         Self::finish_pile(pile, result)
     }
 
-    fn publish_comb(&self, loaded: &LoadedComb, fragment: Fragment) -> Result<()> {
-        let _ = loaded;
+    fn publish_comb(&self, fragment: Fragment) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection =
-                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze Comb mutation store snapshot")?;
-            let mut candidate = Self::materialize_collection(collection, &store_snapshot, "Comb")?;
-            candidate += fragment.facts().clone();
-            comb_model::load_catalog(&candidate).context("validate Comb mutation")?;
-            pile.commit(collection, &signer, fragment)
-                .context("commit authored Comb cursor")?;
-            Ok(())
-        })();
+        let collection = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+        let result = pile
+            .commit(collection, &signer, fragment)
+            .context("commit authored Comb cursor")
+            .map(|_| ());
         Self::finish_pile(pile, result)
     }
 }
 
 // ── on-demand chunk queries ───────────────────────────────────────────
-// Chunks are queried directly from the TribleSet — no pre-materialization.
+// Chunks are queried directly from their maintained pattern — no flattening.
 
 /// One-line render of a chunk for list/similar output: the summary's first
 /// line, or a wordless-image marker, or empty.
-fn chunk_oneline(reader: &PileSnapshot, space: &TribleSet, id: Id) -> String {
+fn chunk_oneline<P: TriblePattern>(reader: &PileSnapshot, space: &P, id: Id) -> String {
     if let Some(h) = chunk_summary_handle(space, id) {
         return reader
             .get::<View<str>, UTF8String>(h)
@@ -409,26 +429,17 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
 /// that matches the query's width. This replaces a "narrowest strict
 /// container, else max raw overlap" rule that let an oversized root shadow
 /// every finer cover (raw overlap also favours wide chunks).
-fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Epoch) -> Option<Id> {
+fn find_chunk_by_time_range<P: TriblePattern>(
+    space: &P,
+    query_start: Epoch,
+    query_end: Epoch,
+) -> Option<Id> {
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
     let mut best: Option<(Id, i128)> = None; // (id, specificity score)
 
-    for chunk_id in all_chunk_ids(space) {
-        let start_val = chunk_start_at(space, chunk_id);
-        let end_val = chunk_end_at(space, chunk_id);
-        let (Some(start_v), Some(end_v)) = (start_val, end_val) else {
-            continue;
-        };
-
-        let chunk_start = epoch_from_interval(start_v)
-            .to_tai_duration()
-            .total_nanoseconds();
-        let chunk_end = epoch_end_from_interval(end_v)
-            .to_tai_duration()
-            .total_nanoseconds();
-
+    for (chunk_start, chunk_end, chunk_id) in collect_chunk_spans(space) {
         if chunk_start > query_end_ns || chunk_end < query_start_ns {
             continue;
         }
@@ -439,7 +450,8 @@ fn find_chunk_by_time_range(space: &TribleSet, query_start: Epoch, query_end: Ep
         let width = chunk_end - chunk_start;
         let score = 2 * overlap - width;
         match best {
-            Some((_, prev_score)) if prev_score >= score => {}
+            Some((prev_id, prev_score))
+                if prev_score > score || (prev_score == score && prev_id <= chunk_id) => {}
             _ => best = Some((chunk_id, score)),
         }
     }
@@ -513,11 +525,22 @@ fn cmd_embed(storage: MemoryStorage<'_>) -> Result<()> {
     let space = &loaded.memory.memory.facts;
     let mut todo: Vec<(Id, Src)> = Vec::new();
     for chunk in all_chunk_ids(space) {
-        if chunk_embedding_handle(&loaded.embeddings.facts, chunk)?.is_some() {
+        if chunk_embedding_handle(
+            &loaded
+                .embeddings
+                .as_ref()
+                .expect("load_context(true) attaches Embeddings")
+                .facts,
+            chunk,
+        )?
+        .is_some()
+        {
             continue;
         }
         // An image chunk is wordless — route it to vision; otherwise embed
-        // its summary with text. (A validated chunk has exactly one.)
+        // its summary with text. Local writers emit one content value; an
+        // additive imported row with several remains readable through the
+        // deterministic typed accessors above.
         if let Some(h) = chunk_image_handle(space, chunk) {
             todo.push((chunk, Src::Image(h)));
         } else if let Some(h) = chunk_summary_handle(space, chunk) {
@@ -618,9 +641,12 @@ fn cmd_similar(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let space = &loaded.memory.memory.facts;
     let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
     for chunk in all_chunk_ids(space) {
-        if let Some(h) = chunk_embedding_handle(&loaded.embeddings.facts, chunk)? {
-            let v: View<[f32]> = loaded
-                .embeddings
+        let embeddings = loaded
+            .embeddings
+            .as_ref()
+            .expect("load_context(true) attaches Embeddings");
+        if let Some(h) = chunk_embedding_handle(&embeddings.facts, chunk)? {
+            let v: View<[f32]> = embeddings
                 .reader
                 .get(h)
                 .map_err(|e| anyhow!("read embedding: {e:?}"))?;
@@ -904,7 +930,7 @@ fn create_chunk(
         observed_at: BTreeSet::from([observed_at]),
         aliases: BTreeSet::new(),
     })?;
-    storage.publish_memory(loaded, fragment)?;
+    storage.publish_memory(fragment)?;
     Ok(chunk_id)
 }
 
@@ -947,8 +973,7 @@ fn cmd_image(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         bail!("image file is empty: {}", image_path.display());
     }
 
-    let loaded = storage.load()?;
-    let chunk_id = create_image_chunk(storage, &loaded, &bytes, range)?;
+    let chunk_id = create_image_chunk(storage, &bytes, range)?;
     println!("range: {}", format_time_range(range.0, range.1));
     println!("id: {chunk_id:x}");
     println!(
@@ -965,7 +990,6 @@ fn cmd_image(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 /// at it like any chunk.
 fn create_image_chunk(
     storage: MemoryStorage<'_>,
-    loaded: &LoadedMemory,
     bytes: &[u8],
     range: (Epoch, Epoch),
 ) -> Result<Id> {
@@ -983,7 +1007,7 @@ fn create_image_chunk(
         observed_at: BTreeSet::from([observed_at]),
         aliases: BTreeSet::new(),
     })?;
-    storage.publish_memory(loaded, fragment)?;
+    storage.publish_memory(fragment)?;
     Ok(chunk_id)
 }
 
@@ -1032,7 +1056,7 @@ fn comb_advance(
         predecessors,
         observed_at: BTreeSet::from([observed_at]),
     })?;
-    storage.publish_comb(loaded, fragment)
+    storage.publish_comb(fragment)
 }
 
 /// `memory consolidate start <ts> | stop | <ts> <summary...>`
@@ -1596,8 +1620,8 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 /// `cover start` (which stores it for cursor-chunked reading), so the cover
 /// semantics — antichain completeness, the character budget, the
 /// `--about`/`--filter`/`--remove` composition — live in one place and the two
-/// callers can never drift. Memory and Embeddings were materialized during
-/// the same open-pile read held by `loaded`.
+/// callers can never drift. Memory and optional Embeddings are attached from
+/// one immutable maintained store snapshot held by `loaded`.
 fn build_context_cover(
     loaded: &LoadedContext,
     budget_chars: usize,
@@ -1619,12 +1643,24 @@ fn build_context_cover(
         remove: remove_q.map(str::to_string),
         sim_threshold,
     };
-    faculties::memory_cover::render_cover(
-        &loaded.memory.memory.facts,
-        &loaded.embeddings.facts,
-        &loaded.memory.memory.reader,
-        &opts,
-    )
+    if let Some(embeddings) = loaded.embeddings.as_ref() {
+        faculties::memory_cover::render_cover(
+            &loaded.memory.memory.facts,
+            &embeddings.facts,
+            &loaded.memory.memory.reader,
+            &opts,
+        )
+    } else {
+        // No semantic option was requested, so the renderer never consults
+        // this relation. Keeping it truly empty avoids maintaining Embeddings
+        // for commands that cannot observe them.
+        faculties::memory_cover::render_cover(
+            &loaded.memory.memory.facts,
+            &TribleSet::new(),
+            &loaded.memory.memory.reader,
+            &opts,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2232,9 +2268,9 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn print_archive_meta(
+fn print_archive_meta<P: TriblePattern>(
     reader: &PileSnapshot,
-    archive: &TribleSet,
+    archive: &P,
     archive_msg_id: Id,
 ) -> Result<()> {
     let mut native_projection = false;
@@ -2400,8 +2436,8 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
 
 /// Find all canonical Archive source projections whose own timestamp (or the
 /// projected block timestamp when source time is absent) falls in the range.
-fn find_archive_in_range(
-    catalog: &TribleSet,
+fn find_archive_in_range<P: TriblePattern>(
+    catalog: &P,
     query_start: Epoch,
     query_end: Epoch,
 ) -> Vec<(Id, Inline<NsTAIInterval>)> {
@@ -2502,7 +2538,7 @@ fn cmd_provenance(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 // show / turn subcommands
 // ---------------------------------------------------------------------------
 
-fn print_chunk(reader: &PileSnapshot, space: &TribleSet, chunk_id: Id) -> Result<()> {
+fn print_chunk<P: TriblePattern>(reader: &PileSnapshot, space: &P, chunk_id: Id) -> Result<()> {
     if let Some(handle) = chunk_summary_handle(space, chunk_id) {
         let summary: View<str> = reader.get(handle).context("read chunk summary")?;
         print!("{}", summary.trim_end());
@@ -2533,10 +2569,10 @@ fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     let prefix = normalize_prefix(raw)?;
     let space = &loaded.memory.facts;
 
-    // Intrinsic ids and historical aliases are both stable names for one
-    // immutable revision.  Resolve them into target ids before deciding
-    // ambiguity, so an intrinsic id that is also recorded as its own alias
-    // still denotes one chunk.
+    // Entity ids and historical aliases are both stable names for one
+    // immutable episode. Resolve them into target ids before deciding
+    // ambiguity, so an id that is also recorded as its own alias still
+    // denotes one chunk. No lookup depends on how the id was minted.
     let mut chunk_matches = BTreeSet::new();
     for chunk_id in all_chunk_ids(&loaded.memory.facts) {
         if id_starts_with(chunk_id, prefix.as_str()) {
@@ -2573,7 +2609,7 @@ fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     bail!("no chunk id matches prefix '{prefix}'")
 }
 
-fn print_turn_facets(reader: &PileSnapshot, space: &TribleSet, raw: &str) -> Result<()> {
+fn print_turn_facets<P: TriblePattern>(reader: &PileSnapshot, space: &P, raw: &str) -> Result<()> {
     let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
     for chunk_id in all_chunk_ids(space) {
@@ -2744,10 +2780,9 @@ mod tests {
     }
 
     fn publish_chunk(storage: MemoryStorage<'_>, draft: memory_model::ChunkDraft) -> Id {
-        let loaded = storage.load().expect("load Memory collection");
         let (fragment, id) = memory_model::chunk_fragment(draft).expect("build Memory chunk");
         storage
-            .publish_memory(&loaded, fragment)
+            .publish_memory(fragment)
             .expect("publish Memory chunk");
         id
     }
@@ -2785,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_aliases_resolve_to_their_exact_intrinsic_revision() {
+    fn historical_aliases_resolve_to_their_exact_episode() {
         let pile = TestPile::new();
         let storage = pile.storage();
         let alias = Id::new([0x71; 16]).unwrap();

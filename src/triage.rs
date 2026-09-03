@@ -16,12 +16,12 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
-use crate::cognition as cognition_model;
 use crate::headspace::{self, Catalog, ConfigValue, ProfileValue, Resolution};
 use crate::message as message_model;
 use crate::relations::{self as relations_model, IdentityComponents, ProfileView};
@@ -35,19 +35,34 @@ pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>
 pub type Interval = Inline<inlineencodings::NsTAIInterval>;
 
 /// One immutable collection value from a single frozen pile prefix.
-#[derive(Clone, Copy, Debug)]
-pub struct SourceView<'a> {
-    pub facts: &'a TribleSet,
+#[derive(Debug)]
+pub struct SourceView<'a, P: TriblePattern = TribleSet> {
+    pub facts: &'a P,
     pub reader: &'a PileSnapshot,
 }
 
-#[derive(Clone, Copy)]
-pub struct ScanSources<'a> {
-    pub cognition: SourceView<'a>,
-    pub headspace: SourceView<'a>,
+impl<P: TriblePattern> Copy for SourceView<'_, P> {}
+
+impl<P: TriblePattern> Clone for SourceView<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub struct ScanSources<'a, P: TriblePattern = TribleSet> {
+    pub cognition: SourceView<'a, P>,
+    pub headspace: SourceView<'a, P>,
     pub secrets: &'a SecretsSnapshot<PileSnapshot>,
-    pub relations: SourceView<'a>,
-    pub messages: SourceView<'a>,
+    pub relations: SourceView<'a, P>,
+    pub messages: SourceView<'a, P>,
+}
+
+impl<P: TriblePattern> Copy for ScanSources<'_, P> {}
+
+impl<P: TriblePattern> Clone for ScanSources<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -355,7 +370,7 @@ where
     Ok(view.to_string())
 }
 
-fn tagged_entities(space: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn tagged_entities<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: kind }])).collect()
 }
 
@@ -397,9 +412,10 @@ where
 }
 
 /// Project every native Exec event exactly once by entity id.
-pub fn collect_exec_state<Store>(reader: &Store, space: &TribleSet) -> Result<ExecState>
+pub fn collect_exec_state<Store, P>(reader: &Store, space: &P) -> Result<ExecState>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let mut state = ExecState::default();
     for id in tagged_entities(space, KIND_EXEC_REQUEST_ID) {
@@ -510,9 +526,10 @@ where
 }
 
 /// Project every native model-chat event exactly once by entity id.
-pub fn collect_model_chat_state<Store>(reader: &Store, space: &TribleSet) -> Result<ModelChatState>
+pub fn collect_model_chat_state<Store, P>(reader: &Store, space: &P) -> Result<ModelChatState>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let mut state = ModelChatState::default();
     for id in tagged_entities(space, KIND_MODEL_REQUEST_ID) {
@@ -632,9 +649,10 @@ where
     Ok(state)
 }
 
-pub fn collect_reason_state<Store>(reader: &Store, space: &TribleSet) -> Result<Vec<ReasonEventRow>>
+pub fn collect_reason_state<Store, P>(reader: &Store, space: &P) -> Result<Vec<ReasonEventRow>>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let mut rows = Vec::new();
     for id in tagged_entities(space, KIND_REASON_EVENT_ID) {
@@ -1064,8 +1082,8 @@ pub fn project_triage_headspace(catalog: &Catalog) -> TriageHeadspace {
     }
 }
 
-pub fn project_headspace(
-    headspace_view: SourceView<'_>,
+pub fn project_headspace<P: TriblePattern>(
+    headspace_view: SourceView<'_, P>,
     secrets: &SecretsSnapshot<PileSnapshot>,
 ) -> Result<TriageHeadspace> {
     let catalog = headspace::project_result(headspace_view.reader, headspace_view.facts)
@@ -1075,7 +1093,7 @@ pub fn project_headspace(
     Ok(project_triage_headspace(&catalog))
 }
 
-pub fn relation_state(view: SourceView<'_>) -> Result<RelationState> {
+pub fn relation_state<P: TriblePattern>(view: SourceView<'_, P>) -> Result<RelationState> {
     let mut terms = BTreeSet::new();
     let mut forked_profiles = Vec::new();
     for (person, profile) in relations_model::person_profile_views(view.reader, view.facts) {
@@ -1106,9 +1124,9 @@ pub fn relation_state(view: SourceView<'_>) -> Result<RelationState> {
     })
 }
 
-pub fn count_unread_messages(
-    messages: SourceView<'_>,
-    relations: SourceView<'_>,
+pub fn count_unread_messages<P: TriblePattern>(
+    messages: SourceView<'_, P>,
+    relations: SourceView<'_, P>,
     reader: Id,
 ) -> Result<usize> {
     let identities = IdentityComponents::from_facts(relations.facts)?;
@@ -1240,18 +1258,10 @@ impl ScanReport {
 }
 
 /// Project the complete native `triage scan` semantic state.
-pub fn project_scan(sources: ScanSources<'_>, options: ScanOptions) -> Result<ScanReport> {
-    cognition_model::validate_catalog(sources.cognition.reader, sources.cognition.facts)
-        .context("validate Cognition collection")?;
-    relations_model::validate_catalog(sources.relations.reader, sources.relations.facts)
-        .context("validate Relations collection")?;
-    message_model::validate_catalog(
-        sources.messages.reader,
-        sources.messages.facts,
-        sources.relations.facts,
-    )
-    .context("validate Message collection")?;
-
+pub fn project_scan<P: TriblePattern>(
+    sources: ScanSources<'_, P>,
+    options: ScanOptions,
+) -> Result<ScanReport> {
     let exec_state = collect_exec_state(sources.cognition.reader, sources.cognition.facts)?;
     let model_state = collect_model_chat_state(sources.cognition.reader, sources.cognition.facts)?;
     let reason_events = collect_reason_state(sources.cognition.reader, sources.cognition.facts)?;

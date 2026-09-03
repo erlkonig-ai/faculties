@@ -17,6 +17,7 @@ use triblespace::core::collection::lww_register::{
 };
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
@@ -27,6 +28,7 @@ use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
+use crate::storage::{FactArchive, FactCollection};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -37,14 +39,14 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 /// the index is then attached for exactly that source cover. Maintained
 /// artifacts are cache exhaust, never additional semantic authority.
 pub struct CompassSnapshot {
-    facts: TribleSet,
+    facts: FactArchive,
     store_snapshot: PileSnapshot,
     status: LwwIndex,
 }
 
 impl CompassSnapshot {
-    /// Materialized facts admitted by this exact snapshot.
-    pub fn facts(&self) -> &TribleSet {
+    /// Shard-preserving facts admitted by this exact snapshot.
+    pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
@@ -59,7 +61,7 @@ impl CompassSnapshot {
     }
 
     /// Consume the coherent snapshot into facts, store snapshot, and status index.
-    pub fn into_parts(self) -> (TribleSet, PileSnapshot, LwwIndex) {
+    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwIndex) {
         (self.facts, self.store_snapshot, self.status)
     }
 }
@@ -387,7 +389,7 @@ pub fn priority_fragment(
     }
 }
 
-pub fn goal_ids(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn goal_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     find!(
         goal: Id,
         pattern!(facts, [{ ?goal @ metadata::tag: &KIND_GOAL_ID }])
@@ -395,7 +397,7 @@ pub fn goal_ids(facts: &TribleSet) -> BTreeSet<Id> {
     .collect()
 }
 
-pub fn note_ids(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn note_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     find!(
         note: Id,
         pattern!(facts, [{ ?note @
@@ -407,7 +409,7 @@ pub fn note_ids(facts: &TribleSet) -> BTreeSet<Id> {
     .collect()
 }
 
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P: TriblePattern>(facts: &P, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &kind }])).collect()
 }
 
@@ -831,7 +833,7 @@ fn validate_candidate_structure(current: &TribleSet, candidate: &TribleSet) -> R
 }
 
 /// Active explicit priority edges after deterministic last-event reduction.
-pub fn active_priority_edges(facts: &TribleSet) -> BTreeSet<(Id, Id)> {
+pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
     let mut latest: BTreeMap<(Id, Id), ((i128, Id), bool)> = BTreeMap::new();
     let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
         let order = (interval_key(at), event);
@@ -880,7 +882,7 @@ pub fn active_priority_edges(facts: &TribleSet) -> BTreeSet<(Id, Id)> {
 /// Explicit priority assertions are joined with the structural rule that a
 /// child precedes its parent. Keeping this interpretation here makes every
 /// presentation of the board read the same partial order.
-pub fn goal_priority_edges(facts: &TribleSet) -> BTreeSet<(Id, Id)> {
+pub fn goal_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
     let goals = goal_ids(facts);
     let mut edges = active_priority_edges(facts);
     for (child, parent) in find!(
@@ -1063,22 +1065,38 @@ pub fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
-    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
-        .context("read Compass collection")?;
-    validate_known_payloads(&store_snapshot, &facts)?;
-    let target = status_register_collection(pile, signer.verifying_key())?;
-    let maintained = pile
-        .maintain_exact::<RegisterCoordinatesMapping>(target, &cover)
+    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let facts =
+        FactCollection::new(pile, source).context("register maintained Compass fact collection")?;
+    let status_target = status_register_for_source(pile, source)?;
+    let instant = crate::clock::now()?;
+    let before = pile.snapshot().context("freeze Compass source snapshot")?;
+    let support = before
+        .collection_at(source, instant)
+        .context("observe resident Compass source collection")?
+        .support()
+        .clone();
+    drop(before);
+    drop(
+        facts
+            .maintain_exact(pile, &support)
+            .context("maintain Compass fact collection")?,
+    );
+    let store_snapshot = pile
+        .maintain_exact::<RegisterCoordinatesMapping>(status_target, &support)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
-    let status = maintained
-        .collection_exact(target, &cover)
+    let fact_archive = store_snapshot
+        .collection_exact(facts.rank9(), &support)
+        .map_err(|error| anyhow!("observe Compass fact collection: {error}"))?
+        .view::<FactArchive>()
+        .map_err(|error| anyhow!("read Compass fact collection: {error}"))?;
+    let status = store_snapshot
+        .collection_exact(status_target, &support)
         .map_err(|error| anyhow!("observe Compass status register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Compass status register: {error}"))?;
     Ok(CompassSnapshot {
-        facts,
+        facts: fact_archive,
         store_snapshot,
         status,
     })

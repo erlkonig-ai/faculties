@@ -1,15 +1,20 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
-use faculties::atlas::{self, AtlasCatalog, AtlasEntry};
+use faculties::atlas;
+use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::{CliRequest, Faculty, Invocation, Param, Spec, Verb};
-use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::repo::pile::Pile;
-use triblespace::prelude::{Id, SnapshotSource};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::prelude::{find, pattern, Id, SnapshotSource};
 
 const SHARED: &[Param] = &[
     Param::caller("pile", "Path to the pile file to use")
@@ -59,21 +64,31 @@ impl AtlasContext {
         Ok(Self { pile, signer })
     }
 
-    fn with_catalog<T>(&mut self, operation: impl FnOnce(&AtlasCatalog) -> Result<T>) -> Result<T> {
-        let collection = open_configured(
+    fn with_view<T>(
+        &mut self,
+        operation: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>,
+    ) -> Result<T> {
+        let source = open_configured(
             &mut self.pile,
             DEFAULT_SCOPE_ID,
             self.signer.verifying_key(),
         )?;
-        let store_snapshot = self
+        let collection = FactCollection::new(&mut self.pile, source)
+            .context("register maintained Atlas fact collection")?;
+        let before = self
             .pile
             .snapshot()
-            .context("freeze native Atlas store snapshot")?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .context("materialize native Atlas collection")?;
-        let catalog = atlas::load_catalog(&store_snapshot, &facts)
-            .context("validate native Atlas catalog")?;
-        operation(&catalog)
+            .context("freeze Atlas source snapshot")?;
+        let instant = clock::now()?;
+        let store_snapshot = collection
+            .maintain_at(&mut self.pile, &before, instant)
+            .context("maintain Atlas fact collection")?;
+        let facts = store_snapshot
+            .collection_at(collection.rank9(), instant)
+            .context("observe maintained Atlas fact collection")?
+            .view::<FactArchive>()
+            .context("read maintained Atlas fact collection")?;
+        operation(&facts, &store_snapshot)
     }
 
     fn finish<T>(self, result: Result<T>) -> Result<T> {
@@ -116,15 +131,15 @@ fn handle(context: &mut AtlasContext, invocation: &Invocation, output: &mut Out)
 }
 
 fn list(context: &mut AtlasContext, output: &mut Out) -> Result<()> {
-    context.with_catalog(|catalog| {
-        let mut rows = catalog.entries().collect::<Vec<_>>();
+    context.with_view(|facts, reader| {
+        let mut rows = atlas::named_entries(reader, facts)?;
         rows.sort_by(|left, right| {
             left.names
                 .cmp(&right.names)
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        for row in rows {
+        for row in &rows {
             let tags = if row.tags.is_empty() {
                 String::new()
             } else {
@@ -169,8 +184,10 @@ fn list(context: &mut AtlasContext, output: &mut Out) -> Result<()> {
 }
 
 fn show(context: &mut AtlasContext, prefix: &str, output: &mut Out) -> Result<()> {
-    context.with_catalog(|catalog| {
-        let row = resolve_prefix(catalog, prefix)?;
+    context.with_view(|facts, reader| {
+        let id = resolve_prefix(facts, prefix)?;
+        let row = atlas::named_entry(reader, facts, id)?
+            .expect("a resolved named Atlas id still has a typed name");
 
         output.line(format!("id: {:x}", row.id));
         for name in &row.names {
@@ -206,17 +223,24 @@ fn show(context: &mut AtlasContext, prefix: &str, output: &mut Out) -> Result<()
     })
 }
 
-fn resolve_prefix<'a>(catalog: &'a AtlasCatalog, prefix: &str) -> Result<&'a AtlasEntry> {
+fn resolve_prefix<P>(facts: &P, prefix: &str) -> Result<Id>
+where
+    P: TriblePattern,
+{
     let prefix = prefix.trim().to_lowercase();
     if prefix.is_empty() {
         bail!("id prefix is empty");
     }
-    let mut matches = catalog
-        .entries()
-        .filter(|entry| format!("{:x}", entry.id).starts_with(&prefix));
+    let mut matches = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @ metadata::name: _?name }])
+    )
+    .filter(|id| format!("{id:x}").starts_with(&prefix))
+    .collect::<BTreeSet<_>>()
+    .into_iter();
     match (matches.next(), matches.next()) {
         (None, _) => bail!("no id matches prefix '{prefix}'"),
-        (Some(entry), None) => Ok(entry),
+        (Some(id), None) => Ok(id),
         (Some(_), Some(_)) => bail!("multiple ids match prefix '{prefix}'"),
     }
 }
@@ -270,7 +294,6 @@ mod tests {
         let name = fragment.put::<blobencodings::UTF8String, _>("Alpha".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name };
         publish_fragment(&pile, Some(&key), DEFAULT_SCOPE_ID, fragment).unwrap();
-        let before_reads = std::fs::metadata(&pile).unwrap().len();
         let id = format!("{id:x}");
 
         let list = ATLAS_SPEC
@@ -317,7 +340,9 @@ mod tests {
 
         assert_eq!(cli_output, mcp_output);
         assert_eq!(cli_output.lines()[1], "name: Alpha");
-        assert_eq!(std::fs::metadata(&pile).unwrap().len(), before_reads);
+        // Ordinary reads may append deterministic maintained derivations; a
+        // read is not an authored Atlas commit and therefore need not preserve
+        // the pile's byte length.
 
         let show = ATLAS_SPEC
             .mcp_tools()

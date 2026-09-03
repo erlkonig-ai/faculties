@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -269,7 +270,7 @@ struct SelectorMatches {
     references: BTreeSet<FileReference>,
 }
 
-fn selector_matches(space: &TribleSet, selector: &str) -> SelectorMatches {
+fn selector_matches<P: TriblePattern>(space: &P, selector: &str) -> SelectorMatches {
     let mut matches = SelectorMatches::default();
     for (entity, content) in find!(
         (entity: Id, content: ContentHandle),
@@ -313,7 +314,7 @@ fn selector_matches(space: &TribleSet, selector: &str) -> SelectorMatches {
 /// import entity ids as well as file content digests. Matches are deduplicated
 /// by entity, so one file matching through both its id and digest remains one
 /// candidate.
-pub fn resolve_selector(space: &TribleSet, input: &str) -> Result<Id> {
+pub fn resolve_selector<P: TriblePattern>(space: &P, input: &str) -> Result<Id> {
     let selector = normalize_selector(input)?;
 
     if selector.len() == 32 {
@@ -354,7 +355,7 @@ pub fn resolve_selector(space: &TribleSet, input: &str) -> Result<Id> {
 /// separate reference tokens. Complete 32- and 64-character tokens are direct
 /// and need no catalog evidence; shorter prefixes are expanded from canonical
 /// file, directory, and import records.
-pub fn resolve_reference(space: &TribleSet, input: &str) -> Result<FileReference> {
+pub fn resolve_reference<P: TriblePattern>(space: &P, input: &str) -> Result<FileReference> {
     let selector = normalize_selector(input)?;
 
     if selector.len() == 32 {
@@ -467,7 +468,7 @@ pub fn normalize_media_type_or_default(media_type: &str) -> String {
 ///
 /// The join deliberately verifies the target's kind as well as following the
 /// relation. A dangling or wrongly-typed target is not a valid media type.
-pub fn media_type_name_handle(space: &TribleSet, file_id: Id) -> Option<NameHandle> {
+pub fn media_type_name_handle<P: TriblePattern>(space: &P, file_id: Id) -> Option<NameHandle> {
     find!(
         (name: NameHandle),
         pattern!(space, [
@@ -488,7 +489,7 @@ fn one_file_value<T: Ord>(values: BTreeSet<T>, field: &str, file_id: Id) -> Resu
 }
 
 /// Resolve the unique content handle of one file entity, if present.
-pub fn content_handle(space: &TribleSet, file_id: Id) -> Result<Option<ContentHandle>> {
+pub fn content_handle<P: TriblePattern>(space: &P, file_id: Id) -> Result<Option<ContentHandle>> {
     one_file_value(
         find!(
             content: ContentHandle,
@@ -501,7 +502,7 @@ pub fn content_handle(space: &TribleSet, file_id: Id) -> Result<Option<ContentHa
 }
 
 /// Resolve the unique leaf-name handle of one file entity, if present.
-pub fn name_handle(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>> {
+pub fn name_handle<P: TriblePattern>(space: &P, file_id: Id) -> Result<Option<NameHandle>> {
     one_file_value(
         find!(
             name: NameHandle,
@@ -515,7 +516,10 @@ pub fn name_handle(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>>
 
 /// Resolve a file's unique media-type name while checking the referenced
 /// entity's canonical kind.
-pub fn media_type_name_handle_strict(space: &TribleSet, file_id: Id) -> Result<Option<NameHandle>> {
+pub fn media_type_name_handle_strict<P: TriblePattern>(
+    space: &P,
+    file_id: Id,
+) -> Result<Option<NameHandle>> {
     one_file_value(
         find!(
             name: NameHandle,
@@ -1480,7 +1484,7 @@ mod tests {
             (name: NameHandle),
             pattern!(&file, [{ media_type_id @ metadata::tag: &KIND_MEDIA_TYPE, metadata::name: ?name }])
         ));
-        let name_handle = media_type_name_handle(&file, file_id).expect("media type name");
+        let name_handle = media_type_name_handle(file.facts(), file_id).expect("media type name");
         assert_eq!(
             Some(name_handle),
             find!(

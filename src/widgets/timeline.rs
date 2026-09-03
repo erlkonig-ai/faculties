@@ -345,11 +345,9 @@ fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> String {
         .unwrap_or_default()
 }
 
-fn interval_start(interval: Inline<NsTAIInterval>) -> i128 {
-    let (lower, _): (i128, i128) = interval
-        .try_from_inline()
-        .expect("validated point or interval timestamp is inline");
-    lower
+fn interval_start(interval: Inline<NsTAIInterval>) -> Option<i128> {
+    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
+    Some(lower)
 }
 
 /// Emit a Compass event per status-change entity. Also records "goal
@@ -447,16 +445,19 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
 
 /// Emit a LocalMessages event per message.
 fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let rows = crate::message::load_message_rows(dataset.facts)
-        .expect("StorageState validated the Message collection");
+    let Ok(rows) = crate::message::load_message_rows(dataset.facts) else {
+        return;
+    };
     for row in rows {
-        let body = crate::message::read_body(dataset.reader, row.body)
-            .expect("StorageState validated Message body attachments");
+        let Some(ts_ns) = interval_start(row.created_at) else {
+            continue;
+        };
+        let body = read_text(dataset, row.body);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::LocalMessages,
             entity_id: row.id,
-            ts_ns: interval_start(row.created_at),
+            ts_ns,
             summary: preview(&body, 80),
             status: None,
             from_to: Some(format!("{} → {}", id_hex(row.from), id_hex(row.to))),
@@ -466,26 +467,22 @@ fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Even
 
 /// Emit a Wiki event per fragment-version.
 fn collect_wiki_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let observed = dataset
-        .observed_order(metadata::supersedes.id())
-        .expect("StorageState attached the exact Wiki supersession index");
-    let catalog = crate::wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
-        .expect("StorageState validated the Wiki collection");
-    for revision in catalog.revisions.revision_records() {
-        let Some(authored_at) = revision.authored_at() else {
-            continue;
-        };
-        let title = crate::wiki::read_text(dataset.reader, revision.title)
-            .expect("StorageState validated Wiki title attachments");
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Wiki,
-            entity_id: revision.id,
-            ts_ns: interval_start(authored_at),
-            summary: preview(&title, 80),
-            status: None,
-            from_to: None,
-        });
+    for revision_id in crate::wiki::revision_ids(dataset.facts) {
+        for revision in crate::wiki::revision_records(dataset.facts, revision_id) {
+            let Some(ts_ns) = revision.authored_at().and_then(interval_start) else {
+                continue;
+            };
+            let title = read_text(dataset, revision.title);
+            out.push(Event {
+                source_idx: idx,
+                kind: SourceKind::Wiki,
+                entity_id: revision.id,
+                ts_ns,
+                summary: preview(&title, 80),
+                status: None,
+                from_to: None,
+            });
+        }
     }
 }
 
@@ -615,11 +612,14 @@ fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
                     }
                 )
             });
+        let Some(ts_ns) = interval_start(*timestamp) else {
+            continue;
+        };
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Archive,
             entity_id: projection,
-            ts_ns: interval_start(*timestamp),
+            ts_ns,
             summary: preview(&content, 80),
             status: None,
             from_to: None,

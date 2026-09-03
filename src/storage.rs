@@ -1,6 +1,6 @@
 //! Durable signing identity and native-collection plumbing shared by every faculty.
 //!
-//! Three concerns that every faculty needs before it can read or write
+//! Four concerns that every faculty needs before it can read or write
 //! anything, and that none of them should re-implement:
 //!
 //! - **Signing identity.** [`signer_path`], [`load_signer`], and [`initialize_signer`]
@@ -10,6 +10,9 @@
 //! - **Opening.** [`open_pile_strict`] refreshes eagerly and reports a
 //!   malformed suffix as evidence through [`pile_read_error`] rather than
 //!   silently truncating it.
+//! - **Read models.** [`FactCollection`] names the canonical maintained
+//!   SimpleArchive → Succinct → Rank9 descriptor chain without hiding either
+//!   maintenance writes or immutable snapshot attachment.
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.

@@ -14,16 +14,16 @@ use clap::{Parser, Subcommand};
 use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::planner::{
-    self as planner_model, cancellation_fragment, event_facts, event_fragment, note_fragment,
-    read_text, EventDraft, EventRow, IntervalValue, PlannerCatalog, STATUS_CANCELLED,
+    self as planner_model, cancellation_fragment, event_fragment, note_fragment, read_text,
+    EventDraft, EventRow, IntervalValue, PlannerCatalog, TextHandle, STATUS_CANCELLED,
     STATUS_CONFIRMED, TRANSP_OPAQUE,
 };
 use faculties::schemas::planner::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::Epoch;
 use rrule::{RRuleSet, Tz};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
@@ -122,9 +122,8 @@ struct PlannerStorage<'a> {
 }
 
 struct LoadedPlanner {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
-    catalog: PlannerCatalog,
 }
 
 impl PlannerStorage<'_> {
@@ -140,18 +139,24 @@ impl PlannerStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Planner store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize Planner collection")?;
-            let catalog = planner_model::validate_catalog(&store_snapshot, &facts)
-                .context("validate Planner collection")?;
+            let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection = FactCollection::new(&mut pile, source)
+                .context("register maintained Planner fact collection")?;
+            let before = pile.snapshot().context("freeze Planner source snapshot")?;
+            let instant = clock::now()?;
+            let store_snapshot = collection
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Planner fact collection")?;
+            let facts = store_snapshot
+                .collection_at(collection.rank9(), instant)
+                .context("observe maintained Planner fact collection")?
+                .view::<FactArchive>()
+                .context("attach maintained Planner fact collection")?;
             let loaded = LoadedPlanner {
                 facts,
                 reader: store_snapshot,
-                catalog,
             };
-            operation(&mut pile, collection, &signer, &loaded)
+            operation(&mut pile, source, &signer, &loaded)
         })();
         finish_pile(pile, result)
     }
@@ -168,8 +173,6 @@ impl PlannerStorage<'_> {
         self.with_store(|pile, collection, signer, loaded| {
             let (fragment, value) = operation(loaded)?;
             if let Some(mut fragment) = fragment {
-                planner_model::validate_candidate(&loaded.reader, &loaded.facts, &fragment)
-                    .context("validate Planner mutation")?;
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
@@ -301,8 +304,8 @@ fn fmt_interval(interval: IntervalValue) -> Result<String> {
     Ok(formatted)
 }
 
-fn resolve_event_id(input: &str, catalog: &PlannerCatalog) -> Result<Id> {
-    faculties::resolve_id_prefix(input, catalog.events.keys().copied())
+fn resolve_event_id<P: TriblePattern + ?Sized>(input: &str, facts: &P) -> Result<Id> {
+    faculties::resolve_id_prefix(input, planner_model::event_ids(facts))
 }
 
 fn normalized_status(value: Option<&str>) -> String {
@@ -547,8 +550,9 @@ fn cmd_list(
         .map(chrono_to_epoch)
         .unwrap_or_else(|| Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0));
     storage.with_view(|loaded| {
+        let catalog = planner_model::load_catalog(&loaded.facts)?;
         print_occurrences(&collect_occurrences(
-            &loaded.catalog,
+            &catalog,
             (start, end),
             show_cancelled,
         )?)?;
@@ -581,7 +585,8 @@ fn local_day_window(days: i64) -> Result<(Epoch, Epoch)> {
 fn cmd_relative(storage: PlannerStorage<'_>, days: i64) -> Result<()> {
     let window = local_day_window(days)?;
     storage.with_view(|loaded| {
-        print_occurrences(&collect_occurrences(&loaded.catalog, window, false)?)?;
+        let catalog = planner_model::load_catalog(&loaded.facts)?;
+        print_occurrences(&collect_occurrences(&catalog, window, false)?)?;
         Ok(())
     })
 }
@@ -590,7 +595,8 @@ fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
     let now = clock::now()?;
     let far = Epoch::from_gregorian_utc(2100, 1, 1, 0, 0, 0, 0);
     storage.with_view(|loaded| {
-        let occurrences = collect_occurrences(&loaded.catalog, (now, far), false)?;
+        let catalog = planner_model::load_catalog(&loaded.facts)?;
+        let occurrences = collect_occurrences(&catalog, (now, far), false)?;
         let next: Vec<_> = occurrences
             .into_iter()
             .filter(|occurrence| occurrence.end >= now)
@@ -604,7 +610,7 @@ fn cmd_next(storage: PlannerStorage<'_>) -> Result<()> {
 fn cmd_note(storage: PlannerStorage<'_>, id: String, text: String) -> Result<()> {
     let text = faculties::text_arg(&text, "note")?;
     let event_id = storage.update("add event note", |loaded| {
-        let event_id = resolve_event_id(&id, &loaded.catalog)?;
+        let event_id = resolve_event_id(&id, &loaded.facts)?;
         let fragment = note_fragment(event_id, &text, clock::point_now()?)?;
         Ok((Some(fragment), event_id))
     })?;
@@ -614,14 +620,19 @@ fn cmd_note(storage: PlannerStorage<'_>, id: String, text: String) -> Result<()>
 
 fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
     storage.with_view(|loaded| {
-        let event_id = resolve_event_id(&id, &loaded.catalog)?;
-        let row = &loaded.catalog.events[&event_id];
+        let event_id = resolve_event_id(&id, &loaded.facts)?;
+        let row = planner_model::event(&loaded.facts, event_id).ok_or_else(|| {
+            anyhow!(
+                "event {} has no readable Planner projection",
+                fmt_id(event_id)
+            )
+        })?;
         println!("event {}  {}", fmt_id(event_id), row.summary);
         println!("  time:     {}", fmt_interval(row.time)?);
         if let Some(location) = &row.location {
             println!("  location: {location}");
         }
-        let status = if loaded.catalog.is_cancelled(event_id) {
+        let status = if planner_model::event_is_cancelled(&loaded.facts, event_id) {
             STATUS_CANCELLED
         } else {
             &row.status
@@ -640,7 +651,7 @@ fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
             }
         }
 
-        let mut notes: Vec<_> = loaded.catalog.notes_for(event_id).copied().collect();
+        let mut notes = planner_model::notes_for_event(&loaded.facts, event_id);
         notes.sort_by_key(|row| (interval_key(row.created_at), row.id));
         if !notes.is_empty() {
             println!("  notes:");
@@ -656,8 +667,8 @@ fn cmd_show(storage: PlannerStorage<'_>, id: String) -> Result<()> {
 
 fn cmd_cancel(storage: PlannerStorage<'_>, id: String) -> Result<()> {
     let (event_id, already_cancelled) = storage.update("cancel event", |loaded| {
-        let event_id = resolve_event_id(&id, &loaded.catalog)?;
-        if loaded.catalog.is_cancelled(event_id) {
+        let event_id = resolve_event_id(&id, &loaded.facts)?;
+        if planner_model::event_is_cancelled(&loaded.facts, event_id) {
             return Ok((None, (event_id, true)));
         }
         Ok((Some(cancellation_fragment(event_id)), (event_id, false)))
@@ -672,7 +683,7 @@ fn cmd_cancel(storage: PlannerStorage<'_>, id: String) -> Result<()> {
 
 fn cmd_resolve(storage: PlannerStorage<'_>, prefix: String) -> Result<()> {
     storage.with_view(|loaded| {
-        println!("{}", fmt_id(resolve_event_id(&prefix, &loaded.catalog)?));
+        println!("{}", fmt_id(resolve_event_id(&prefix, &loaded.facts)?));
         Ok(())
     })
 }
@@ -789,31 +800,58 @@ fn truncate_short(value: &str) -> String {
 /// collapse; same-UID conflicts are an error independent of file order.
 fn stage_import_event(
     loaded: &LoadedPlanner,
-    staged: &mut BTreeMap<Id, Fragment>,
+    staged: &mut BTreeMap<TextHandle, Fragment>,
     uid: &str,
     fragment: Fragment,
 ) -> Result<bool> {
-    let id = fragment.root().expect("event fragment has one root");
-    let candidate = event_facts(fragment.facts(), id);
-    if loaded.catalog.events.contains_key(&id) {
-        if event_facts(&loaded.facts, id) == candidate {
+    let candidate = planner_model::load_catalog(fragment.facts())?
+        .events
+        .into_values()
+        .next()
+        .ok_or_else(|| anyhow!("constructed iCalendar event has no readable projection"))?;
+    let existing = planner_model::events_with_uid(&loaded.facts, candidate.uid);
+    if !existing.is_empty() {
+        if existing
+            .iter()
+            .any(|existing| same_event_definition(existing, &candidate))
+        {
             return Ok(false);
         }
         bail!(
-            "iCalendar UID '{uid}' names event {} but its immutable fields differ from the existing event",
-            fmt_id(id)
+            "iCalendar UID '{uid}' already exists but its immutable fields differ from the imported event"
         );
     }
-    if let Some(previous) = staged.get(&id) {
-        if event_facts(previous.facts(), id) == candidate {
+    if let Some(previous) = staged.get(&candidate.uid) {
+        let previous = planner_model::load_catalog(previous.facts())?
+            .events
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow!("staged iCalendar event has no readable projection"))?;
+        if same_event_definition(&previous, &candidate) {
             return Ok(false);
         }
         bail!(
             "iCalendar UID '{uid}' occurs more than once in this batch with conflicting immutable fields"
         );
     }
-    staged.insert(id, fragment);
+    staged.insert(candidate.uid, fragment);
     Ok(true)
+}
+
+fn same_event_definition(left: &EventRow, right: &EventRow) -> bool {
+    left.uid == right.uid
+        && left.summary == right.summary
+        && left.description == right.description
+        && left.time == right.time
+        && left.rrule == right.rrule
+        && left.rdates == right.rdates
+        && left.exdates == right.exdates
+        && left.location == right.location
+        && left.status == right.status
+        && left.transp == right.transp
+        && left.attendees == right.attendees
+        && left.organizer == right.organizer
+        && left.sequence == right.sequence
 }
 
 fn cmd_ingest(storage: PlannerStorage<'_>, files: Vec<PathBuf>) -> Result<()> {
@@ -821,7 +859,7 @@ fn cmd_ingest(storage: PlannerStorage<'_>, files: Vec<PathBuf>) -> Result<()> {
         bail!("no files supplied");
     }
     let (imported, total, duplicates) = storage.update("ingest iCalendar events", |loaded| {
-        let mut staged = BTreeMap::<Id, Fragment>::new();
+        let mut staged = BTreeMap::<TextHandle, Fragment>::new();
         let mut total = 0usize;
         let mut duplicates = 0usize;
 
@@ -985,8 +1023,9 @@ mod tests {
         assert_eq!(storage.commit_count().unwrap(), 1);
         storage
             .with_view(|loaded| {
-                assert_eq!(loaded.catalog.events.len(), 1);
-                assert_eq!(loaded.catalog.notes.len(), 1);
+                let catalog = planner_model::load_catalog(&loaded.facts)?;
+                assert_eq!(catalog.events.len(), 1);
+                assert_eq!(catalog.notes.len(), 1);
                 Ok(())
             })
             .unwrap();
@@ -1037,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_reingest_does_not_publish_another_commit() {
+    fn exact_reingest_does_not_publish_another_authored_commit() {
         let directory = TestDirectory::new();
         let (pile, key) = fresh_storage(&directory);
         let ics = directory.0.join("event.ics");
@@ -1052,11 +1091,9 @@ mod tests {
         };
 
         cmd_ingest(storage, vec![ics.clone()]).unwrap();
-        let length = fs::metadata(&pile).unwrap().len();
         cmd_ingest(storage, vec![ics]).unwrap();
 
         assert_eq!(storage.commit_count().unwrap(), 1);
-        assert_eq!(fs::metadata(&pile).unwrap().len(), length);
     }
 
     #[test]
@@ -1080,7 +1117,7 @@ mod tests {
         assert_eq!(storage.commit_count().unwrap(), 0);
         storage
             .with_view(|loaded| {
-                assert!(loaded.catalog.events.is_empty());
+                assert!(planner_model::event_ids(&loaded.facts).is_empty());
                 Ok(())
             })
             .unwrap();
@@ -1106,9 +1143,15 @@ mod tests {
         assert_eq!(storage.commit_count().unwrap(), 2);
         storage
             .with_view(|loaded| {
-                assert_eq!(loaded.catalog.events[&event_id].status, STATUS_CONFIRMED);
-                assert!(loaded.catalog.is_cancelled(event_id));
-                assert_eq!(loaded.catalog.cancellations.len(), 1);
+                assert_eq!(
+                    planner_model::event(&loaded.facts, event_id)
+                        .expect("published event remains readable")
+                        .status,
+                    STATUS_CONFIRMED
+                );
+                assert!(planner_model::event_is_cancelled(&loaded.facts, event_id));
+                let catalog = planner_model::load_catalog(&loaded.facts)?;
+                assert_eq!(catalog.cancellations.len(), 1);
                 Ok(())
             })
             .unwrap();

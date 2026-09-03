@@ -16,8 +16,9 @@ use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
-use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
@@ -67,10 +68,17 @@ struct StatusStorage<'a> {
     key: Option<&'a Path>,
 }
 
-struct Catalogs {
-    status: TribleSet,
-    relations: TribleSet,
-    reader: PileSnapshot,
+/// One immutable observation over two separately admitted Rank9 relations.
+struct StatusObservation {
+    status: FactArchive,
+    relations: FactArchive,
+    snapshot: PileSnapshot,
+}
+
+/// The maintained Relations relation needed while resolving a Status writer.
+struct RelationsObservation {
+    relations: FactArchive,
+    snapshot: PileSnapshot,
 }
 
 impl StatusStorage<'_> {
@@ -100,24 +108,80 @@ impl StatusStorage<'_> {
     }
 }
 
-fn load_catalogs(pile: &mut Pile, signer: &SigningKey) -> Result<Catalogs> {
-    let status_collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let relations_collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-    let reader = pile
+fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<StatusObservation> {
+    // Register every descriptor before fixing the one shared source boundary.
+    let status_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let status = FactCollection::new(pile, status_source)
+        .context("register maintained Status fact collection")?;
+    let relations_source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+    let relations = FactCollection::new(pile, relations_source)
+        .context("register maintained Relations fact collection")?;
+
+    let instant = clock::now()?;
+    let before = pile
         .snapshot()
-        .context("freeze shared Status/Relations store snapshot")?;
-    let (status_facts, _) = faculties::storage::read_fact_collection(status_collection, &reader)
-        .context("materialize authored Status collection")?;
-    let (relations_facts, _) =
-        faculties::storage::read_fact_collection(relations_collection, &reader)
-            .context("materialize authored Relations collection")?;
-    status::validate_catalog(&reader, &status_facts).context("validate Status collection")?;
-    relations::validate_catalog(&reader, &relations_facts)
-        .context("validate Relations collection")?;
-    Ok(Catalogs {
-        status: status_facts,
-        relations: relations_facts,
-        reader,
+        .context("freeze shared Status/Relations source snapshot")?;
+    drop(
+        status
+            .maintain_at(pile, &before, instant)
+            .context("maintain Status fact collection")?,
+    );
+    drop(
+        relations
+            .maintain_at(pile, &before, instant)
+            .context("maintain Relations fact collection")?,
+    );
+    drop(before);
+
+    let snapshot = pile
+        .snapshot()
+        .context("freeze maintained Status/Relations snapshot")?;
+    let status = snapshot
+        .collection_at(status.rank9(), instant)
+        .context("observe Status Rank9 collection")?
+        .view::<FactArchive>()
+        .context("read Status Rank9 collection")?;
+    let relations = snapshot
+        .collection_at(relations.rank9(), instant)
+        .context("observe Relations Rank9 collection")?
+        .view::<FactArchive>()
+        .context("read Relations Rank9 collection")?;
+    Ok(StatusObservation {
+        status,
+        relations,
+        snapshot,
+    })
+}
+
+fn maintain_and_observe_relations(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<RelationsObservation> {
+    let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+    let collection = FactCollection::new(pile, source)
+        .context("register maintained Relations fact collection")?;
+    let instant = clock::now()?;
+    let before = pile
+        .snapshot()
+        .context("freeze Relations source snapshot")?;
+    drop(
+        collection
+            .maintain_at(pile, &before, instant)
+            .context("maintain Relations fact collection")?,
+    );
+    drop(before);
+
+    let snapshot = pile
+        .snapshot()
+        .context("freeze maintained Relations snapshot")?;
+    let relations = snapshot
+        .collection_at(collection.rank9(), instant)
+        .context("observe Relations Rank9 collection")?
+        .view::<FactArchive>()
+        .context("read Relations Rank9 collection")?;
+    Ok(RelationsObservation {
+        relations,
+        snapshot,
     })
 }
 
@@ -152,7 +216,10 @@ fn format_age(now: i128, past: i128) -> String {
 /// Exact ids deliberately do not require Relations membership. Labels and
 /// aliases use the complete native Relations read model and fail closed on
 /// ambiguity or a forked profile/lifecycle track.
-fn resolve_window_id(reader: &PileSnapshot, facts: &TribleSet, input: &str) -> Result<Id> {
+fn resolve_window_id<P>(reader: &PileSnapshot, facts: &P, input: &str) -> Result<Id>
+where
+    P: TriblePattern,
+{
     let input = input.trim();
     if let Some(id) = Id::from_hex(input) {
         return Ok(id);
@@ -165,7 +232,10 @@ fn resolve_window_id(reader: &PileSnapshot, facts: &TribleSet, input: &str) -> R
 
 /// Render a Relations label without hiding unsettled state. Unknown anchors
 /// remain valid Status windows and render as their exact id.
-fn window_label(reader: &PileSnapshot, facts: &TribleSet, window: Id) -> Result<String> {
+fn window_label<P>(reader: &PileSnapshot, facts: &P, window: Id) -> Result<String>
+where
+    P: TriblePattern,
+{
     if !relations::person_anchors(facts).contains(&window) {
         return Ok(fmt_id(window));
     }
@@ -200,11 +270,10 @@ fn store_status_at(
     at: status::IntervalValue,
 ) -> Result<(CollectionCommit, Id)> {
     storage.with_pile(|pile, signer| {
-        let catalogs = load_catalogs(pile, signer)?;
-        let window = resolve_window_id(&catalogs.reader, &catalogs.relations, selector)?;
+        let observation = maintain_and_observe_relations(pile, signer)?;
+        let window = resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
+        drop(observation);
         let fragment = status::status_fragment(window, text, at)?;
-        status::validate_catalog_union(&catalogs.reader, &catalogs.status, &fragment)
-            .context("preflight authored Status union")?;
         Ok((commit_status(pile, signer, fragment)?, window))
     })
 }
@@ -225,8 +294,8 @@ fn cmd_set(storage: StatusStorage<'_>, persona: Option<&str>, text: String) -> R
 
 fn cmd_list(storage: StatusStorage<'_>) -> Result<()> {
     storage.with_pile(|pile, signer| {
-        let catalogs = load_catalogs(pile, signer)?;
-        let latest = status::latest_per_window(status::load_status_rows(&catalogs.status)?)?;
+        let observation = maintain_and_observe_status(pile, signer)?;
+        let latest = status::latest_per_window(status::load_status_rows(&observation.status)?)?;
         if latest.is_empty() {
             println!("No statuses set yet.");
             return Ok(());
@@ -236,8 +305,9 @@ fn cmd_list(storage: StatusStorage<'_>) -> Result<()> {
         let mut rows: Vec<(String, Id, String, String)> = latest
             .into_values()
             .map(|row| {
-                let label = window_label(&catalogs.reader, &catalogs.relations, row.window)?;
-                let text = status::read_text(&catalogs.reader, row.text)?;
+                let label =
+                    window_label(&observation.snapshot, &observation.relations, row.window)?;
+                let text = status::read_text(&observation.snapshot, row.text)?;
                 let age = format_age(now, status::point_timestamp(row.at)?);
                 Ok((label, row.window, text, age))
             })
@@ -252,11 +322,11 @@ fn cmd_list(storage: StatusStorage<'_>) -> Result<()> {
 
 fn cmd_show(storage: StatusStorage<'_>, selector: String, limit: usize) -> Result<()> {
     storage.with_pile(|pile, signer| {
-        let catalogs = load_catalogs(pile, signer)?;
-        let window = resolve_window_id(&catalogs.reader, &catalogs.relations, &selector)?;
-        let label = window_label(&catalogs.reader, &catalogs.relations, window)?;
+        let observation = maintain_and_observe_status(pile, signer)?;
+        let window = resolve_window_id(&observation.snapshot, &observation.relations, &selector)?;
+        let label = window_label(&observation.snapshot, &observation.relations, window)?;
         let mut rows: Vec<((i128, Id), status::StatusRow)> =
-            status::load_status_rows(&catalogs.status)?
+            status::load_status_rows(&observation.status)?
                 .into_iter()
                 .filter(|row| row.window == window)
                 .map(|row| Ok((status::event_key(&row)?, row)))
@@ -270,7 +340,7 @@ fn cmd_show(storage: StatusStorage<'_>, selector: String, limit: usize) -> Resul
         }
         let now = status::point_timestamp(clock::point_now()?)?;
         for (index, ((at, _), row)) in rows.into_iter().take(limit).enumerate() {
-            let text = status::read_text(&catalogs.reader, row.text)?;
+            let text = status::read_text(&observation.snapshot, row.text)?;
             let age = format_age(now, at);
             let marker = if index == 0 { "*" } else { " " };
             println!("{marker} {text}  ({age} ago)");
@@ -369,9 +439,6 @@ mod tests {
         storage(fixture)
             .with_pile(|pile, signer| {
                 let collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-                let reader = pile.snapshot()?;
-                let (current, _) = faculties::storage::read_fact_collection(collection, &reader)?;
-                relations::validate_catalog_union(&reader, &current, &fragment)?;
                 pile.commit(collection, signer, fragment)?;
                 Ok(())
             })
@@ -390,8 +457,8 @@ mod tests {
 
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
-                assert_eq!(status::load_status_rows(&catalogs.status)?.len(), 1);
+                let observation = maintain_and_observe_status(pile, signer)?;
+                assert_eq!(status::load_status_rows(&observation.status)?.len(), 1);
                 Ok(())
             })
             .unwrap();
@@ -403,18 +470,23 @@ mod tests {
         let window = Id::new([0x82; 16]).unwrap();
         store_status_at(storage(&fixture), &fmt_id(window), "first", at(20.0)).unwrap();
         store_status_at(storage(&fixture), &fmt_id(window), "second", at(21.0)).unwrap();
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let observation = maintain_and_observe_status(pile, signer)?;
+                assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
+                Ok(())
+            })
+            .unwrap();
         let length = fs::metadata(&fixture.pile).unwrap().len();
         let key = fs::read(&fixture.key).unwrap();
 
-        for _ in 0..2 {
-            storage(&fixture)
-                .with_pile(|pile, signer| {
-                    let catalogs = load_catalogs(pile, signer)?;
-                    assert_eq!(status::load_status_rows(&catalogs.status)?.len(), 2);
-                    Ok(())
-                })
-                .unwrap();
-        }
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let observation = maintain_and_observe_status(pile, signer)?;
+                assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
         assert_eq!(fs::read(&fixture.key).unwrap(), key);
     }
@@ -438,8 +510,8 @@ mod tests {
 
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
-                let rows = status::load_status_rows(&catalogs.status)?;
+                let observation = maintain_and_observe_status(pile, signer)?;
+                let rows = status::load_status_rows(&observation.status)?;
                 assert!(rows.is_empty());
 
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
@@ -480,17 +552,17 @@ mod tests {
 
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
+                let observation = maintain_and_observe_relations(pile, signer)?;
                 assert_eq!(
-                    resolve_window_id(&catalogs.reader, &catalogs.relations, "example")?,
+                    resolve_window_id(&observation.snapshot, &observation.relations, "example")?,
                     person
                 );
                 assert_eq!(
-                    resolve_window_id(&catalogs.reader, &catalogs.relations, "SAMPLE")?,
+                    resolve_window_id(&observation.snapshot, &observation.relations, "SAMPLE")?,
                     person
                 );
                 assert_eq!(
-                    window_label(&catalogs.reader, &catalogs.relations, person)?,
+                    window_label(&observation.snapshot, &observation.relations, person)?,
                     "Example"
                 );
                 Ok(())
@@ -513,13 +585,18 @@ mod tests {
 
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
+                let observation = maintain_and_observe_relations(pile, signer)?;
                 assert_eq!(
-                    resolve_window_id(&catalogs.reader, &catalogs.relations, &fmt_id(unknown))?,
+                    resolve_window_id(
+                        &observation.snapshot,
+                        &observation.relations,
+                        &fmt_id(unknown)
+                    )?,
                     unknown
                 );
                 assert!(
-                    resolve_window_id(&catalogs.reader, &catalogs.relations, "shared").is_err()
+                    resolve_window_id(&observation.snapshot, &observation.relations, "shared")
+                        .is_err()
                 );
                 Ok(())
             })
@@ -535,12 +612,15 @@ mod tests {
         );
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let catalogs = load_catalogs(pile, signer)?;
+                let observation = maintain_and_observe_relations(pile, signer)?;
                 assert!(
-                    resolve_window_id(&catalogs.reader, &catalogs.relations, "fork-a").is_err()
+                    resolve_window_id(&observation.snapshot, &observation.relations, "fork-a")
+                        .is_err()
                 );
-                assert!(window_label(&catalogs.reader, &catalogs.relations, first)?
-                    .contains("profile fork"));
+                assert!(
+                    window_label(&observation.snapshot, &observation.relations, first)?
+                        .contains("profile fork")
+                );
                 Ok(())
             })
             .unwrap();

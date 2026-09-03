@@ -14,6 +14,7 @@ use hifitime::Epoch;
 use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::Message;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
@@ -388,19 +389,28 @@ fn required<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<T> {
     one(values, field)?.ok_or_else(|| anyhow!("missing {field}"))
 }
 
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &kind }])).collect()
 }
 
 /// Every canonical RFC-5322 parser projection in stable id order.
-pub fn projection_ids(facts: &TribleSet) -> Vec<Id> {
+pub fn projection_ids<P>(facts: &P) -> Vec<Id>
+where
+    P: TriblePattern,
+{
     ids_of_kind(facts, KIND_PARSED_PROJECTION)
         .into_iter()
         .collect()
 }
 
 /// Every immutable native draft intent in stable id order.
-pub fn draft_ids(facts: &TribleSet) -> Vec<Id> {
+pub fn draft_ids<P>(facts: &P) -> Vec<Id>
+where
+    P: TriblePattern,
+{
     ids_of_kind(facts, KIND_DRAFT_INTENT).into_iter().collect()
 }
 
@@ -681,11 +691,17 @@ pub fn account_config_fragment(anchor: Id, input: AccountConfigInput) -> Result<
     Ok((fragment, id))
 }
 
-pub fn account_anchors(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn account_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     ids_of_kind(facts, KIND_MAIL_ACCOUNT)
 }
 
-pub fn account_config(facts: &TribleSet, id: Id) -> Result<AccountConfigRecord> {
+pub fn account_config<P>(facts: &P, id: Id) -> Result<AccountConfigRecord>
+where
+    P: TriblePattern,
+{
     Ok(AccountConfigRecord {
         id,
         account: required(
@@ -767,7 +783,10 @@ fn dag_heads(graph: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
         .collect())
 }
 
-pub fn account_head(facts: &TribleSet, anchor: Id) -> Result<Head> {
+pub fn account_head<P>(facts: &P, anchor: Id) -> Result<Head>
+where
+    P: TriblePattern,
+{
     let mut graph = BTreeMap::new();
     for id in ids_of_kind(facts, KIND_ACCOUNT_CONFIG) {
         let record = account_config(facts, id)?;
@@ -1522,6 +1541,52 @@ fn file_attachment_union<Overlay: BlobStoreGet>(
     })
 }
 
+/// Decode one attachment for an ordinary typed read.
+///
+/// The query itself selects the Files vocabulary this consumer understands.
+/// Unlike import validation, this path neither reconstructs the intrinsic id
+/// nor rejects additive facts that another version may understand.
+fn file_attachment<P>(reader: &PileSnapshot, facts: &P, file: Id) -> Result<AttachmentData>
+where
+    P: TriblePattern,
+{
+    let content = required(
+        find!(value: BytesHandle, pattern!(facts, [{ file @
+            metadata::tag: &KIND_FILE,
+            file_schema::content: ?value,
+        }]))
+        .collect(),
+        "file content",
+    )?;
+    let name = required(
+        find!(value: TextHandle, pattern!(facts, [{ file @
+            metadata::tag: &KIND_FILE,
+            file_schema::name: ?value,
+        }]))
+        .collect(),
+        "file name",
+    )?;
+    let media_name = required(
+        find!(value: TextHandle, pattern!(facts, [
+            { file @
+                metadata::tag: &KIND_FILE,
+                file_schema::media_type: _?media_type,
+            },
+            { _?media_type @
+                metadata::tag: &KIND_MEDIA_TYPE,
+                metadata::name: ?value,
+            },
+        ]))
+        .collect(),
+        "media type name",
+    )?;
+    Ok(AttachmentData {
+        filename: read_text(reader, name)?,
+        media_type: read_text(reader, media_name)?,
+        bytes: read_bytes(reader, content)?,
+    })
+}
+
 fn validate_source_text_payloads<Overlay: BlobStoreGet>(
     reader: &PileSnapshot,
     overlay: Option<&Overlay>,
@@ -1547,7 +1612,10 @@ fn validate_source_text_payloads<Overlay: BlobStoreGet>(
     Ok(())
 }
 
-fn draft_from_facts(facts: &TribleSet, id: Id) -> Result<DraftRecord> {
+fn draft_from_facts<P>(facts: &P, id: Id) -> Result<DraftRecord>
+where
+    P: TriblePattern,
+{
     Ok(DraftRecord {
         id,
         nonce: required(
@@ -1592,14 +1660,20 @@ fn draft_from_facts(facts: &TribleSet, id: Id) -> Result<DraftRecord> {
     })
 }
 
-pub fn draft_value(facts: &TribleSet, id: Id) -> Result<DraftRecord> {
+pub fn draft_value<P>(facts: &P, id: Id) -> Result<DraftRecord>
+where
+    P: TriblePattern,
+{
     if !ids_of_kind(facts, KIND_DRAFT_INTENT).contains(&id) {
         bail!("unknown draft {id:x}");
     }
     draft_from_facts(facts, id)
 }
 
-fn attempt_from_facts(facts: &TribleSet, id: Id) -> Result<SendAttemptRecord> {
+fn attempt_from_facts<P>(facts: &P, id: Id) -> Result<SendAttemptRecord>
+where
+    P: TriblePattern,
+{
     Ok(SendAttemptRecord {
         id,
         draft: required(
@@ -1640,21 +1714,30 @@ fn attempt_from_facts(facts: &TribleSet, id: Id) -> Result<SendAttemptRecord> {
     })
 }
 
-pub fn send_attempt(facts: &TribleSet, id: Id) -> Result<SendAttemptRecord> {
+pub fn send_attempt<P>(facts: &P, id: Id) -> Result<SendAttemptRecord>
+where
+    P: TriblePattern,
+{
     if !ids_of_kind(facts, KIND_SEND_ATTEMPT).contains(&id) {
         bail!("unknown send attempt {id:x}");
     }
     attempt_from_facts(facts, id)
 }
 
-pub fn attempts_for_draft(facts: &TribleSet, draft_id: Id) -> Vec<Id> {
+pub fn attempts_for_draft<P>(facts: &P, draft_id: Id) -> Vec<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_SEND_ATTEMPT, attempt::draft: &draft_id }]))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-pub fn acceptances_for_attempt(facts: &TribleSet, attempt_id: Id) -> Vec<Id> {
+pub fn acceptances_for_attempt<P>(facts: &P, attempt_id: Id) -> Vec<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_SMTP_ACCEPTANCE, acceptance::attempt: &attempt_id }]))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1662,11 +1745,14 @@ pub fn acceptances_for_attempt(facts: &TribleSet, attempt_id: Id) -> Vec<Id> {
 }
 
 /// Resolve the exact Decide frontier which authorizes a send.
-pub fn authorized_send(
+pub fn authorized_send<P>(
     reader: &PileSnapshot,
-    decide_facts: &TribleSet,
+    decide_facts: &P,
     draft_id: Id,
-) -> Result<(Id, Vec<Id>)> {
+) -> Result<(Id, Vec<Id>)>
+where
+    P: TriblePattern,
+{
     let decision = draft_decision_id(draft_id);
     let snapshots = match decide::resolution(decide_facts, decision) {
         Resolution::Unique(snapshot) => vec![snapshot],
@@ -1700,13 +1786,17 @@ pub fn authorized_send(
 ///
 /// The account schema stores one immutable secret id, so this path performs no
 /// name or “latest version” arbitration and has no password-identity fallback.
-pub fn open_account<R: BlobStoreGet>(
+pub fn open_account<R, P>(
     mail_reader: &PileSnapshot,
-    mail_facts: &TribleSet,
+    mail_facts: &P,
     secrets: &SecretsSnapshot<R>,
     anchor: Id,
     signing_key: &SigningKey,
-) -> Result<OpenAccount> {
+) -> Result<OpenAccount>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
     let config_id = match account_head(mail_facts, anchor)? {
         Head::Unique(id) => id,
         Head::Missing => bail!("mail account {anchor:x} has no configuration"),
@@ -2614,11 +2704,15 @@ fn validate_legacy_evidence<Overlay: BlobStoreGet>(
 /// Project every inbound parser result and its read state for one exact
 /// persona component.  A later observation of the same WireMessage does not
 /// reopen it because read evidence is keyed by `(wire, reader)`.
-pub fn inbox_projection(
-    mail_facts: &TribleSet,
-    relations_facts: &TribleSet,
+pub fn inbox_projection<M, R>(
+    mail_facts: &M,
+    relations_facts: &R,
     persona: Id,
-) -> Result<Vec<InboxProjection>> {
+) -> Result<Vec<InboxProjection>>
+where
+    M: TriblePattern,
+    R: TriblePattern,
+{
     let identities = IdentityComponents::from_facts(relations_facts)?;
     let component = identities.component(persona)?;
     let read_wires: BTreeSet<Id> = find!(
@@ -2669,17 +2763,17 @@ pub fn inbox_projection(
     Ok(rows)
 }
 
-fn text_values(
+fn text_values<P>(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &P,
     id: Id,
-    attribute: Id,
-) -> Result<Vec<String>> {
-    let handles: BTreeSet<TextHandle> = facts
-        .iter()
-        .filter(|fact| fact.e() == &id && fact.a() == &attribute)
-        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>())
-        .collect();
+    attribute: &Attribute<inlineencodings::Handle<blobencodings::UTF8String>>,
+) -> Result<Vec<String>>
+where
+    P: TriblePattern,
+{
+    let handles: BTreeSet<TextHandle> =
+        find!(handle: TextHandle, pattern!(facts, [{ id @ attribute: ?handle }])).collect();
     handles
         .into_iter()
         .map(|handle| read_text(reader, handle))
@@ -2692,10 +2786,10 @@ fn text_values(
 /// decide whether a wire is unread and inspect residency of only the From and
 /// Subject it would actually print. Missing Body or attachment bytes are not
 /// relevant to that operation.
-pub fn projection_summary_record(
-    facts: &TribleSet,
-    projection_id: Id,
-) -> Result<ProjectionSummaryRecord> {
+pub fn projection_summary_record<P>(facts: &P, projection_id: Id) -> Result<ProjectionSummaryRecord>
+where
+    P: TriblePattern,
+{
     if !ids_of_kind(facts, KIND_PARSED_PROJECTION).contains(&projection_id) {
         bail!("unknown Mail projection {projection_id:x}");
     }
@@ -2732,11 +2826,14 @@ pub fn projection_summary_record(
     })
 }
 
-pub fn projection_view(
+pub fn projection_view<P>(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &P,
     projection_id: Id,
-) -> Result<ProjectionView> {
+) -> Result<ProjectionView>
+where
+    P: TriblePattern,
+{
     let summary = projection_summary_record(facts, projection_id)?;
     let body = required(
         find!(v: TextHandle, pattern!(facts, [{ projection_id @ projection::body: ?v }])).collect(),
@@ -2751,9 +2848,9 @@ pub fn projection_view(
             .from
             .map(|handle| read_text(reader, handle))
             .transpose()?,
-        to: text_values(reader, facts, projection_id, projection::to.id())?,
-        cc: text_values(reader, facts, projection_id, projection::cc.id())?,
-        bcc: text_values(reader, facts, projection_id, projection::bcc.id())?,
+        to: text_values(reader, facts, projection_id, &projection::to)?,
+        cc: text_values(reader, facts, projection_id, &projection::cc)?,
+        bcc: text_values(reader, facts, projection_id, &projection::bcc)?,
         subject: read_text(reader, summary.subject)?,
         body: read_text(reader, body)?,
         claimed_date: summary.claimed_date,
@@ -2773,7 +2870,10 @@ pub fn projection_view(
 /// Resolve the exact immutable transport evidence behind one projection.
 /// Conflicting tags or imported directions are rejected rather than reduced
 /// to a priority order.
-pub fn projection_direction(facts: &TribleSet, source: Id) -> Result<ProjectionDirection> {
+pub fn projection_direction<P>(facts: &P, source: Id) -> Result<ProjectionDirection>
+where
+    P: TriblePattern,
+{
     let mut candidates = BTreeSet::new();
     let tags = find!(value: Id, pattern!(facts, [{ source @ metadata::tag: ?value }]))
         .collect::<BTreeSet<_>>();
@@ -2833,24 +2933,88 @@ fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
     }
 }
 
-pub fn wire_claimed_message_id(
+pub fn wire_claimed_message_id<P>(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &P,
     wire_id: Id,
-) -> Result<Option<String>> {
+) -> Result<Option<String>>
+where
+    P: TriblePattern,
+{
     if !ids_of_kind(facts, KIND_WIRE_MESSAGE).contains(&wire_id) {
         bail!("unknown wire message {wire_id:x}");
     }
-    wire_claimed_message_id_union(reader, None::<&PileSnapshot>, facts, wire_id)
+    let claimed = one(
+        find!(v: TextHandle, pattern!(facts, [{ wire_id @ wire::claimed_message_id: ?v }]))
+            .collect(),
+        "wire claimed Message-ID",
+    )?;
+    let digest = one(
+        find!(v: DigestValue, pattern!(facts, [{ wire_id @ wire::raw_digest: ?v }])).collect(),
+        "wire raw digest",
+    )?;
+    match (claimed, digest) {
+        (Some(handle), None) => Ok(Some(canonical_message_id_value(&read_text(
+            reader, handle,
+        )?)?)),
+        (None, Some(_)) => Ok(None),
+        (Some(_), Some(_)) => bail!("wire {wire_id:x} mixes claimed and raw-digest identity"),
+        (None, None) => bail!("wire {wire_id:x} has no identity"),
+    }
 }
 
-pub fn materialize_draft(
+pub fn materialize_draft<M, F>(
     reader: &PileSnapshot,
-    mail_facts: &TribleSet,
-    files_facts: &TribleSet,
+    mail_facts: &M,
+    files_facts: &F,
     id: Id,
-) -> Result<MaterializedDraft> {
-    materialize_draft_union(reader, None::<&PileSnapshot>, mail_facts, files_facts, id)
+) -> Result<MaterializedDraft>
+where
+    M: TriblePattern,
+    F: TriblePattern,
+{
+    let record = draft_value(mail_facts, id)?;
+    let read_all = |handles: &[TextHandle]| -> Result<Vec<String>> {
+        handles
+            .iter()
+            .map(|&handle| read_text(reader, handle))
+            .collect()
+    };
+    let attachments = record
+        .attachments
+        .iter()
+        .map(|&file| file_attachment(reader, files_facts, file))
+        .collect::<Result<_>>()?;
+    let wires = ids_of_kind(mail_facts, KIND_WIRE_MESSAGE);
+    let resolve_wire = |wire: Id, field: &str| -> Result<String> {
+        if !wires.contains(&wire) {
+            bail!("unknown wire message {wire:x}");
+        }
+        wire_claimed_message_id(reader, mail_facts, wire)?
+            .ok_or_else(|| anyhow!("draft names digest-only {field} wire {wire:x}"))
+    };
+    Ok(MaterializedDraft {
+        id,
+        account: record.account,
+        envelope_from: read_text(reader, record.envelope_from)?,
+        to: read_all(&record.to)?,
+        cc: read_all(&record.cc)?,
+        bcc: read_all(&record.bcc)?,
+        subject: read_text(reader, record.subject)?,
+        body: read_text(reader, record.body)?,
+        attachments,
+        in_reply_to: record
+            .in_reply_to
+            .iter()
+            .map(|&wire| resolve_wire(wire, "In-Reply-To"))
+            .collect::<Result<_>>()?,
+        references: record
+            .references
+            .iter()
+            .map(|&wire| resolve_wire(wire, "References"))
+            .collect::<Result<_>>()?,
+        created_at: record.created_at,
+    })
 }
 
 fn materialize_draft_union<Overlay: BlobStoreGet>(
@@ -2937,26 +3101,22 @@ pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<
     if unix >= 0.0 {
         builder = builder.date(std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(unix));
     }
-    let mut recipients = Vec::new();
     for value in &draft.to {
         let mailbox: Mailbox = value
             .parse()
             .with_context(|| format!("parse To {value:?}"))?;
-        recipients.push(mailbox.email.to_string());
         builder = builder.to(mailbox);
     }
     for value in &draft.cc {
         let mailbox: Mailbox = value
             .parse()
             .with_context(|| format!("parse Cc {value:?}"))?;
-        recipients.push(mailbox.email.to_string());
         builder = builder.cc(mailbox);
     }
     for value in &draft.bcc {
         let mailbox: Mailbox = value
             .parse()
             .with_context(|| format!("parse Bcc {value:?}"))?;
-        recipients.push(mailbox.email.to_string());
         builder = builder.bcc(mailbox);
     }
     if !draft.in_reply_to.is_empty() {
@@ -3009,10 +3169,7 @@ pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<
     };
     Ok(RenderedMail {
         raw: message.formatted(),
-        envelope: SmtpEnvelope {
-            from: draft.envelope_from.clone(),
-            recipients,
-        },
+        envelope: smtp_envelope(&draft.envelope_from, &draft.to, &draft.cc, &draft.bcc)?,
     })
 }
 
@@ -3114,23 +3271,26 @@ pub trait SmtpSubmit {
     fn submit(&mut self, envelope: &SmtpEnvelope, raw: &[u8]) -> Result<AcceptedReply>;
 }
 
-fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
-    let senders = normalized_mailboxes([input.envelope_from.clone()])?;
+fn smtp_envelope(from: &str, to: &[String], cc: &[String], bcc: &[String]) -> Result<SmtpEnvelope> {
+    let senders = normalized_mailboxes([from.to_owned()])?;
     let [(_, from)] = senders.as_slice() else {
-        bail!("attempt envelope sender must contain exactly one mailbox");
+        bail!("SMTP envelope sender must contain exactly one mailbox");
     };
-    let recipients =
-        normalized_mailboxes(input.to.iter().chain(&input.cc).chain(&input.bcc).cloned())?
-            .into_iter()
-            .map(|(_, address)| address)
-            .collect::<Vec<_>>();
+    let recipients = normalized_mailboxes(to.iter().chain(cc).chain(bcc).cloned())?
+        .into_iter()
+        .map(|(_, address)| address)
+        .collect::<Vec<_>>();
     if recipients.is_empty() {
-        bail!("send attempt has no envelope recipients");
+        bail!("SMTP envelope has no recipients");
     }
     Ok(SmtpEnvelope {
         from: from.clone(),
         recipients,
     })
+}
+
+fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
+    smtp_envelope(&input.envelope_from, &input.to, &input.cc, &input.bcc)
 }
 
 /// Freeze and validate one exact SMTP effect plan against one local snapshot.
@@ -3141,17 +3301,19 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// cannot prove that this local snapshot was globally fresh or complete: SMTP
 /// execution is therefore an affine authority which deployments must
 /// serialize per account rather than running concurrently on replicas.
-#[allow(clippy::too_many_arguments)]
-pub fn prepare_send<R>(
+pub fn prepare_send<M, F, D>(
     mail_reader: &PileSnapshot,
     decide_reader: &PileSnapshot,
-    mail_facts: &TribleSet,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &SecretsSnapshot<R>,
+    mail_facts: &M,
+    files_facts: &F,
+    decide_facts: &D,
     input: SendAttemptInput,
-) -> Result<PreparedSend> {
+) -> Result<PreparedSend>
+where
+    M: TriblePattern,
+    F: TriblePattern,
+    D: TriblePattern,
+{
     let draft = draft_from_facts(mail_facts, input.draft)
         .with_context(|| format!("prepare send for unknown draft {:x}", input.draft))?;
     match account_head(mail_facts, draft.account)? {
@@ -3175,20 +3337,43 @@ pub fn prepare_send<R>(
     }
 
     let envelope = smtp_envelope_for_attempt(&input)?;
+    let config = account_config(mail_facts, input.config)?;
+    let materialized = materialize_draft(mail_reader, mail_facts, files_facts, input.draft)?;
+    let expected = render_draft(
+        &materialized,
+        &OpenAccount {
+            anchor: config.account,
+            config: config.id,
+            address: read_text(mail_reader, config.address)?,
+            display_name: read_text(mail_reader, config.display_name)?,
+            pop_endpoint: read_text(mail_reader, config.pop_endpoint)?,
+            smtp_endpoint: read_text(mail_reader, config.smtp_endpoint)?,
+            username: read_text(mail_reader, config.username)?,
+            password: String::new(),
+            enabled: config.enabled,
+        },
+    )?;
+    if input.raw != expected.raw {
+        let first_difference = input
+            .raw
+            .iter()
+            .zip(&expected.raw)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| input.raw.len().min(expected.raw.len()));
+        bail!(
+            "send attempt bytes or envelope do not equal the authorized DraftIntent rendering: raw lengths {} != {} or first byte difference at {first_difference}",
+            input.raw.len(),
+            expected.raw.len(),
+        );
+    }
+    if envelope != expected.envelope {
+        bail!(
+            "send attempt bytes or envelope do not equal the authorized DraftIntent rendering: SMTP envelope differs"
+        );
+    }
     let raw = input.raw.clone();
     let (attempt, attempt_id) = send_attempt_fragment(input)?;
     let outgoing = outgoing_publication(attempt_id, &raw)?;
-    let mut files_union = files_facts.clone();
-    files_union += outgoing.files.facts().clone();
-    validate_catalog_union(
-        mail_reader,
-        mail_facts,
-        &attempt,
-        &files_union,
-        decide_facts,
-        relations_facts,
-        secrets,
-    )?;
     Ok(PreparedSend {
         attempt,
         attempt_id,
@@ -4156,15 +4341,13 @@ mod tests {
             &views.mail.facts,
             &views.files.facts,
             &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
             SendAttemptInput {
                 raw: corrupt,
                 ..base_attempt.clone()
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("subject/body"));
+        assert!(format!("{error:#}").contains("bytes or envelope"));
 
         let prepared = prepare_send(
             &views.mail.reader,
@@ -4172,8 +4355,6 @@ mod tests {
             &views.mail.facts,
             &views.files.facts,
             &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
             base_attempt,
         )
         .unwrap();
@@ -4339,8 +4520,6 @@ mod tests {
             &views.mail.facts,
             &views.files.facts,
             &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
             SendAttemptInput {
                 draft: draft.draft,
                 config: account.config,

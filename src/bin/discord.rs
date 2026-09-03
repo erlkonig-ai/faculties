@@ -28,19 +28,22 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
-use faculties::collection_names::open_configured;
+use faculties::collection_names::{open_configured, open_exact_in};
 use faculties::discord as discord_model;
 use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{
+    records::CollectionHandle, Collection, CollectionCommit, CollectionSnapshotExt,
+    CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
@@ -120,19 +123,21 @@ enum ChannelsCommand {
 struct DiscordStorage<'a> {
     pile: &'a Path,
     key: Option<&'a Path>,
+    collection: Option<CollectionHandle>,
 }
 
 #[derive(Clone)]
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 struct DiscordSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
+    maintained: FactCollection,
     signer: SigningKey,
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
@@ -145,31 +150,53 @@ impl DiscordSession<'_> {
     }
 
     fn commit(&mut self, mut fragment: Fragment, description: String) -> Result<CollectionCommit> {
-        discord_model::validate_candidate(&self.reader, &self.facts, &fragment)
-            .context("preflight Discord collection candidate")?;
-        let added = fragment.facts().clone();
         fragment.describe_with(entity! { metadata::description: description });
         let commit = self
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
-        self.facts += added;
-        self.reader = self
+        let before = self
             .pile
             .snapshot()
-            .context("refresh Discord attachment snapshot")?;
+            .context("freeze Discord post-commit source snapshot")?;
+        let instant = faculties::clock::now()?;
+        self.reader = self
+            .maintained
+            .maintain_at(self.pile, &before, instant)
+            .context("maintain Discord fact collection after commit")?;
+        self.facts = self
+            .reader
+            .collection_at(self.maintained.rank9(), instant)
+            .context("observe maintained Discord fact collection after commit")?
+            .view::<FactArchive>()
+            .context("read maintained Discord fact collection after commit")?;
         Ok(commit)
     }
 }
 
 impl DiscordStorage<'_> {
+    fn open_collection(
+        &self,
+        pile: &mut Pile,
+        authority: VerifyingKey,
+    ) -> Result<Collection<SimpleArchive>> {
+        let Some(handle) = self.collection else {
+            return open_configured(pile, DEFAULT_SCOPE_ID, authority);
+        };
+        let snapshot = pile
+            .snapshot()
+            .context("freeze store while opening exact Discord collection")?;
+        open_exact_in(&snapshot, DEFAULT_SCOPE_ID, authority, handle)
+    }
+
     /// Prove that this process can publish to the selected collection before
     /// an outbound Discord side effect occurs.
     fn preflight_write(&self) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).map(|_| ());
+        let result = self
+            .open_collection(&mut pile, signer.verifying_key())
+            .map(|_| ());
         finish_pile(pile, result)
     }
 
@@ -180,15 +207,25 @@ impl DiscordStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Discord store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize Discord collection")?;
-            discord_model::validate_catalog(&store_snapshot, &facts)
-                .context("validate Discord collection")?;
+            let collection = self.open_collection(&mut pile, signer.verifying_key())?;
+            let maintained = FactCollection::new(&mut pile, collection)
+                .context("register maintained Discord fact collection")?;
+            let before = pile
+                .snapshot()
+                .context("freeze Discord pre-maintenance snapshot")?;
+            let instant = faculties::clock::now()?;
+            let store_snapshot = maintained
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Discord fact collection")?;
+            let facts = store_snapshot
+                .collection_at(maintained.rank9(), instant)
+                .context("observe maintained Discord fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Discord fact collection")?;
             operation(&mut DiscordSession {
                 pile: &mut pile,
                 collection,
+                maintained,
                 signer,
                 facts,
                 reader: store_snapshot,
@@ -230,6 +267,7 @@ fn main() -> Result<()> {
     let storage = DiscordStorage {
         pile: &cli.pile,
         key: cli.key.as_deref(),
+        collection: None,
     };
 
     match command {
@@ -1218,10 +1256,6 @@ mod tests {
     use super::*;
     use faculties::schemas::files::KIND_FILE;
     use std::fs::File;
-    use std::sync::Mutex;
-
-    static COLLECTION_OVERRIDE_ENV: Mutex<()> = Mutex::new(());
-
     fn message_json(
         id: &str,
         channel: &str,
@@ -1257,12 +1291,12 @@ mod tests {
         DiscordStorage {
             pile,
             key: Some(key),
+            collection: None,
         }
     }
 
     #[test]
     fn unauthorized_collection_fails_before_remote_post() {
-        let _guard = COLLECTION_OVERRIDE_ENV.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let (pile_path, key) = fresh_storage(&directory);
         let root = SigningKey::from_bytes(&[0x41; 32]);
@@ -1275,12 +1309,13 @@ mod tests {
             .unwrap();
         pile.close().unwrap();
 
-        let variable = faculties::collection_names::override_env_name(DEFAULT_SCOPE_ID);
-        let previous = std::env::var_os(&variable);
-        std::env::set_var(&variable, hex::encode(collection.handle().raw));
         let mut posts = 0;
         let result = send_with(
-            test_storage(&pile_path, &key),
+            DiscordStorage {
+                pile: &pile_path,
+                key: Some(&key),
+                collection: Some(collection.handle()),
+            },
             "unused-token",
             "100000000000000002",
             "must not leave this process",
@@ -1289,11 +1324,6 @@ mod tests {
                 Ok(json!({}))
             },
         );
-        match previous {
-            Some(value) => std::env::set_var(&variable, value),
-            None => std::env::remove_var(&variable),
-        }
-
         let error = result.unwrap_err();
         assert!(error.to_string().contains("WRITE admission"), "{error:#}");
         assert_eq!(posts, 0, "authorization failure must precede HTTP POST");
@@ -1491,7 +1521,7 @@ mod tests {
             discord_model::CoverageInterval::new(100000000000000007, 100000000000000008, true)
                 .unwrap();
         assert!(build_ingest_fragment(&messages, Some(interval), |_| bail!("offline")).is_err());
-        assert!(storage.view().unwrap().facts.is_empty());
+        assert!(storage.view().unwrap().facts.iter().next().is_none());
 
         let fragment =
             build_ingest_fragment(&messages, Some(interval), |_| Ok(b"bytes".to_vec())).unwrap();

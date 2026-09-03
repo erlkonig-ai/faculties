@@ -18,9 +18,9 @@ use triblespace::core::metadata;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::schemas::wiki::{extract_link_targets, TAG_SPECS};
+use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-use crate::wiki::{self, WikiCatalog};
+use crate::wiki;
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -91,9 +91,15 @@ impl GaugeLive {
         let observed = dataset
             .observed_order(metadata::supersedes.id())
             .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
-        let catalog = wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
-            .map_err(|error| format!("validate Wiki collection for Gauge: {error:#}"))?;
-        let entries = catalog.revisions.list_entries();
+        let entries = wiki::entries(dataset.facts, observed)
+            .into_iter()
+            .filter(|entry| {
+                !entry
+                    .frontier
+                    .iter()
+                    .all(|revision| revision.tags.contains(&TAG_ARCHIVED_ID))
+            })
+            .collect::<Vec<_>>();
         let total_entries = entries.len();
         let total_heads = entries.iter().map(|entry| entry.frontier.len()).sum();
         let forked_entries = entries
@@ -107,13 +113,14 @@ impl GaugeLive {
 
         for head in entries.iter().flat_map(|entry| &entry.frontier) {
             for tag in &head.tags {
-                if let Some(name) = resolve_tag_name(&catalog, dataset, *tag) {
+                if let Some(name) = resolve_tag_name(dataset, *tag) {
                     *tag_counts.entry(name).or_insert(0) += 1;
                 }
             }
 
-            let content = wiki::read_text(dataset.reader, head.content)
-                .map_err(|error| format!("read Wiki revision {:x}: {error:#}", head.id))?;
+            let Ok(content) = wiki::read_text(dataset.reader, head.content) else {
+                continue;
+            };
             let link_count = extract_link_targets(&content).len();
             if link_count == 0 {
                 orphans += 1;
@@ -137,17 +144,8 @@ impl GaugeLive {
     }
 }
 
-fn resolve_tag_name(
-    catalog: &WikiCatalog,
-    dataset: DatasetView<'_>,
-    tag: triblespace::core::id::Id,
-) -> Option<String> {
-    if let Some(handle) = catalog.tag_names.get(&tag) {
-        return wiki::read_text(dataset.reader, *handle).ok();
-    }
-    TAG_SPECS
-        .iter()
-        .find_map(|(known, name)| (*known == tag).then(|| (*name).to_owned()))
+fn resolve_tag_name(dataset: DatasetView<'_>, tag: triblespace::core::id::Id) -> Option<String> {
+    wiki::tag_display_name_from_facts(dataset.facts, dataset.reader, tag).ok()
 }
 
 // ── Widget ───────────────────────────────────────────────────────────

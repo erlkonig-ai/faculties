@@ -316,12 +316,12 @@ fn with_model<T>(
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let snapshot = wiki_model::materialize_indexed_collection(&mut pile, &signer)
-            .context("materialize indexed Wiki collection")?;
+        let snapshot = wiki_model::query_snapshot(&mut pile, &signer)
+            .context("query maintained Wiki collection")?;
         let model = GaugeModel::load(
-            snapshot.catalog(),
             snapshot.store_snapshot(),
             snapshot.facts(),
+            snapshot.observed(),
         )?;
         operation(&model)
     })();

@@ -12,6 +12,7 @@ use anybytes::View;
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::blobencodings::UTF8String;
@@ -323,11 +324,14 @@ pub struct SelectedMessageVersion {
 /// Identity is the full modeled semantic state, not a serialized REST payload.
 /// Equal states collapse even if redundant provenance happened to give them
 /// distinct entity ids; divergent maximal states remain visible.
-pub fn select_messages(
-    facts: &TribleSet,
+pub fn select_messages<P>(
+    facts: &P,
     channel_filter: Option<Id>,
     since: Option<Inline<NsTAIInterval>>,
-) -> Result<Vec<SelectedMessageVersion>> {
+) -> Result<Vec<SelectedMessageVersion>>
+where
+    P: TriblePattern,
+{
     let since_key = since.map(interval_key);
     let mut required: BTreeMap<Id, BTreeSet<RequiredMessageFields>> = BTreeMap::new();
     for (observation, anchor, content, author, created_at, channel) in find!(
@@ -489,7 +493,10 @@ pub fn select_messages(
 /// Discord's REST message object does not version profile fields. If several
 /// names have been observed, all distinct names are shown rather than making a
 /// false latest-name claim.
-pub fn user_labels(facts: &TribleSet, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>> {
+pub fn user_labels<P>(facts: &P, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>>
+where
+    P: TriblePattern,
+{
     let mut names: BTreeMap<Id, BTreeSet<String>> = BTreeMap::new();
     for (user, handle) in find!(
         (user: Id, handle: TextHandle),
@@ -549,7 +556,10 @@ pub fn user_labels(facts: &TribleSet, reader: &PileSnapshot) -> Result<BTreeMap<
     Ok(labels)
 }
 
-pub fn channel_labels(facts: &TribleSet, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>> {
+pub fn channel_labels<P>(facts: &P, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>>
+where
+    P: TriblePattern,
+{
     let mut values: BTreeMap<Id, BTreeSet<String>> = BTreeMap::new();
     for (channel, handle) in find!(
         (channel: Id, handle: TextHandle),
@@ -650,7 +660,10 @@ pub fn connected_frontier(intervals: &[CoverageInterval]) -> Option<CoverageFron
     })
 }
 
-pub fn channel_coverage(facts: &TribleSet, channel: Id) -> Result<Option<CoverageFrontier>> {
+pub fn channel_coverage<P>(facts: &P, channel: Id) -> Result<Option<CoverageFrontier>>
+where
+    P: TriblePattern,
+{
     let mut by_receipt = CoverageReceipts::new();
     collect_intervals(
         facts,
@@ -681,13 +694,16 @@ pub fn channel_coverage(facts: &TribleSet, channel: Id) -> Result<Option<Coverag
     Ok(connected_frontier(&intervals))
 }
 
-fn collect_intervals(
-    facts: &TribleSet,
+fn collect_intervals<P>(
+    facts: &P,
     channel: Id,
     kind: Id,
     baseline: bool,
     output: &mut CoverageReceipts,
-) -> Result<()> {
+) -> Result<()>
+where
+    P: TriblePattern,
+{
     for (receipt, after, through) in find!(
         (
             receipt: Id,
@@ -777,7 +793,7 @@ mod tests {
         facts += coverage_fragment(channel, intervals[0]);
         facts += coverage_fragment(channel, intervals[1]);
         assert_eq!(
-            channel_coverage(&facts, channel).unwrap(),
+            channel_coverage(facts.facts(), channel).unwrap(),
             Some(CoverageFrontier {
                 floor_exclusive: 100,
                 through_inclusive: 150,
@@ -789,7 +805,7 @@ mod tests {
         let concurrent_baseline = CoverageInterval::new(300, 350, true).unwrap();
         facts += coverage_fragment(channel, concurrent_baseline);
         assert_eq!(
-            channel_coverage(&facts, channel)
+            channel_coverage(facts.facts(), channel)
                 .unwrap()
                 .unwrap()
                 .through_inclusive,
@@ -799,7 +815,7 @@ mod tests {
         // Only explicit connected evidence may bridge to that later interval.
         facts += coverage_fragment(channel, CoverageInterval::new(150, 320, false).unwrap());
         assert_eq!(
-            channel_coverage(&facts, channel)
+            channel_coverage(facts.facts(), channel)
                 .unwrap()
                 .unwrap()
                 .through_inclusive,
@@ -814,7 +830,7 @@ mod tests {
 
         facts += coverage_fragment(channel, CoverageInterval::new(300, 350, true).unwrap());
         assert_eq!(
-            channel_coverage(&facts, channel).unwrap(),
+            channel_coverage(facts.facts(), channel).unwrap(),
             Some(CoverageFrontier {
                 floor_exclusive: 300,
                 through_inclusive: 350,
@@ -825,7 +841,7 @@ mod tests {
         // but continuous coverage now owes the larger (100, ...] scope.
         facts += coverage_fragment(channel, CoverageInterval::new(100, 150, true).unwrap());
         assert_eq!(
-            channel_coverage(&facts, channel).unwrap(),
+            channel_coverage(facts.facts(), channel).unwrap(),
             Some(CoverageFrontier {
                 floor_exclusive: 100,
                 through_inclusive: 150,
@@ -834,7 +850,7 @@ mod tests {
 
         facts += coverage_fragment(channel, CoverageInterval::new(150, 320, false).unwrap());
         assert_eq!(
-            channel_coverage(&facts, channel).unwrap(),
+            channel_coverage(facts.facts(), channel).unwrap(),
             Some(CoverageFrontier {
                 floor_exclusive: 100,
                 through_inclusive: 350,

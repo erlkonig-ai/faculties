@@ -14,6 +14,7 @@ use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::id_hex;
@@ -218,7 +219,10 @@ pub fn auth_profile_fragment(
 }
 
 /// Decode one auth-profile record without selecting a current head.
-pub fn auth_profile(catalog: &TribleSet, id: Id) -> Result<AuthProfileRecord> {
+pub fn auth_profile<P>(catalog: &P, id: Id) -> Result<AuthProfileRecord>
+where
+    P: TriblePattern,
+{
     Ok(AuthProfileRecord {
         id,
         source: one_required(
@@ -260,7 +264,10 @@ pub fn auth_profile(catalog: &TribleSet, id: Id) -> Result<AuthProfileRecord> {
     })
 }
 
-pub fn auth_profile_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+pub fn auth_profile_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(
         profile: Id,
         pattern!(catalog, [{
@@ -273,7 +280,10 @@ pub fn auth_profile_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
 }
 
 /// Sources for which at least one auth-profile version exists.
-pub fn auth_profile_sources(catalog: &TribleSet) -> BTreeSet<Id> {
+pub fn auth_profile_sources<P>(catalog: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(
         source: Id,
         pattern!(catalog, [{
@@ -285,7 +295,10 @@ pub fn auth_profile_sources(catalog: &TribleSet) -> BTreeSet<Id> {
     .collect()
 }
 
-pub fn auth_profile_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+pub fn auth_profile_head_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     let profiles = auth_profile_ids(catalog, source);
     let superseded = find!(
         predecessor: Id,
@@ -300,7 +313,10 @@ pub fn auth_profile_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
     profiles.difference(&superseded).copied().collect()
 }
 
-pub fn auth_profile_head(catalog: &TribleSet, source: Id) -> AuthProfileHead {
+pub fn auth_profile_head<P>(catalog: &P, source: Id) -> AuthProfileHead
+where
+    P: TriblePattern,
+{
     let heads = auth_profile_head_ids(catalog, source)
         .into_iter()
         .collect::<Vec<_>>();
@@ -318,11 +334,33 @@ pub fn auth_profile_head(catalog: &TribleSet, source: Id) -> AuthProfileHead {
 /// secret versions may legitimately have been left behind by a vault cutover;
 /// requiring those historical versions would make an additive successor
 /// unable to repair the active profile.
-pub fn validate_auth_secret_references<R>(
-    teams_catalog: &TribleSet,
+pub fn validate_auth_secret_references<R, P>(
+    teams_catalog: &P,
     secrets: &SecretsSnapshot<R>,
-) -> Result<()> {
-    for source in auth_profile_sources(teams_catalog) {
+) -> Result<()>
+where
+    P: TriblePattern,
+{
+    validate_auth_secret_references_for_sources(
+        teams_catalog,
+        secrets,
+        auth_profile_sources(teams_catalog),
+    )
+}
+
+/// Validate active auth-profile references only for the named sources.
+///
+/// This is the publication-boundary form: a candidate update cannot be
+/// blocked by unrelated historical profiles elsewhere in the collection.
+pub fn validate_auth_secret_references_for_sources<R, P>(
+    teams_catalog: &P,
+    secrets: &SecretsSnapshot<R>,
+    sources: impl IntoIterator<Item = Id>,
+) -> Result<()>
+where
+    P: TriblePattern,
+{
+    for source in sources {
         for profile in auth_profile_head_ids(teams_catalog, source) {
             let record = auth_profile(teams_catalog, profile)?;
             for (label, secret) in [
@@ -621,7 +659,10 @@ pub fn coverage_fragment(
     Ok(fragment)
 }
 
-pub fn coverage_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+pub fn coverage_head_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     let receipts = receipt_ids(catalog, source);
     let superseded = find!(
         predecessor: Id,
@@ -635,11 +676,14 @@ pub fn coverage_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
     receipts.difference(&superseded).copied().collect()
 }
 
-pub fn coverage_head(
+pub fn coverage_head<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source: Id,
-) -> Result<Option<CoverageHead>> {
+) -> Result<Option<CoverageHead>>
+where
+    P: TriblePattern,
+{
     let receipts = receipt_ids(catalog, source);
     if receipts.is_empty() {
         return Ok(None);
@@ -673,10 +717,13 @@ pub fn coverage_head(
 /// Evaluate the receipt DAG and return one unambiguous visibility per logical
 /// message. Unversioned tombstones remain causally ordered by their receipts;
 /// full observations use Graph's source modification time.
-pub fn current_message_states(
-    catalog: &TribleSet,
+pub fn current_message_states<P>(
+    catalog: &P,
     source: Id,
-) -> Result<BTreeMap<Id, CurrentMessageState>> {
+) -> Result<BTreeMap<Id, CurrentMessageState>>
+where
+    P: TriblePattern,
+{
     let heads = coverage_head_ids(catalog, source);
     if heads.is_empty() {
         return Ok(BTreeMap::new());
@@ -863,7 +910,10 @@ pub fn current_message_states(
 }
 
 /// Stable native Teams sources present in the materialized collection.
-pub fn source_ids(catalog: &TribleSet) -> BTreeSet<Id> {
+pub fn source_ids<P>(catalog: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(
         source: Id,
         pattern!(catalog, [{ ?source @ metadata::tag: teams::kind_source }])
@@ -872,7 +922,10 @@ pub fn source_ids(catalog: &TribleSet) -> BTreeSet<Id> {
 }
 
 /// Decode the exact tenant coordinate of a native source.
-pub fn source_label(reader: &PileSnapshot, catalog: &TribleSet, source: Id) -> Result<String> {
+pub fn source_label<P>(reader: &PileSnapshot, catalog: &P, source: Id) -> Result<String>
+where
+    P: TriblePattern,
+{
     let handle = one_required(
         find!(
             value: TextHandle,
@@ -886,11 +939,14 @@ pub fn source_label(reader: &PileSnapshot, catalog: &TribleSet, source: Id) -> R
 
 /// Decode every source-scoped chat identity without choosing among conflicting
 /// values. Structural ambiguity is an error, not a display-name fallback.
-pub fn chat_labels(
+pub fn chat_labels<P>(
     reader: &PileSnapshot,
-    catalog: &TribleSet,
+    catalog: &P,
     source: Id,
-) -> Result<BTreeMap<Id, String>> {
+) -> Result<BTreeMap<Id, String>>
+where
+    P: TriblePattern,
+{
     let mut handles = BTreeMap::<Id, BTreeSet<TextHandle>>::new();
     for (chat, handle) in find!(
         (chat: Id, handle: TextHandle),
@@ -917,7 +973,10 @@ pub fn chat_labels(
 
 /// Evaluate the source receipt DAG and materialize its selected message
 /// observations as reusable presentation records.
-pub fn current_messages(catalog: &TribleSet, source: Id) -> Result<Vec<CurrentMessage>> {
+pub fn current_messages<P>(catalog: &P, source: Id) -> Result<Vec<CurrentMessage>>
+where
+    P: TriblePattern,
+{
     let mut message_chats = BTreeMap::<Id, BTreeSet<Id>>::new();
     for (message, chat) in find!(
         (message: Id, chat: Id),
@@ -971,13 +1030,16 @@ pub fn current_messages(catalog: &TribleSet, source: Id) -> Result<Vec<CurrentMe
     Ok(rows)
 }
 
-fn current_message_record(
-    catalog: &TribleSet,
+fn current_message_record<P>(
+    catalog: &P,
     message: Id,
     chat: Id,
     observation: Option<Id>,
     deleted: bool,
-) -> Result<CurrentMessage> {
+) -> Result<CurrentMessage>
+where
+    P: TriblePattern,
+{
     let Some(observation_id) = observation else {
         return Ok(CurrentMessage {
             message,
@@ -1229,7 +1291,10 @@ fn apply_page_observations(
     Ok(())
 }
 
-fn receipt_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+fn receipt_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     let mut receipts = find!(
         receipt: Id,
         pattern!(catalog, [{
@@ -1414,21 +1479,6 @@ pub fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Resu
     read_utf8string(reader, handle, field)
 }
 
-/// Validate a prospective signed member before it reaches append-only storage.
-pub fn validate_candidate(
-    reader: &PileSnapshot,
-    catalog: &TribleSet,
-    fragment: &Fragment,
-) -> Result<()> {
-    validate_commit_fragment(fragment.facts())?;
-    let mut union = catalog.clone();
-    union += fragment.facts().clone();
-    reject_retired_oauth_evidence(&union)?;
-    let active = active_catalog(&union);
-    validate_catalog_structure(&active)?;
-    validate_fragment_payloads(reader, fragment, &active)
-}
-
 /// Enforce the independently signed Teams transaction boundary.
 pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
     reject_retired_oauth_evidence(facts)?;
@@ -1519,12 +1569,12 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
     for tombstone in &tombstones {
         validate_tombstone(facts, *tombstone, &messages)?;
     }
-    validate_receipt_identity_local(facts, receipt, source, &events)?;
+    validate_receipt_shape(facts, receipt)?;
     validate_attachment_file_structure(facts, &attachments)
 }
 
 fn validate_source_identity(facts: &TribleSet, source: Id) -> Result<()> {
-    let tenant = one_required(
+    let _tenant = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ source @ teams::tenant_id: ?value }])
@@ -1532,15 +1582,6 @@ fn validate_source_identity(facts: &TribleSet, source: Id) -> Result<()> {
         .collect(),
         "Teams source tenant",
     )?;
-    let expected = entity! {
-        metadata::tag: teams::kind_source,
-        teams::tenant_id: tenant,
-    }
-    .root()
-    .expect("source identity has one root");
-    if expected != source {
-        bail!("Teams source {source:x} is not intrinsically tenant-scoped");
-    }
     Ok(())
 }
 
@@ -1552,7 +1593,7 @@ fn validate_chat_identity(facts: &TribleSet, chat: Id, sources: &BTreeSet<Id>) -
     if !sources.contains(&source) {
         bail!("Teams chat {chat:x} names an unknown source");
     }
-    let external = one_required(
+    let _external = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ chat @ teams::chat_id: ?value }])
@@ -1560,16 +1601,6 @@ fn validate_chat_identity(facts: &TribleSet, chat: Id, sources: &BTreeSet<Id>) -
         .collect(),
         "Teams chat external id",
     )?;
-    let expected = entity! {
-        metadata::tag: teams::kind_chat,
-        teams::source: source,
-        teams::chat_id: external,
-    }
-    .root()
-    .expect("chat identity has one root");
-    if expected != chat {
-        bail!("Teams chat {chat:x} is not intrinsically source-scoped");
-    }
     Ok(())
 }
 
@@ -1581,7 +1612,7 @@ fn validate_author_identity(facts: &TribleSet, author: Id, sources: &BTreeSet<Id
     if !sources.contains(&source) {
         bail!("Teams user {author:x} names an unknown source");
     }
-    let external = one_required(
+    let _external = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ author @ teams::user_id: ?value }])
@@ -1589,16 +1620,6 @@ fn validate_author_identity(facts: &TribleSet, author: Id, sources: &BTreeSet<Id
         .collect(),
         "Teams user external id",
     )?;
-    let expected = entity! {
-        metadata::tag: archive::kind_author,
-        teams::source: source,
-        teams::user_id: external,
-    }
-    .root()
-    .expect("user identity has one root");
-    if expected != author {
-        bail!("Teams user {author:x} is not intrinsically source-scoped");
-    }
     Ok(())
 }
 
@@ -1610,7 +1631,7 @@ fn validate_message_identity(facts: &TribleSet, message: Id, chats: &BTreeSet<Id
     if !chats.contains(&chat) {
         bail!("Teams message {message:x} names an unknown chat");
     }
-    let external = one_required(
+    let _external = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ message @ teams::message_id: ?value }])
@@ -1618,25 +1639,10 @@ fn validate_message_identity(facts: &TribleSet, message: Id, chats: &BTreeSet<Id
         .collect(),
         "Teams message external id",
     )?;
-    let expected = entity! {
-        metadata::tag: archive::kind_message,
-        teams::chat: chat,
-        teams::message_id: external,
-    }
-    .root()
-    .expect("message identity has one root");
-    if expected != message {
-        bail!("Teams message {message:x} is not intrinsically chat-scoped");
-    }
     Ok(())
 }
 
-fn validate_receipt_identity_local(
-    facts: &TribleSet,
-    receipt: Id,
-    source: Id,
-    events: &BTreeSet<Id>,
-) -> Result<()> {
+fn validate_receipt_shape(facts: &TribleSet, receipt: Id) -> Result<()> {
     let tag = one_required(
         find!(value: Id, pattern!(facts, [{ receipt @ metadata::tag: ?value }])).collect(),
         "Teams receipt kind",
@@ -1688,10 +1694,9 @@ fn validate_receipt_identity_local(
         "Teams legacy snapshot source coordinate",
     )?;
 
-    let expected = if tag == teams::kind_coverage {
-        let request =
-            request.ok_or_else(|| anyhow::anyhow!("Teams coverage request is missing"))?;
-        let cursor = cursor.ok_or_else(|| anyhow::anyhow!("Teams coverage cursor is missing"))?;
+    if tag == teams::kind_coverage {
+        request.ok_or_else(|| anyhow::anyhow!("Teams coverage request is missing"))?;
+        cursor.ok_or_else(|| anyhow::anyhow!("Teams coverage cursor is missing"))?;
         let kind = kind.ok_or_else(|| anyhow::anyhow!("Teams coverage kind is missing"))?;
         let kind_text = String::try_from_inline(&kind)
             .map_err(|error| anyhow::anyhow!("decode Teams coverage kind: {error:?}"))?;
@@ -1701,18 +1706,6 @@ fn validate_receipt_identity_local(
         if coordinate.is_some() {
             bail!("Graph Teams coverage receipt carries a legacy source coordinate");
         }
-        entity! {
-            metadata::tag: teams::kind_coverage,
-            teams::source: source,
-            teams::coverage_generation: generation,
-            teams::coverage_request: request,
-            teams::coverage_cursor: cursor,
-            teams::coverage_kind: kind,
-            metadata::supersedes*: predecessors,
-            teams::coverage_observation*: events.clone(),
-        }
-        .root()
-        .expect("coverage identity has one root")
     } else if tag == teams::kind_legacy_snapshot {
         if generation_value != 0
             || request.is_some()
@@ -1722,22 +1715,10 @@ fn validate_receipt_identity_local(
         {
             bail!("legacy Teams snapshot has Graph cursor state, a predecessor, or nonzero generation");
         }
-        let coordinate = coordinate
+        coordinate
             .ok_or_else(|| anyhow::anyhow!("legacy Teams snapshot source coordinate is missing"))?;
-        entity! {
-            metadata::tag: teams::kind_legacy_snapshot,
-            teams::source: source,
-            teams::coverage_generation: generation,
-            teams::snapshot_source_coordinate: coordinate,
-            teams::coverage_observation*: events.clone(),
-        }
-        .root()
-        .expect("legacy snapshot identity has one root")
     } else {
         bail!("unknown Teams receipt kind {tag:x}");
-    };
-    if expected != receipt {
-        bail!("Teams receipt {receipt:x} is not intrinsic");
     }
     Ok(())
 }
@@ -1770,7 +1751,7 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
         bail!("Teams facts omit attachment file {missing:x}");
     }
     for media_type in &media_types {
-        let name = one_required(
+        let _name = one_required(
             find!(
                 value: Inline<Handle<UTF8String>>,
                 pattern!(facts, [{ *media_type @ metadata::name: ?value }])
@@ -1778,15 +1759,9 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
             .collect(),
             "attachment media type name",
         )?;
-        let expected = entity! { metadata::tag: KIND_MEDIA_TYPE, metadata::name: name }
-            .root()
-            .expect("media type identity has one root");
-        if expected != *media_type {
-            bail!("attachment media type {media_type:x} is not intrinsic");
-        }
     }
     for file_id in files_present {
-        let content = one_required(
+        let _content = one_required(
             find!(
                 value: Inline<Handle<RawBytes>>,
                 pattern!(facts, [{ file_id @ file::content: ?value }])
@@ -1794,7 +1769,7 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
             .collect(),
             "attachment file content",
         )?;
-        let name = one_required(
+        let _name = one_required(
             find!(
                 value: Inline<Handle<UTF8String>>,
                 pattern!(facts, [{ file_id @ file::name: ?value }])
@@ -1809,92 +1784,8 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
         if !media_types.contains(&media_type) {
             bail!("Teams facts omit media-type identity {media_type:x}");
         }
-        let expected = entity! {
-            metadata::tag: KIND_FILE,
-            file::content: content,
-            file::name: name,
-            file::media_type: media_type,
-        }
-        .root()
-        .expect("file identity has one root");
-        if expected != file_id {
-            bail!("attachment file {file_id:x} is not canonical");
-        }
     }
     Ok(())
-}
-
-fn validate_fragment_payloads(
-    reader: &PileSnapshot,
-    fragment: &Fragment,
-    catalog: &TribleSet,
-) -> Result<()> {
-    let mut local = fragment.blobs().clone();
-    let local = local.snapshot().context("snapshot Teams page payloads")?;
-    let text_attributes = text_attributes();
-    for fact in fragment.facts() {
-        if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<UTF8String>>();
-            let text: anybytes::View<str> = if local
-                .metadata(handle)
-                .context("inspect staged Teams text payload")?
-                .is_some()
-            {
-                local.get(handle).with_context(|| {
-                    format!(
-                        "decode staged Teams text payload {}",
-                        hex::encode_upper(handle.raw)
-                    )
-                })?
-            } else {
-                reader.get(handle).with_context(|| {
-                    format!(
-                        "read existing Teams text payload {}",
-                        hex::encode_upper(handle.raw)
-                    )
-                })?
-            };
-            if fact.a() == &teams::tenant_id.id()
-                && (text.is_empty()
-                    || text.as_ref() != canonical_tenant(text.as_ref())
-                    || is_generic_tenant(text.as_ref()))
-            {
-                bail!("Teams page carries a non-canonical tenant identity");
-            }
-            if fact.a() == &teams::snapshot_source_coordinate.id()
-                && !is_canonical_snapshot_source_coordinate(text.as_ref())
-            {
-                bail!("Teams page carries a non-canonical legacy source coordinate");
-            }
-            if [teams::auth_client_id.id(), teams::auth_user_id.id()].contains(fact.a())
-                && canonical_nonempty(text.as_ref(), "Teams auth-profile text")?.as_str()
-                    != text.as_ref()
-            {
-                bail!("Teams auth profile carries non-canonical public configuration");
-            }
-            if fact.a() == &teams::auth_scopes.id()
-                && canonical_auth_scopes(text.as_ref())?.as_str() != text.as_ref()
-            {
-                bail!("Teams auth profile carries non-canonical delegated scopes");
-            }
-        } else if fact.a() == &file::content.id() {
-            let handle = *fact.v::<Handle<RawBytes>>();
-            let _: Bytes = if local
-                .metadata(handle)
-                .context("inspect staged attachment bytes")?
-                .is_some()
-            {
-                local
-                    .get(handle)
-                    .context("decode staged attachment bytes")?
-            } else {
-                reader
-                    .get(handle)
-                    .context("read existing attachment bytes")?
-            };
-        }
-    }
-    validate_attachment_payload_sizes(reader, Some(&local), catalog)
 }
 
 /// Validate the complete materialized Teams collection and all referenced
@@ -2312,7 +2203,7 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     if !messages.contains(&message) {
         bail!("Teams attachment {attachment:x} names an unknown message");
     }
-    let source = one_required(
+    let _source = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ attachment @ archive::attachment_source_id: ?value }])
@@ -2333,7 +2224,7 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     if kind_text != "attachment" && kind_text != "hosted-content" {
         bail!("invalid Teams attachment kind {kind_text:?}");
     }
-    let name = one_optional(
+    let _name = one_optional(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ attachment @ archive::attachment_name: ?value }])
@@ -2364,18 +2255,6 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     )?;
     if file.is_some() != size.is_some() {
         bail!("Teams attachment {attachment:x} must carry file and byte size together");
-    }
-    let expected = entity! {
-        metadata::tag: archive::kind_attachment,
-        archive::attachment_source_id: source,
-        teams::attachment_message: message,
-        teams::attachment_kind: kind,
-        archive::attachment_name?: name,
-    }
-    .root()
-    .expect("attachment identity has one root");
-    if expected != attachment {
-        bail!("Teams attachment {attachment:x} is not an intrinsic source occurrence");
     }
     Ok(())
 }
@@ -2415,7 +2294,7 @@ fn validate_observation(
         .collect(),
         "Teams observation created time",
     )?;
-    let modified = one_required(
+    let _modified = one_required(
         find!(
             value: Inline<NsTAIInterval>,
             pattern!(catalog, [{ observation @ teams::modified_at: ?value }])
@@ -2451,7 +2330,7 @@ fn validate_observation(
         .collect(),
         "Teams observation content",
     )?;
-    let etag = one_required(
+    let _etag = one_required(
         find!(
             value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ observation @ teams::etag: ?value }])
@@ -2497,17 +2376,6 @@ fn validate_observation(
     if state_text == "deleted" && deleted.is_none() {
         bail!("versioned deleted Teams observation {observation:x} lacks deletedDateTime");
     }
-    let expected = entity! {
-        metadata::tag: teams::kind_message_observation,
-        teams::message: message,
-        teams::modified_at: modified,
-        teams::etag: etag,
-    }
-    .root()
-    .expect("observation identity has one root");
-    if expected != observation {
-        bail!("Teams observation {observation:x} is not an intrinsic source version");
-    }
     Ok(())
 }
 
@@ -2540,15 +2408,6 @@ fn validate_tombstone(catalog: &TribleSet, tombstone: Id, messages: &BTreeSet<Id
     .is_none()
     {
         bail!("Teams tombstone {tombstone:x} has no raw source representation");
-    }
-    let expected = entity! {
-        metadata::tag: teams::kind_message_tombstone,
-        teams::message: message,
-    }
-    .root()
-    .expect("tombstone identity has one root");
-    if expected != tombstone {
-        bail!("Teams tombstone {tombstone:x} is not intrinsic");
     }
     Ok(())
 }
@@ -2881,7 +2740,10 @@ fn validate_auth_profiles(catalog: &TribleSet, sources: &BTreeSet<Id>) -> Result
     Ok(())
 }
 
-fn context_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+fn context_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(
         context: Id,
         pattern!(catalog, [{
@@ -2893,7 +2755,10 @@ fn context_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
     .collect()
 }
 
-pub fn context_head_ids(catalog: &TribleSet, source: Id) -> BTreeSet<Id> {
+pub fn context_head_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     let contexts = context_ids(catalog, source);
     let superseded = find!(
         predecessor: Id,

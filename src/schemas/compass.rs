@@ -91,8 +91,8 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
 /// `metadata::created_at`. `maximal` never proposes, so the pattern enumerates
 /// the goal's status events and the index kills the dominated ones; its
 /// `(created_at, event-id)` total order leaves exactly one.
-pub fn latest_status_event(
-    space: &TribleSet,
+pub fn latest_status_event<P: TriblePattern>(
+    space: &P,
     register: &LwwIndex,
     goal_id: Id,
 ) -> Option<(Id, String, IntervalValue)> {

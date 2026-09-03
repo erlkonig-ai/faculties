@@ -8,7 +8,7 @@
 //! or clock-based arbitration.
 
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -19,8 +19,9 @@ use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::CollectionStoreExt;
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::prelude::*;
 
@@ -262,67 +263,32 @@ enum IdentityCommand {
     List,
 }
 
-#[derive(Clone, Copy)]
 struct RelationsStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    pile: &'a mut Pile,
+    signer: &'a SigningKey,
+    collection: Collection<SimpleArchive>,
+    facts: &'a FactArchive,
+    reader: &'a PileSnapshot,
 }
 
 impl RelationsStorage<'_> {
-    fn with_pile<T>(
-        &self,
-        operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
-    ) -> Result<T> {
-        // Reads and writes share the same durable authority. Ordinary CLI
-        // commands never mint a key or substitute an ephemeral identity.
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = operation(&mut pile, &signer);
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
+    fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
+        f(self.facts, self.reader)
     }
 
-    fn with_view<T>(&self, f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<T>) -> Result<T> {
-        self.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize authored Relations collection")?;
-            relations::validate_catalog(&store_snapshot, &facts)
-                .context("validate authored Relations collection")?;
-            f(&facts, &store_snapshot)
-        })
-    }
-
-    /// Build and preflight one update against the exact known collection
-    /// union. `None` is a genuine no-op and writes no collection record.
+    /// Build one typed local update. `None` is a genuine no-op and writes no
+    /// collection record.
     fn update<T>(
-        &self,
-        f: impl FnOnce(&TribleSet, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
+        &mut self,
+        f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize authored Relations collection")?;
-            relations::validate_catalog(&store_snapshot, &facts)
-                .context("validate authored Relations collection")?;
-            let (fragment, result) = f(&facts, &store_snapshot)?;
-            if let Some(fragment) = fragment {
-                relations::validate_catalog_union(&store_snapshot, &facts, &fragment)
-                    .context("preflight authored Relations union")?;
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Relations fragment")?;
-            }
-            Ok(result)
-        })
+        let (fragment, result) = f(self.facts, self.reader)?;
+        if let Some(fragment) = fragment {
+            self.pile
+                .commit(self.collection, self.signer, fragment)
+                .context("commit authored Relations fragment")?;
+        }
+        Ok(result)
     }
 }
 
@@ -340,7 +306,7 @@ fn now_observation() -> Result<relations::ObservedAt> {
 
 fn resolve_person_anchor(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &FactArchive,
     selector: &str,
     include_retired: bool,
 ) -> Result<Id> {
@@ -357,7 +323,7 @@ fn resolve_person_anchor(
     }
 }
 
-fn resolve_group_anchor(reader: &PileSnapshot, facts: &TribleSet, selector: &str) -> Result<Id> {
+fn resolve_group_anchor(reader: &PileSnapshot, facts: &FactArchive, selector: &str) -> Result<Id> {
     match relations::resolve_group(reader, facts, selector)? {
         SelectorOutcome::Unique(id) => Ok(id),
         SelectorOutcome::Forked {
@@ -487,7 +453,7 @@ fn apply_profile_patch(input: &mut ProfileInput, patch: ProfilePatchArgs) -> Res
 }
 
 fn cmd_add(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     label: String,
     id: Option<Id>,
     source: Vec<String>,
@@ -505,7 +471,7 @@ fn cmd_add(
 }
 
 fn cmd_set(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     person: String,
     source: Vec<String>,
     patch: ProfilePatchArgs,
@@ -546,7 +512,7 @@ fn cmd_set(
 }
 
 fn cmd_reconcile_profile(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     person_selector: String,
     base: Option<String>,
     patch: ProfilePatchArgs,
@@ -603,7 +569,7 @@ fn cmd_reconcile_profile(
     Ok(())
 }
 
-fn lifecycle_state(facts: &TribleSet, person: Id) -> Result<(Vec<Id>, Option<bool>)> {
+fn lifecycle_state(facts: &FactArchive, person: Id) -> Result<(Vec<Id>, Option<bool>)> {
     match relations::lifecycle_head(facts, person)? {
         Head::Missing => bail!("person {} has no lifecycle", fmt_id(person)),
         Head::Unique(id) => Ok((
@@ -614,7 +580,11 @@ fn lifecycle_state(facts: &TribleSet, person: Id) -> Result<(Vec<Id>, Option<boo
     }
 }
 
-fn cmd_set_retired(storage: RelationsStorage<'_>, selector: String, retired: bool) -> Result<()> {
+fn cmd_set_retired(
+    storage: &mut RelationsStorage<'_>,
+    selector: String,
+    retired: bool,
+) -> Result<()> {
     enum Outcome {
         Unchanged(Id),
         Changed { person: Id, successor: Id },
@@ -680,7 +650,7 @@ fn print_profile(id: Id, input: &ProfileInput) {
     }
 }
 
-fn cmd_show(storage: RelationsStorage<'_>, selector: String) -> Result<()> {
+fn cmd_show(storage: &mut RelationsStorage<'_>, selector: String) -> Result<()> {
     storage.with_view(|facts, reader| {
         let person = resolve_person_anchor(reader, facts, &selector, true)?;
         println!("person: {}", fmt_id(person));
@@ -726,7 +696,7 @@ fn cmd_show(storage: RelationsStorage<'_>, selector: String) -> Result<()> {
 }
 
 fn cmd_list(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     limit: usize,
     all: bool,
     retired_only: bool,
@@ -781,7 +751,7 @@ fn cmd_list(
     })
 }
 
-fn cmd_group_create(storage: RelationsStorage<'_>, name: String) -> Result<()> {
+fn cmd_group_create(storage: &mut RelationsStorage<'_>, name: String) -> Result<()> {
     let (group, snapshot) = storage.update(|facts, reader| {
         match relations::resolve_group(reader, facts, &name)? {
             SelectorOutcome::Missing => {}
@@ -800,7 +770,7 @@ fn cmd_group_create(storage: RelationsStorage<'_>, name: String) -> Result<()> {
 }
 
 fn cmd_group_add(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     group_selector: String,
     person_selector: String,
 ) -> Result<()> {
@@ -838,7 +808,7 @@ fn cmd_group_add(
 }
 
 fn cmd_group_remove(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     group_selector: String,
     person_selector: String,
 ) -> Result<()> {
@@ -878,7 +848,7 @@ fn cmd_group_remove(
 }
 
 fn cmd_group_rename(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     group_selector: String,
     name: String,
 ) -> Result<()> {
@@ -908,7 +878,7 @@ fn cmd_group_rename(
 }
 
 fn cmd_group_reconcile(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     selector: String,
     explicit_name: Option<String>,
 ) -> Result<()> {
@@ -964,7 +934,7 @@ fn cmd_group_reconcile(
 
 fn print_group_snapshot(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &FactArchive,
     snapshot: GroupSnapshot,
 ) -> Result<()> {
     println!("snapshot: {}", fmt_id(snapshot.id));
@@ -978,7 +948,7 @@ fn print_group_snapshot(
     Ok(())
 }
 
-fn cmd_group_show(storage: RelationsStorage<'_>, selector: String) -> Result<()> {
+fn cmd_group_show(storage: &mut RelationsStorage<'_>, selector: String) -> Result<()> {
     storage.with_view(|facts, reader| {
         let group = resolve_group_anchor(reader, facts, &selector)?;
         println!("group: {}", fmt_id(group));
@@ -998,7 +968,7 @@ fn cmd_group_show(storage: RelationsStorage<'_>, selector: String) -> Result<()>
     })
 }
 
-fn cmd_group_list(storage: RelationsStorage<'_>) -> Result<()> {
+fn cmd_group_list(storage: &mut RelationsStorage<'_>) -> Result<()> {
     storage.with_view(|facts, reader| {
         let mut rows = Vec::new();
         for group in relations::group_anchors(facts) {
@@ -1037,7 +1007,7 @@ fn cmd_group_list(storage: RelationsStorage<'_>) -> Result<()> {
 }
 
 fn cmd_identity_resolve(
-    storage: RelationsStorage<'_>,
+    storage: &mut RelationsStorage<'_>,
     first: String,
     second: String,
     same: bool,
@@ -1094,7 +1064,7 @@ fn cmd_identity_resolve(
     Ok(())
 }
 
-fn cmd_identity_list(storage: RelationsStorage<'_>) -> Result<()> {
+fn cmd_identity_list(storage: &mut RelationsStorage<'_>) -> Result<()> {
     storage.with_view(|facts, _| {
         let heads = relations::identity_heads(facts)?;
         if heads.is_empty() {
@@ -1141,60 +1111,102 @@ fn cmd_identity_list(storage: RelationsStorage<'_>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let storage = RelationsStorage {
-        pile: &cli.pile,
-        key: cli.key.as_deref(),
+    let Some(command) = cli.command else {
+        Cli::command().print_help().ok();
+        println!();
+        return Ok(());
     };
 
-    match cli.command {
-        None => {
-            Cli::command().print_help().ok();
-            println!();
+    let signer = load_signer(&cli.pile, cli.key.as_deref())?;
+    let mut pile = open_pile_strict(&cli.pile)?;
+    let result = (|| {
+        let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        let facts = FactCollection::new(&mut pile, collection)
+            .context("register maintained Relations fact collection")?;
+        let before = pile
+            .snapshot()
+            .context("freeze Relations pre-maintenance snapshot")?;
+        let instant = clock::now()?;
+        drop(
+            facts
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Relations fact collection")?,
+        );
+        let reader = pile
+            .snapshot()
+            .context("freeze maintained Relations snapshot")?;
+        let observed = reader
+            .collection_at(facts.rank9(), instant)
+            .context("observe Relations Rank9 projection")?;
+        let view = observed
+            .view::<FactArchive>()
+            .context("read Relations Rank9 projection")?;
+        let mut storage = RelationsStorage {
+            pile: &mut pile,
+            signer: &signer,
+            collection: facts.source(),
+            facts: &view,
+            reader: &reader,
+        };
+
+        match command {
+            Command::Add {
+                label,
+                id,
+                source,
+                profile,
+            } => cmd_add(&mut storage, label, id, source, profile),
+            Command::Set {
+                person,
+                source,
+                patch,
+            } => cmd_set(&mut storage, person, source, patch),
+            Command::Reconcile {
+                person,
+                base,
+                patch,
+            } => cmd_reconcile_profile(&mut storage, person, base, patch),
+            Command::List {
+                limit,
+                all,
+                retired,
+            } => cmd_list(&mut storage, limit, all, retired),
+            Command::Show { person } => cmd_show(&mut storage, person),
+            Command::Retire { person } => cmd_set_retired(&mut storage, person, true),
+            Command::Unretire { person } => cmd_set_retired(&mut storage, person, false),
+            Command::Group { command } => match command {
+                GroupCommand::Create { name } => cmd_group_create(&mut storage, name),
+                GroupCommand::Add { group, person } => cmd_group_add(&mut storage, group, person),
+                GroupCommand::Remove { group, person } => {
+                    cmd_group_remove(&mut storage, group, person)
+                }
+                GroupCommand::Rename { group, name } => cmd_group_rename(&mut storage, group, name),
+                GroupCommand::Reconcile { group, name } => {
+                    cmd_group_reconcile(&mut storage, group, name)
+                }
+                GroupCommand::List => cmd_group_list(&mut storage),
+                GroupCommand::Show { group } => cmd_group_show(&mut storage, group),
+            },
+            Command::Identity { command } => match command {
+                IdentityCommand::Resolve {
+                    first,
+                    second,
+                    same,
+                    distinct: _,
+                } => cmd_identity_resolve(&mut storage, first, second, same),
+                IdentityCommand::List => cmd_identity_list(&mut storage),
+            },
         }
-        Some(Command::Add {
-            label,
-            id,
-            source,
-            profile,
-        }) => cmd_add(storage, label, id, source, profile)?,
-        Some(Command::Set {
-            person,
-            source,
-            patch,
-        }) => cmd_set(storage, person, source, patch)?,
-        Some(Command::Reconcile {
-            person,
-            base,
-            patch,
-        }) => cmd_reconcile_profile(storage, person, base, patch)?,
-        Some(Command::List {
-            limit,
-            all,
-            retired,
-        }) => cmd_list(storage, limit, all, retired)?,
-        Some(Command::Show { person }) => cmd_show(storage, person)?,
-        Some(Command::Retire { person }) => cmd_set_retired(storage, person, true)?,
-        Some(Command::Unretire { person }) => cmd_set_retired(storage, person, false)?,
-        Some(Command::Group { command }) => match command {
-            GroupCommand::Create { name } => cmd_group_create(storage, name)?,
-            GroupCommand::Add { group, person } => cmd_group_add(storage, group, person)?,
-            GroupCommand::Remove { group, person } => cmd_group_remove(storage, group, person)?,
-            GroupCommand::Rename { group, name } => cmd_group_rename(storage, group, name)?,
-            GroupCommand::Reconcile { group, name } => cmd_group_reconcile(storage, group, name)?,
-            GroupCommand::List => cmd_group_list(storage)?,
-            GroupCommand::Show { group } => cmd_group_show(storage, group)?,
-        },
-        Some(Command::Identity { command }) => match command {
-            IdentityCommand::Resolve {
-                first,
-                second,
-                same,
-                distinct: _,
-            } => cmd_identity_resolve(storage, first, second, same)?,
-            IdentityCommand::List => cmd_identity_list(storage)?,
-        },
+    })();
+    let close = pile.close().map_err(anyhow::Error::from);
+    match (result, close) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error.context("close Relations pile")),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing Relations pile also failed: {close_error}")))
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1267,29 +1279,36 @@ mod tests {
         let key = directory.join("relations.key");
         fs::File::create(&pile).unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
-        let storage = RelationsStorage {
-            pile: &pile,
-            key: Some(&key),
-        };
+        let signer = load_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        let collection =
+            open_configured(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let facts = FactCollection::new(&mut store, collection).unwrap();
 
         let person = genid().id;
         let (fragment, initial, _) = relations::person_fragment(person, profile("Ada")).unwrap();
-        storage.update(|_, _| Ok((Some(fragment), ()))).unwrap();
+        store.commit(collection, &signer, fragment).unwrap();
 
         let left = relations::profile_fragment(person, profile("Ada Left"), &[initial]).unwrap();
         let right = relations::profile_fragment(person, profile("Ada Right"), &[initial]).unwrap();
-        storage.update(|_, _| Ok((Some(left), ()))).unwrap();
-        storage.update(|_, _| Ok((Some(right), ()))).unwrap();
+        store.commit(collection, &signer, left).unwrap();
+        store.commit(collection, &signer, right).unwrap();
 
-        storage
-            .with_view(|facts, _| {
-                match relations::profile_head(facts, person)? {
-                    Head::Forked(heads) => assert_eq!(heads.len(), 2),
-                    other => panic!("expected visible fork, got {other:?}"),
-                }
-                Ok(())
-            })
-            .unwrap();
+        let before = store.snapshot().unwrap();
+        let instant = clock::now().unwrap();
+        drop(facts.maintain_at(&mut store, &before, instant).unwrap());
+        let reader = store.snapshot().unwrap();
+        let observed = reader.collection_at(facts.rank9(), instant).unwrap();
+        let view = observed.view::<FactArchive>().unwrap();
+        match relations::profile_head(&view, person).unwrap() {
+            Head::Forked(heads) => assert_eq!(heads.len(), 2),
+            other => panic!("expected visible fork, got {other:?}"),
+        }
+        drop(view);
+        drop(observed);
+        drop(reader);
+        drop(before);
+        store.close().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 }

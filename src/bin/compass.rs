@@ -2,10 +2,11 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::collection_names::open_configured;
 use faculties::schemas::compass::{
-    board, latest_status_event, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
+    board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
+    KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::{clock, compass, relations};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -119,10 +120,10 @@ enum Command {
 }
 
 // ── on-demand board queries ───────────────────────────────────────────
-// All data lives in the TribleSet; we query directly via find!() instead
-// of pre-materializing into Rust structs.
+// All data stays in the maintained Succinct view; query it directly instead
+// of pre-materializing Rust catalogs.
 
-/// Query helpers that operate directly on the checked-out TribleSet + workspace.
+/// Query helpers that operate directly on one immutable fact view + workspace.
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
@@ -235,7 +236,7 @@ impl CompassStorage<'_> {
 
     fn with_view<T>(
         &self,
-        f: impl FnOnce(&TribleSet, &PileSnapshot, &LwwIndex) -> Result<T>,
+        f: impl FnOnce(&FactArchive, &PileSnapshot, &LwwIndex) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
             let view = compass::materialize_indexed_collection(pile, signer)?;
@@ -248,34 +249,65 @@ impl CompassStorage<'_> {
     fn update<T>(
         &self,
         persona: Option<&str>,
-        f: impl FnOnce(&TribleSet, &PileSnapshot, Option<Id>) -> Result<(Option<Fragment>, T)>,
+        f: impl FnOnce(&FactArchive, &PileSnapshot, Option<Id>) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let view = compass::materialize_indexed_collection(pile, signer)?;
-            let facts = view.facts();
-            let reader = view.store_snapshot();
-            let by = if let Some(persona) = persona {
-                let collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-                let relation_reader = pile
-                    .snapshot()
-                    .context("freeze Relations store snapshot for Compass persona")?;
-                let (relation_facts, _) =
-                    faculties::storage::read_fact_collection(collection, &relation_reader)
-                        .context("materialize Relations collection for Compass persona")?;
-                relations::validate_catalog(&relation_reader, &relation_facts)
-                    .context("validate Relations collection for Compass persona")?;
-                Some(resolve_persona_id(
-                    &relation_facts,
-                    &relation_reader,
-                    persona,
-                )?)
+            // Register every descriptor before fixing the one shared source
+            // boundary used by this action.
+            let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+            let compass_facts = FactCollection::new(pile, compass_source)
+                .context("register maintained Compass fact collection")?;
+            let relation_facts = if persona.is_some() {
+                let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+                Some(
+                    FactCollection::new(pile, source)
+                        .context("register maintained Relations fact collection")?,
+                )
             } else {
                 None
             };
-            let (fragment, value) = f(facts, reader, by)?;
+
+            let instant = clock::now()?;
+            let before = pile
+                .snapshot()
+                .context("freeze shared Compass/Relations source snapshot")?;
+            drop(
+                compass_facts
+                    .maintain_at(pile, &before, instant)
+                    .context("maintain Compass fact collection")?,
+            );
+            if let Some(relation_facts) = relation_facts {
+                drop(
+                    relation_facts
+                        .maintain_at(pile, &before, instant)
+                        .context("maintain Relations fact collection for Compass persona")?,
+                );
+            }
+            drop(before);
+
+            // Attach every view through one immutable post-maintenance store
+            // boundary, so validation and persona resolution cannot mix
+            // collection watermarks.
+            let reader = pile
+                .snapshot()
+                .context("freeze maintained Compass/Relations snapshot")?;
+            let facts = reader
+                .collection_at(compass_facts.rank9(), instant)
+                .context("observe Compass fact collection")?
+                .view::<FactArchive>()
+                .context("read Compass fact collection")?;
+            let by = if let (Some(persona), Some(relation_facts)) = (persona, relation_facts) {
+                let relations = reader
+                    .collection_at(relation_facts.rank9(), instant)
+                    .context("observe Relations fact collection for Compass persona")?
+                    .view::<FactArchive>()
+                    .context("read Relations fact collection for Compass persona")?;
+                Some(resolve_persona_id(&relations, &reader, persona)?)
+            } else {
+                None
+            };
+            let (fragment, value) = f(&facts, &reader, by)?;
             if let Some(fragment) = fragment {
-                compass::validate_candidate(reader, facts, &fragment)
-                    .context("validate Compass action before publication")?;
                 compass::commit_collection(pile, signer, fragment)?;
             }
             Ok(value)
@@ -283,14 +315,14 @@ impl CompassStorage<'_> {
     }
 }
 
-fn task_title(reader: &PileSnapshot, space: &TribleSet, task_id: Id) -> String {
+fn task_title<P: TriblePattern>(reader: &PileSnapshot, space: &P, task_id: Id) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .and_then(|h| read_text(reader, h).ok())
         .unwrap_or_default()
 }
 
-fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
+fn task_tags<P: TriblePattern>(space: &P, task_id: Id) -> Vec<String> {
     let mut tags: Vec<String> = find!(
         tag: String,
         pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
@@ -301,17 +333,17 @@ fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
     tags
 }
 
-fn task_parent(space: &TribleSet, task_id: Id) -> Option<Id> {
+fn task_parent<P: TriblePattern>(space: &P, task_id: Id) -> Option<Id> {
     find!(p: Id, pattern!(space, [{ task_id @ board::parent: ?p }])).next()
 }
 
-fn task_created_at(space: &TribleSet, task_id: Id) -> Option<IntervalValue> {
+fn task_created_at<P: TriblePattern>(space: &P, task_id: Id) -> Option<IntervalValue> {
     find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }])).next()
 }
 
 /// Latest status for a task.
-fn task_latest_status(
-    space: &TribleSet,
+fn task_latest_status<P: TriblePattern>(
+    space: &P,
     status_register: &LwwIndex,
     task_id: Id,
 ) -> Option<(String, IntervalValue)> {
@@ -319,12 +351,12 @@ fn task_latest_status(
 }
 
 /// All goal IDs.
-fn all_goal_ids(space: &TribleSet) -> Vec<Id> {
+fn all_goal_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])).collect()
 }
 
 /// All note event IDs.
-fn all_note_ids(space: &TribleSet) -> Vec<Id> {
+fn all_note_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
     find!(
         id: Id,
         pattern!(space, [
@@ -345,11 +377,11 @@ fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 }
 
 /// Parse a full 32-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
-fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
+fn resolve_task_id<P: TriblePattern>(input: &str, space: &P) -> Result<Id> {
     faculties::resolve_id_prefix(input, all_goal_ids(space))
 }
 
-fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
+fn resolve_note_id<P: TriblePattern>(input: &str, space: &P) -> Result<Id> {
     let trimmed = input.trim();
     if trimmed.len() != 32 {
         bail!("supersedes requires a full 32-char note id: '{trimmed}'");
@@ -362,11 +394,20 @@ fn resolve_note_id(input: &str, space: &TribleSet) -> Result<Id> {
     Ok(note_id)
 }
 
-fn parent_paths(space: &TribleSet) -> Result<PathIndex> {
+fn parent_paths<P: TriblePattern>(space: &P) -> Result<PathIndex> {
     let parent_plus = PathExpr::from(Step::Forward(board::parent.id().into()))
         .plus()
         .compile();
-    PathIndex::from_tribles(parent_plus, space.iter())
+    let edges: TribleSet = find!(
+        (child: Id, parent: Id),
+        pattern!(space, [{ ?child @ board::parent: ?parent }])
+    )
+    .map(|(child, parent)| {
+        let parent: Inline<inlineencodings::GenId> = parent.to_inline();
+        Trible::force(&child, &board::parent.id(), &parent)
+    })
+    .collect();
+    PathIndex::from_tribles(parent_plus, edges.iter())
         .map_err(|error| anyhow::anyhow!("materialize goal-parent ancestry: {error}"))
 }
 
@@ -381,18 +422,18 @@ fn is_ancestor(paths: &PathIndex, from: Id, to: Id) -> bool {
 }
 
 /// Count notes for a task.
-fn note_count(space: &TribleSet, task_id: Id) -> usize {
+fn note_count<P: TriblePattern>(space: &P, task_id: Id) -> usize {
     find!(
         _n: TextHandle,
         pattern!(space, [{ _?evt @ metadata::tag: &KIND_NOTE_ID, board::task: &task_id, board::note: ?_n }])
     ).count()
 }
 
-fn event_actor(space: &TribleSet, event_id: Id) -> Option<Id> {
+fn event_actor<P: TriblePattern>(space: &P, event_id: Id) -> Option<Id> {
     find!(by: Id, pattern!(space, [{ event_id @ board::by: ?by }])).next()
 }
 
-fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
+fn note_tags<P: TriblePattern>(space: &P, note_id: Id) -> Vec<String> {
     let mut tags: Vec<String> =
         find!(tag: String, pattern!(space, [{ note_id @ board::tag: ?tag }])).collect();
     tags.sort();
@@ -400,7 +441,7 @@ fn note_tags(space: &TribleSet, note_id: Id) -> Vec<String> {
     tags
 }
 
-fn note_references(reader: &PileSnapshot, space: &TribleSet, note_id: Id) -> Vec<String> {
+fn note_references<P: TriblePattern>(reader: &PileSnapshot, space: &P, note_id: Id) -> Vec<String> {
     let mut references: Vec<String> = find!(
         handle: TextHandle,
         pattern!(space, [{ note_id @ board::reference: ?handle }])
@@ -412,7 +453,7 @@ fn note_references(reader: &PileSnapshot, space: &TribleSet, note_id: Id) -> Vec
     references
 }
 
-fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
+fn note_supersedes<P: TriblePattern>(space: &P, note_id: Id) -> Vec<Id> {
     let mut predecessors: Vec<Id> = find!(
         predecessor: Id,
         pattern!(space, [{ note_id @ metadata::supersedes: ?predecessor }])
@@ -423,9 +464,9 @@ fn note_supersedes(space: &TribleSet, note_id: Id) -> Vec<Id> {
     predecessors
 }
 
-fn render_board(
+fn render_board<P: TriblePattern>(
     reader: &PileSnapshot,
-    space: &TribleSet,
+    space: &P,
     status_register: &LwwIndex,
     status_filter: &[String],
     tag_filter: &[String],
@@ -647,7 +688,11 @@ fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, 
 /// Resolve one active Relations person for attribution. The flag remains a
 /// cooperative authorship claim, but it cannot name an unknown or retired
 /// anchor.
-fn resolve_persona_id(space: &TribleSet, reader: &PileSnapshot, input: &str) -> Result<Id> {
+fn resolve_persona_id<P: TriblePattern>(
+    space: &P,
+    reader: &PileSnapshot,
+    input: &str,
+) -> Result<Id> {
     relations::resolve_person(reader, space, input, false)?.require_unique("persona", input)
 }
 

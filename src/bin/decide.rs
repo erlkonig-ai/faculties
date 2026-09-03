@@ -10,7 +10,7 @@ use faculties::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
@@ -114,7 +114,7 @@ struct DecideStorage<'a> {
 }
 
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
@@ -132,11 +132,18 @@ impl DecideStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Decide store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize authored Decide collection")?;
-            decide::validate_catalog(&store_snapshot, &facts)
-                .context("validate authored Decide collection")?;
+            let maintained = FactCollection::new(&mut pile, collection)
+                .context("register maintained Decide fact collection")?;
+            let before = pile.snapshot().context("freeze Decide source snapshot")?;
+            let instant = clock::now()?;
+            let store_snapshot = maintained
+                .maintain_at(&mut pile, &before, instant)
+                .context("maintain Decide fact collection")?;
+            let facts = store_snapshot
+                .collection_at(maintained.rank9(), instant)
+                .context("observe maintained Decide fact collection")?
+                .view::<FactArchive>()
+                .context("read maintained Decide fact collection")?;
             operation(
                 &mut pile,
                 collection,
@@ -161,8 +168,6 @@ impl DecideStorage<'_> {
     ) -> Result<T> {
         self.with_store(|pile, collection, signer, view| {
             let (mut fragment, value) = operation(view)?;
-            decide::validate_catalog_union(&view.reader, &view.facts, &fragment)
-                .context("preflight authored Decide union")?;
             fragment.describe_with(entity! { metadata::description: description });
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
@@ -256,7 +261,7 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
-fn resolve_decision(input: &str, facts: &TribleSet) -> Result<Id> {
+fn resolve_decision(input: &str, facts: &FactArchive) -> Result<Id> {
     faculties::resolve_id_prefix(input, decide::decision_anchors(facts))
 }
 
@@ -301,7 +306,7 @@ fn reconciliation_heads(state: Resolution, decision: Id) -> Result<Vec<Id>> {
     }
 }
 
-fn evidence(facts: &TribleSet, decision: Id, forced: bool) -> Result<Vec<Id>> {
+fn evidence(facts: &FactArchive, decision: Id, forced: bool) -> Result<Vec<Id>> {
     let factors = decide::factors_for_decision(facts, decision)?;
     let pros = factors
         .iter()

@@ -13,10 +13,11 @@ use faculties::collection_names::open_configured;
 use faculties::headspace::{self, Catalog, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as vaults};
-use faculties::storage::{load_signer, open_pile_strict};
-use triblespace::core::collection::CollectionStoreExt;
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -156,12 +157,11 @@ struct SecretSetArgs {
 }
 
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 struct Views {
-    headspace: CollectionView,
     catalog: Catalog,
     secrets: vaults::VaultDiscovery,
 }
@@ -190,16 +190,23 @@ impl Storage<'_> {
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
-        let store_snapshot = pile
+        let source = open_configured(pile, scope, self.signer.verifying_key())?;
+        let collection = FactCollection::new(pile, source)
+            .with_context(|| format!("register maintained {label} fact collection"))?;
+        let instant = clock::now()?;
+        let before = pile
             .snapshot()
-            .with_context(|| format!("freeze {label} store snapshot"))?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .with_context(|| format!("materialize {label} collection"))?;
-        Ok(CollectionView {
-            facts,
-            reader: store_snapshot,
-        })
+            .with_context(|| format!("freeze {label} source snapshot"))?;
+        let reader = collection
+            .maintain_at(pile, &before, instant)
+            .with_context(|| format!("maintain {label} fact collection"))?;
+        drop(before);
+        let facts = reader
+            .collection_at(collection.rank9(), instant)
+            .with_context(|| format!("observe maintained {label} fact collection"))?
+            .view::<FactArchive>()
+            .with_context(|| format!("attach maintained {label} fact collection"))?;
+        Ok(CollectionView { facts, reader })
     }
 
     fn views(&self) -> Result<Views> {
@@ -213,14 +220,8 @@ impl Storage<'_> {
                 .context("discover readable Secrets vaults")?
         };
         let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
-            .context("validate Headspace collection")?;
-        headspace::validate_secret_references(&catalog, secrets.snapshot())
-            .context("validate exact Headspace credential references")?;
-        Ok(Views {
-            headspace,
-            catalog,
-            secrets,
-        })
+            .context("project Headspace collection")?;
+        Ok(Views { catalog, secrets })
     }
 
     fn add_secret(&self, views: &Views, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
@@ -381,25 +382,7 @@ fn parse_exact_vault(views: &Views, raw: &str) -> Result<Id> {
     Ok(vault)
 }
 
-fn preflight_headspace(views: &Views, fragment: &Fragment) -> Result<Catalog> {
-    let candidate = headspace::validate_catalog_union(
-        &views.headspace.reader,
-        &views.headspace.facts,
-        fragment,
-    )
-    .context("validate Headspace successor")?;
-    headspace::validate_secret_references(&candidate, views.secrets.snapshot())
-        .context("validate successor's exact Secrets references")?;
-    Ok(candidate)
-}
-
-fn publish_headspace(
-    storage: &Storage<'_>,
-    views: &Views,
-    fragment: Fragment,
-    description: &str,
-) -> Result<()> {
-    preflight_headspace(views, &fragment)?;
+fn publish_headspace(storage: &Storage<'_>, fragment: Fragment, description: &str) -> Result<()> {
     storage.publish(DEFAULT_SCOPE_ID, fragment, description)
 }
 
@@ -417,12 +400,7 @@ fn use_profile(storage: &Storage<'_>, selector: &str) -> Result<()> {
     config.active_profile = anchor;
     let fragment =
         headspace::config_snapshot_fragment(&config, &views.catalog.config.head_ids())?.0;
-    publish_headspace(
-        storage,
-        &views,
-        fragment,
-        "headspace: switch active profile",
-    )?;
+    publish_headspace(storage, fragment, "headspace: switch active profile")?;
     print_reloaded(storage)
 }
 
@@ -470,12 +448,7 @@ fn add_profile(storage: &Storage<'_>, args: &AddArgs) -> Result<()> {
     config.active_profile = anchor;
     let fragment =
         headspace::add_profile_fragment(&profile, &config, &views.catalog.config.head_ids())?.0;
-    publish_headspace(
-        storage,
-        &views,
-        fragment,
-        "headspace: add and activate profile",
-    )?;
+    publish_headspace(storage, fragment, "headspace: add and activate profile")?;
     print_reloaded(storage)
 }
 
@@ -518,7 +491,7 @@ fn set_profile_field(storage: &Storage<'_>, field: SetField, raw: &str) -> Resul
         &views.catalog.profiles[&config.active_profile].head_ids(),
     )?
     .0;
-    publish_headspace(storage, &views, fragment, "headspace: update profile")?;
+    publish_headspace(storage, fragment, "headspace: update profile")?;
     print_reloaded(storage)
 }
 
@@ -539,7 +512,7 @@ fn unset_profile_field(storage: &Storage<'_>, field: UnsetField) -> Result<()> {
         &views.catalog.profiles[&config.active_profile].head_ids(),
     )?
     .0;
-    publish_headspace(storage, &views, fragment, "headspace: unset profile field")?;
+    publish_headspace(storage, fragment, "headspace: unset profile field")?;
     print_reloaded(storage)
 }
 
@@ -622,7 +595,6 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
             let successor = secret_successor(&views.catalog, role, Some(secret))?;
             publish_headspace(
                 storage,
-                &views,
                 successor.fragment,
                 "headspace: exact credential reference",
             )?;
@@ -667,7 +639,6 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
             let successor = secret_successor(&refreshed.catalog, role, Some(secret))?;
             publish_headspace(
                 storage,
-                &refreshed,
                 successor.fragment,
                 "headspace: exact credential reference",
             )?;
@@ -687,7 +658,6 @@ fn unset_secret(storage: &Storage<'_>, role: SecretRole) -> Result<()> {
     }
     publish_headspace(
         storage,
-        &views,
         successor.fragment,
         "headspace: unset exact credential reference",
     )?;
@@ -709,12 +679,7 @@ fn reconcile(storage: &Storage<'_>, raw: &str) -> Result<()> {
     let Some((fragment, _)) = views.catalog.reconcile_fragment(chosen)? else {
         return print_headspace(&views.catalog, None);
     };
-    publish_headspace(
-        storage,
-        &views,
-        fragment,
-        "headspace: reconcile snapshot track",
-    )?;
+    publish_headspace(storage, fragment, "headspace: reconcile snapshot track")?;
     print_reloaded(storage)
 }
 

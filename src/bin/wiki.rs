@@ -11,15 +11,21 @@ use faculties::collection_names::open_configured;
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use faculties::schemas::wiki::{self as schema, extract_link_targets};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
-    RevisionReadModel, RevisionRecord, WikiCatalog,
+    RevisionRecord,
 };
 #[cfg(test)]
 use hifitime::Epoch;
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::observed_union::{ObserveStatesMapping, ObservedIndex};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
+};
+use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[cfg(feature = "local-embed")]
@@ -219,16 +225,10 @@ struct WikiStorage<'a> {
     key: Option<&'a Path>,
 }
 
-#[cfg(feature = "local-embed")]
-struct CollectionView {
-    facts: TribleSet,
-    reader: PileSnapshot,
-}
-
 struct WikiView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
-    catalog: WikiCatalog,
+    observed: ObservedIndex,
 }
 
 impl WikiStorage<'_> {
@@ -250,33 +250,101 @@ impl WikiStorage<'_> {
         }
     }
 
-    #[cfg(feature = "local-embed")]
-    fn scope_view(&self, scope: Id, label: &str) -> Result<CollectionView> {
+    fn views(&self, scopes: &[(Id, &str)]) -> Result<(WikiView, Vec<FactArchive>)> {
         self.with_pile(|pile, signer| {
-            let collection = open_configured(pile, scope, signer.verifying_key())?;
-            let store_snapshot = pile
+            let authority = signer.verifying_key();
+            let wiki_source = open_configured(pile, schema::DEFAULT_SCOPE_ID, authority)?;
+            let wiki_facts = FactCollection::new(pile, wiki_source)
+                .context("register maintained Wiki fact collection")?;
+            let observed = wiki_model::observed_collection(pile, authority)?;
+            let mut auxiliaries = Vec::with_capacity(scopes.len());
+            for &(scope, label) in scopes {
+                let source = open_configured(pile, scope, authority)?;
+                let facts = FactCollection::new(pile, source)
+                    .with_context(|| format!("register maintained {label} fact collection"))?;
+                auxiliaries.push((source, facts, label));
+            }
+            let before = pile
                 .snapshot()
-                .with_context(|| format!("freeze {label} store snapshot"))?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .with_context(|| format!("materialize {label} collection"))?;
-            Ok(CollectionView {
-                facts,
-                reader: store_snapshot,
-            })
+                .context("freeze Wiki and auxiliary source snapshot")?;
+            let instant = clock::now()?;
+
+            let wiki_support = before
+                .collection_at(wiki_source, instant)
+                .context("observe resident Wiki source collection")?
+                .support()
+                .clone();
+            let auxiliary_supports = auxiliaries
+                .iter()
+                .map(|(source, _, label)| {
+                    before
+                        .collection_at(*source, instant)
+                        .with_context(|| format!("observe resident {label} source collection"))
+                        .map(|snapshot| snapshot.support().clone())
+                })
+                .collect::<Result<Vec<Support>>>()?;
+
+            drop(
+                wiki_facts
+                    .maintain_exact(pile, &wiki_support)
+                    .context("maintain Wiki fact collection")?,
+            );
+            drop(
+                pile.maintain_exact::<ObserveStatesMapping>(observed, &wiki_support)
+                    .context("maintain Wiki supersession index")?,
+            );
+            for ((_, facts, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
+                drop(
+                    facts
+                        .maintain_exact(pile, support)
+                        .with_context(|| format!("maintain {label} fact collection"))?,
+                );
+            }
+
+            // Attach every maintained view from one later snapshot. No
+            // command can accidentally combine Wiki facts from one revision
+            // of the pile with Files or Embeddings from another.
+            let reader = pile
+                .snapshot()
+                .context("freeze maintained Wiki and auxiliary snapshot")?;
+            let facts = reader
+                .collection_exact(wiki_facts.rank9(), &wiki_support)
+                .context("observe Wiki fact collection")?
+                .view::<FactArchive>()
+                .context("read Wiki fact collection")?;
+            let observed = reader
+                .collection_exact(observed, &wiki_support)
+                .context("observe Wiki supersession index")?
+                .view::<ObservedIndex>()
+                .context("read Wiki supersession index")?;
+            let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
+            for ((_, collection, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
+                auxiliary_facts.push(
+                    reader
+                        .collection_exact(collection.rank9(), support)
+                        .with_context(|| format!("observe {label} fact collection"))?
+                        .view::<FactArchive>()
+                        .with_context(|| format!("read {label} fact collection"))?,
+                );
+            }
+            Ok((
+                WikiView {
+                    facts,
+                    reader,
+                    observed,
+                },
+                auxiliary_facts,
+            ))
         })
     }
 
     fn view(&self) -> Result<WikiView> {
-        self.with_pile(|pile, signer| {
-            let snapshot = wiki_model::materialize_indexed_collection(pile, signer)
-                .context("materialize indexed Wiki collection")?;
-            let (facts, reader, _observed, catalog) = snapshot.into_parts();
-            Ok(WikiView {
-                facts,
-                reader,
-                catalog,
-            })
-        })
+        self.views(&[]).map(|(wiki, _)| wiki)
+    }
+
+    fn view_with_scope(&self, scope: Id, label: &str) -> Result<(WikiView, FactArchive)> {
+        let (wiki, mut facts) = self.views(&[(scope, label)])?;
+        Ok((wiki, facts.pop().expect("one requested auxiliary scope")))
     }
 
     #[cfg(feature = "local-embed")]
@@ -318,19 +386,16 @@ fn entry_label(entry: &EntryRecord) -> String {
 /// Every id the CLI accepts. A revision, and nothing else: the legacy anchor
 /// stopped being a selector on 2026-08-18, so an anchor id now matches nothing
 /// rather than silently naming whatever text is current.
-fn all_selectors(model: &RevisionReadModel) -> BTreeSet<Id> {
-    model
-        .revision_records()
-        .map(|revision| revision.id)
-        .collect()
+fn all_selectors<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
+    wiki_model::revision_ids(facts)
 }
 
-fn resolve_prefix(model: &RevisionReadModel, raw: &str) -> Result<Id> {
+fn resolve_prefix<P: TriblePattern>(facts: &P, raw: &str) -> Result<Id> {
     let clean = raw.trim().to_ascii_lowercase();
     if clean.is_empty() || clean.len() > 32 || !clean.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("invalid Wiki selector '{raw}'");
     }
-    let candidates = all_selectors(model);
+    let candidates = all_selectors(facts);
     let matches: Vec<Id> = candidates
         .into_iter()
         .filter(|id| format!("{id:x}").starts_with(&clean))
@@ -349,70 +414,81 @@ fn resolve_prefix(model: &RevisionReadModel, raw: &str) -> Result<Id> {
 /// revision. Mutations resolve exact here and then join the whole frontier
 /// through [`mutation_entry`], so a write already follows the entry no matter
 /// which member id it is handed.
-fn selector_revisions<'a>(
-    model: &'a RevisionReadModel,
+fn selector_revisions(
+    view: &WikiView,
     selector: Id,
     follow_frontier: bool,
-) -> Result<Vec<&'a RevisionRecord>> {
-    let ids: Vec<Id> = if let Some(revision) = model.revision(selector) {
-        if follow_frontier {
-            model
-                .entry_containing(revision.id)
-                .expect("every revision belongs to one entry")
-                .frontier
-                .iter()
-                .map(|head| head.id)
-                .collect()
-        } else {
-            vec![revision.id]
-        }
-    } else {
+) -> Result<Vec<RevisionRecord>> {
+    let revisions = wiki_model::revision_records(&view.facts, selector);
+    if revisions.is_empty() {
         bail!("unknown Wiki selector {selector:x}");
-    };
-    ids.into_iter()
-        .map(|id| {
-            model
-                .revision(id)
-                .ok_or_else(|| anyhow!("selector names missing revision {id:x}"))
-        })
-        .collect()
+    }
+    if follow_frontier {
+        Ok(wiki_model::entry(&view.facts, &view.observed, selector)
+            .expect("queryable revision belongs to one entry")
+            .frontier)
+    } else {
+        Ok(revisions)
+    }
 }
 
-fn mutation_entry<'a>(model: &'a RevisionReadModel, raw: &str) -> Result<&'a EntryRecord> {
-    let selector = resolve_prefix(model, raw)?;
-    let revisions = selector_revisions(model, selector, false)?;
-    let mut entries: Vec<&EntryRecord> = revisions
-        .into_iter()
-        .map(|revision| {
-            model
-                .entry_containing(revision.id)
-                .expect("admitted revision has an entry")
-        })
-        .collect();
-    entries.sort_by_key(|entry| entry.roots.clone());
-    entries.dedup_by(|left, right| left.roots == right.roots);
-    match entries.as_slice() {
-        [entry] => Ok(*entry),
-        _ => bail!("selector spans several disconnected Wiki entries"),
-    }
+fn mutation_entry(view: &WikiView, raw: &str) -> Result<EntryRecord> {
+    let selector = resolve_prefix(&view.facts, raw)?;
+    wiki_model::entry(&view.facts, &view.observed, selector)
+        .ok_or_else(|| anyhow!("unknown Wiki selector {selector:x}"))
 }
 
 fn read_string(reader: &PileSnapshot, handle: schema::TextHandle) -> Result<String> {
     wiki_model::read_text(reader, handle)
 }
 
-fn tag_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) -> Result<String> {
-    wiki_model::tag_display_name(catalog, reader, id)
+fn tag_name<P: TriblePattern>(facts: &P, reader: &PileSnapshot, id: Id) -> Result<String> {
+    let mut names = BTreeSet::new();
+    for handle in find!(
+        handle: schema::TextHandle,
+        pattern!(facts, [{ id @ metadata::name: ?handle }])
+    ) {
+        names.insert(read_string(reader, handle)?);
+    }
+    Ok(if names.is_empty() {
+        schema::TAG_SPECS
+            .iter()
+            .find_map(|(known, label)| (*known == id).then_some((*label).to_owned()))
+            .unwrap_or_else(|| format!("{id:x}"))
+    } else {
+        names.into_iter().collect::<Vec<_>>().join(" / ")
+    })
 }
 
-fn format_tags(
-    catalog: &WikiCatalog,
+fn tag_ids_named<P: TriblePattern>(
+    facts: &P,
+    reader: &PileSnapshot,
+    wanted: &str,
+) -> Result<BTreeSet<Id>> {
+    let wanted = wanted.trim();
+    let mut ids = BTreeSet::new();
+    for (id, handle) in find!(
+        (id: Id, handle: schema::TextHandle),
+        pattern!(facts, [{ ?id @ metadata::name: ?handle }])
+    ) {
+        if read_string(reader, handle)?.eq_ignore_ascii_case(wanted) {
+            ids.insert(id);
+        }
+    }
+    if ids.is_empty() {
+        bail!("unknown tag '{wanted}'");
+    }
+    Ok(ids)
+}
+
+fn format_tags<P: TriblePattern>(
+    facts: &P,
     reader: &PileSnapshot,
     tags: &BTreeSet<Id>,
 ) -> Result<String> {
     let mut names = Vec::new();
     for tag in tags {
-        names.push(tag_name(catalog, reader, *tag)?);
+        names.push(tag_name(facts, reader, *tag)?);
     }
     Ok(if names.is_empty() {
         String::new()
@@ -421,15 +497,21 @@ fn format_tags(
     })
 }
 
-fn resolve_tags(
-    catalog: &WikiCatalog,
+fn resolve_tags<P: TriblePattern>(
+    facts: &P,
     reader: &PileSnapshot,
     names: &[String],
     fragment: &mut Fragment,
 ) -> Result<BTreeSet<Id>> {
-    let mut by_name = BTreeMap::new();
-    for (&id, &handle) in &catalog.tag_names {
-        by_name.insert(read_string(reader, handle)?.to_ascii_lowercase(), id);
+    let mut by_name: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
+    for (id, handle) in find!(
+        (id: Id, handle: schema::TextHandle),
+        pattern!(facts, [{ ?id @ metadata::name: ?handle }])
+    ) {
+        by_name
+            .entry(read_string(reader, handle)?.to_ascii_lowercase())
+            .or_default()
+            .insert(id);
     }
     let mut out = BTreeSet::new();
     for raw in names {
@@ -437,12 +519,12 @@ fn resolve_tags(
         if name.is_empty() {
             continue;
         }
-        if let Some(id) = by_name.get(&name) {
-            out.insert(*id);
+        if let Some(ids) = by_name.get(&name) {
+            out.extend(ids.iter().copied());
         } else {
             let (record, id, _) = wiki_model::tag_record(&name)?;
             *fragment += record;
-            by_name.insert(name, id);
+            by_name.insert(name, BTreeSet::from([id]));
             out.insert(id);
         }
     }
@@ -492,12 +574,12 @@ fn stage_revision(
     Ok(revision)
 }
 
-fn known_link_ids(model: &RevisionReadModel) -> BTreeSet<Id> {
-    all_selectors(model)
+fn known_link_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
+    all_selectors(facts)
 }
 
-fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool) -> Result<()> {
-    let known = known_link_ids(model);
+fn validate_links<P: TriblePattern>(content: &str, facts: &P, allow_dangling: bool) -> Result<()> {
+    let known = known_link_ids(facts);
     let mut failures = Vec::new();
     let re = regex::Regex::new(r"wiki:(?:[A-Za-z_][A-Za-z0-9_]*:)?([0-9A-Fa-f]+)").unwrap();
     for captures in re.captures_iter(content) {
@@ -517,23 +599,20 @@ fn validate_links(content: &str, model: &RevisionReadModel, allow_dangling: bool
     }
 }
 
-fn load_files(storage: WikiStorage<'_>) -> Result<TribleSet> {
-    storage.with_pile(|pile, signer| {
-        let collection = open_configured(pile, FILES_SCOPE_ID, signer.verifying_key())?;
-        let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
-        faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .map(|(facts, _)| facts)
-            .context("materialize Files collection")
-    })
+struct ReferenceResolver<'a, P: TriblePattern> {
+    wiki: &'a P,
+    files: Option<&'a P>,
 }
 
-#[derive(Clone, Copy)]
-struct ReferenceResolver<'a> {
-    wiki: &'a RevisionReadModel,
-    files: Option<&'a TribleSet>,
+impl<P: TriblePattern> Copy for ReferenceResolver<'_, P> {}
+
+impl<P: TriblePattern> Clone for ReferenceResolver<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
-impl ReferenceResolver<'_> {
+impl<P: TriblePattern> ReferenceResolver<'_, P> {
     fn expand(&self, scheme: &str, rest: &str) -> Result<String> {
         match scheme {
             // A Wiki reference names a REVISION: immutable, pinned to the text
@@ -576,7 +655,7 @@ fn split_typed(rest: &str) -> (String, &str) {
     (String::new(), rest)
 }
 
-fn lint_fix(content: &str, resolver: ReferenceResolver<'_>) -> String {
+fn lint_fix<P: TriblePattern>(content: &str, resolver: ReferenceResolver<'_, P>) -> String {
     let mut output = String::with_capacity(content.len());
     let mut fenced = false;
     for line in content.lines() {
@@ -618,7 +697,7 @@ struct LintPatterns {
     wiki_references: regex::Regex,
 }
 
-fn lint_line(line: &str, resolver: ReferenceResolver<'_>) -> String {
+fn lint_line<P: TriblePattern>(line: &str, resolver: ReferenceResolver<'_, P>) -> String {
     let patterns = regexes();
     let line = if let Some(rest) = line.strip_prefix("### ") {
         format!("=== {rest}")
@@ -677,13 +756,13 @@ fn validate_typst(content: &str) -> Result<()> {
 
 fn prepare_content(
     raw: &str,
-    model: &RevisionReadModel,
-    files: Option<&TribleSet>,
+    wiki: &FactArchive,
+    files: Option<&FactArchive>,
     allow_dangling: bool,
 ) -> Result<String> {
-    let content = lint_fix(raw, ReferenceResolver { wiki: model, files });
+    let content = lint_fix(raw, ReferenceResolver { wiki, files });
     validate_typst(&content)?;
-    validate_links(&content, model, allow_dangling)?;
+    validate_links(&content, wiki, allow_dangling)?;
     Ok(content)
 }
 
@@ -704,12 +783,10 @@ fn cmd_create(
 ) -> Result<()> {
     let title = faculties::text_arg(&title, "title")?;
     let raw = faculties::text_arg(&content, "content")?;
-    let view = storage.view()?;
-    let catalog = &view.catalog;
-    let files = load_files(storage)?;
-    let content = prepare_content(&raw, &catalog.revisions, Some(&files), force)?;
+    let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files")?;
+    let content = prepare_content(&raw, &view.facts, Some(&files), force)?;
     let mut fragment = Fragment::empty();
-    let tags = resolve_tags(&catalog, &view.reader, &tags, &mut fragment)?;
+    let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
     let revision = stage_revision(storage, &mut fragment, None, title, content, tags)?;
     storage.publish(fragment)?;
     println!("revision {revision:x}");
@@ -724,9 +801,13 @@ fn cmd_edit(
     tag_names: Vec<String>,
     force: bool,
 ) -> Result<()> {
-    let view = storage.view()?;
-    let catalog = &view.catalog;
-    let entry = mutation_entry(&catalog.revisions, &id)?;
+    let (view, files) = if content.is_some() {
+        let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files")?;
+        (view, Some(files))
+    } else {
+        (storage.view()?, None)
+    };
+    let entry = mutation_entry(&view, &id)?;
     if content.is_none() && title.is_none() && tag_names.is_empty() && entry.frontier.len() == 1 {
         bail!("nothing to change");
     }
@@ -734,37 +815,36 @@ fn cmd_edit(
     let title = match title {
         Some(value) => faculties::text_arg(&value, "title")?,
         None => {
-            let handle = agreed(entry, |head| head.title, "title")?;
+            let handle = agreed(&entry, |head| head.title, "title")?;
             read_string(&view.reader, handle)?
         }
     };
     let content = match content {
         Some(value) => {
             let raw = faculties::text_arg(&value, "content")?;
-            let files = load_files(storage)?;
-            prepare_content(&raw, &catalog.revisions, Some(&files), force)?
+            prepare_content(&raw, &view.facts, files.as_ref(), force)?
         }
         None => {
-            let handle = agreed(entry, |head| head.content, "content")?;
+            let handle = agreed(&entry, |head| head.content, "content")?;
             read_string(&view.reader, handle)?
         }
     };
     let tags = if tag_names.is_empty() {
-        agreed(entry, |head| head.tags.clone(), "tags")?
+        agreed(&entry, |head| head.tags.clone(), "tags")?
             .into_iter()
             .collect()
     } else {
-        resolve_tags(&catalog, &view.reader, &tag_names, &mut fragment)?
+        resolve_tags(&view.facts, &view.reader, &tag_names, &mut fragment)?
     };
-    let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
+    let revision = stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
     storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
 }
 
 fn print_revision(
+    facts: &FactArchive,
     reader: &PileSnapshot,
-    catalog: &WikiCatalog,
     revision: &RevisionRecord,
 ) -> Result<()> {
     let title = revision_title(reader, revision)?;
@@ -781,7 +861,7 @@ fn print_revision(
                 .join(", ")
         );
     }
-    let tags = format_tags(catalog, reader, &revision.tags)?;
+    let tags = format_tags(facts, reader, &revision.tags)?;
     if !tags.is_empty() {
         println!("tags:{tags}");
     }
@@ -792,9 +872,8 @@ fn print_revision(
 
 fn cmd_show(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let selector = resolve_prefix(&catalog.revisions, &id)?;
-    let revisions = selector_revisions(&catalog.revisions, selector, !exact)?;
+    let selector = resolve_prefix(&view.facts, &id)?;
+    let revisions = selector_revisions(&view, selector, !exact)?;
     // A forked entry has no single current text, so print EVERY head under a
     // banner naming them. Silently picking one would be the same class of
     // wrong answer this command's default exists to remove — indistinguishable
@@ -814,16 +893,15 @@ fn cmd_show(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
         if index > 0 {
             println!("\n---\n");
         }
-        print_revision(&view.reader, &catalog, revision)?;
+        print_revision(&view.facts, &view.reader, revision)?;
     }
     Ok(())
 }
 
 fn cmd_export(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let selector = resolve_prefix(&catalog.revisions, &id)?;
-    let revisions = selector_revisions(&catalog.revisions, selector, !exact)?;
+    let selector = resolve_prefix(&view.facts, &id)?;
+    let revisions = selector_revisions(&view, selector, !exact)?;
     let [revision] = revisions.as_slice() else {
         bail!(
             "selector resolves to a fork ({}); choose one with --exact",
@@ -836,10 +914,6 @@ fn cmd_export(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<()> {
     };
     print!("{}", revision_content(&view.reader, revision)?);
     Ok(())
-}
-
-fn history(model: &RevisionReadModel, entry: &EntryRecord) -> Vec<RevisionRecord> {
-    model.history(entry)
 }
 
 fn unified_diff(old: &str, new: &str) -> Vec<String> {
@@ -869,9 +943,8 @@ fn cmd_diff(
     to: Option<usize>,
 ) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let entry = mutation_entry(&catalog.revisions, &id)?;
-    let rows = history(&catalog.revisions, entry);
+    let entry = mutation_entry(&view, &id)?;
+    let rows = wiki_model::entry_history(&view.facts, &entry);
     if rows.len() < 2 {
         bail!("entry has only {} revision(s)", rows.len());
     }
@@ -896,39 +969,35 @@ fn cmd_diff(
 
 fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let entry = mutation_entry(&catalog.revisions, &id)?;
+    let entry = mutation_entry(&view, &id)?;
     let mut fragment = Fragment::empty();
-    let mut tags: BTreeSet<Id> = agreed(entry, |head| head.tags.clone(), "tags")?
+    let mut tags: BTreeSet<Id> = agreed(&entry, |head| head.tags.clone(), "tags")?
         .into_iter()
         .collect();
     let normalized = name.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         bail!("tag name cannot be empty");
     }
-    let existing = catalog.tag_names.iter().find_map(|(&id, &handle)| {
-        read_string(&view.reader, handle)
-            .ok()
-            .filter(|value| value == &normalized)
-            .map(|_| id)
-    });
-    let desired = match (existing, add) {
-        (Some(id), _) => id,
-        (None, false) => bail!("unknown tag '{normalized}'"),
-        (None, true) => resolve_tags(
-            &catalog,
+    let desired = if add {
+        resolve_tags(
+            &view.facts,
             &view.reader,
             std::slice::from_ref(&normalized),
             &mut fragment,
         )?
-        .into_iter()
-        .next()
-        .expect("non-empty tag name"),
+    } else {
+        tag_ids_named(&view.facts, &view.reader, &normalized)?
     };
     let changed = if add {
-        tags.insert(desired)
+        let before = tags.len();
+        tags.extend(desired);
+        tags.len() != before
     } else {
-        tags.remove(&desired)
+        let before = tags.len();
+        for id in desired {
+            tags.remove(&id);
+        }
+        tags.len() != before
     };
     if !changed {
         println!(
@@ -937,9 +1006,12 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
         );
         return Ok(());
     }
-    let title = read_string(&view.reader, agreed(entry, |head| head.title, "title")?)?;
-    let content = read_string(&view.reader, agreed(entry, |head| head.content, "content")?)?;
-    let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
+    let title = read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?;
+    let content = read_string(
+        &view.reader,
+        agreed(&entry, |head| head.content, "content")?,
+    )?;
+    let revision = stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
     storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
@@ -947,9 +1019,8 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
 
 fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let entry = mutation_entry(&catalog.revisions, &id)?;
-    let rows = history(&catalog.revisions, entry);
+    let entry = mutation_entry(&view, &id)?;
+    let rows = wiki_model::entry_history(&view.facts, &entry);
     let Some(chosen) = rows.get(to.saturating_sub(1)) else {
         bail!("revision index out of range")
     };
@@ -957,7 +1028,7 @@ fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<()> {
     let content = revision_content(&view.reader, chosen)?;
     let tags = chosen.tags.iter().copied().collect();
     let mut fragment = Fragment::empty();
-    let revision = stage_revision(storage, &mut fragment, Some(entry), title, content, tags)?;
+    let revision = stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
     storage.publish(fragment)?;
     println!("revision {revision:x}");
     Ok(())
@@ -997,21 +1068,23 @@ struct BacklinkSummary {
 /// X", which A's current text does not say.
 fn backlink_summaries(
     reader: &PileSnapshot,
-    revisions: &RevisionReadModel,
+    facts: &FactArchive,
 ) -> Result<BTreeMap<Id, BacklinkSummary>> {
     let expression = regex::Regex::new(
         r#"#link\("wiki:(?:(?P<kind>[A-Za-z_][A-Za-z0-9_]*):)?(?P<id>[0-9A-Fa-f]{32})"\)"#,
     )
     .expect("static Wiki link expression");
     let mut summaries = BTreeMap::<Id, BacklinkSummary>::new();
-    for source in revisions.revision_records() {
-        let content = revision_content(reader, source)?;
-        for captures in expression.captures_iter(&content) {
-            let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
-            let summary = summaries.entry(target).or_default();
-            summary.tags.extend(source.tags.iter().copied());
-            if let Some(kind) = captures.name("kind") {
-                summary.types.insert(kind.as_str().to_ascii_lowercase());
+    for id in wiki_model::revision_ids(facts) {
+        for source in wiki_model::revision_records(facts, id) {
+            let content = revision_content(reader, &source)?;
+            for captures in expression.captures_iter(&content) {
+                let target = Id::from_hex(&captures["id"]).expect("expression matched a full id");
+                let summary = summaries.entry(target).or_default();
+                summary.tags.extend(source.tags.iter().copied());
+                if let Some(kind) = captures.name("kind") {
+                    summary.types.insert(kind.as_str().to_ascii_lowercase());
+                }
             }
         }
     }
@@ -1020,20 +1093,19 @@ fn backlink_summaries(
 
 fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
     let Some(id) = id else {
-        return cmd_link_audit(&view, &catalog, top, strict);
+        return cmd_link_audit(&view, top, strict);
     };
-    let entry = match mutation_entry(&catalog.revisions, &id) {
+    let entry = match mutation_entry(&view, &id) {
         Ok(entry) => entry,
-        Err(error) => return Err(explain_selector(&view, &catalog, &id, error)),
+        Err(error) => return Err(explain_selector(&view, &id, error)),
     };
     println!("outgoing:");
-    for target in derived_links(&view.reader, entry)? {
+    for target in derived_links(&view.reader, &entry)? {
         println!("  {target:x}");
     }
     println!("incoming:");
-    for source in incoming_revisions(&view.reader, &catalog.revisions, entry)? {
+    for source in incoming_revisions(&view, &entry)? {
         println!("  {source:x}");
     }
     Ok(())
@@ -1045,16 +1117,11 @@ fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: b
 /// pre-cutover citation -- fails for three different reasons, and "no Wiki id
 /// matches" is the same sentence for all of them. Only reached on the failure
 /// path, so the ordinary lookup pays nothing for it.
-fn explain_selector(
-    view: &WikiView,
-    catalog: &WikiCatalog,
-    raw: &str,
-    error: anyhow::Error,
-) -> anyhow::Error {
+fn explain_selector(view: &WikiView, raw: &str, error: anyhow::Error) -> anyhow::Error {
     let Some(target) = Id::from_hex(raw.trim()) else {
         return error;
     };
-    let model = match FrontierModel::load(catalog, &view.reader, &view.facts) {
+    let model = match FrontierModel::load(&view.reader, &view.facts, &view.observed) {
         Ok(model) => model,
         Err(load_error) => return error.context(load_error),
     };
@@ -1153,8 +1220,8 @@ fn print_class(model: &FrontierModel, heading: &str, rows: &[LinkReference], top
 /// means something broke is a citation into an entry whose every current state
 /// is archived; an unwritten target is the wiki's link-liberally convention
 /// working as intended, and a legacy anchor is a migration signal.
-fn cmd_link_audit(view: &WikiView, catalog: &WikiCatalog, top: usize, strict: bool) -> Result<()> {
-    let model = FrontierModel::load(catalog, &view.reader, &view.facts)?;
+fn cmd_link_audit(view: &WikiView, top: usize, strict: bool) -> Result<()> {
+    let model = FrontierModel::load(&view.reader, &view.facts, &view.observed)?;
     let audit = model.audit();
     let unreferenced = model.unreferenced(&audit);
 
@@ -1226,21 +1293,21 @@ fn short(value: &str, chars: usize) -> String {
 /// naming "A" claims A currently cites it, which A's text denies. Naming A1 is
 /// exactly true — A1 did — and `wiki show <A1>`, which follows the entry
 /// forward, shows whether A's current text still does.
-fn incoming_revisions(
-    reader: &PileSnapshot,
-    revisions: &RevisionReadModel,
-    entry: &EntryRecord,
-) -> Result<Vec<Id>> {
+fn incoming_revisions(view: &WikiView, entry: &EntryRecord) -> Result<Vec<Id>> {
     let target_ids: BTreeSet<Id> = entry.members.iter().copied().collect();
     let mut out = Vec::new();
-    for source in revisions.revision_records() {
-        if revision_links(reader, source)?
-            .iter()
-            .any(|id| target_ids.contains(id))
-        {
-            out.push(source.id);
+    for id in wiki_model::revision_ids(&view.facts) {
+        for source in wiki_model::revision_records(&view.facts, id) {
+            if revision_links(&view.reader, &source)?
+                .iter()
+                .any(|id| target_ids.contains(id))
+            {
+                out.push(source.id);
+            }
         }
     }
+    out.sort_unstable();
+    out.dedup();
     Ok(out)
 }
 
@@ -1254,41 +1321,17 @@ fn cmd_list(
     all: bool,
 ) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let wanted: BTreeSet<Id> = tag_names
+    let wanted: Vec<BTreeSet<Id>> = tag_names
         .iter()
-        .map(|name| {
-            catalog
-                .tag_names
-                .iter()
-                .find_map(|(&id, &handle)| {
-                    read_string(&view.reader, handle)
-                        .ok()
-                        .filter(|value| value.eq_ignore_ascii_case(name))
-                        .map(|_| id)
-                })
-                .ok_or_else(|| anyhow!("unknown tag '{name}'"))
-        })
+        .map(|name| tag_ids_named(&view.facts, &view.reader, name))
         .collect::<Result<_>>()?;
-    let named_tag = |name: &str| -> Result<Id> {
-        catalog
-            .tag_names
-            .iter()
-            .find_map(|(&id, &handle)| {
-                read_string(&view.reader, handle)
-                    .ok()
-                    .filter(|value| value.eq_ignore_ascii_case(name))
-                    .map(|_| id)
-            })
-            .ok_or_else(|| anyhow!("unknown tag '{name}'"))
-    };
-    let with_backlink_tags: Vec<Id> = with_backlink_tag
+    let with_backlink_tags: Vec<BTreeSet<Id>> = with_backlink_tag
         .iter()
-        .map(|name| named_tag(name))
+        .map(|name| tag_ids_named(&view.facts, &view.reader, name))
         .collect::<Result<_>>()?;
-    let without_backlink_tags: Vec<Id> = without_backlink_tag
+    let without_backlink_tags: Vec<BTreeSet<Id>> = without_backlink_tag
         .iter()
-        .map(|name| named_tag(name))
+        .map(|name| tag_ids_named(&view.facts, &view.reader, name))
         .collect::<Result<_>>()?;
     let with_backlink_types: Vec<String> = with_backlink_type
         .iter()
@@ -1302,24 +1345,28 @@ fn cmd_list(
         || !without_backlink_tags.is_empty()
         || !with_backlink_types.is_empty()
         || !without_backlink_types.is_empty();
-    // Titles and tags are already in the catalog. Only backlink filters need
-    // page content, so scan every revision once and invert its links on demand.
+    // Only backlink filters need page content, so scan every revision once and
+    // invert its links on demand.
     let backlink_summaries = if has_backlink_filter {
-        Some(backlink_summaries(&view.reader, &catalog.revisions)?)
+        Some(backlink_summaries(&view.reader, &view.facts)?)
     } else {
         None
     };
-    let entries = if all {
-        catalog.revisions.all_entries()
-    } else {
-        catalog.revisions.list_entries()
-    };
+    let mut entries = wiki_model::entries(&view.facts, &view.observed);
+    if !all {
+        entries.retain(|entry| {
+            !entry
+                .frontier
+                .iter()
+                .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
+        });
+    }
     for entry in entries {
         if !wanted.is_empty()
             && !entry
                 .frontier
                 .iter()
-                .any(|head| wanted.iter().all(|tag| head.tags.contains(tag)))
+                .any(|head| wanted.iter().all(|ids| !head.tags.is_disjoint(ids)))
         {
             continue;
         }
@@ -1334,10 +1381,10 @@ fn cmd_list(
             }
             if !with_backlink_tags
                 .iter()
-                .all(|tag| incoming_tags.contains(tag))
+                .all(|ids| !incoming_tags.is_disjoint(ids))
                 || without_backlink_tags
                     .iter()
-                    .any(|tag| incoming_tags.contains(tag))
+                    .any(|ids| !incoming_tags.is_disjoint(ids))
                 || !with_backlink_types
                     .iter()
                     .all(|kind| incoming_types.contains(kind))
@@ -1362,7 +1409,7 @@ fn cmd_list(
                 "  {:x}  {}{}",
                 head.id,
                 revision_title(&view.reader, head)?,
-                format_tags(&catalog, &view.reader, &head.tags)?
+                format_tags(&view.facts, &view.reader, &head.tags)?
             );
         }
     }
@@ -1371,10 +1418,12 @@ fn cmd_list(
 
 fn cmd_history(storage: WikiStorage<'_>, id: String) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let entry = mutation_entry(&catalog.revisions, &id)?;
-    println!("# History: {}", entry_label(entry));
-    for (index, revision) in history(&catalog.revisions, entry).iter().enumerate() {
+    let entry = mutation_entry(&view, &id)?;
+    println!("# History: {}", entry_label(&entry));
+    for (index, revision) in wiki_model::entry_history(&view.facts, &entry)
+        .iter()
+        .enumerate()
+    {
         println!(
             "v{}  {:x}  {}  parents=[{}]{}",
             index + 1,
@@ -1398,15 +1447,19 @@ fn cmd_history(storage: WikiStorage<'_>, id: String) -> Result<()> {
 
 fn cmd_tag_list(storage: WikiStorage<'_>) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
     let mut counts = HashMap::new();
-    for revision in catalog.revisions.revision_records() {
-        for tag in &revision.tags {
-            *counts.entry(*tag).or_insert(0usize) += 1;
+    for id in wiki_model::revision_ids(&view.facts) {
+        for revision in wiki_model::revision_records(&view.facts, id) {
+            for tag in &revision.tags {
+                *counts.entry(*tag).or_insert(0usize) += 1;
+            }
         }
     }
     let mut rows = Vec::new();
-    for (&id, &handle) in &catalog.tag_names {
+    for (id, handle) in find!(
+        (id: Id, handle: schema::TextHandle),
+        pattern!(&view.facts, [{ ?id @ metadata::name: ?handle }])
+    ) {
         rows.push((
             read_string(&view.reader, handle)?,
             id,
@@ -1422,10 +1475,8 @@ fn cmd_tag_list(storage: WikiStorage<'_>) -> Result<()> {
 
 fn cmd_tag_mint(storage: WikiStorage<'_>, name: String) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    if let Some((&id, _)) = catalog.tag_names.iter().find(|(_, handle)| {
-        read_string(&view.reader, **handle).is_ok_and(|value| value.eq_ignore_ascii_case(&name))
-    }) {
+    if let Ok(ids) = tag_ids_named(&view.facts, &view.reader, &name) {
+        let id = *ids.first().expect("non-empty named tag set");
         println!("{id:x}  {}", name.trim().to_ascii_lowercase());
         return Ok(());
     }
@@ -1452,18 +1503,16 @@ fn collect_typ_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn cmd_import(storage: WikiStorage<'_>, path: PathBuf, tags: Vec<String>) -> Result<()> {
-    let view = storage.view()?;
-    let catalog = &view.catalog;
-    let files_catalog = load_files(storage)?;
+    let (view, files_catalog) = storage.view_with_scope(FILES_SCOPE_ID, "Files")?;
     let mut files = Vec::new();
     collect_typ_files(&path, &mut files)?;
     files.sort();
     let mut fragment = Fragment::empty();
-    let tags = resolve_tags(&catalog, &view.reader, &tags, &mut fragment)?;
+    let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
     for path in files {
         let content =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let content = prepare_content(&content, &catalog.revisions, Some(&files_catalog), true)?;
+        let content = prepare_content(&content, &view.facts, Some(&files_catalog), true)?;
         let title = content
             .lines()
             .find_map(|line| line.strip_prefix("= "))
@@ -1485,13 +1534,16 @@ fn cmd_import(storage: WikiStorage<'_>, path: PathBuf, tags: Vec<String>) -> Res
 
 fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
     let needle = query.to_ascii_lowercase();
-    let entries = if all {
-        catalog.revisions.all_entries()
-    } else {
-        catalog.revisions.list_entries()
-    };
+    let mut entries = wiki_model::entries(&view.facts, &view.observed);
+    if !all {
+        entries.retain(|entry| {
+            !entry
+                .frontier
+                .iter()
+                .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
+        });
+    }
     for entry in entries {
         for head in &entry.frontier {
             let title = revision_title(&view.reader, head)?;
@@ -1532,13 +1584,13 @@ fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool)
 /// and counted as neither. `wiki links` is the full classified report.
 fn cmd_check(storage: WikiStorage<'_>, compile: bool) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    let model = FrontierModel::load(catalog, &view.reader, &view.facts)?;
+    let model = FrontierModel::load(&view.reader, &view.facts, &view.observed)?;
     let mut issues = 0usize;
     let mut legacy = 0usize;
     let mut unwritten = 0usize;
     let mut archived = 0usize;
-    for entry in catalog.revisions.all_entries() {
+    let entries = wiki_model::entries(&view.facts, &view.observed);
+    for entry in &entries {
         // An archived page citing an archived page is not actionable, and
         // scoping links to the LIVE frontier is what keeps this command and
         // `wiki links` from reporting two different numbers for one corpus.
@@ -1578,7 +1630,7 @@ fn cmd_check(storage: WikiStorage<'_>, compile: bool) -> Result<()> {
             }
         }
     }
-    let entries = catalog.revisions.all_entries().len();
+    let entries = entries.len();
     println!(
         "Checked {} live entries ({archived} archived, links not scanned), \
          {issues} issues ({legacy} legacy anchor, {unwritten} unwritten target)",
@@ -1597,7 +1649,7 @@ enum ReferenceLineResolution {
 
 fn resolve_reference_line(
     line: &str,
-    resolver: ReferenceResolver<'_>,
+    resolver: ReferenceResolver<'_, FactArchive>,
 ) -> Result<ReferenceLineResolution> {
     let (scheme, rest) = line
         .split_once(':')
@@ -1613,11 +1665,9 @@ fn resolve_reference_line(
 
 fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String) -> Result<()> {
     let input = faculties::text_arg(&input, "input")?;
-    let view = storage.view()?;
-    let catalog = &view.catalog;
-    let files = load_files(storage)?;
+    let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files")?;
     let resolver = ReferenceResolver {
-        wiki: &catalog.revisions,
+        wiki: &view.facts,
         files: Some(&files),
     };
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -1631,16 +1681,14 @@ fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String) -> Result<()> {
 }
 
 fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool) -> Result<()> {
-    let view = storage.view()?;
-    let catalog = &view.catalog;
-    let files = load_files(storage)?;
+    let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files")?;
     let resolver = ReferenceResolver {
-        wiki: &catalog.revisions,
+        wiki: &view.facts,
         files: Some(&files),
     };
     let mut fragment = Fragment::empty();
     let mut changed = 0usize;
-    for entry in catalog.revisions.all_entries() {
+    for entry in wiki_model::entries(&view.facts, &view.observed) {
         for head in &entry.frontier {
             let content = revision_content(&view.reader, head)?;
             let revised = lint_fix(&content, resolver);
@@ -1682,8 +1730,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool) -> Result<()> {
 fn cmd_batch_export(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&dir)?;
     let view = storage.view()?;
-    let catalog = &view.catalog;
-    for entry in catalog.revisions.all_entries() {
+    for entry in wiki_model::entries(&view.facts, &view.observed) {
         for head in &entry.frontier {
             fs::write(
                 dir.join(format!("{:x}.typ", head.id)),
@@ -1696,7 +1743,6 @@ fn cmd_batch_export(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
 
 fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
     let view = storage.view()?;
-    let catalog = &view.catalog;
     let mut fragment = Fragment::empty();
     for entry in fs::read_dir(&dir)? {
         let path = entry?.path();
@@ -1706,9 +1752,7 @@ fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
         let raw = path.file_stem().unwrap_or_default().to_string_lossy();
         let revision_id = Id::from_hex(&raw)
             .ok_or_else(|| anyhow!("invalid revision filename {}", path.display()))?;
-        let entry = catalog
-            .revisions
-            .entry_containing(revision_id)
+        let entry = wiki_model::entry(&view.facts, &view.observed, revision_id)
             .ok_or_else(|| anyhow!("unknown revision {revision_id:x}"))?;
         if entry.frontier.len() != 1 || entry.frontier[0].id != revision_id {
             bail!("stale batch file {revision_id:x}: entry frontier changed");
@@ -1721,7 +1765,7 @@ fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
         stage_revision(
             storage,
             &mut fragment,
-            Some(entry),
+            Some(&entry),
             revision_title(&view.reader, head)?,
             content,
             head.tags.iter().copied().collect(),
@@ -1746,17 +1790,23 @@ fn l2_normalize(mut values: Vec<f32>) -> Vec<f32> {
 
 #[cfg(feature = "local-embed")]
 fn cmd_embed(storage: WikiStorage<'_>) -> Result<()> {
-    let view = storage.view()?;
-    let embedding_view = storage.scope_view(EMBEDDINGS_SCOPE_ID, "Embeddings")?;
-    let catalog = &view.catalog;
+    let (view, embedding_facts) = storage.view_with_scope(EMBEDDINGS_SCOPE_ID, "Embeddings")?;
     let existing: BTreeSet<Id> = find!(
         revision: Id,
-        pattern!(&embedding_view.facts, [{ ?revision @ embeddings::attr::embedding: _?handle }])
+        pattern!(&embedding_facts, [{ ?revision @ embeddings::attr::embedding: _?handle }])
     )
     .collect();
     let embedder = faculties::nomic::load_text_embedder()?;
     let mut fragment = Fragment::empty();
-    for entry in catalog.revisions.list_entries() {
+    for entry in wiki_model::entries(&view.facts, &view.observed)
+        .into_iter()
+        .filter(|entry| {
+            !entry
+                .frontier
+                .iter()
+                .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
+        })
+    {
         for head in &entry.frontier {
             if existing.contains(&head.id) {
                 continue;
@@ -1783,35 +1833,36 @@ fn cmd_embed(_storage: WikiStorage<'_>) -> Result<()> {
 
 #[cfg(feature = "local-embed")]
 fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<()> {
-    let view = storage.view()?;
-    let embedding_view = storage.scope_view(EMBEDDINGS_SCOPE_ID, "Embeddings")?;
-    let catalog = &view.catalog;
+    let (view, embedding_facts) = storage.view_with_scope(EMBEDDINGS_SCOPE_ID, "Embeddings")?;
     let embedder = faculties::nomic::load_text_embedder()?;
     let query = l2_normalize(embedder.embed_query(&query)?);
-    let current: BTreeSet<Id> = catalog
-        .revisions
-        .list_entries()
+    let current: BTreeSet<Id> = wiki_model::entries(&view.facts, &view.observed)
         .into_iter()
+        .filter(|entry| {
+            !entry
+                .frontier
+                .iter()
+                .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
+        })
         .flat_map(|entry| entry.frontier.into_iter().map(|head| head.id))
         .collect();
     let mut pairs = Vec::new();
     for (revision, handle) in find!(
         (revision: Id, handle: Inline<inlineencodings::Handle<Embedding768>>),
-        pattern!(&embedding_view.facts, [{ ?revision @ embeddings::attr::embedding: ?handle }])
+        pattern!(&embedding_facts, [{ ?revision @ embeddings::attr::embedding: ?handle }])
     ) {
         if !current.contains(&revision) {
             continue;
         }
-        let vector: anybytes::View<[f32]> = embedding_view.reader.get(handle)?;
+        let vector: anybytes::View<[f32]> = view.reader.get(handle)?;
         pairs.push((revision, vector.as_ref().to_vec()));
     }
     for (score, revision) in embeddings::nearest(&pairs, &query, 0.0)?
         .into_iter()
         .take(10)
     {
-        let title = catalog
-            .revisions
-            .revision(revision)
+        let title = wiki_model::revision_records(&view.facts, revision)
+            .first()
             .map(|row| revision_title(&view.reader, row))
             .transpose()?
             .unwrap_or_default();
@@ -1952,13 +2003,12 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
-        let catalog = &current.catalog;
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.observed, root).unwrap();
         let mut forks = Fragment::empty();
         let left = stage_revision(
             storage,
             &mut forks,
-            Some(entry),
+            Some(&entry),
             "left".to_owned(),
             "left".to_owned(),
             BTreeSet::new(),
@@ -1967,7 +2017,7 @@ mod tests {
         let right = stage_revision(
             storage,
             &mut forks,
-            Some(entry),
+            Some(&entry),
             "right".to_owned(),
             "right".to_owned(),
             BTreeSet::new(),
@@ -1985,8 +2035,7 @@ mod tests {
         )
         .unwrap();
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
-        let entry = catalog.revisions.entry_containing(left).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.observed, left).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         assert_eq!(entry.frontier[0].supersedes, BTreeSet::from([left, right]));
     }
@@ -2016,8 +2065,7 @@ mod tests {
         .unwrap();
 
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.observed, root).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         (root, entry.frontier[0].id)
     }
@@ -2032,15 +2080,14 @@ mod tests {
         assert_ne!(root, head, "the fixture must actually supersede something");
 
         let view = storage.view().unwrap();
-        let catalog = &view.catalog;
-        let shown = selector_revisions(&catalog.revisions, root, true).unwrap();
+        let shown = selector_revisions(&view, root, true).unwrap();
         assert_eq!(
             shown.iter().map(|r| r.id).collect::<Vec<_>>(),
             vec![head],
             "a superseded selector must resolve forward to the head"
         );
         assert_eq!(
-            revision_content(&view.reader, shown[0]).unwrap(),
+            revision_content(&view.reader, &shown[0]).unwrap(),
             "second draft"
         );
         cmd_show(storage, format!("{root:x}"), false).unwrap();
@@ -2055,17 +2102,16 @@ mod tests {
         let (root, head) = superseded_pair(storage);
 
         let view = storage.view().unwrap();
-        let catalog = &view.catalog;
-        let pinned = selector_revisions(&catalog.revisions, root, false).unwrap();
+        let pinned = selector_revisions(&view, root, false).unwrap();
         assert_eq!(pinned.iter().map(|r| r.id).collect::<Vec<_>>(), vec![root]);
         assert_eq!(
-            revision_content(&view.reader, pinned[0]).unwrap(),
+            revision_content(&view.reader, &pinned[0]).unwrap(),
             "first draft"
         );
         cmd_show(storage, format!("{root:x}"), true).unwrap();
         // The head still reads as itself under either policy.
         assert_eq!(
-            selector_revisions(&catalog.revisions, head, true)
+            selector_revisions(&view, head, true)
                 .unwrap()
                 .iter()
                 .map(|r| r.id)
@@ -2082,12 +2128,9 @@ mod tests {
         let storage = fixture.storage();
         let (_root, _head) = superseded_pair(storage);
         let view = storage.view().unwrap();
-        let catalog = &view.catalog;
 
         let absent = "f40312df406d1bf1bb5c94ec954e490b";
-        let error = resolve_prefix(&catalog.revisions, absent)
-            .unwrap_err()
-            .to_string();
+        let error = resolve_prefix(&view.facts, absent).unwrap_err().to_string();
         assert!(error.contains("no Wiki id matches"), "got: {error}");
         assert!(cmd_show(storage, absent.to_owned(), false).is_err());
         assert!(cmd_show(storage, absent.to_owned(), true).is_err());
@@ -2113,13 +2156,12 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
-        let catalog = &current.catalog;
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.observed, root).unwrap();
         let mut forks = Fragment::empty();
         let left = stage_revision(
             storage,
             &mut forks,
-            Some(entry),
+            Some(&entry),
             "left".to_owned(),
             "left".to_owned(),
             BTreeSet::new(),
@@ -2128,7 +2170,7 @@ mod tests {
         let right = stage_revision(
             storage,
             &mut forks,
-            Some(entry),
+            Some(&entry),
             "right".to_owned(),
             "right".to_owned(),
             BTreeSet::new(),
@@ -2137,8 +2179,7 @@ mod tests {
         storage.publish(forks).unwrap();
 
         let view = storage.view().unwrap();
-        let catalog = &view.catalog;
-        let heads: BTreeSet<Id> = selector_revisions(&catalog.revisions, root, true)
+        let heads: BTreeSet<Id> = selector_revisions(&view, root, true)
             .unwrap()
             .iter()
             .map(|r| r.id)
@@ -2159,7 +2200,13 @@ mod tests {
     fn unanchored_native_revision_is_a_cli_selector() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        assert!(load_files(storage).unwrap().is_empty());
+        let (_, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files").unwrap();
+        assert!(find!(
+            id: Id,
+            pattern!(&files, [{ ?id @ metadata::tag: _?kind }])
+        )
+        .next()
+        .is_none());
         let mut fragment = Fragment::empty();
         let revision = stage_revision(
             storage,
@@ -2172,12 +2219,11 @@ mod tests {
         .unwrap();
         storage.publish(fragment).unwrap();
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
         assert_eq!(
-            resolve_prefix(&catalog.revisions, &format!("{revision:x}")).unwrap(),
+            resolve_prefix(&after.facts, &format!("{revision:x}")).unwrap(),
             revision
         );
-        let entry = catalog.revisions.entry_containing(revision).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.observed, revision).unwrap();
         assert_eq!(entry.roots, vec![revision]);
     }
 
@@ -2197,12 +2243,11 @@ mod tests {
         .unwrap();
         storage.publish(fragment).unwrap();
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
         let short = &format!("{revision:x}")[..8];
         let fixed = lint_fix(
             &format!("[review](wiki:reviews:{short})"),
             ReferenceResolver {
-                wiki: &catalog.revisions,
+                wiki: &after.facts,
                 files: None,
             },
         );
@@ -2246,13 +2291,12 @@ mod tests {
 
         // A2: same page, citation removed.
         let current = storage.view().unwrap();
-        let catalog = &current.catalog;
-        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        let source_entry = wiki_model::entry(&current.facts, &current.observed, citing).unwrap();
         let mut edit = Fragment::empty();
         let dropped = stage_revision(
             storage,
             &mut edit,
-            Some(source_entry),
+            Some(&source_entry),
             "source".to_owned(),
             "no citation any more".to_owned(),
             BTreeSet::new(),
@@ -2261,10 +2305,9 @@ mod tests {
         storage.publish(edit).unwrap();
 
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
         // `dropped` really is the page's current text, so an entry-scoped
         // answer would have had a live entry to name.
-        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        let source_entry = wiki_model::entry(&after.facts, &after.observed, citing).unwrap();
         assert_eq!(
             source_entry
                 .frontier
@@ -2274,8 +2317,8 @@ mod tests {
             vec![dropped]
         );
 
-        let target_entry = catalog.revisions.entry_containing(target).unwrap();
-        let incoming = incoming_revisions(&after.reader, &catalog.revisions, target_entry).unwrap();
+        let target_entry = wiki_model::entry(&after.facts, &after.observed, target).unwrap();
+        let incoming = incoming_revisions(&after, &target_entry).unwrap();
         assert!(
             incoming.contains(&citing),
             "the revision that wrote the citation must be listed"
@@ -2319,13 +2362,12 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view().unwrap();
-        let catalog = &current.catalog;
-        let source_entry = catalog.revisions.entry_containing(citing).unwrap();
+        let source_entry = wiki_model::entry(&current.facts, &current.observed, citing).unwrap();
         let mut edit = Fragment::empty();
         stage_revision(
             storage,
             &mut edit,
-            Some(source_entry),
+            Some(&source_entry),
             "source".to_owned(),
             "no citation any more".to_owned(),
             BTreeSet::from([later_tag]),
@@ -2334,8 +2376,7 @@ mod tests {
         storage.publish(edit).unwrap();
 
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
-        let summaries = backlink_summaries(&after.reader, &catalog.revisions).unwrap();
+        let summaries = backlink_summaries(&after.reader, &after.facts).unwrap();
         assert_eq!(
             summaries.get(&target).unwrap().tags,
             BTreeSet::from([citing_tag])
@@ -2370,8 +2411,7 @@ mod tests {
         storage.publish(fragment).unwrap();
 
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
-        let summaries = backlink_summaries(&after.reader, &catalog.revisions).unwrap();
+        let summaries = backlink_summaries(&after.reader, &after.facts).unwrap();
         let incoming = summaries.get(&target).unwrap();
         assert_eq!(incoming.tags, BTreeSet::from([source_tag]));
         assert_eq!(incoming.types, BTreeSet::from(["reviews".to_owned()]));
@@ -2422,16 +2462,15 @@ mod tests {
     #[test]
     fn a_legacy_anchor_is_not_a_selector_and_is_left_untouched() {
         let (fragment, anchor, v1, _v2) = legacy_anchor_pair();
-        let catalog = wiki_model::load_catalog(fragment.facts()).unwrap();
         let resolver = ReferenceResolver {
-            wiki: &catalog.revisions,
+            wiki: fragment.facts(),
             files: None,
         };
         assert!(
-            catalog.revisions.revision(v1).is_some(),
+            !wiki_model::revision_records(fragment.facts(), v1).is_empty(),
             "the fixture's legacy versions must load, or this proves nothing"
         );
-        let error = resolve_prefix(&catalog.revisions, &format!("{anchor:x}"))
+        let error = resolve_prefix(fragment.facts(), &format!("{anchor:x}"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("no Wiki id matches"), "got: {error}");
@@ -2450,9 +2489,8 @@ mod tests {
     #[test]
     fn lint_leaves_revision_citations_byte_unchanged() {
         let (fragment, _anchor, v1, v2) = legacy_anchor_pair();
-        let catalog = wiki_model::load_catalog(fragment.facts()).unwrap();
         let resolver = ReferenceResolver {
-            wiki: &catalog.revisions,
+            wiki: fragment.facts(),
             files: None,
         };
         for target in [v1, v2] {
@@ -2501,14 +2539,16 @@ mod tests {
         cmd_lint(storage, true, false).unwrap();
 
         let after = storage.view().unwrap();
-        let catalog = &after.catalog;
-        let original = catalog.revisions.revision(citing).unwrap();
+        let original = wiki_model::revision_records(&after.facts, citing)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(
             read_string(&after.reader, original.content).unwrap(),
             format!("see #link(\"wiki:{truncated}\")[the page]"),
             "the original revision is content-addressed and must be untouched"
         );
-        let entry = catalog.revisions.entry_containing(citing).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.observed, citing).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         let head = &entry.frontier[0];
         assert_ne!(head.id, citing, "the fix is a successor, not a mutation");
@@ -2544,12 +2584,10 @@ mod tests {
 
         let storage = fixture.storage();
         let view = storage.view().unwrap();
-        let catalog = &view.catalog;
 
         let anchor_hex = format!("{anchor:x}");
         let reported = explain_selector(
             &view,
-            &catalog,
             &anchor_hex,
             anyhow!("no Wiki id matches '{anchor_hex}'"),
         )
@@ -2560,13 +2598,8 @@ mod tests {
         );
 
         let never = "ffffffffffffffffffffffffffffffff";
-        let reported = explain_selector(
-            &view,
-            &catalog,
-            never,
-            anyhow!("no Wiki id matches '{never}'"),
-        )
-        .to_string();
+        let reported =
+            explain_selector(&view, never, anyhow!("no Wiki id matches '{never}'")).to_string();
         assert!(
             reported.contains("no fragment has ever had it") && !reported.contains("ANCHOR"),
             "an id no fragment ever had must not be called an anchor; got: {reported}"

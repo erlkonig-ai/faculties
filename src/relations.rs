@@ -1,13 +1,12 @@
 //! Collection-native Relations values and read semantics.
 //!
-//! Stable person/group anchors define the addressable native subjects. A
-//! materialized collection may also retain historical mutable facts on those
-//! same anchors, but native state reads only exact intrinsic snapshots whose
-//! predecessor sets record domain lineage. Replica union may therefore expose
-//! a fork, but it can never silently pick a scalar winner. Persisted normalized
-//! labels are deliberately absent: lookup is a pure view over the current
-//! profile text and can later be accelerated by a derived collection without
-//! changing truth.
+//! Stable person/group anchors define the addressable native subjects. Typed
+//! queries recognize the snapshot relations this reader understands directly;
+//! entity ids remain opaque and unrelated open-world facts remain invisible.
+//! Predecessor relations expose replica-union forks without a clock-selected
+//! winner. Persisted normalized labels are deliberately absent: lookup is a
+//! pure view over the current profile text and can later be accelerated by a
+//! derived collection without changing truth.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -16,6 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
@@ -186,6 +186,13 @@ fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
 fn sorted_handles(values: impl IntoIterator<Item = TextHandle>) -> Vec<TextHandle> {
     let mut values: Vec<TextHandle> = values.into_iter().collect();
     values.sort_unstable_by_key(|value| value.raw);
+    values.dedup();
+    values
+}
+
+fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values: Vec<String> = values.into_iter().collect();
+    values.sort();
     values.dedup();
     values
 }
@@ -443,12 +450,15 @@ pub fn group_snapshot_fragment(
 /// it closes a fork, so membership is the join (set union) of the snapshots it
 /// names. The group name remains an explicit human choice because names do not
 /// themselves form a useful join-semilattice.
-pub fn reconcile_group_fragment(
-    facts: &TribleSet,
+pub fn reconcile_group_fragment<P>(
+    facts: &P,
     group_id: Id,
     name: impl Into<String>,
     predecessors: &[Id],
-) -> Result<Fragment> {
+) -> Result<Fragment>
+where
+    P: TriblePattern,
+{
     let predecessors = sorted_ids(predecessors.iter().copied());
     if predecessors.len() < 2 {
         bail!("group reconciliation requires at least two distinct predecessors");
@@ -493,38 +503,36 @@ pub fn identity_verdict_fragment(
     }))
 }
 
-fn exactly_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
-    let count = values.len();
-    if count != 1 {
-        bail!("Relations entity {entity:x} has {count} values for {field}; expected exactly one");
-    }
-    Ok(values.into_iter().next().unwrap())
-}
-
-fn at_most_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    let count = values.len();
-    if count > 1 {
-        bail!("Relations entity {entity:x} has {count} values for {field}; expected at most one");
-    }
-    Ok(values.into_iter().next())
-}
-
-/// Read one exact self-authenticating native profile snapshot. Historical
-/// anchor-shaped rows may share field attributes, but without the intrinsic
-/// identity and complete native record they cannot enter this view.
-pub fn profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
-    let snapshot = ProfileSnapshot {
+/// Read one decodable profile projection.
+///
+/// The entity id is an opaque anchor. Extra open-world facts do not invalidate
+/// the projection, and values which do not decode to the requested schema are
+/// skipped by the typed query. Published snapshots have one scalar projection;
+/// if foreign additive facts provide several, the byte-smallest typed value is
+/// used deterministically instead of imposing a collection-wide cardinality
+/// constraint.
+pub fn profile_snapshot<P>(facts: &P, id: Id) -> Result<ProfileSnapshot>
+where
+    P: TriblePattern,
+{
+    let (person, label) = find!(
+        (person: Id, label: TextHandle),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_PERSON_PROFILE,
+            profile::of: ?person,
+            metadata::name: ?label,
+        }])
+    )
+    .min_by(|(left_person, left_label), (right_person, right_label)| {
+        left_person
+            .cmp(right_person)
+            .then_with(|| left_label.raw.cmp(&right_label.raw))
+    })
+    .ok_or_else(|| anyhow!("Relations entity {id:x} has no decodable profile projection"))?;
+    Ok(ProfileSnapshot {
         id,
-        person: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ profile::of: ?v }])).collect(),
-            id,
-            "profile::of",
-        )?,
-        label: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ metadata::name: ?v }])).collect(),
-            id,
-            "metadata::name",
-        )?,
+        person,
+        label,
         aliases: sorted_handles(
             find!(v: TextHandle, pattern!(facts, [{ id @ profile::alias: ?v }])),
         ),
@@ -532,26 +540,14 @@ pub fn profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
             v: TextHandle,
             pattern!(facts, [{ id @ profile::affinity: ?v }])
         )),
-        first_name: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ profile::first_name: ?v }])).collect(),
-            id,
-            "profile::first_name",
-        )?,
-        last_name: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ profile::last_name: ?v }])).collect(),
-            id,
-            "profile::last_name",
-        )?,
-        display_name: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ profile::display_name: ?v }])).collect(),
-            id,
-            "profile::display_name",
-        )?,
-        note: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ metadata::description: ?v }])).collect(),
-            id,
-            "metadata::description",
-        )?,
+        first_name: find!(v: TextHandle, pattern!(facts, [{ id @ profile::first_name: ?v }]))
+            .min_by_key(|value| value.raw),
+        last_name: find!(v: TextHandle, pattern!(facts, [{ id @ profile::last_name: ?v }]))
+            .min_by_key(|value| value.raw),
+        display_name: find!(v: TextHandle, pattern!(facts, [{ id @ profile::display_name: ?v }]))
+            .min_by_key(|value| value.raw),
+        note: find!(v: TextHandle, pattern!(facts, [{ id @ metadata::description: ?v }]))
+            .min_by_key(|value| value.raw),
         teams_user_ids: sorted_handles(find!(
             v: TextHandle,
             pattern!(facts, [{ id @ profile::teams_user_id: ?v }])
@@ -564,16 +560,10 @@ pub fn profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
             v: TextHandle,
             pattern!(facts, [{ id @ profile::phone: ?v }])
         )),
-        company: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ profile::company: ?v }])).collect(),
-            id,
-            "profile::company",
-        )?,
-        position: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ profile::position: ?v }])).collect(),
-            id,
-            "profile::position",
-        )?,
+        company: find!(v: TextHandle, pattern!(facts, [{ id @ profile::company: ?v }]))
+            .min_by_key(|value| value.raw),
+        position: find!(v: TextHandle, pattern!(facts, [{ id @ profile::position: ?v }]))
+            .min_by_key(|value| value.raw),
         profile_urls: sorted_handles(find!(
             v: TextHandle,
             pattern!(facts, [{ id @ profile::profile_url: ?v }])
@@ -582,108 +572,125 @@ pub fn profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
             v: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?v }])
         )),
-    };
-    let expected = ensure_intrinsic(id, profile_record(&snapshot), "profile")?;
-    require_exact_native_entity(facts, id, &expected, "profile")?;
-    Ok(snapshot)
+    })
 }
 
-pub fn lifecycle_snapshot(facts: &TribleSet, id: Id) -> Result<LifecycleSnapshot> {
-    let snapshot = LifecycleSnapshot {
+pub fn lifecycle_snapshot<P>(facts: &P, id: Id) -> Result<LifecycleSnapshot>
+where
+    P: TriblePattern,
+{
+    let (person, retired) = find!(
+        (person: Id, retired: bool),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            lifecycle::of: ?person,
+            lifecycle::retired: ?retired,
+        }])
+    )
+    .min_by(|left, right| left.cmp(right))
+    .ok_or_else(|| anyhow!("Relations entity {id:x} has no decodable lifecycle projection"))?;
+    Ok(LifecycleSnapshot {
         id,
-        person: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ lifecycle::of: ?v }])).collect(),
-            id,
-            "lifecycle::of",
-        )?,
-        retired: exactly_one(
-            find!(v: bool, pattern!(facts, [{ id @ lifecycle::retired: ?v }])).collect(),
-            id,
-            "lifecycle::retired",
-        )?,
+        person,
+        retired,
         predecessors: sorted_ids(find!(
             v: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?v }])
         )),
-    };
-    let expected = ensure_intrinsic(id, lifecycle_record(&snapshot), "lifecycle")?;
-    require_exact_native_entity(facts, id, &expected, "lifecycle")?;
-    Ok(snapshot)
+    })
 }
 
-pub fn group_snapshot(facts: &TribleSet, id: Id) -> Result<GroupSnapshot> {
-    let snapshot = GroupSnapshot {
+pub fn group_snapshot<P>(facts: &P, id: Id) -> Result<GroupSnapshot>
+where
+    P: TriblePattern,
+{
+    let (group, name) = find!(
+        (group: Id, name: TextHandle),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_GROUP_SNAPSHOT,
+            group::snapshot_of: ?group,
+            metadata::name: ?name,
+        }])
+    )
+    .min_by(|(left_group, left_name), (right_group, right_name)| {
+        left_group
+            .cmp(right_group)
+            .then_with(|| left_name.raw.cmp(&right_name.raw))
+    })
+    .ok_or_else(|| anyhow!("Relations entity {id:x} has no decodable group projection"))?;
+    Ok(GroupSnapshot {
         id,
-        group: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ group::snapshot_of: ?v }])).collect(),
-            id,
-            "group::snapshot_of",
-        )?,
-        name: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ metadata::name: ?v }])).collect(),
-            id,
-            "metadata::name",
-        )?,
+        group,
+        name,
         members: sorted_ids(find!(v: Id, pattern!(facts, [{ id @ group::member: ?v }]))),
         predecessors: sorted_ids(find!(
             v: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?v }])
         )),
-    };
-    let expected = ensure_intrinsic(id, group_record(&snapshot), "group snapshot")?;
-    require_exact_native_entity(facts, id, &expected, "group snapshot")?;
-    Ok(snapshot)
+    })
 }
 
-pub fn identity_verdict(facts: &TribleSet, id: Id) -> Result<IdentityVerdict> {
-    let snapshot = IdentityVerdict {
+pub fn identity_verdict<P>(facts: &P, id: Id) -> Result<IdentityVerdict>
+where
+    P: TriblePattern,
+{
+    let (low, high, same) = find!(
+        (low: Id, high: Id, same: bool),
+        pattern!(facts, [{ id @
+            metadata::tag: &KIND_IDENTITY_VERDICT,
+            identity::low: ?low,
+            identity::high: ?high,
+            identity::same: ?same,
+        }])
+    )
+    .min_by(|left, right| left.cmp(right))
+    .ok_or_else(|| anyhow!("Relations entity {id:x} has no decodable identity projection"))?;
+    Ok(IdentityVerdict {
         id,
-        low: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ identity::low: ?v }])).collect(),
-            id,
-            "identity::low",
-        )?,
-        high: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ identity::high: ?v }])).collect(),
-            id,
-            "identity::high",
-        )?,
-        same: exactly_one(
-            find!(v: bool, pattern!(facts, [{ id @ identity::same: ?v }])).collect(),
-            id,
-            "identity::same",
-        )?,
+        low,
+        high,
+        same,
         predecessors: sorted_ids(find!(
             v: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?v }])
         )),
-    };
-    let expected = ensure_intrinsic(id, identity_record(&snapshot), "identity verdict")?;
-    require_exact_native_entity(facts, id, &expected, "identity verdict")?;
-    Ok(snapshot)
+    })
 }
 
-pub fn person_anchors(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn person_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
 
-pub fn group_anchors(facts: &TribleSet) -> BTreeSet<Id> {
+pub fn group_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_GROUP }])).collect()
 }
 
 /// Every exact source label asserted for a stable person anchor, sorted and
 /// deduplicated. No scalar winner is selected when several systems observed
 /// the same person.
-pub fn person_sources(facts: &TribleSet, person: Id) -> Result<Vec<String>> {
-    source_set(
-        find!(value: String, pattern!(facts, [{ person @ legacy::source: ?value }])).collect(),
-    )
+pub fn person_sources<P>(facts: &P, person: Id) -> Result<Vec<String>>
+where
+    P: TriblePattern,
+{
+    Ok(sorted_strings(find!(
+        value: String,
+        pattern!(facts, [{ person @ legacy::source: ?value }])
+    )))
 }
 
 /// Every creation-time observation attached to a stable person or group
 /// anchor, in chronological order. Repeated observations collapse by set
 /// semantics.
-pub fn creation_observations(facts: &TribleSet, anchor: Id) -> Vec<ObservedAt> {
+pub fn creation_observations<P>(facts: &P, anchor: Id) -> Vec<ObservedAt>
+where
+    P: TriblePattern,
+{
     sorted_observations(find!(
         value: ObservedAt,
         pattern!(facts, [{ anchor @ metadata::created_at: ?value }])
@@ -694,15 +701,30 @@ pub fn creation_observations(facts: &TribleSet, anchor: Id) -> Vec<ObservedAt> {
 ///
 /// This is a projection, not a stored scalar fact: later union may reveal an
 /// earlier observation without invalidating any existing assertion.
-pub fn earliest_creation_observation(facts: &TribleSet, anchor: Id) -> Option<ObservedAt> {
+pub fn earliest_creation_observation<P>(facts: &P, anchor: Id) -> Option<ObservedAt>
+where
+    P: TriblePattern,
+{
     creation_observations(facts, anchor).into_iter().next()
 }
 
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
 }
 
-fn track_head(
+fn head_from(ids: BTreeSet<Id>, superseded: BTreeSet<Id>) -> Head {
+    let heads: Vec<Id> = ids.difference(&superseded).copied().collect();
+    match heads.as_slice() {
+        [] => Head::Missing,
+        [head] => Head::Unique(*head),
+        _ => Head::Forked(heads),
+    }
+}
+
+fn validate_track_head(
     ids: BTreeSet<Id>,
     predecessors: impl Fn(Id) -> Result<Vec<Id>>,
     label: &str,
@@ -729,43 +751,82 @@ fn track_head(
     }
 }
 
-pub fn profile_head(facts: &TribleSet, person: Id) -> Result<Head> {
-    let ids = find!(
+pub fn profile_head<P>(facts: &P, person: Id) -> Result<Head>
+where
+    P: TriblePattern,
+{
+    let ids: BTreeSet<Id> = find!(
         id: Id,
-        pattern!(facts, [{ ?id @ metadata::tag: &KIND_PERSON_PROFILE, profile::of: person }])
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_PERSON_PROFILE,
+            profile::of: person,
+            metadata::name: _?label,
+        }])
     )
     .collect();
-    track_head(
-        ids,
-        |id| Ok(profile_snapshot(facts, id)?.predecessors),
-        "profile",
+    let superseded = find!(
+        predecessor: Id,
+        pattern!(facts, [{ _?id @
+            metadata::tag: &KIND_PERSON_PROFILE,
+            profile::of: person,
+            metadata::name: _?label,
+            metadata::supersedes: ?predecessor,
+        }])
     )
+    .collect();
+    Ok(head_from(ids, superseded))
 }
 
-pub fn lifecycle_head(facts: &TribleSet, person: Id) -> Result<Head> {
-    let ids = find!(
+pub fn lifecycle_head<P>(facts: &P, person: Id) -> Result<Head>
+where
+    P: TriblePattern,
+{
+    let ids: BTreeSet<Id> = find!(
         id: Id,
-        pattern!(facts, [{ ?id @ metadata::tag: &KIND_PERSON_LIFECYCLE, lifecycle::of: person }])
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            lifecycle::of: person,
+            lifecycle::retired: _?retired,
+        }])
     )
     .collect();
-    track_head(
-        ids,
-        |id| Ok(lifecycle_snapshot(facts, id)?.predecessors),
-        "lifecycle",
+    let superseded = find!(
+        predecessor: Id,
+        pattern!(facts, [{ _?id @
+            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            lifecycle::of: person,
+            lifecycle::retired: _?retired,
+            metadata::supersedes: ?predecessor,
+        }])
     )
+    .collect();
+    Ok(head_from(ids, superseded))
 }
 
-pub fn group_head(facts: &TribleSet, group_id: Id) -> Result<Head> {
-    let ids = find!(
+pub fn group_head<P>(facts: &P, group_id: Id) -> Result<Head>
+where
+    P: TriblePattern,
+{
+    let ids: BTreeSet<Id> = find!(
         id: Id,
-        pattern!(facts, [{ ?id @ metadata::tag: &KIND_GROUP_SNAPSHOT, group::snapshot_of: group_id }])
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_GROUP_SNAPSHOT,
+            group::snapshot_of: group_id,
+            metadata::name: _?name,
+        }])
     )
     .collect();
-    track_head(
-        ids,
-        |id| Ok(group_snapshot(facts, id)?.predecessors),
-        "group",
+    let superseded = find!(
+        predecessor: Id,
+        pattern!(facts, [{ _?id @
+            metadata::tag: &KIND_GROUP_SNAPSHOT,
+            group::snapshot_of: group_id,
+            metadata::name: _?name,
+            metadata::supersedes: ?predecessor,
+        }])
     )
+    .collect();
+    Ok(head_from(ids, superseded))
 }
 
 fn pair(first: Id, second: Id) -> Result<(Id, Id)> {
@@ -779,22 +840,33 @@ fn pair(first: Id, second: Id) -> Result<(Id, Id)> {
     })
 }
 
-pub fn identity_head(facts: &TribleSet, first: Id, second: Id) -> Result<Head> {
+pub fn identity_head<P>(facts: &P, first: Id, second: Id) -> Result<Head>
+where
+    P: TriblePattern,
+{
     let (low, high) = pair(first, second)?;
-    let ids = find!(
+    let ids: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @
             metadata::tag: &KIND_IDENTITY_VERDICT,
             identity::low: low,
             identity::high: high,
+            identity::same: _?same,
         }])
     )
     .collect();
-    track_head(
-        ids,
-        |id| Ok(identity_verdict(facts, id)?.predecessors),
-        "identity verdict",
+    let superseded = find!(
+        predecessor: Id,
+        pattern!(facts, [{ _?id @
+            metadata::tag: &KIND_IDENTITY_VERDICT,
+            identity::low: low,
+            identity::high: high,
+            identity::same: _?same,
+            metadata::supersedes: ?predecessor,
+        }])
     )
+    .collect();
+    Ok(head_from(ids, superseded))
 }
 
 fn ensure_intrinsic(id: Id, record: Fragment, label: &str) -> Result<TribleSet> {
@@ -832,6 +904,100 @@ fn require_exact_native_entity(
     Ok(())
 }
 
+fn validate_profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
+    let snapshot = profile_snapshot(facts, id)?;
+    let expected = ensure_intrinsic(id, profile_record(&snapshot), "profile")?;
+    require_exact_native_entity(facts, id, &expected, "profile")?;
+    Ok(snapshot)
+}
+
+fn validate_lifecycle_snapshot(facts: &TribleSet, id: Id) -> Result<LifecycleSnapshot> {
+    let snapshot = lifecycle_snapshot(facts, id)?;
+    let expected = ensure_intrinsic(id, lifecycle_record(&snapshot), "lifecycle")?;
+    require_exact_native_entity(facts, id, &expected, "lifecycle")?;
+    Ok(snapshot)
+}
+
+fn validate_group_snapshot(facts: &TribleSet, id: Id) -> Result<GroupSnapshot> {
+    let snapshot = group_snapshot(facts, id)?;
+    let expected = ensure_intrinsic(id, group_record(&snapshot), "group snapshot")?;
+    require_exact_native_entity(facts, id, &expected, "group snapshot")?;
+    Ok(snapshot)
+}
+
+fn validate_identity_verdict(facts: &TribleSet, id: Id) -> Result<IdentityVerdict> {
+    let snapshot = identity_verdict(facts, id)?;
+    let expected = ensure_intrinsic(id, identity_record(&snapshot), "identity verdict")?;
+    require_exact_native_entity(facts, id, &expected, "identity verdict")?;
+    Ok(snapshot)
+}
+
+fn validate_profile_head(facts: &TribleSet, person: Id) -> Result<Head> {
+    let ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_PERSON_PROFILE,
+            profile::of: person,
+        }])
+    )
+    .collect();
+    validate_track_head(
+        ids,
+        |id| Ok(validate_profile_snapshot(facts, id)?.predecessors),
+        "profile",
+    )
+}
+
+fn validate_lifecycle_head(facts: &TribleSet, person: Id) -> Result<Head> {
+    let ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            lifecycle::of: person,
+        }])
+    )
+    .collect();
+    validate_track_head(
+        ids,
+        |id| Ok(validate_lifecycle_snapshot(facts, id)?.predecessors),
+        "lifecycle",
+    )
+}
+
+fn validate_group_head(facts: &TribleSet, group_id: Id) -> Result<Head> {
+    let ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_GROUP_SNAPSHOT,
+            group::snapshot_of: group_id,
+        }])
+    )
+    .collect();
+    validate_track_head(
+        ids,
+        |id| Ok(validate_group_snapshot(facts, id)?.predecessors),
+        "group",
+    )
+}
+
+fn validate_identity_head(facts: &TribleSet, first: Id, second: Id) -> Result<Head> {
+    let (low, high) = pair(first, second)?;
+    let ids = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_IDENTITY_VERDICT,
+            identity::low: low,
+            identity::high: high,
+        }])
+    )
+    .collect();
+    validate_track_head(
+        ids,
+        |id| Ok(validate_identity_verdict(facts, id)?.predecessors),
+        "identity verdict",
+    )
+}
+
 fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
     let people = person_anchors(facts);
     let groups = group_anchors(facts);
@@ -850,7 +1016,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
 
     let mut text_handles = Vec::new();
     for &id in &profile_ids {
-        let snapshot = profile_snapshot(facts, id)?;
+        let snapshot = validate_profile_snapshot(facts, id)?;
         if !people.contains(&snapshot.person) {
             bail!(
                 "profile {id:x} names undeclared person {:x}",
@@ -901,7 +1067,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
         );
     }
     for &id in &lifecycle_ids {
-        let snapshot = lifecycle_snapshot(facts, id)?;
+        let snapshot = validate_lifecycle_snapshot(facts, id)?;
         if !people.contains(&snapshot.person) {
             bail!(
                 "lifecycle {id:x} names undeclared person {:x}",
@@ -910,7 +1076,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
         }
     }
     for &id in &group_ids {
-        let snapshot = group_snapshot(facts, id)?;
+        let snapshot = validate_group_snapshot(facts, id)?;
         if !groups.contains(&snapshot.group) {
             bail!(
                 "group snapshot {id:x} names undeclared group {:x}",
@@ -925,7 +1091,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
         if snapshot.predecessors.len() > 1 {
             let mut inherited_members = BTreeSet::new();
             for predecessor in &snapshot.predecessors {
-                let parent = group_snapshot(facts, *predecessor).with_context(|| {
+                let parent = validate_group_snapshot(facts, *predecessor).with_context(|| {
                     format!("read group reconciliation predecessor {predecessor:x}")
                 })?;
                 if parent.group != snapshot.group {
@@ -947,7 +1113,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
         text_handles.push((snapshot.name, true));
     }
     for &id in &verdict_ids {
-        let snapshot = identity_verdict(facts, id)?;
+        let snapshot = validate_identity_verdict(facts, id)?;
         if snapshot.low >= snapshot.high {
             bail!("identity verdict {id:x} does not use canonical ordered endpoints");
         }
@@ -957,21 +1123,21 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
     }
 
     for &person in &people {
-        if matches!(profile_head(facts, person)?, Head::Missing) {
+        if matches!(validate_profile_head(facts, person)?, Head::Missing) {
             bail!("person {person:x} has no profile snapshot");
         }
-        if matches!(lifecycle_head(facts, person)?, Head::Missing) {
+        if matches!(validate_lifecycle_head(facts, person)?, Head::Missing) {
             bail!("person {person:x} has no lifecycle snapshot");
         }
     }
     for &group_id in &groups {
-        if matches!(group_head(facts, group_id)?, Head::Missing) {
+        if matches!(validate_group_head(facts, group_id)?, Head::Missing) {
             bail!("group {group_id:x} has no group snapshot");
         }
     }
     for &id in &verdict_ids {
-        let verdict = identity_verdict(facts, id)?;
-        let _ = identity_head(facts, verdict.low, verdict.high)?;
+        let verdict = validate_identity_verdict(facts, id)?;
+        let _ = validate_identity_head(facts, verdict.low, verdict.high)?;
     }
 
     Ok(text_handles)
@@ -1123,7 +1289,10 @@ where
     })
 }
 
-pub fn current_profile(facts: &TribleSet, person: Id) -> Result<ProfileSnapshot> {
+pub fn current_profile<P>(facts: &P, person: Id) -> Result<ProfileSnapshot>
+where
+    P: TriblePattern,
+{
     match profile_head(facts, person)? {
         Head::Unique(id) => profile_snapshot(facts, id),
         Head::Missing => bail!("person {person:x} has no profile"),
@@ -1139,7 +1308,10 @@ pub fn current_profile(facts: &TribleSet, person: Id) -> Result<ProfileSnapshot>
     }
 }
 
-pub fn person_is_retired(facts: &TribleSet, person: Id) -> Result<bool> {
+pub fn person_is_retired<P>(facts: &P, person: Id) -> Result<bool>
+where
+    P: TriblePattern,
+{
     match lifecycle_head(facts, person)? {
         Head::Unique(id) => Ok(lifecycle_snapshot(facts, id)?.retired),
         Head::Missing => bail!("person {person:x} has no lifecycle"),
@@ -1150,7 +1322,10 @@ pub fn person_is_retired(facts: &TribleSet, person: Id) -> Result<bool> {
     }
 }
 
-pub fn current_group(facts: &TribleSet, group_id: Id) -> Result<GroupSnapshot> {
+pub fn current_group<P>(facts: &P, group_id: Id) -> Result<GroupSnapshot>
+where
+    P: TriblePattern,
+{
     match group_head(facts, group_id)? {
         Head::Unique(id) => group_snapshot(facts, id),
         Head::Missing => bail!("group {group_id:x} has no snapshot"),
@@ -1242,7 +1417,10 @@ fn selector_outcome(
 /// so the fork cannot change the verdict — the same reasoning
 /// [`IdentityComponents::from_facts`] already applies to agreement-only
 /// verdict forks. `None` means genuinely indeterminate.
-fn retired_verdict(facts: &TribleSet, person: Id, state: &Head) -> Result<Option<bool>> {
+fn retired_verdict<P>(facts: &P, person: Id, state: &Head) -> Result<Option<bool>>
+where
+    P: TriblePattern,
+{
     match state {
         Head::Unique(id) => Ok(Some(lifecycle_snapshot(facts, *id)?.retired)),
         Head::Forked(heads) => {
@@ -1274,14 +1452,15 @@ fn retired_verdict(facts: &TribleSet, person: Id, state: &Head) -> Result<Option
 ///
 /// A profile fork always blocks a surviving candidate: the label match itself
 /// is then head-dependent.
-pub fn resolve_person<Store>(
+pub fn resolve_person<Store, P>(
     reader: &Store,
-    facts: &TribleSet,
+    facts: &P,
     input: &str,
     include_retired: bool,
 ) -> Result<SelectorOutcome>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let input = input.trim();
     if input.is_empty() {
@@ -1343,13 +1522,10 @@ where
     Ok(selector_outcome(settled, forked, retired))
 }
 
-pub fn resolve_group<Store>(
-    reader: &Store,
-    facts: &TribleSet,
-    input: &str,
-) -> Result<SelectorOutcome>
+pub fn resolve_group<Store, P>(reader: &Store, facts: &P, input: &str) -> Result<SelectorOutcome>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let input = input.trim();
     if input.is_empty() {
@@ -1448,15 +1624,27 @@ fn union_roots(parent: &mut HashMap<Id, Id>, first: Id, second: Id) {
 }
 
 impl IdentityComponents {
-    pub fn from_facts(facts: &TribleSet) -> Result<Self> {
+    pub fn from_facts<P>(facts: &P) -> Result<Self>
+    where
+        P: TriblePattern,
+    {
         let people = person_anchors(facts);
         let mut parent: HashMap<Id, Id> = people.iter().map(|&id| (id, id)).collect();
-        let verdict_ids = ids_of_kind(facts, KIND_IDENTITY_VERDICT);
-        let mut pairs = BTreeSet::new();
-        for id in verdict_ids {
-            let verdict = identity_verdict(facts, id)?;
-            pairs.insert((verdict.low, verdict.high));
-        }
+        let pairs: BTreeSet<(Id, Id)> = find!(
+            (low: Id, high: Id),
+            pattern!(facts, [
+                { _?verdict @
+                    metadata::tag: &KIND_IDENTITY_VERDICT,
+                    identity::low: ?low,
+                    identity::high: ?high,
+                    identity::same: _?same,
+                },
+                { ?low @ metadata::tag: &KIND_PERSON_ID },
+                { ?high @ metadata::tag: &KIND_PERSON_ID },
+            ])
+        )
+        .filter(|(low, high)| low < high)
+        .collect();
 
         let mut same = Vec::new();
         let mut distinct = Vec::new();
@@ -1609,7 +1797,10 @@ impl IdentityComponents {
 /// Addressable groups containing `person`, where settled same-person
 /// components participate in equality but the exact input anchor remains the
 /// caller's attribution identity.
-pub fn groups_for_member(facts: &TribleSet, person: Id) -> Result<BTreeSet<Id>> {
+pub fn groups_for_member<P>(facts: &P, person: Id) -> Result<BTreeSet<Id>>
+where
+    P: TriblePattern,
+{
     let identities = IdentityComponents::from_facts(facts)?;
     let mut groups = BTreeSet::new();
     for group_id in group_anchors(facts) {
@@ -1634,9 +1825,10 @@ pub enum ProfileView {
     Invalid(String),
 }
 
-pub fn person_profile_views<Store>(reader: &Store, facts: &TribleSet) -> Vec<(Id, ProfileView)>
+pub fn person_profile_views<Store, P>(reader: &Store, facts: &P) -> Vec<(Id, ProfileView)>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     person_anchors(facts)
         .into_iter()
@@ -1659,13 +1851,14 @@ where
 
 /// Every current person profile, preserving exact anchor identity. Retired
 /// people are included or excluded explicitly; a fork remains an error.
-pub fn current_people<Store>(
+pub fn current_people<Store, P>(
     reader: &Store,
-    facts: &TribleSet,
+    facts: &P,
     include_retired: bool,
 ) -> Result<Vec<(Id, ProfileInput)>>
 where
     Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
 {
     let mut people = Vec::new();
     for person in person_anchors(facts) {
@@ -1684,12 +1877,25 @@ where
 }
 
 /// Return all canonical identity pairs and their fork-visible heads.
-pub fn identity_heads(facts: &TribleSet) -> Result<BTreeMap<(Id, Id), Head>> {
-    let mut pairs = BTreeSet::new();
-    for id in ids_of_kind(facts, KIND_IDENTITY_VERDICT) {
-        let verdict = identity_verdict(facts, id)?;
-        pairs.insert((verdict.low, verdict.high));
-    }
+pub fn identity_heads<P>(facts: &P) -> Result<BTreeMap<(Id, Id), Head>>
+where
+    P: TriblePattern,
+{
+    let pairs: BTreeSet<(Id, Id)> = find!(
+        (low: Id, high: Id),
+        pattern!(facts, [
+            { _?verdict @
+                metadata::tag: &KIND_IDENTITY_VERDICT,
+                identity::low: ?low,
+                identity::high: ?high,
+                identity::same: _?same,
+            },
+            { ?low @ metadata::tag: &KIND_PERSON_ID },
+            { ?high @ metadata::tag: &KIND_PERSON_ID },
+        ])
+    )
+    .filter(|(low, high)| low < high)
+    .collect();
     pairs
         .into_iter()
         .map(|pair| Ok((pair, identity_head(facts, pair.0, pair.1)?)))
