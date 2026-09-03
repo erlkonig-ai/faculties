@@ -1144,14 +1144,32 @@ pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 /// a tag named `cover` is returned. Concurrent untagged heads likewise do not
 /// erase a tagged head. Callers therefore see the authored revision DAG's
 /// actual frontier rather than a timestamp-selected legacy approximation.
-pub fn cover_fragments(
+pub fn cover_fragments<P, O>(
     reader: &PileSnapshot,
-    catalog: &WikiCatalog,
-) -> Result<Vec<(String, String)>> {
+    facts: &P,
+    order: &O,
+) -> Result<Vec<(String, String)>>
+where
+    P: TriblePattern,
+    O: RegisterOrder + ?Sized,
+{
+    let frontier: Vec<RevisionRecord> = resolve(order, revision_ids(facts))
+        .into_iter()
+        .flat_map(|revision| revision_records(facts, revision))
+        .collect();
+    let candidate_tags: BTreeSet<Id> = frontier
+        .iter()
+        .flat_map(|revision| revision.tags.iter().copied())
+        .collect();
     let mut cover_tags = BTreeSet::new();
-    for (&tag, &handle) in &catalog.tag_names {
-        if read_text(reader, handle)?.eq_ignore_ascii_case("cover") {
-            cover_tags.insert(tag);
+    for tag in candidate_tags {
+        for handle in find!(
+            handle: TextHandle,
+            pattern!(facts, [{ tag @ metadata::name: ?handle }])
+        ) {
+            if read_text(reader, handle)?.eq_ignore_ascii_case("cover") {
+                cover_tags.insert(tag);
+            }
         }
     }
     if cover_tags.is_empty() {
@@ -1159,19 +1177,18 @@ pub fn cover_fragments(
     }
 
     let mut rows = Vec::new();
-    for entry in catalog.revisions.all_entries() {
-        for revision in entry.frontier {
-            if revision.tags.is_disjoint(&cover_tags) {
-                continue;
-            }
-            rows.push((
-                read_text(reader, revision.title)?,
-                read_text(reader, revision.content)?,
-                revision.id,
-            ));
+    for revision in frontier {
+        if revision.tags.is_disjoint(&cover_tags) {
+            continue;
         }
+        rows.push((
+            read_text(reader, revision.title)?,
+            read_text(reader, revision.content)?,
+            revision.id,
+        ));
     }
     rows.sort_by(|left, right| (&left.0, left.2).cmp(&(&right.0, right.2)));
+    rows.dedup();
     Ok(rows
         .into_iter()
         .map(|(title, content, _)| (title, content))
@@ -1908,9 +1925,9 @@ mod tests {
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = validate_catalog(&reader, &facts).unwrap();
+        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
         assert_eq!(
-            cover_fragments(&reader, &catalog).unwrap(),
+            cover_fragments(&reader, &facts, &order).unwrap(),
             vec![
                 ("left".to_owned(), "left body".to_owned()),
                 ("right".to_owned(), "right body".to_owned()),

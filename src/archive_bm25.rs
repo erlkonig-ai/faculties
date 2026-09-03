@@ -481,12 +481,13 @@ mod tests {
         let store = StoredBlobs::new(attachments);
         let index = parse(derive(&store.reader, source));
         assert_eq!(index.doc_count(), 1);
+        let predecessor_inline: Inline<GenId> = predecessor_id.to_inline();
         assert_eq!(
             index
                 .document_keys()
                 .map(|document| document.raw)
                 .collect::<Vec<_>>(),
-            vec![predecessor_id.to_inline().raw],
+            vec![predecessor_inline.raw],
         );
     }
 
@@ -553,6 +554,7 @@ mod tests {
             source_and_attachments(graph_with_unknown_fact);
         let open_world_store = StoredBlobs::new(attachments);
         let index = parse(derive(&open_world_store.reader, graph_with_unknown_fact));
+        let block_inline: Inline<GenId> = block_id.to_inline();
         assert_eq!(
             index.doc_count(),
             1,
@@ -563,7 +565,7 @@ mod tests {
                 .document_keys()
                 .map(|document| document.raw)
                 .collect::<Vec<_>>(),
-            vec![block_id.to_inline().raw],
+            vec![block_inline.raw],
             "the selected entity id remains opaque",
         );
 

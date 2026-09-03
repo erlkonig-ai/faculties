@@ -99,7 +99,7 @@ struct LoadedContext {
 
 struct LoadedComb {
     memory: LoadedMemory,
-    comb_catalog: comb_model::CombCatalog,
+    comb: CollectionView,
 }
 
 struct LoadedProvenance {
@@ -237,19 +237,23 @@ impl MemoryStorage<'_> {
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let memory_collection = FactCollection::new(&mut pile, memory_source)
                 .context("register maintained Memory collection")?;
-            let comb_collection =
+            let comb_source =
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            let comb_collection = FactCollection::new(&mut pile, comb_source)
+                .context("register maintained Comb collection")?;
             let instant = clock::now()?;
             let before = pile
                 .snapshot()
                 .context("freeze Memory/Comb source snapshot")?;
-            let (comb_facts, _) =
-                faculties::storage::read_fact_collection(comb_collection, &before)
-                    .context("read legacy Comb collection")?;
             drop(
                 memory_collection
                     .maintain_at(&mut pile, &before, instant)
                     .context("maintain Memory collection")?,
+            );
+            drop(
+                comb_collection
+                    .maintain_at(&mut pile, &before, instant)
+                    .context("maintain Comb collection")?,
             );
             drop(before);
             let store_snapshot = pile
@@ -257,12 +261,8 @@ impl MemoryStorage<'_> {
                 .context("freeze maintained Memory/Comb snapshot")?;
             let memory =
                 Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
-            let comb_catalog =
-                comb_model::load_catalog(&comb_facts).context("validate Comb collection")?;
-            Ok(LoadedComb {
-                memory,
-                comb_catalog,
-            })
+            let comb = Self::attach_collection(comb_collection, &store_snapshot, instant, "Comb")?;
+            Ok(LoadedComb { memory, comb })
         })();
         Self::finish_pile(pile, result)
     }
@@ -1040,10 +1040,9 @@ fn comb_advance(
     let now = clock::now()?;
     let position = position.map(clock::point).transpose()?;
     let observed_at = clock::point(now)?;
-    let predecessors = loaded
-        .comb_catalog
-        .resolution(stream, persona)
-        .map(comb_model::CursorResolution::head_ids)
+    let comb = &loaded.comb.facts;
+    let predecessors = comb_model::resolution(comb, stream, persona)?
+        .map(|resolution| resolution.head_ids())
         .unwrap_or_default()
         .into_iter()
         .collect();
@@ -1104,7 +1103,8 @@ fn cmd_consolidate(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             if summary.is_empty() {
                 bail!("summary required: memory consolidate <ts> <summary...>");
             }
-            let Some(resolution) = loaded.comb_catalog.resolution(CONSOLIDATE_STREAM, &persona)
+            let Some(resolution) =
+                comb_model::resolution(&loaded.comb.facts, CONSOLIDATE_STREAM, &persona)?
             else {
                 bail!(
                     "no open consolidation edge for persona {persona}: \
@@ -1229,9 +1229,8 @@ fn cmd_replay(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             if count == 0 {
                 bail!("memory replay batch count must be greater than zero");
             }
-            let Some(resolution) = loaded
-                .comb_catalog
-                .resolution(MEMORY_REPLAY_STREAM, &persona)
+            let Some(resolution) =
+                comb_model::resolution(&loaded.comb.facts, MEMORY_REPLAY_STREAM, &persona)?
             else {
                 bail!(
                     "no active memory replay for persona {persona}: \

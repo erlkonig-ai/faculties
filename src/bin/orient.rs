@@ -35,6 +35,7 @@ use faculties::schemas::relations::{
 use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
+use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
@@ -2964,16 +2965,36 @@ fn cmd_wake(
         let memory_source = open_configured(&mut storage, MEMORY_SCOPE_ID, signer.verifying_key())?;
         let memory_collection = FactCollection::new(&mut storage, memory_source)
             .context("register maintained Memory collection")?;
-        let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
-            .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
+        let wiki_source = open_configured(&mut storage, WIKI_SCOPE_ID, signer.verifying_key())?;
+        let wiki_collection = FactCollection::new(&mut storage, wiki_source)
+            .context("register maintained Wiki collection")?;
+        let wiki_observed = wiki_model::observed_collection(&mut storage, signer.verifying_key())
+            .context("register maintained Wiki supersession index")?;
         let instant = clock::now()?;
         let source_snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake source snapshot: {error}"))?;
+        let wiki_support = source_snapshot
+            .collection_at(wiki_source, instant)
+            .context("observe resident Wiki source collection")?
+            .support()
+            .clone();
         drop(
             memory_collection
                 .maintain_at(&mut storage, &source_snapshot, instant)
                 .context("maintain Memory collection")?,
+        );
+        drop(
+            wiki_collection
+                .maintain_exact(&mut storage, &wiki_support)
+                .context("maintain Wiki collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact::<
+                    triblespace::core::collection::observed_union::ObserveStatesMapping,
+                >(wiki_observed, &wiki_support)
+                .context("maintain Wiki supersession index")?,
         );
         let observation =
             maintain_and_observe_sources_at(&mut storage, &source_snapshot, &sources, instant)?;
@@ -2984,6 +3005,18 @@ fn cmd_wake(
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;
+        let wiki_facts = observation
+            .snapshot
+            .collection_exact(wiki_collection.rank9(), &wiki_support)
+            .context("observe maintained Wiki collection")?
+            .view::<FactArchive>()
+            .context("attach maintained Wiki collection")?;
+        let wiki_order = observation
+            .snapshot
+            .collection_exact(wiki_observed, &wiki_support)
+            .context("observe maintained Wiki supersession index")?
+            .view::<triblespace::core::collection::observed_union::ObservedIndex>()
+            .context("attach maintained Wiki supersession index")?;
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
@@ -2999,7 +3032,7 @@ fn cmd_wake(
             &CoverOpts::plain(chars),
         )?;
 
-        let beliefs = wiki_model::cover_fragments(wiki.store_snapshot(), wiki.catalog())?;
+        let beliefs = wiki_model::cover_fragments(&observation.snapshot, &wiki_facts, &wiki_order)?;
         let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
 
         let mut report = String::new();
