@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -5,19 +6,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
+use faculties::clock;
 use faculties::collection_names::open_configured;
-use faculties::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
+use faculties::schemas::headspace::{
+    playground_config, DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID, KIND_CONFIG_ID, KIND_LIVE_RECORD,
+};
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict};
-use faculties::{clock, headspace};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::pile::Pile;
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
@@ -78,6 +83,18 @@ enum Command {
 struct ApiKeys {
     tavily: Option<String>,
     exa: Option<String>,
+}
+
+/// The exact immutable credential versions named by one Web-visible
+/// Headspace frontier.
+///
+/// Sets are intentional: TribleSpace does not impose attribute cardinality.
+/// Repeated values remain useful alternatives rather than invalidating the
+/// collection, while genuinely divergent frontier heads remain visible.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WebSecretVersions {
+    tavily: BTreeSet<Id>,
+    exa: BTreeSet<Id>,
 }
 
 fn main() -> Result<()> {
@@ -265,55 +282,53 @@ struct WebStorage<'a> {
     key: Option<&'a Path>,
 }
 
-struct CollectionView {
-    facts: TribleSet,
-    reader: PileSnapshot,
-}
-
 impl WebStorage<'_> {
-    fn materialize(
-        &self,
-        pile: &mut Pile,
-        signer: &SigningKey,
-        scope: Id,
-        label: &str,
-    ) -> Result<CollectionView> {
-        let collection = open_configured(pile, scope, signer.verifying_key())?;
-        let store_snapshot = pile
-            .snapshot()
-            .with_context(|| format!("freeze {label} store snapshot"))?;
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .with_context(|| format!("materialize {label} collection"))?;
-        Ok(CollectionView {
-            facts,
-            reader: store_snapshot,
-        })
-    }
-
     /// Resolve Headspace once and decrypt exactly the credential versions it
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let headspace =
-                self.materialize(&mut pile, &signer, HEADSPACE_SCOPE_ID, "Headspace")?;
+            let source = open_configured(&mut pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
+            let headspace = FactCollection::new(&mut pile, source)
+                .context("register maintained Headspace fact collection")?;
+
+            // One frozen source watermark decides which Headspace support this
+            // command may observe. Maintenance can append physical views, but
+            // cannot move that semantic boundary.
+            let before = pile
+                .snapshot()
+                .context("freeze Headspace source snapshot")?;
+            let instant = clock::now()?;
+            let support = before
+                .collection_at(headspace.source(), instant)
+                .context("observe resident Headspace collection")?
+                .support()
+                .clone();
+            drop(before);
+            drop(
+                headspace
+                    .maintain_exact(&mut pile, &support)
+                    .context("maintain Headspace fact collection")?,
+            );
+
             let secrets = vaults::discover_local_vaults(&mut pile, &signer)
                 .context("discover readable Secrets vaults")?;
-            let catalog = headspace::project_result(&headspace.reader, &headspace.facts)
-                .context("validate Headspace collection")?;
-            headspace::validate_secret_references(&catalog, secrets.snapshot())
-                .context("validate exact Headspace credential references")?;
-            let (config, _) = headspace::settled_active(&catalog)
-                .context("resolve active Headspace configuration")?;
-            if config.tavily_secret_version.is_none() && config.exa_secret_version.is_none() {
-                return Ok(ApiKeys::default());
-            }
 
-            let opened = headspace::open_active_secrets(&catalog, secrets.snapshot(), &signer)?;
+            // Secrets discovery owns a later immutable pile snapshot. Attach
+            // the exact maintained Headspace support through that same world,
+            // then project only the facts Web actually consumes.
+            let reader = secrets.snapshot().store_snapshot();
+            let facts = reader
+                .collection_exact(headspace.rank9(), &support)
+                .context("attach maintained Headspace collection")?
+                .view::<FactArchive>()
+                .context("read maintained Headspace collection")?;
+            let versions = web_secret_versions(&facts)?;
+
             Ok(ApiKeys {
-                tavily: opened.tavily_api_key,
-                exa: opened.exa_api_key,
+                tavily: open_web_secret(&secrets, &signer, &versions.tavily, "Tavily")?,
+                exa: open_web_secret(&secrets, &signer, &versions.exa, "Exa")?,
             })
         })();
         finish_pile(pile, result, "credential read")
@@ -329,6 +344,102 @@ impl WebStorage<'_> {
             .context("commit Web observation")
             .map(|_| ());
         finish_pile(pile, result, "observation write")
+    }
+}
+
+/// Query the current Headspace Web-credential projection without loading a
+/// second catalog beside TribleSpace.
+///
+/// A snapshot participates when its two type tags are present and decodable.
+/// Additional facts are open-world annotations. Entity ids are opaque: the
+/// projection never reconstructs or validates an intrinsic root. The only
+/// cross-row semantic retained here is Headspace's explicit supersession DAG;
+/// concurrent heads may agree on this Web-specific projection, while a real
+/// credential fork is surfaced rather than arbitrated by arrival order.
+fn web_secret_versions<P>(facts: &P) -> Result<WebSecretVersions>
+where
+    P: TriblePattern + ?Sized,
+{
+    let configs = find!(
+        id: Id,
+        pattern!(facts, [{ ?id @
+            metadata::tag: KIND_LIVE_RECORD,
+            metadata::tag: KIND_CONFIG_ID,
+        }])
+    )
+    .collect::<BTreeSet<_>>();
+    if configs.is_empty() {
+        return Ok(WebSecretVersions::default());
+    }
+
+    let superseded = find!(
+        (successor: Id, predecessor: Id),
+        pattern!(facts, [{ ?successor @ metadata::supersedes: ?predecessor }])
+    )
+    .filter_map(|(successor, predecessor)| {
+        (configs.contains(&successor) && configs.contains(&predecessor)).then_some(predecessor)
+    })
+    .collect::<BTreeSet<_>>();
+
+    let mut frontier = configs.difference(&superseded).copied();
+    let Some(first) = frontier.next() else {
+        bail!("Headspace Web credential track has no current state");
+    };
+    let selected = web_secret_versions_at(facts, first);
+    for head in frontier {
+        if web_secret_versions_at(facts, head) != selected {
+            bail!("Headspace Web credential configuration is forked");
+        }
+    }
+    Ok(selected)
+}
+
+fn web_secret_versions_at<P>(facts: &P, config: Id) -> WebSecretVersions
+where
+    P: TriblePattern + ?Sized,
+{
+    WebSecretVersions {
+        tavily: find!(
+            version: Id,
+            pattern!(facts, [{ config @ playground_config::tavily_secret_version: ?version }])
+        )
+        .collect(),
+        exa: find!(
+            version: Id,
+            pattern!(facts, [{ config @ playground_config::exa_secret_version: ?version }])
+        )
+        .collect(),
+    }
+}
+
+/// Open the first usable exact credential reference in canonical id order.
+///
+/// Repeated attribute values are alternatives, not a cardinality error. A
+/// reference that is absent from this local Secrets view therefore does not
+/// mask another usable reference asserted on the same Headspace state.
+fn open_web_secret(
+    secrets: &vaults::VaultDiscovery,
+    signer: &SigningKey,
+    versions: &BTreeSet<Id>,
+    role: &str,
+) -> Result<Option<String>> {
+    let mut failures = Vec::new();
+    for version in versions {
+        match secrets.snapshot().open(*version, signer) {
+            Ok(plaintext) => match String::from_utf8(plaintext) {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) => failures.push(format!("{version:x}: not UTF-8 ({error})")),
+            },
+            Err(error) => failures.push(format!("{version:x}: {error:#}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(None)
+    } else {
+        bail!(
+            "no referenced {role} Secrets version is locally usable: {}",
+            failures.join("; ")
+        )
     }
 }
 
@@ -652,10 +763,28 @@ mod tests {
     use std::fs::File;
 
     use hifitime::Epoch;
-    use triblespace::macros::{find, pattern};
 
     use super::*;
     use faculties::storage::{initialize_signer, open_pile_strict};
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn config_fragment(
+        id: Id,
+        predecessor: Option<Id>,
+        tavily: Option<Id>,
+        exa: Option<Id>,
+    ) -> Fragment {
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &KIND_LIVE_RECORD,
+            metadata::tag: &KIND_CONFIG_ID,
+            metadata::supersedes?: predecessor,
+            playground_config::tavily_secret_version?: tavily,
+            playground_config::exa_secret_version?: exa,
+        }
+    }
 
     #[test]
     fn cli_exposes_one_fixed_collection_without_legacy_coordinates() {
@@ -693,6 +822,46 @@ mod tests {
         .unwrap();
         assert_eq!(keys.tavily.as_deref(), Some("explicit-tavily-key"));
         assert!(keys.exa.is_none());
+    }
+
+    #[test]
+    fn web_credential_projection_uses_opaque_ids_and_the_current_frontier() {
+        let old = id(0x91);
+        let current = id(0x92);
+        let old_tavily = id(0x93);
+        let current_tavily = id(0x94);
+        let current_exa = id(0x95);
+        let mut fragment = config_fragment(old, None, Some(old_tavily), None);
+        fragment += config_fragment(current, Some(old), Some(current_tavily), Some(current_exa));
+
+        let projected = web_secret_versions(fragment.facts()).unwrap();
+        assert_eq!(projected.tavily, BTreeSet::from([current_tavily]));
+        assert_eq!(projected.exa, BTreeSet::from([current_exa]));
+    }
+
+    #[test]
+    fn repeated_credential_values_are_alternatives_not_a_cardinality_error() {
+        let config = id(0xa1);
+        let first = id(0xa2);
+        let second = id(0xa3);
+        let mut fragment = config_fragment(config, None, Some(first), None);
+        fragment += entity! { ExclusiveId::force_ref(&config) @
+            playground_config::tavily_secret_version: &second,
+        };
+
+        let projected = web_secret_versions(fragment.facts()).unwrap();
+        assert_eq!(projected.tavily, BTreeSet::from([first, second]));
+    }
+
+    #[test]
+    fn divergent_web_credential_frontiers_remain_visible() {
+        let mut fragment = config_fragment(id(0xb1), None, Some(id(0xb2)), None);
+        fragment += config_fragment(id(0xb3), None, Some(id(0xb4)), None);
+
+        assert!(web_secret_versions(fragment.facts())
+            .unwrap_err()
+            .to_string()
+            .contains("forked"));
     }
 
     #[test]
@@ -768,12 +937,18 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection =
+        let source =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let (facts, _) =
-            faculties::storage::read_fact_collection(collection, &store_snapshot).unwrap();
+        let collection = FactCollection::new(&mut pile, source).unwrap();
+        let before = pile.snapshot().unwrap();
+        let instant = clock::now().unwrap();
+        let store_snapshot = collection.maintain_at(&mut pile, &before, instant).unwrap();
+        let facts = store_snapshot
+            .collection_at(collection.rank9(), instant)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
         assert_eq!(
             find!(
                 (entity: Id),
