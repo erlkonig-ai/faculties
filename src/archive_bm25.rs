@@ -278,12 +278,8 @@ fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<Projectio
 
 /// Validate one block and report whether it is Archive's canonical bottom.
 fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<bool, String> {
-    let identity = [
-        schema::block::previous.id(),
-        schema::block::timestamp.id(),
-        schema::block::contains.id(),
-    ];
-    let nonidentity = [metadata::tag.id()];
+    let identity = [schema::block::previous.id(), schema::block::contains.id()];
+    let nonidentity = [metadata::tag.id(), schema::block::timestamp.id()];
     validate_intrinsic_entity(entity, rows, schema::block::KIND, &identity, &nonidentity)?;
 
     let previous = values(rows, schema::block::previous.id());
@@ -291,10 +287,7 @@ fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<bool, Stri
         parse_id(*raw, "block previous")?;
     }
     let timestamps = values(rows, schema::block::timestamp.id());
-    if timestamps.len() > 1 {
-        return Err(format!("Archive block {entity:X} has multiple timestamps"));
-    }
-    if let Some(raw) = timestamps.first() {
+    for raw in &timestamps {
         NsTAIInterval::validate(Inline::new(*raw))
             .map_err(|_| format!("Archive block {entity:X} has an invalid timestamp"))?;
     }
