@@ -134,12 +134,14 @@ where
                 metadata::updated_at: ?updated_at,
         }])
     )
-    .map(|(id, device, priority, updated_at)| RouteRow {
-        id,
-        channel: channel.to_owned(),
-        device,
-        priority,
-        updated_at,
+    .filter_map(|(id, device, priority, updated_at)| {
+        (updated_at.0 == updated_at.1).then(|| RouteRow {
+            id,
+            channel: channel.to_owned(),
+            device,
+            priority,
+            updated_at,
+        })
     })
     .collect()
 }
@@ -239,6 +241,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].device, "Reachy");
         assert_eq!(rows[1].device, "MacBook");
+
+        let non_point = (Epoch::from_tai_seconds(4.0), Epoch::from_tai_seconds(5.0))
+            .try_to_inline()
+            .unwrap();
+        let invalid = route_record(CHANNEL_SHOUT, "Time warp", 0_u64.to_inline(), non_point);
+        assert!(route_rows(invalid.facts(), CHANNEL_SHOUT).is_empty());
     }
 
     #[test]
