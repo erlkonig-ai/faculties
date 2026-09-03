@@ -23,7 +23,7 @@
 //! old records remain additive history; operators initialize a fresh
 //! policy-era vault and supply the credentials again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anybytes::View;
@@ -267,7 +267,7 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
         let mut unsupported_non_root_commits = 0usize;
         let mut skipped_merges = 0usize;
         let mut skipped_derives = 0usize;
-        let mut expected = BTreeMap::new();
+        let mut expected = BTreeSet::new();
 
         for record in source {
             match record {
@@ -283,7 +283,7 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
                     source_commits += 1;
                     let successor =
                         CollectionCommit::sign(signer, spec.new, commit.data(), commit.metadata());
-                    expected.insert(successor.id(), successor);
+                    expected.insert(successor);
                 }
                 CollectionRecord::Merge(_) => skipped_merges += 1,
                 CollectionRecord::Derive(_) => skipped_derives += 1,
@@ -291,29 +291,17 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
         }
 
         let target = records.get(&spec.new).map(Vec::as_slice).unwrap_or(&[]);
-        let mut target_by_id = BTreeMap::new();
-        let mut target_commits = 0usize;
+        let mut target_commits = BTreeSet::new();
         for record in target {
-            if matches!(record, CollectionRecord::Commit(_)) {
-                target_commits += 1;
+            if let CollectionRecord::Commit(commit) = record {
+                target_commits.insert(*commit);
             }
-            target_by_id.insert(record.id(), *record);
         }
 
-        let mut missing = Vec::new();
-        for commit in expected.values() {
-            match target_by_id.get(&commit.id()) {
-                Some(CollectionRecord::Commit(existing)) if existing == commit => {}
-                Some(_) => {
-                    bail!(
-                        "collection-record id {} collides while re-seating {}",
-                        commit.id(),
-                        spec.name,
-                    );
-                }
-                None => missing.push(*commit),
-            }
-        }
+        let missing = expected
+            .difference(&target_commits)
+            .copied()
+            .collect::<Vec<_>>();
 
         let summary = RootReseat {
             scope: spec.scope,
@@ -323,7 +311,7 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
             source_records: source.len(),
             source_commits,
             target_records: target.len(),
-            target_commits,
+            target_commits: target_commits.len(),
             missing_commits: missing.len(),
             invalid_commits,
             unsupported_non_root_commits,
@@ -454,7 +442,6 @@ pub fn publish_path(pile: &Path, key: Option<&Path>) -> Result<CollectionPolicyR
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::fs::{self, File};
 
     use super::*;

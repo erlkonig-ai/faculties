@@ -62,7 +62,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{
+    Collection, CollectionCommit, CollectionRecord, CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
@@ -2244,11 +2246,13 @@ fn validate_scan_commits(
     let mut scan_commits = BTreeMap::<Id, usize>::new();
     for commit in commits {
         let handle = inlineencodings::Handle::<SimpleArchive>::from_hash(commit.data());
-        let blob: Blob<SimpleArchive> = reader
-            .get(handle)
-            .with_context(|| format!("read Posture scan COMMIT {}", fmt_id(commit.id())))?;
-        let facts = TribleSet::try_from_blob(blob)
-            .with_context(|| format!("decode Posture scan COMMIT {}", fmt_id(commit.id())))?;
+        let fingerprint = CollectionRecord::Commit(*commit).fingerprint();
+        let blob: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
+            format!("read Posture scan COMMIT record fingerprint {fingerprint}")
+        })?;
+        let facts = TribleSet::try_from_blob(blob).with_context(|| {
+            format!("decode Posture scan COMMIT record fingerprint {fingerprint}")
+        })?;
         let scan = find!(
             scan: Id,
             pattern!(&facts, [{ ?scan @ metadata::tag: (&KIND_SCAN) }])

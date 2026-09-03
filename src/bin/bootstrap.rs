@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
+use triblespace::core::collection::CollectionRecord;
 
 #[derive(Parser)]
 #[command(
@@ -38,7 +39,13 @@ fn main() -> Result<()> {
 
     let report = faculties::bootstrap::import(&cli.pile, cli.key.as_deref())?;
     println!("bootstrap generation {}", hex::encode(report.generation));
-    println!("wiki COMMIT {:x}", report.wiki_commit.id());
-    println!("compass COMMIT {:x}", report.compass_commit.id());
+    println!(
+        "wiki COMMIT record fingerprint {}",
+        CollectionRecord::Commit(report.wiki_commit).fingerprint()
+    );
+    println!(
+        "compass COMMIT record fingerprint {}",
+        CollectionRecord::Commit(report.compass_commit).fingerprint()
+    );
     Ok(())
 }

@@ -536,7 +536,7 @@ where
                     None,
                     format!(
                         "access-inbox record fingerprint {} metadata: {error}",
-                        commit.fingerprint()
+                        CollectionRecord::Commit(commit).fingerprint()
                     ),
                 ));
                 continue;
@@ -551,7 +551,7 @@ where
                 None,
                 format!(
                     "access-inbox record fingerprint {} metadata: {error}",
-                    commit.fingerprint()
+                    CollectionRecord::Commit(commit).fingerprint()
                 ),
             ));
             continue;
@@ -568,7 +568,7 @@ where
                     None,
                     format!(
                         "access-inbox record fingerprint {} data: {error}",
-                        commit.fingerprint()
+                        CollectionRecord::Commit(commit).fingerprint()
                     ),
                 ));
                 continue;
@@ -585,7 +585,7 @@ where
                     None,
                     format!(
                         "access-inbox record fingerprint {} data: {error}",
-                        commit.fingerprint()
+                        CollectionRecord::Commit(commit).fingerprint()
                     ),
                 ));
                 continue;

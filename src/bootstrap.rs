@@ -482,8 +482,8 @@ pub fn generation() -> [u8; 32] {
 /// Import one locally authored Wiki root and one locally authored Compass root.
 ///
 /// The pile and durable key must already exist. Both fragments are constructed
-/// completely before publication. Replaying with the same key is
-/// content-addressed and yields the same two content COMMIT ids.
+/// completely before publication. Replaying with the same key yields the same
+/// two exact signed COMMIT records.
 pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
@@ -599,11 +599,8 @@ mod tests {
         let left = imported("left");
         let right = imported("right");
         assert_eq!(left.report.generation, right.report.generation);
-        assert_ne!(left.report.wiki_commit.id(), right.report.wiki_commit.id());
-        assert_ne!(
-            left.report.compass_commit.id(),
-            right.report.compass_commit.id()
-        );
+        assert_ne!(left.report.wiki_commit, right.report.wiki_commit);
+        assert_ne!(left.report.compass_commit, right.report.compass_commit);
 
         let (left_wiki, left_compass) = views(&left);
         let (right_wiki, right_compass) = views(&right);
@@ -659,8 +656,8 @@ mod tests {
         let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
-        assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
-        assert_eq!(first.compass_commit.id(), second.compass_commit.id());
+        assert_eq!(first.wiki_commit, second.wiki_commit);
+        assert_eq!(first.compass_commit, second.compass_commit);
         assert_eq!(
             bytes_before, bytes_after,
             "exact replay must not grow the pile"
@@ -737,8 +734,8 @@ mod tests {
         let upgraded = import(&pile_path, Some(&key_path)).unwrap();
         let bytes_after_upgrade = std::fs::metadata(&pile_path).unwrap().len();
         let replay = import(&pile_path, Some(&key_path)).unwrap();
-        assert_eq!(upgraded.wiki_commit.id(), replay.wiki_commit.id());
-        assert_eq!(upgraded.compass_commit.id(), replay.compass_commit.id());
+        assert_eq!(upgraded.wiki_commit, replay.wiki_commit);
+        assert_eq!(upgraded.compass_commit, replay.compass_commit);
         assert_eq!(
             bytes_after_upgrade,
             std::fs::metadata(&pile_path).unwrap().len()
@@ -925,7 +922,7 @@ mod tests {
         let first = import(&imported.pile, Some(&imported.key)).unwrap();
         let bytes = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
-        assert_eq!(first.wiki_commit.id(), second.wiki_commit.id());
+        assert_eq!(first.wiki_commit, second.wiki_commit);
         assert_eq!(bytes, std::fs::metadata(&imported.pile).unwrap().len());
 
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();

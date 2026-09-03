@@ -2465,7 +2465,7 @@ mod tests {
             let second = store
                 .commit(collection, signer, file)
                 .context("second replay")?;
-            assert_eq!(first.id(), second.id());
+            assert_eq!(first, second);
             Ok(())
         })
         .unwrap();
