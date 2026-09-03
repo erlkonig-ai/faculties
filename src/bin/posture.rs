@@ -38,9 +38,9 @@ use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::decide::{self, Resolution};
 #[cfg(test)]
-use faculties::posture_finding::Inner;
+use faculties::posture_finding::finding_id;
 use faculties::posture_finding::{
-    commit_message_location, finding_entity, finding_id, git_probe, Carrier, GitObjects, Location,
+    commit_message_location, finding_entity, git_probe, Carrier, GitObjects, Inner, Location,
 };
 use faculties::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
 use faculties::schemas::embeddings::{self, Embedding768};
@@ -53,21 +53,18 @@ use faculties::schemas::posture::{
 };
 #[cfg(any(feature = "local-embed", test))]
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
 use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::Blob;
-use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionRecord, CollectionStoreExt,
-};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -1880,31 +1877,93 @@ struct PostureStorage<'a> {
     key: Option<&'a Path>,
 }
 
-#[derive(Debug)]
 struct CollectionView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 impl PostureStorage<'_> {
     fn load_scope(&self, scope: Id, label: &str) -> Result<CollectionView> {
+        self.load_scopes(&[(scope, label)])?
+            .pop()
+            .ok_or_else(|| anyhow!("missing Posture {label} collection view"))
+    }
+
+    fn load_scopes(&self, scopes: &[(Id, &str)]) -> Result<Vec<CollectionView>> {
         // Authority is loaded before storage is touched. Ordinary reads and
         // writes never mint an identity or substitute an ephemeral signer.
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
-            let store_snapshot = pile
+            // Register every descriptor before freezing the one source
+            // boundary shared by this operation.
+            let maintained = scopes
+                .iter()
+                .map(|(scope, label)| {
+                    let collection = open_configured(&mut pile, *scope, signer.verifying_key())?;
+                    FactCollection::new(&mut pile, collection)
+                        .with_context(|| format!("register maintained Posture {label} collection"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let before = pile
                 .snapshot()
-                .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .with_context(|| format!("materialize authored Posture {label} collection"))?;
-            Ok(CollectionView {
-                facts,
-                reader: store_snapshot,
-            })
+                .context("freeze shared Posture source snapshot")?;
+            let instant = now_epoch()?;
+            for ((_, label), collection) in scopes.iter().zip(&maintained) {
+                drop(
+                    collection
+                        .maintain_at(&mut pile, &before, instant)
+                        .with_context(|| format!("maintain Posture {label} collection"))?,
+                );
+            }
+            drop(before);
+
+            // Every logical view is attached through this one immutable
+            // post-maintenance watermark.
+            let reader = pile
+                .snapshot()
+                .context("freeze maintained Posture store snapshot")?;
+            scopes
+                .iter()
+                .zip(maintained)
+                .map(|((_, label), collection)| {
+                    let facts = reader
+                        .collection_at(collection.rank9(), instant)
+                        .with_context(|| format!("observe maintained Posture {label} collection"))?
+                        .view::<FactArchive>()
+                        .with_context(|| format!("read maintained Posture {label} collection"))?;
+                    Ok(CollectionView {
+                        facts,
+                        reader: reader.clone(),
+                    })
+                })
+                .collect()
         })();
         finish_pile(pile, result)
+    }
+
+    fn scan_and_decide_views(&self) -> Result<(CollectionView, CollectionView)> {
+        let mut views = self.load_scopes(&[
+            (DEFAULT_SCAN_SCOPE_ID, "scan"),
+            (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
+        ])?;
+        let decisions = views.pop().expect("two requested Posture views");
+        let scans = views.pop().expect("two requested Posture views");
+        Ok((scans, decisions))
+    }
+
+    fn policy_scan_and_decide_views(
+        &self,
+    ) -> Result<(CollectionView, CollectionView, CollectionView)> {
+        let mut views = self.load_scopes(&[
+            (DEFAULT_POLICY_SCOPE_ID, "policy"),
+            (DEFAULT_SCAN_SCOPE_ID, "scan"),
+            (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
+        ])?;
+        let decisions = views.pop().expect("three requested Posture views");
+        let scans = views.pop().expect("three requested Posture views");
+        let policy = views.pop().expect("three requested Posture views");
+        Ok((policy, scans, decisions))
     }
 
     /// The signed COMMITs this key authored in `scope`. Tests use it to check
@@ -1932,21 +1991,18 @@ impl PostureStorage<'_> {
     }
 
     fn policy_view(&self) -> Result<CollectionView> {
-        let view = self.load_scope(DEFAULT_POLICY_SCOPE_ID, "policy")?;
-        validate_policy_view(&view)?;
-        Ok(view)
+        self.load_scope(DEFAULT_POLICY_SCOPE_ID, "policy")
     }
 
-    /// Reads do not validate. See [`validate_scan_commits`].
+    /// Scans are queried as open-world observations; publication is already
+    /// one atomic collection COMMIT by construction.
     fn scan_view(&self) -> Result<CollectionView> {
         self.load_scope(DEFAULT_SCAN_SCOPE_ID, "scan")
     }
 
+    #[cfg(test)]
     fn decide_view(&self) -> Result<CollectionView> {
-        let view = self.load_scope(DEFAULT_DECIDE_SCOPE_ID, "Decide")?;
-        decide::validate_catalog(&view.reader, &view.facts)
-            .context("validate authored Decide collection")?;
-        Ok(view)
+        self.load_scope(DEFAULT_DECIDE_SCOPE_ID, "Decide")
     }
 
     fn publish_policy(
@@ -1957,10 +2013,7 @@ impl PostureStorage<'_> {
         self.with_store(
             DEFAULT_POLICY_SCOPE_ID,
             "policy",
-            |pile, collection, signer, current, reader, _| {
-                faculties::posture_policy::validate_policy_catalog_union(
-                    reader, current, &fragment,
-                )?;
+            |pile, collection, signer| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Posture policy fragment")
@@ -1969,24 +2022,11 @@ impl PostureStorage<'_> {
     }
 
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
-        self.with_store(
-            DEFAULT_SCAN_SCOPE_ID,
-            "scan",
-            |pile, collection, signer, _current, reader, commits| {
-                let scan = validate_scan_commit_fragment(fragment.facts())?;
-                validate_scan_commits(reader, commits, scan)?;
-                let mut staged_blobs = fragment.blobs().clone();
-                let staged = staged_blobs
-                    .snapshot()
-                    .context("snapshot staged Posture scan payloads")?;
-                // Only the fragment being written is validated. The accumulated
-                // past is not re-judged against today's schema.
-                validate_scan_catalog_with(reader, Some(&staged), fragment.facts())?;
-                fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Posture scan fragment")
-            },
-        )
+        self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
+            fragment.describe_with(entity! { metadata::description: description.to_owned() });
+            pile.commit(collection, signer, fragment)
+                .context("commit authored Posture scan fragment")
+        })
     }
 
     fn with_store<T>(
@@ -1997,22 +2037,14 @@ impl PostureStorage<'_> {
             &mut Pile,
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
-            &TribleSet,
-            &PileSnapshot,
-            &[CollectionCommit],
         ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
-            let reader = pile
-                .snapshot()
-                .with_context(|| format!("freeze authored Posture {label} store snapshot"))?;
-            let (facts, _, commits) =
-                faculties::storage::read_fact_collection_with_commits(collection, &reader)
-                    .with_context(|| format!("materialize authored Posture {label} collection"))?;
-            operation(&mut pile, collection, &signer, &facts, &reader, &commits)
+            operation(&mut pile, collection, &signer)
+                .with_context(|| format!("publish Posture {label} fragment"))
         })();
         finish_pile(pile, result)
     }
@@ -2101,6 +2133,7 @@ fn sighting_entity(fragment: &mut Fragment, finding: Id, document: Id, found: &F
     id
 }
 
+#[cfg(test)]
 fn entity_attributes(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
     facts
         .iter()
@@ -2109,6 +2142,7 @@ fn entity_attributes(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
         .collect()
 }
 
+#[cfg(test)]
 fn require_attributes(
     facts: &TribleSet,
     entity: Id,
@@ -2132,6 +2166,7 @@ fn require_attributes(
     Ok(())
 }
 
+#[cfg(test)]
 fn entity_tags(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
     find!(
         tag: Id,
@@ -2140,6 +2175,7 @@ fn entity_tags(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
     .collect()
 }
 
+#[cfg(test)]
 fn inline_u256_to_u128(value: Inline<inlineencodings::U256BE>) -> Result<u128> {
     if value.raw[..16].iter().any(|byte| *byte != 0) {
         bail!("Posture count exceeds u128");
@@ -2149,137 +2185,7 @@ fn inline_u256_to_u128(value: Inline<inlineencodings::U256BE>) -> Result<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-fn text_attribute_ids() -> HashSet<Id> {
-    [
-        posture::channel_name.id(),
-        posture::term.id(),
-        posture::why.id(),
-        posture::path.id(),
-        posture::locator.id(),
-        posture::value.id(),
-        posture::carrier.id(),
-        posture::evidence.id(),
-        posture::seen_in.id(),
-        posture::target.id(),
-        posture::detail.id(),
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn read_text_with<R>(
-    reader: &PileSnapshot,
-    staged: Option<&R>,
-    handle: TextHandle,
-    field: &str,
-) -> Result<String>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    if let Some(staged) = staged {
-        if staged
-            .metadata(handle)
-            .with_context(|| format!("inspect staged Posture {field} payload"))?
-            .is_some()
-        {
-            let value: View<str> = staged
-                .get(handle)
-                .with_context(|| format!("decode staged Posture {field} payload"))?;
-            return Ok(value.to_string());
-        }
-    }
-    read_text(reader, handle, field)
-}
-
-fn validate_known_payloads_with<R>(
-    reader: &PileSnapshot,
-    staged: Option<&R>,
-    facts: &TribleSet,
-) -> Result<()>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    let text_attributes = text_attribute_ids();
-    for fact in facts {
-        if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            read_text_with(reader, staged, handle, "text")
-                .with_context(|| format!("read Posture text payload for {}", fmt_id(*fact.e())))?;
-        } else if fact.a() == &embeddings::attr::embedding.id() {
-            let handle = *fact.v::<inlineencodings::Handle<Embedding768>>();
-            if let Some(staged) = staged {
-                if staged
-                    .metadata(handle)
-                    .context("inspect staged Posture embedding")?
-                    .is_some()
-                {
-                    let _: View<[f32]> = staged.get(handle).with_context(|| {
-                        format!("decode staged Posture embedding for {}", fmt_id(*fact.e()))
-                    })?;
-                    continue;
-                }
-            }
-            let _: View<[f32]> = reader.get(handle).with_context(|| {
-                format!("read existing Posture embedding for {}", fmt_id(*fact.e()))
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_policy_view(view: &CollectionView) -> Result<()> {
-    faculties::posture_policy::validate_policy_catalog(&view.reader, &view.facts)
-}
-/// Check that every signed COMMIT about to be joined by a new one is exactly
-/// one atomic scan. This runs on the WRITE path only.
-///
-/// It used to run inside `scan_view()`, which meant every read validated all
-/// history against the *current* schema and so guaranteed that any schema
-/// change broke the reader — which is exactly what happened. In an append-only
-/// store the past was valid when it was written; validation belongs in
-/// migrations and at the moment of writing, never on a read path.
-fn validate_scan_commits(
-    reader: &PileSnapshot,
-    commits: &[CollectionCommit],
-    writing: Id,
-) -> Result<()> {
-    let mut scan_commits = BTreeMap::<Id, usize>::new();
-    for commit in commits {
-        let handle = inlineencodings::Handle::<SimpleArchive>::from_hash(commit.data());
-        let fingerprint = CollectionRecord::Commit(*commit).fingerprint();
-        let blob: Blob<SimpleArchive> = reader.get(handle).with_context(|| {
-            format!("read Posture scan COMMIT record fingerprint {fingerprint}")
-        })?;
-        let facts = TribleSet::try_from_blob(blob).with_context(|| {
-            format!("decode Posture scan COMMIT record fingerprint {fingerprint}")
-        })?;
-        let scan = find!(
-            scan: Id,
-            pattern!(&facts, [{ ?scan @ metadata::tag: (&KIND_SCAN) }])
-        )
-        .collect::<BTreeSet<_>>();
-        let Ok(scan) = one_required(scan, "scan COMMIT root") else {
-            // A COMMIT with no scan root predates this shape entirely. It is
-            // history, not a fault to relitigate on every write.
-            continue;
-        };
-        *scan_commits.entry(scan).or_default() += 1;
-    }
-    if let Some((scan, count)) = scan_commits.iter().find(|(_, count)| **count != 1) {
-        bail!(
-            "scan {} is spread across {count} signed COMMITs; scans must be atomic",
-            fmt_id(*scan)
-        );
-    }
-    if scan_commits.contains_key(&writing) {
-        bail!(
-            "scan {} already has a signed COMMIT; scans must be atomic",
-            fmt_id(writing)
-        );
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
     let scans = find!(
         scan: Id,
@@ -2318,19 +2224,7 @@ fn validate_scan_commit_fragment(facts: &TribleSet) -> Result<Id> {
     Ok(scan)
 }
 
-fn validate_scan_catalog_with<R>(
-    reader: &PileSnapshot,
-    staged: Option<&R>,
-    facts: &TribleSet,
-) -> Result<()>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    validate_known_payloads_with(reader, staged, facts)?;
-    validate_scan_structure(facts)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn validate_scan_structure(facts: &TribleSet) -> Result<()> {
     let scans = find!(
         scan: Id,
@@ -3076,7 +2970,7 @@ fn parse_scan_id(raw: Option<&str>) -> Result<Option<Id>> {
         .transpose()
 }
 
-fn all_scan_ids(space: &TribleSet) -> BTreeSet<Id> {
+fn all_scan_ids<P: TriblePattern>(space: &P) -> BTreeSet<Id> {
     find!(
         scan: Id,
         pattern!(space, [{ ?scan @ metadata::tag: (&KIND_SCAN) }])
@@ -3084,7 +2978,7 @@ fn all_scan_ids(space: &TribleSet) -> BTreeSet<Id> {
     .collect()
 }
 
-fn select_scan(space: &TribleSet, requested: Option<&str>) -> Result<Option<Id>> {
+fn select_scan<P: TriblePattern>(space: &P, requested: Option<&str>) -> Result<Option<Id>> {
     if let Some(scan) = parse_scan_id(requested)? {
         if !exists!(pattern!(space, [{ (scan) @ metadata::tag: (&KIND_SCAN) }])) {
             bail!(
@@ -3155,26 +3049,80 @@ struct FindingDecisionState {
 struct Settled {
     ordinary: BTreeSet<Id>,
     justified: BTreeSet<Id>,
+    disputed: BTreeSet<Id>,
     bridges: BTreeMap<Id, BTreeSet<Id>>,
 }
 
 impl Settled {
     fn hides(&self, modality: Id, finding: Id) -> bool {
+        self.hides_any(modality, std::iter::once(finding))
+    }
+
+    fn hides_any(&self, modality: Id, findings: impl IntoIterator<Item = Id>) -> bool {
         let settled = if modality == modality::UNSAFE_ATTRIBUTE_ID {
             &self.justified
         } else {
             &self.ordinary
         };
-        settled.contains(&finding)
-            || self
-                .bridges
-                .get(&finding)
-                .is_some_and(|legacy| legacy.iter().any(|id| settled.contains(id)))
+        let expanded = findings
+            .into_iter()
+            .flat_map(|finding| {
+                std::iter::once(finding).chain(
+                    self.bridges
+                        .get(&finding)
+                        .into_iter()
+                        .flat_map(|legacy| legacy.iter().copied()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        !expanded.iter().any(|id| self.disputed.contains(id))
+            && expanded.iter().any(|id| settled.contains(id))
+    }
+}
+
+/// Find persisted entities which describe this semantic occurrence.
+///
+/// The entity id is deliberately not reconstructed. Intrinsic ids buy
+/// idempotence, but a random-id producer describing the same carrier and inner
+/// coordinate must remain query-equivalent.
+fn findings_at<P: TriblePattern>(facts: &P, modality: Id, location: &Location) -> BTreeSet<Id> {
+    let mut probe = Fragment::empty();
+    let carrier: TextHandle = probe.put(location.carrier.address().to_owned());
+    let carrier_kind = location.carrier.kind();
+    match &location.inner {
+        Inner::Field(field) => {
+            let field: TextHandle = probe.put(field.clone());
+            find!(
+                finding: Id,
+                pattern!(facts, [{
+                    ?finding @
+                    metadata::tag: (&KIND_FINDING),
+                    metadata::tag: (modality),
+                    posture::carrier_kind: (carrier_kind),
+                    posture::carrier: (carrier),
+                    posture::locator: (field)
+                }])
+            )
+            .collect()
+        }
+        Inner::Span { start, end } => find!(
+            finding: Id,
+            pattern!(facts, [{
+                ?finding @
+                metadata::tag: (&KIND_FINDING),
+                metadata::tag: (modality),
+                posture::carrier_kind: (carrier_kind),
+                posture::carrier: (carrier),
+                posture::span_start: (*start),
+                posture::span_end: (*end)
+            }])
+        )
+        .collect(),
     }
 }
 
 /// The legacy occurrence ids a migration bridged onto each finding.
-fn legacy_bridges(facts: &TribleSet) -> BTreeMap<Id, BTreeSet<Id>> {
+fn legacy_bridges<P: TriblePattern>(facts: &P) -> BTreeMap<Id, BTreeSet<Id>> {
     let mut bridges = BTreeMap::<Id, BTreeSet<Id>>::new();
     for (finding, legacy) in find!(
         (finding: Id, legacy: Id),
@@ -3198,9 +3146,9 @@ fn legacy_bridges(facts: &TribleSet) -> BTreeMap<Id, BTreeSet<Id>> {
 /// nothing. A fork or a second resolved decision with another outcome keeps
 /// the finding visible; set union therefore exposes disagreement instead of
 /// choosing a winner by time or iteration order.
-fn settled_findings(
+fn settled_findings<P: TriblePattern>(
     reader: &PileSnapshot,
-    facts: &TribleSet,
+    facts: &P,
     bridges: BTreeMap<Id, BTreeSet<Id>>,
 ) -> Result<Settled> {
     let mut states = BTreeMap::<Id, FindingDecisionState>::new();
@@ -3252,6 +3200,10 @@ fn settled_findings(
         .iter()
         .filter_map(|(finding, state)| (state.benign && !state.disputed).then_some(*finding))
         .collect();
+    let disputed = states
+        .iter()
+        .filter_map(|(finding, state)| state.disputed.then_some(*finding))
+        .collect();
     let justified = states
         .into_iter()
         .filter_map(|(finding, state)| {
@@ -3261,12 +3213,13 @@ fn settled_findings(
     Ok(Settled {
         ordinary,
         justified,
+        disputed,
         bridges,
     })
 }
 
 #[cfg(test)]
-fn benign_occurrences(reader: &PileSnapshot, facts: &TribleSet) -> Result<BTreeSet<Id>> {
+fn benign_occurrences<P: TriblePattern>(reader: &PileSnapshot, facts: &P) -> Result<BTreeSet<Id>> {
     Ok(settled_findings(reader, facts, BTreeMap::new())?.ordinary)
 }
 
@@ -3277,8 +3230,7 @@ fn cmd_list(
     all: bool,
     ids: bool,
 ) -> Result<()> {
-    let view = storage.scan_view()?;
-    let decisions = storage.decide_view()?;
+    let (view, decisions) = storage.scan_and_decide_views()?;
     let want = parse_scan_id(scan.as_deref())?;
     if let Some(scan) = want {
         if !all_scan_ids(&view.facts).contains(&scan) {
@@ -3569,7 +3521,11 @@ fn append_channel(fragment: &mut Fragment, name: &str) -> Id {
     id
 }
 
-fn channel_by_name(reader: &PileSnapshot, space: &TribleSet, raw: &str) -> Result<Option<Id>> {
+fn channel_by_name<P: TriblePattern>(
+    reader: &PileSnapshot,
+    space: &P,
+    raw: &str,
+) -> Result<Option<Id>> {
     let wanted = canonical_channel(raw)?;
     let mut matches = Vec::new();
     for (channel, name) in find!(
@@ -3578,29 +3534,17 @@ fn channel_by_name(reader: &PileSnapshot, space: &TribleSet, raw: &str) -> Resul
             ?channel @ metadata::tag: (&KIND_CHANNEL), posture::channel_name: ?name
         }])
     ) {
-        let expected = entity! {
-            metadata::tag: KIND_CHANNEL,
-            posture::channel_name: name,
-        }
-        .root()
-        .expect("canonical channel has one root");
-        if channel != expected {
-            continue;
-        }
         if read_text(reader, name, "channel name")? == wanted {
             matches.push(channel);
         }
     }
     matches.sort_unstable();
     matches.dedup();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [channel] => Ok(Some(*channel)),
-        _ => bail!(
-            "channel {wanted:?} resolves to {} identities; policy catalog is invalid",
-            matches.len()
-        ),
-    }
+    // Entity ids are opaque. Several writers may have asserted the same
+    // human-facing name under unrelated ids; choose a deterministic typed
+    // projection rather than reconstructing an intrinsic id or imposing a
+    // collection-wide cardinality constraint.
+    Ok(matches.into_iter().min())
 }
 
 #[derive(Debug)]
@@ -3610,7 +3554,7 @@ enum PolicyHead {
     Forked(Vec<Id>),
 }
 
-fn resolve_policy_head(space: &TribleSet, channel: Id) -> Result<PolicyHead> {
+fn resolve_policy_head<P: TriblePattern>(space: &P, channel: Id) -> Result<PolicyHead> {
     let revisions = find!(
         revision: Id,
         pattern!(space, [{
@@ -3671,7 +3615,7 @@ fn append_policy_revision(
     id
 }
 
-fn policy_members(space: &TribleSet, channel: Id) -> Result<(Option<Id>, BTreeSet<Id>)> {
+fn policy_members<P: TriblePattern>(space: &P, channel: Id) -> Result<(Option<Id>, BTreeSet<Id>)> {
     match resolve_policy_head(space, channel)? {
         PolicyHead::Missing => Ok((None, BTreeSet::new())),
         PolicyHead::Unique { revision, members } => Ok((Some(revision), members)),
@@ -3697,7 +3641,7 @@ fn policy_members(space: &TribleSet, channel: Id) -> Result<(Option<Id>, BTreeSe
 #[cfg(any(feature = "local-embed", test))]
 fn take_exemplars_with_body(
     reader: &PileSnapshot,
-    space: &TribleSet,
+    space: &impl TriblePattern,
     members: &mut BTreeSet<Id>,
     body: &str,
 ) -> Result<BTreeSet<Id>> {
@@ -3726,7 +3670,7 @@ fn take_exemplars_with_body(
 
 fn channel_terms(
     reader: &PileSnapshot,
-    space: &TribleSet,
+    space: &impl TriblePattern,
     channel: Id,
 ) -> Result<Vec<(String, String)>> {
     let (_, members) = policy_members(space, channel)?;
@@ -4581,11 +4525,19 @@ fn git_required(repo_path: &Path, args: &[&str]) -> Result<String> {
 
 /// The protected terms for a channel, loaded once so a sweep does not reopen the
 /// pile per repository.
+#[cfg(test)]
 fn load_channel_terms(
     storage: PostureStorage<'_>,
     channel: &str,
 ) -> Result<Option<(Id, Vec<(String, String)>)>> {
     let view = storage.policy_view()?;
+    channel_terms_from_view(&view, channel)
+}
+
+fn channel_terms_from_view(
+    view: &CollectionView,
+    channel: &str,
+) -> Result<Option<(Id, Vec<(String, String)>)>> {
     let Some(channel) = channel_by_name(&view.reader, &view.facts, channel)? else {
         return Ok(None);
     };
@@ -4595,6 +4547,7 @@ fn load_channel_terms(
     )))
 }
 
+#[cfg(test)]
 fn load_terms(storage: PostureStorage<'_>, channel: &str) -> Result<Vec<(String, String)>> {
     Ok(load_channel_terms(storage, channel)?
         .map(|(_, terms)| terms)
@@ -4627,7 +4580,8 @@ fn cmd_git(
         );
     }
     let range = revisions.join(" ");
-    let policy = load_channel_terms(storage, channel)?;
+    let (policy_view, scan_view, decisions) = storage.policy_scan_and_decide_views()?;
+    let policy = channel_terms_from_view(&policy_view, channel)?;
     let (channel_id, terms) = match policy {
         Some((channel_id, terms)) => (Some(channel_id), terms),
         None => (None, Vec::new()),
@@ -4646,11 +4600,10 @@ fn cmd_git(
     // Persist the complete audit before rendering or deciding the exit code.
     // This gives Decide a content-located finding to name and records a
     // genuinely empty audit differently from an audit never run.
-    let decisions = storage.decide_view()?;
     let settled = settled_findings(
         &decisions.reader,
         &decisions.facts,
-        legacy_bridges(&storage.scan_view()?.facts),
+        legacy_bridges(&scan_view.facts),
     )?;
     let findings = hits
         .iter()
@@ -4689,6 +4642,29 @@ fn cmd_git(
             BTreeSet::from([modality::UNSAFE_ATTRIBUTE_ID])
         },
     );
+    let protected_finding_ids = hits
+        .values()
+        .flatten()
+        .filter_map(|hit| {
+            findings_at(fragment.facts(), modality::PROTECTED_TERM, &hit.location)
+                .into_iter()
+                .min()
+                .map(|id| (hit.location.clone(), id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let unsafe_finding_ids = unsafe_attribute_hits
+        .iter()
+        .filter_map(|hit| {
+            findings_at(
+                fragment.facts(),
+                modality::UNSAFE_ATTRIBUTE_ID,
+                &hit.location,
+            )
+            .into_iter()
+            .min()
+            .map(|id| (hit.location.clone(), id))
+        })
+        .collect::<BTreeMap<_, _>>();
     storage.publish_scan(fragment, "posture git audit")?;
 
     let found = hits.values().map(Vec::len).sum::<usize>();
@@ -4698,9 +4674,9 @@ fn cmd_git(
             let kept = term_hits
                 .into_iter()
                 .filter(|hit| {
-                    !settled.hides(
+                    !settled.hides_any(
                         modality::PROTECTED_TERM,
-                        finding_id(modality::PROTECTED_TERM, &hit.location),
+                        findings_at(&scan_view.facts, modality::PROTECTED_TERM, &hit.location),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4712,9 +4688,13 @@ fn cmd_git(
     let unsafe_attribute_hits = unsafe_attribute_hits
         .into_iter()
         .filter(|hit| {
-            !settled.hides(
+            !settled.hides_any(
                 modality::UNSAFE_ATTRIBUTE_ID,
-                finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location),
+                findings_at(
+                    &scan_view.facts,
+                    modality::UNSAFE_ATTRIBUTE_ID,
+                    &hit.location,
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -4739,8 +4719,11 @@ fn cmd_git(
         for (term, term_hits) in &hits {
             println!("  {term}  ({} hit(s))", term_hits.len());
             for hit in term_hits.iter().take(4) {
-                let finding = finding_id(modality::PROTECTED_TERM, &hit.location);
-                println!("    {}  {}", fmt_id(finding), hit.display);
+                let id = protected_finding_ids
+                    .get(&hit.location)
+                    .copied()
+                    .ok_or_else(|| anyhow!("published Posture finding has no entity id"))?;
+                println!("    {}  {}", fmt_id(id), hit.display);
             }
             if term_hits.len() > 4 {
                 println!("    … {} more", term_hits.len() - 4);
@@ -4753,11 +4736,11 @@ fn cmd_git(
             unsafe_attribute_hits.len()
         );
         for hit in &unsafe_attribute_hits {
-            println!(
-                "    {}  {}",
-                fmt_id(finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location)),
-                hit.display
-            );
+            let id = unsafe_finding_ids
+                .get(&hit.location)
+                .copied()
+                .ok_or_else(|| anyhow!("published unsafe-attribute finding has no entity id"))?;
+            println!("    {}  {}", fmt_id(id), hit.display);
         }
     }
     if hits.is_empty() && unsafe_attribute_hits.is_empty() {
@@ -5553,13 +5536,15 @@ fn cmd_sweep(
     all: bool,
     history: bool,
 ) -> Result<()> {
-    let terms = load_terms(storage, channel)?;
+    let (policy_view, scan_view, decisions) = storage.policy_scan_and_decide_views()?;
+    let terms = channel_terms_from_view(&policy_view, channel)?
+        .map(|(_, terms)| terms)
+        .unwrap_or_default();
     let lexical_checked = !terms.is_empty();
-    let decisions = storage.decide_view()?;
     let settled = settled_findings(
         &decisions.reader,
         &decisions.facts,
-        legacy_bridges(&storage.scan_view()?.facts),
+        legacy_bridges(&scan_view.facts),
     )?;
 
     let mut repos = Vec::new();
@@ -5686,9 +5671,9 @@ fn cmd_sweep(
                 let kept = term_hits
                     .into_iter()
                     .filter(|hit| {
-                        !settled.hides(
+                        !settled.hides_any(
                             modality::PROTECTED_TERM,
-                            finding_id(modality::PROTECTED_TERM, &hit.location),
+                            findings_at(&scan_view.facts, modality::PROTECTED_TERM, &hit.location),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5698,9 +5683,13 @@ fn cmd_sweep(
         let unsafe_attribute_hits = unsafe_attribute_hits
             .into_iter()
             .filter(|hit| {
-                !settled.hides(
+                !settled.hides_any(
                     modality::UNSAFE_ATTRIBUTE_ID,
-                    finding_id(modality::UNSAFE_ATTRIBUTE_ID, &hit.location),
+                    findings_at(
+                        &scan_view.facts,
+                        modality::UNSAFE_ATTRIBUTE_ID,
+                        &hit.location,
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -6154,7 +6143,7 @@ mod tests {
     }
 
     #[test]
-    fn one_revision_cannot_name_two_versions_of_the_same_term() {
+    fn one_revision_preserves_parallel_annotations_of_the_same_term() {
         let store = TestStore::new();
         let mut fragment = Fragment::empty();
         let channel = append_channel(&mut fragment, "public-release");
@@ -6172,10 +6161,17 @@ mod tests {
             "ambiguous policy fixture",
         );
 
-        let error = store.storage().policy_view().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("two identities for canonical term"));
+        let view = store.storage().policy_view().unwrap();
+        assert_eq!(
+            channel_terms(&view.reader, &view.facts, channel)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("alpha".to_owned(), "old rationale".to_owned()),
+                ("alpha".to_owned(), "new rationale".to_owned()),
+            ])
+        );
     }
 
     #[test]
@@ -6297,12 +6293,9 @@ mod tests {
             ambiguous,
             "ambiguous exemplar roles",
         );
-        assert!(invalid
-            .storage()
-            .policy_view()
-            .unwrap_err()
-            .to_string()
-            .contains("two identities for canonical exemplar"));
+        let view = invalid.storage().policy_view().unwrap();
+        let (_, members) = policy_members(&view.facts, channel).unwrap();
+        assert_eq!(members, BTreeSet::from([protected, benign]));
     }
 
     #[test]
@@ -6357,8 +6350,9 @@ mod tests {
         );
         drop(view);
 
-        // The same observation signed twice is not two scans. It is one scan
-        // spread over two COMMITs, which the atomicity rule rejects.
+        // The same observation signed twice remains one payload member with
+        // two provenance fibers. Collection set semantics, not a racy
+        // check-before-append, collapse the duplicate data.
         let (files, omissions) = sample_scan_inputs();
         let (duplicate, duplicate_scan) = build_scan_fragment(
             Path::new("fixture-corpus"),
@@ -6385,11 +6379,12 @@ mod tests {
             "changing evidence under an otherwise identical header must change the Merkle root"
         );
 
-        let error = store
+        store
             .storage()
             .publish_scan(duplicate, "duplicate scan fixture")
-            .unwrap_err();
-        assert!(error.to_string().contains("scans must be atomic"));
+            .unwrap();
+        let view = store.storage().scan_view().unwrap();
+        assert_eq!(all_scan_ids(&view.facts), BTreeSet::from([scan]));
     }
 
     #[test]
@@ -6853,7 +6848,7 @@ mod tests {
         pile.close().unwrap();
 
         let view = store.storage().scan_view().unwrap();
-        assert!(view.facts.is_empty());
+        assert!(all_scan_ids(&view.facts).is_empty());
         assert!(store
             .storage()
             .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
@@ -6963,7 +6958,9 @@ mod tests {
             Some(channel)
         );
         assert_ne!(*old_channel, channel);
-        assert!(view.facts.iter().any(|fact| fact.e() == &*old_term));
+        assert!(exists!(pattern!(&view.facts, [{
+            (*old_term) @ metadata::tag: (&KIND_TERM)
+        }])));
         assert_eq!(
             channel_terms(&view.reader, &view.facts, channel).unwrap(),
             vec![("legacy-term".to_owned(), String::new())]
@@ -6976,12 +6973,11 @@ mod tests {
             unknown,
             "unrecognized policy fixture",
         );
-        assert!(store
-            .storage()
-            .policy_view()
-            .unwrap_err()
-            .to_string()
-            .contains("unrecognized entity"));
+        let view = store.storage().policy_view().unwrap();
+        assert_eq!(
+            channel_terms(&view.reader, &view.facts, channel).unwrap(),
+            vec![("legacy-term".to_owned(), String::new())]
+        );
     }
 
     #[test]
@@ -7368,6 +7364,33 @@ mod tests {
         let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
         assert!(benign.justified.contains(&occurrence));
         assert!(!benign.justified.contains(&changed_occurrence));
+    }
+
+    #[test]
+    fn finding_lookup_treats_the_entity_id_as_opaque() {
+        let location = Location::field(
+            Carrier::GitBlob("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            "src/schema.rs#attribute",
+        );
+        let mut fragment = Fragment::empty();
+        let carrier: TextHandle = fragment.put(location.carrier.address().to_owned());
+        let locator: TextHandle = match &location.inner {
+            Inner::Field(field) => fragment.put(field.clone()),
+            Inner::Span { .. } => unreachable!(),
+        };
+        let extrinsic = Id::new([0xa7; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&extrinsic) @
+            metadata::tag: KIND_FINDING,
+            metadata::tag: modality::UNSAFE_ATTRIBUTE_ID,
+            posture::carrier_kind: location.carrier.kind(),
+            posture::carrier: carrier,
+            posture::locator: locator,
+        };
+
+        assert_eq!(
+            findings_at(fragment.facts(), modality::UNSAFE_ATTRIBUTE_ID, &location,),
+            BTreeSet::from([extrinsic]),
+        );
     }
 
     #[test]
