@@ -1910,7 +1910,14 @@ mod tests {
 
         let mut observed_twice = with_42;
         observed_twice += with_43;
-        validate_catalog_structure(&observed_twice.into_facts()).unwrap();
+        let projected = source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "timestamp-observations",
+            b"{}".as_slice(),
+            observed_twice,
+        )
+        .unwrap();
+        validate_catalog_structure(&projected.into_facts()).unwrap();
     }
 
     #[test]
