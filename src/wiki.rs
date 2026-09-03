@@ -15,9 +15,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
 use triblespace::core::collection::observed_union::{
-    ObserveStatesMapping, ObservedIndex, ObservedSetCollection,
+    ObserveStatesMapping, ObservedIndex, ObservedSetBlob,
 };
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -222,7 +222,7 @@ impl WikiSnapshot {
 pub fn observed_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
-) -> Result<ObservedSetCollection>
+) -> Result<Collection<ObservedSetBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
@@ -233,7 +233,7 @@ where
         ObserveStatesMapping::new(metadata::supersedes.id()),
         crate::collection_names::private_policy(authority),
     )?;
-    Ok(ObservedSetCollection::new(source, target))
+    Ok(target)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1313,9 +1313,15 @@ pub fn materialize_indexed_collection(
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
-    let observed = observed_collection(pile, signer.verifying_key())?
-        .ensure(pile, &cover)
+    let target = observed_collection(pile, signer.verifying_key())?;
+    let maintained = pile
+        .maintain_exact::<ObserveStatesMapping>(target, &cover)
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
+    let observed = maintained
+        .collection_exact(target, &cover)
+        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+        .view::<ObservedIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
     let catalog = validate_catalog_with_order(&store_snapshot, &facts, &observed)?;
     Ok(WikiSnapshot {
         facts,

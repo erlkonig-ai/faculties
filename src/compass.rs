@@ -13,9 +13,9 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{
-    LwwIndex, LwwRegisterCollection, RegisterCoordinatesMapping,
+    LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
 };
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
@@ -68,18 +68,35 @@ impl CompassSnapshot {
 pub fn status_register_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
-) -> Result<LwwRegisterCollection>
+) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
+    status_register_for_source(store, source)
+}
+
+fn status_register_for_source<S>(
+    store: &mut S,
+    source: Collection<blobencodings::SimpleArchive>,
+) -> Result<Collection<LwwRegisterBlob>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+{
+    let snapshot = store
+        .snapshot()
+        .context("freeze Compass source policy snapshot")?;
+    let policy = source
+        .policy(&snapshot)
+        .map_err(|error| anyhow!("read Compass source collection policy: {error}"))?;
     let target = store.derive(
         source,
         RegisterCoordinatesMapping::new(board::status_of.id(), metadata::created_at.id()),
-        crate::collection_names::private_policy(authority),
+        policy,
     )?;
-    Ok(LwwRegisterCollection::new(source, target))
+    Ok(target)
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -1051,9 +1068,15 @@ pub fn materialize_indexed_collection(
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
-    let status = status_register_collection(pile, signer.verifying_key())?
-        .ensure(pile, &cover)
+    let target = status_register_collection(pile, signer.verifying_key())?;
+    let maintained = pile
+        .maintain_exact::<RegisterCoordinatesMapping>(target, &cover)
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
+    let status = maintained
+        .collection_exact(target, &cover)
+        .map_err(|error| anyhow!("observe Compass status register: {error}"))?
+        .view::<LwwIndex>()
+        .map_err(|error| anyhow!("read Compass status register: {error}"))?;
     Ok(CompassSnapshot {
         facts,
         store_snapshot,
@@ -1081,10 +1104,26 @@ pub fn commit_collection(
 mod tests {
     use super::*;
     use hifitime::Epoch;
+    use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
 
     fn at(value: i128) -> IntervalValue {
         let value = Epoch::from_unix_seconds(value as f64);
         (value, value).try_to_inline().unwrap()
+    }
+
+    #[test]
+    fn status_register_inherits_the_source_collection_policy() {
+        let mut store = MemoryRepo::default();
+        let authority = SigningKey::from_bytes(&[13; 32]).verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::delegable(authority));
+        let source = store.collection("shared-compass", policy.clone()).unwrap();
+
+        let register = status_register_for_source(&mut store, source).unwrap();
+        let snapshot = store.snapshot().unwrap();
+
+        assert_eq!(register.policy(&snapshot).unwrap(), policy,);
     }
 
     #[test]
