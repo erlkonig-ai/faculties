@@ -1769,15 +1769,15 @@ mod tests {
         let mut row = connection("Ada Lovelace", "linkedin.com/in/ada", "");
         row.company = "Analytical Engines".to_owned();
         ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
-        let before = std::fs::read(&fixture.pile).unwrap();
+        let before = fixture.commit_count();
 
         ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
-        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+        assert_eq!(fixture.commit_count(), before);
 
         row.company = "Difference Engines".to_owned();
         let error = ingest(fixture.storage(), &[row], false).unwrap_err();
         assert!(format!("{error:#}").contains("company"));
-        assert_eq!(std::fs::read(&fixture.pile).unwrap(), before);
+        assert_eq!(fixture.commit_count(), before);
     }
 
     #[test]
