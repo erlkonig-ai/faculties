@@ -38,6 +38,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::relations::{self, Head, ProfileInput};
 use faculties::schemas::linkedin;

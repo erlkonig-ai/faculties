@@ -66,7 +66,9 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::clock;
 use faculties::collection_names::open_configured;
-use faculties::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
+use faculties::schemas::voice::{
+    CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD,
+};
 use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::voice as voice_model;
 use rand_core::OsRng;
