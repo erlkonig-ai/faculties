@@ -316,7 +316,7 @@ fn with_model<T>(
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
-        let snapshot = wiki_model::query_snapshot(&mut pile, &signer)
+        let snapshot = pollster::block_on(wiki_model::query_snapshot(&mut pile, &signer))
             .context("query maintained Wiki collection")?;
         let model = GaugeModel::load(
             snapshot.store_snapshot(),

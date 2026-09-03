@@ -12,8 +12,11 @@ use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
-use faculties::secrets::{self as secrets_model, storage as vaults};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+    FactArchive, FactCollection,
+};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -150,10 +153,6 @@ struct SecretSetArgs {
     /// Exact existing Secrets version. This repairs an interrupted Secrets-first update.
     #[arg(long, conflicts_with = "value", required_unless_present = "value")]
     version: Option<String>,
-    /// Exact vault epoch receiving a newly sealed value. An existing unique
-    /// reference defaults to its version's vault.
-    #[arg(long, conflicts_with = "version")]
-    vault: Option<String>,
 }
 
 struct CollectionView {
@@ -163,7 +162,7 @@ struct CollectionView {
 
 struct Views {
     headspace: CollectionView,
-    secrets: vaults::VaultDiscovery,
+    secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 struct Storage<'a> {
@@ -193,7 +192,6 @@ impl Storage<'_> {
         let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
         let collection = FactCollection::new(pile, source)
             .context("register maintained Headspace fact collection")?;
-
         // One frozen source watermark decides the exact Headspace support.
         // Maintenance and Secrets discovery may append physical views, but
         // cannot move that semantic boundary.
@@ -201,23 +199,28 @@ impl Storage<'_> {
             .snapshot()
             .context("freeze Headspace source snapshot")?;
         let instant = clock::now()?;
+        let secrets_collection =
+            open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
         let support = before
             .collection_at(collection.source(), instant)
             .context("observe resident Headspace collection")?
             .support()
             .clone();
         drop(before);
-        drop(
-            collection
-                .maintain_exact(pile, &support)
-                .context("maintain Headspace fact collection")?,
-        );
-
-        let secrets = vaults::discover_local_vaults(pile, &self.signer)
-            .context("discover readable Secrets vaults")?;
+        let secrets = pollster::block_on(async {
+            drop(
+                collection
+                    .maintain_exact(pile, &support)
+                    .await
+                    .context("maintain Headspace fact collection")?,
+            );
+            secret_storage::ensure_and_snapshot(pile, [secrets_collection], instant)
+                .await
+                .context("ensure configured Secrets collection")
+        })?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
-        let reader = secrets.snapshot().store_snapshot().clone();
+        let reader = secrets.store_snapshot().clone();
         let facts = reader
             .collection_exact(collection.rank9(), &support)
             .context("attach maintained Headspace collection")?
@@ -227,20 +230,16 @@ impl Storage<'_> {
         Ok(Views { headspace, secrets })
     }
 
-    fn add_secret(&self, views: &Views, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
-        let location = views
-            .secrets
-            .location(vault)
-            .ok_or_else(|| anyhow!("vault {vault:x} is not ready for this signer"))?;
+    fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         let mut pile = self.pile.borrow_mut();
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        vaults::add_secret(
+        let collection = open_secrets_collection(pile, self.signer.verifying_key())?;
+        secret_storage::add_secret(
             pile,
             &self.signer,
-            location,
-            views.secrets.snapshot(),
+            collection,
             name,
             plaintext,
             point_now()?,
@@ -371,19 +370,10 @@ fn resolve_profile_selector(views: &Views, raw: &str) -> Result<Id> {
 fn parse_exact_secret(views: &Views, raw: &str, label: &str) -> Result<Id> {
     let id = Id::from_hex(raw.trim())
         .ok_or_else(|| anyhow!("{label} requires one exact 32-hex Secrets version id"))?;
-    if !views.secrets.snapshot().contains(id) {
+    if !views.secrets.contains(id) {
         bail!("unknown exact Secrets version {id:x}");
     }
     Ok(id)
-}
-
-fn parse_exact_vault(views: &Views, raw: &str) -> Result<Id> {
-    let vault = Id::from_hex(raw.trim())
-        .ok_or_else(|| anyhow!("--vault requires one exact 32-hex vault epoch id"))?;
-    if views.secrets.location(vault).is_none() {
-        bail!("vault {vault:x} is not ready for this signer");
-    }
-    Ok(vault)
 }
 
 fn publish_headspace(storage: &Storage<'_>, fragment: Fragment, description: &str) -> Result<()> {
@@ -636,15 +626,6 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
             if plaintext.is_empty() || plaintext.bytes().any(|byte| byte == 0) {
                 bail!("credential is empty or contains NUL");
             }
-            let vault = match args.vault.as_deref() {
-                Some(selector) => parse_exact_vault(&views, selector)?,
-                None => current
-                    .and_then(|id| views.secrets.snapshot().lookup(id))
-                    .map(|(vault, _)| vault)
-                    .ok_or_else(|| {
-                        anyhow!("--vault is required when the role has no predecessor version")
-                    })?,
-            };
             let config =
                 headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
             let profile = settled_config(&config)?
@@ -652,12 +633,7 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
                     anyhow!("Headspace has no active configuration; add a profile first")
                 })?
                 .active_profile;
-            let secret = storage.add_secret(
-                &views,
-                vault,
-                &secret_label(role, profile),
-                plaintext.as_bytes(),
-            )?;
+            let secret = storage.add_secret(&secret_label(role, profile), plaintext.as_bytes())?;
             eprintln!(
                 "Published exact credential {secret:x}; if Headspace publication is interrupted, retry with: headspace secret {} set --version {secret:x}",
                 role_name(role)
@@ -668,7 +644,7 @@ fn set_secret(storage: &Storage<'_>, role: SecretRole, args: &SecretSetArgs) -> 
             // dangling Headspace snapshot.
             drop(views);
             let refreshed = storage.views()?;
-            if !refreshed.secrets.snapshot().contains(secret) {
+            if !refreshed.secrets.contains(secret) {
                 bail!("published exact Secrets version {secret:x} did not materialize");
             }
             let successor = secret_successor(&refreshed, role, Some(secret))?;
@@ -733,7 +709,6 @@ fn open_secret_text(
     };
     let plaintext = views
         .secrets
-        .snapshot()
         .open(secret, &storage.signer)
         .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
     String::from_utf8(plaintext)
@@ -1035,7 +1010,7 @@ mod tests {
     fn headspace_and_secrets_share_one_final_store_snapshot() {
         let (_directory, pile, key) = fixture();
         let (storage, views) = views(&pile, &key);
-        let secrets_reader = views.secrets.snapshot().store_snapshot();
+        let secrets_reader = views.secrets.store_snapshot();
         assert!(views
             .headspace
             .reader
@@ -1113,21 +1088,11 @@ mod tests {
 
         let signer = load_signer(&pile, Some(&key)).unwrap();
         let mut store = open_pile_strict(&pile).unwrap();
-        let vault = Id::new([0x77; 16]).unwrap();
-        let location = vaults::create_vault(
+        let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
+        let version = secret_storage::add_secret(
             &mut store,
             &signer,
-            vault,
-            "headspace-test",
-            point_now().unwrap(),
-        )
-        .unwrap();
-        let discovery = vaults::discover_local_vaults(&mut store, &signer).unwrap();
-        let version = vaults::add_secret(
-            &mut store,
-            &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "hs/model/interrupted",
             b"exact",
             point_now().unwrap(),
@@ -1144,14 +1109,13 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, repaired) = views(&pile, &key);
-        assert_eq!(repaired.secrets.snapshot().vaults().len(), 1);
-        assert!(repaired.secrets.snapshot().contains(version));
+        assert_eq!(repaired.secrets.collections().len(), 1);
+        assert!(repaired.secrets.contains(version));
         let config_resolution =
             headspace::current_config(&repaired.headspace.reader, &repaired.headspace.facts)
                 .unwrap();
@@ -1174,13 +1138,12 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, replay) = views(&pile, &key);
-        assert_eq!(replay.secrets.snapshot().vaults().len(), 1);
+        assert_eq!(replay.secrets.collections().len(), 1);
         let config_resolution =
             headspace::current_config(&replay.headspace.reader, &replay.headspace.facts).unwrap();
         let config = settled_config(&config_resolution).unwrap().unwrap();

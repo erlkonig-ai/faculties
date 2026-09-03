@@ -118,8 +118,7 @@ fn with_habits<T>(
             .context("register maintained Habit fact collection")?;
         let before = pile.snapshot().context("freeze Habit source snapshot")?;
         let instant = clock::now()?;
-        let reader = maintained
-            .maintain_at(&mut pile, &before, instant)
+        let reader = pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
             .context("maintain Habit fact collection")?;
         drop(before);
         let facts = reader

@@ -41,14 +41,66 @@ use triblespace::core::collection::{
     CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::id::Id;
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::Store;
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource, StoreRead};
+use triblespace::core::repo::{
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, SnapshotSource, StoreRead,
+};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
+
+/// Open the explicitly configured Secrets policy boundary for publication.
+///
+/// `TRIBLESPACE_COLLECTION_SECRETS` selects an exact shared source descriptor;
+/// otherwise the usual signer-private `secrets` descriptor is registered.
+/// This validates descriptor identity but deliberately performs no admission
+/// check: local publication is unconditional, and WRITE admission is applied
+/// when collection snapshots admit commits.
+pub fn open_secrets_collection<S>(
+    store: &mut S,
+    subject: VerifyingKey,
+) -> Result<crate::secrets::storage::SecretsCollection>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet,
+{
+    let source =
+        crate::collection_names::open_configured(store, crate::secrets::DEFAULT_SCOPE_ID, subject)
+            .context("open configured Secrets source collection")?;
+    crate::secrets::storage::SecretsCollection::from_source(store, source)
+        .context("register maintained Secrets collection descriptors")
+}
+
+/// Open the explicitly configured Secrets policy boundary for disclosure.
+///
+/// Exact shared descriptors must admit `subject` under their READ policy
+/// before a caller may attach or decrypt the collection. An unset override
+/// still registers the ordinary signer-private `secrets` descriptor. The
+/// caller-supplied instant is reused by companion collection reads in the same
+/// logical operation.
+pub fn open_secrets_collection_read<S>(
+    store: &mut S,
+    subject: VerifyingKey,
+    instant: Epoch,
+) -> Result<crate::secrets::storage::SecretsCollection>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+{
+    let source = crate::collection_names::open_configured_read(
+        store,
+        crate::secrets::DEFAULT_SCOPE_ID,
+        subject,
+        instant,
+    )
+    .context("open configured Secrets source collection for READ")?;
+    crate::secrets::storage::SecretsCollection::from_source(store, source)
+        .context("register maintained Secrets collection descriptors")
+}
 
 /// The three typed lattice coordinates of one maintained Faculty fact collection.
 ///
@@ -119,21 +171,21 @@ impl FactCollection {
     /// later returned snapshot truthfully includes all compatible concurrent
     /// work visible after maintenance. The same foundational support crosses
     /// both mapping edges; a downstream edge never constructs its source.
-    pub fn maintain_at<S>(
+    pub async fn maintain_at<S>(
         self,
         store: &mut S,
         before: &S::Snapshot,
         instant: Epoch,
     ) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         let support = before
             .collection_at(self.source, instant)
             .context("observe resident fact collection")?
             .support()
             .clone();
-        self.maintain_exact(store, &support)
+        self.maintain_exact(store, &support).await
     }
 
     /// Maintain both derivation hops for one explicit foundational support.
@@ -141,17 +193,19 @@ impl FactCollection {
     /// This is useful when several physical views must be pinned to the same
     /// denotational support. It performs no admission or source observation of
     /// its own.
-    pub fn maintain_exact<S>(self, store: &mut S, support: &Support) -> Result<S::Snapshot>
+    pub async fn maintain_exact<S>(self, store: &mut S, support: &Support) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         drop(
             store
                 .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .await
                 .context("maintain Succinct fact collection")?,
         );
         store
             .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .await
             .context("maintain Rank9 fact collection")
     }
 }
@@ -204,10 +258,9 @@ impl TargetDiscovery {
 ///
 /// `scope` resolves the faculty's canonical name. Without an exact override,
 /// `authority` seeds the descriptor's direct READ and WRITE policies; with an
-/// override, the selected descriptor keeps its own immutable policies and the
-/// signer must already satisfy WRITE admission. The returned handle selects
-/// records. No definition registry, blob scan, or legacy pin lookup
-/// participates in target discovery.
+/// override, the selected descriptor keeps its own immutable policies. The
+/// returned handle selects records. No definition registry, blob scan, or
+/// legacy pin lookup participates in target discovery.
 pub fn discover_target<S>(
     store: &mut S,
     scope: Id,
@@ -255,16 +308,18 @@ where
 }
 
 /// Read one authorized SimpleArchive union through a caller-supplied coherent
-/// store snapshot, returning the foundational support used for maintained indexes.
+/// store snapshot and authorization instant, returning the foundational
+/// support used for maintained indexes.
 pub fn read_fact_collection<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
+    instant: Epoch,
 ) -> Result<(TribleSet, Support)>
 where
     S: StoreRead,
 {
     let support = collection
-        .admitted(snapshot)
+        .admitted_at(snapshot, instant)
         .context("discover authorized collection support")?;
     let facts = snapshot
         .collection_exact(collection, &support)
@@ -275,16 +330,17 @@ where
 }
 
 /// Read one authorized SimpleArchive union and retain the exact provenance
-/// claims selected by the same admission decision.
+/// claims selected by the same snapshot-and-instant admission decision.
 pub fn read_fact_collection_with_commits<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
+    instant: Epoch,
 ) -> Result<(TribleSet, Support, Vec<CollectionCommit>)>
 where
     S: StoreRead,
 {
     let (support, commits) = collection
-        .admitted_with_commits(snapshot)
+        .admitted_with_commits_at(snapshot, instant)
         .context("discover authorized collection support and commits")?;
     let facts = snapshot
         .collection_exact(collection, &support)
@@ -601,9 +657,8 @@ mod tests {
 
         let instant = triblespace::core::clock::epoch_now();
         let before = store.snapshot().unwrap();
-        let after = maintained
-            .maintain_at(&mut store, &before, instant)
-            .unwrap();
+        let after =
+            pollster::block_on(maintained.maintain_at(&mut store, &before, instant)).unwrap();
         let observed = after.collection_at(maintained.rank9(), instant).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
         let actual: TribleSet = view.iter().collect();

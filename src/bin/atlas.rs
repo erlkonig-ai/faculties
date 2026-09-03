@@ -80,9 +80,9 @@ impl AtlasContext {
             .snapshot()
             .context("freeze Atlas source snapshot")?;
         let instant = clock::now()?;
-        let store_snapshot = collection
-            .maintain_at(&mut self.pile, &before, instant)
-            .context("maintain Atlas fact collection")?;
+        let store_snapshot =
+            pollster::block_on(collection.maintain_at(&mut self.pile, &before, instant))
+                .context("maintain Atlas fact collection")?;
         let facts = store_snapshot
             .collection_at(collection.rank9(), instant)
             .context("observe maintained Atlas fact collection")?

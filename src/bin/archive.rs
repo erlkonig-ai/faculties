@@ -139,13 +139,17 @@ struct ReplayView {
 
 impl ArchiveStorage<'_> {
     fn load(&self) -> Result<ArchiveSnapshot> {
-        ArchiveSnapshot::load_local(self.pile, self.key, archive_schema::DEFAULT_SCOPE_ID)
+        pollster::block_on(ArchiveSnapshot::load_local(
+            self.pile,
+            self.key,
+            archive_schema::DEFAULT_SCOPE_ID,
+        ))
     }
 
     fn load_comb(&self) -> Result<FactArchive> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let source = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(&mut pile, source)
                 .context("register maintained Comb cursor collection")?;
@@ -158,13 +162,14 @@ impl ArchiveStorage<'_> {
                 .clone();
             let after = collection
                 .maintain_exact(&mut pile, &support)
+                .await
                 .context("maintain Comb cursor collection")?;
             after
                 .collection_exact(collection.rank9(), &support)
                 .context("attach exact Comb cursor collection")?
                 .view::<FactArchive>()
                 .context("read exact Comb cursor collection")
-        })();
+        });
         finish_pile(pile, result)
     }
 
@@ -177,7 +182,7 @@ impl ArchiveStorage<'_> {
     fn load_replay(&self) -> Result<ReplayView> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let archive_source = open_configured(
                 &mut pile,
                 archive_schema::DEFAULT_SCOPE_ID,
@@ -203,6 +208,7 @@ impl ArchiveStorage<'_> {
             drop(
                 comb_collections
                     .maintain_exact(&mut pile, &comb_support)
+                    .await
                     .context("maintain Comb cursor collection")?,
             );
             let archive = ArchiveSnapshot::maintain_from(
@@ -211,7 +217,8 @@ impl ArchiveStorage<'_> {
                 archive_schema::DEFAULT_SCOPE_ID,
                 &before,
                 instant,
-            )?;
+            )
+            .await?;
             let comb_facts = archive
                 .store_snapshot()
                 .collection_exact(comb_collections.rank9(), &comb_support)
@@ -222,7 +229,7 @@ impl ArchiveStorage<'_> {
                 archive,
                 comb_facts,
             })
-        })();
+        });
         finish_pile(pile, result)
     }
 }
@@ -279,7 +286,7 @@ fn run_import_all(
     if source == ImportSource::Codex {
         // The batch case that matters: 3,161 refused Codex rollouts, and the
         // open is ~9.3 s against ~1 s of projection. One open, N commits.
-        let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
         let result = (|| {
             for (index, path) in paths.iter().enumerate() {
                 eprintln!("[{}/{total}] {}", index + 1, path.display());
@@ -310,7 +317,7 @@ fn run_import(storage: ArchiveStorage<'_>, path: &Path, source: ImportSource) ->
 }
 
 fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_agy::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -322,7 +329,7 @@ fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
 }
 
 fn run_chatgpt_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_chatgpt::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -334,7 +341,7 @@ fn run_chatgpt_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
 }
 
 fn run_claude_code_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_claude_code::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -346,7 +353,7 @@ fn run_claude_code_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()
 }
 
 fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let result = run_codex_into(&mut writer, path);
     writer.close(result)
 }
@@ -369,7 +376,7 @@ fn run_codex_into(writer: &mut ArchiveImportWriter, path: &Path) -> Result<()> {
 
 #[allow(dead_code)]
 fn run_codex_import_legacy(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_codex::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -381,7 +388,7 @@ fn run_codex_import_legacy(storage: ArchiveStorage<'_>, path: &Path) -> Result<(
 }
 
 fn run_claude_web_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_claude_web::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -393,7 +400,7 @@ fn run_claude_web_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()>
 }
 
 fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_copilot::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -405,7 +412,7 @@ fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
 }
 
 fn run_gemini_import(storage: ArchiveStorage<'_>, path: &Path) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
+    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
     let projection = archive_gemini::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -901,7 +908,10 @@ fn run_thread(storage: ArchiveStorage<'_>, prefix: &str, limit: usize) -> Result
 
 fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<()> {
     let text = faculties::text_arg(text, "search text")?;
-    let search = ArchiveSearchSnapshot::ensure_local(storage.pile, storage.key)?;
+    let search = pollster::block_on(ArchiveSearchSnapshot::ensure_local(
+        storage.pile,
+        storage.key,
+    ))?;
     for hit in search.search(&text, limit)? {
         let block = search.archive().block(hit.block)?;
         println!(
@@ -917,8 +927,11 @@ fn run_search(storage: ArchiveStorage<'_>, text: &str, limit: usize) -> Result<(
 }
 
 fn run_index(storage: ArchiveStorage<'_>) -> Result<()> {
-    let succinct = archive_collection::ensure_succinct_index(storage.pile, storage.key)?;
-    let bm25 = archive_collection::ensure_bm25_index(storage.pile, storage.key)?;
+    let (succinct, bm25) = pollster::block_on(async {
+        let succinct = archive_collection::ensure_succinct_index(storage.pile, storage.key).await?;
+        let bm25 = archive_collection::ensure_bm25_index(storage.pile, storage.key).await?;
+        Ok::<_, anyhow::Error>((succinct, bm25))
+    })?;
     println!(
         "Archive: {} authored commit(s), {} distinct source element(s) covered by raw-Succinct",
         succinct.source_commits, succinct.source_elements,
@@ -1466,8 +1479,11 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &source, ImportSource::ClaudeCode).unwrap();
-        let first =
-            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        let first = pollster::block_on(archive_collection::ensure_succinct_index(
+            &fixture.pile,
+            Some(&fixture.key),
+        ))
+        .unwrap();
         assert_eq!(first.source_commits, 1);
         assert_eq!(first.source_elements, 1);
         assert_ne!(first.source_collection, first.target_collection);
@@ -1484,26 +1500,39 @@ mod tests {
             1
         );
         drop(archive);
-        let repeated =
-            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        let repeated = pollster::block_on(archive_collection::ensure_succinct_index(
+            &fixture.pile,
+            Some(&fixture.key),
+        ))
+        .unwrap();
         assert_eq!(repeated, first);
 
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
 
-        let first_bm25 =
-            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        let first_bm25 = pollster::block_on(archive_collection::ensure_bm25_index(
+            &fixture.pile,
+            Some(&fixture.key),
+        ))
+        .unwrap();
         assert_eq!(first_bm25.source_commits, 1);
         assert_eq!(first_bm25.source_elements, 1);
         assert_eq!(first_bm25.cover_segments, 1);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
-            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap(),
+            pollster::block_on(archive_collection::ensure_bm25_index(
+                &fixture.pile,
+                Some(&fixture.key),
+            ))
+            .unwrap(),
             first_bm25
         );
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_bm25);
 
-        let search =
-            ArchiveSearchSnapshot::ensure_local(&fixture.pile, Some(&fixture.key)).unwrap();
+        let search = pollster::block_on(ArchiveSearchSnapshot::ensure_local(
+            &fixture.pile,
+            Some(&fixture.key),
+        ))
+        .unwrap();
         let hits = search.search("quasar", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].projections, [id]);

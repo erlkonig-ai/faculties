@@ -252,89 +252,95 @@ impl WikiStorage<'_> {
 
     fn views(&self, scopes: &[(Id, &str)]) -> Result<(WikiView, Vec<FactArchive>)> {
         self.with_pile(|pile, signer| {
-            let authority = signer.verifying_key();
-            let wiki_source = open_configured(pile, schema::DEFAULT_SCOPE_ID, authority)?;
-            let wiki_facts = FactCollection::new(pile, wiki_source)
-                .context("register maintained Wiki fact collection")?;
-            let observed = wiki_model::observed_collection(pile, authority)?;
-            let mut auxiliaries = Vec::with_capacity(scopes.len());
-            for &(scope, label) in scopes {
-                let source = open_configured(pile, scope, authority)?;
-                let facts = FactCollection::new(pile, source)
-                    .with_context(|| format!("register maintained {label} fact collection"))?;
-                auxiliaries.push((source, facts, label));
-            }
-            let before = pile
-                .snapshot()
-                .context("freeze Wiki and auxiliary source snapshot")?;
-            let instant = clock::now()?;
+            pollster::block_on(async {
+                let authority = signer.verifying_key();
+                let wiki_source = open_configured(pile, schema::DEFAULT_SCOPE_ID, authority)?;
+                let wiki_facts = FactCollection::new(pile, wiki_source)
+                    .context("register maintained Wiki fact collection")?;
+                let observed = wiki_model::observed_collection(pile, authority)?;
+                let mut auxiliaries = Vec::with_capacity(scopes.len());
+                for &(scope, label) in scopes {
+                    let source = open_configured(pile, scope, authority)?;
+                    let facts = FactCollection::new(pile, source)
+                        .with_context(|| format!("register maintained {label} fact collection"))?;
+                    auxiliaries.push((source, facts, label));
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze Wiki and auxiliary source snapshot")?;
+                let instant = clock::now()?;
 
-            let wiki_support = before
-                .collection_at(wiki_source, instant)
-                .context("observe resident Wiki source collection")?
-                .support()
-                .clone();
-            let auxiliary_supports = auxiliaries
-                .iter()
-                .map(|(source, _, label)| {
-                    before
-                        .collection_at(*source, instant)
-                        .with_context(|| format!("observe resident {label} source collection"))
-                        .map(|snapshot| snapshot.support().clone())
-                })
-                .collect::<Result<Vec<Support>>>()?;
+                let wiki_support = before
+                    .collection_at(wiki_source, instant)
+                    .context("observe resident Wiki source collection")?
+                    .support()
+                    .clone();
+                let auxiliary_supports = auxiliaries
+                    .iter()
+                    .map(|(source, _, label)| {
+                        before
+                            .collection_at(*source, instant)
+                            .with_context(|| format!("observe resident {label} source collection"))
+                            .map(|snapshot| snapshot.support().clone())
+                    })
+                    .collect::<Result<Vec<Support>>>()?;
 
-            drop(
-                wiki_facts
-                    .maintain_exact(pile, &wiki_support)
-                    .context("maintain Wiki fact collection")?,
-            );
-            drop(
-                pile.maintain_exact::<ObserveStatesMapping>(observed, &wiki_support)
-                    .context("maintain Wiki supersession index")?,
-            );
-            for ((_, facts, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
                 drop(
-                    facts
-                        .maintain_exact(pile, support)
-                        .with_context(|| format!("maintain {label} fact collection"))?,
+                    wiki_facts
+                        .maintain_exact(pile, &wiki_support)
+                        .await
+                        .context("maintain Wiki fact collection")?,
                 );
-            }
+                drop(
+                    pile.maintain_exact::<ObserveStatesMapping>(observed, &wiki_support)
+                        .await
+                        .context("maintain Wiki supersession index")?,
+                );
+                for ((_, facts, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
+                    drop(
+                        facts
+                            .maintain_exact(pile, support)
+                            .await
+                            .with_context(|| format!("maintain {label} fact collection"))?,
+                    );
+                }
 
-            // Attach every maintained view from one later snapshot. No
-            // command can accidentally combine Wiki facts from one revision
-            // of the pile with Files or Embeddings from another.
-            let reader = pile
-                .snapshot()
-                .context("freeze maintained Wiki and auxiliary snapshot")?;
-            let facts = reader
-                .collection_exact(wiki_facts.rank9(), &wiki_support)
-                .context("observe Wiki fact collection")?
-                .view::<FactArchive>()
-                .context("read Wiki fact collection")?;
-            let observed = reader
-                .collection_exact(observed, &wiki_support)
-                .context("observe Wiki supersession index")?
-                .view::<ObservedIndex>()
-                .context("read Wiki supersession index")?;
-            let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
-            for ((_, collection, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
-                auxiliary_facts.push(
-                    reader
-                        .collection_exact(collection.rank9(), support)
-                        .with_context(|| format!("observe {label} fact collection"))?
-                        .view::<FactArchive>()
-                        .with_context(|| format!("read {label} fact collection"))?,
-                );
-            }
-            Ok((
-                WikiView {
-                    facts,
-                    reader,
-                    observed,
-                },
-                auxiliary_facts,
-            ))
+                // Attach every maintained view from one later snapshot. No
+                // command can accidentally combine Wiki facts from one revision
+                // of the pile with Files or Embeddings from another.
+                let reader = pile
+                    .snapshot()
+                    .context("freeze maintained Wiki and auxiliary snapshot")?;
+                let facts = reader
+                    .collection_exact(wiki_facts.rank9(), &wiki_support)
+                    .context("observe Wiki fact collection")?
+                    .view::<FactArchive>()
+                    .context("read Wiki fact collection")?;
+                let observed = reader
+                    .collection_exact(observed, &wiki_support)
+                    .context("observe Wiki supersession index")?
+                    .view::<ObservedIndex>()
+                    .context("read Wiki supersession index")?;
+                let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
+                for ((_, collection, label), support) in auxiliaries.iter().zip(&auxiliary_supports)
+                {
+                    auxiliary_facts.push(
+                        reader
+                            .collection_exact(collection.rank9(), support)
+                            .with_context(|| format!("observe {label} fact collection"))?
+                            .view::<FactArchive>()
+                            .with_context(|| format!("read {label} fact collection"))?,
+                    );
+                }
+                Ok((
+                    WikiView {
+                        facts,
+                        reader,
+                        observed,
+                    },
+                    auxiliary_facts,
+                ))
+            })
         })
     }
 

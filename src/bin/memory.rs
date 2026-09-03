@@ -151,7 +151,7 @@ impl MemoryStorage<'_> {
     fn load(&self) -> Result<LoadedMemory> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(&mut pile, source)
                 .context("register maintained Memory collection")?;
@@ -160,6 +160,7 @@ impl MemoryStorage<'_> {
             drop(
                 collection
                     .maintain_at(&mut pile, &before, instant)
+                    .await
                     .context("maintain Memory collection")?,
             );
             drop(before);
@@ -167,7 +168,7 @@ impl MemoryStorage<'_> {
                 .snapshot()
                 .context("freeze maintained Memory snapshot")?;
             Self::load_memory_from_snapshot(collection, &store_snapshot, instant)
-        })();
+        });
         Self::finish_pile(pile, result)
     }
 
@@ -176,7 +177,7 @@ impl MemoryStorage<'_> {
     fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let memory_collection = FactCollection::new(&mut pile, memory_source)
@@ -198,12 +199,14 @@ impl MemoryStorage<'_> {
             drop(
                 memory_collection
                     .maintain_at(&mut pile, &before, instant)
+                    .await
                     .context("maintain Memory collection")?,
             );
             if let Some(collection) = embeddings_collection {
                 drop(
                     collection
                         .maintain_at(&mut pile, &before, instant)
+                        .await
                         .context("maintain shared Embeddings collection")?,
                 );
             }
@@ -224,7 +227,7 @@ impl MemoryStorage<'_> {
                 })
                 .transpose()?;
             Ok(LoadedContext { memory, embeddings })
-        })();
+        });
         Self::finish_pile(pile, result)
     }
 
@@ -232,7 +235,7 @@ impl MemoryStorage<'_> {
     fn load_comb(&self) -> Result<LoadedComb> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let memory_collection = FactCollection::new(&mut pile, memory_source)
@@ -248,11 +251,13 @@ impl MemoryStorage<'_> {
             drop(
                 memory_collection
                     .maintain_at(&mut pile, &before, instant)
+                    .await
                     .context("maintain Memory collection")?,
             );
             drop(
                 comb_collection
                     .maintain_at(&mut pile, &before, instant)
+                    .await
                     .context("maintain Comb collection")?,
             );
             drop(before);
@@ -263,7 +268,7 @@ impl MemoryStorage<'_> {
                 Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
             let comb = Self::attach_collection(comb_collection, &store_snapshot, instant, "Comb")?;
             Ok(LoadedComb { memory, comb })
-        })();
+        });
         Self::finish_pile(pile, result)
     }
 
@@ -272,7 +277,7 @@ impl MemoryStorage<'_> {
     fn load_provenance(&self) -> Result<LoadedProvenance> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let cognition_source = open_configured(
@@ -303,6 +308,7 @@ impl MemoryStorage<'_> {
                 drop(
                     collection
                         .maintain_at(&mut pile, &before, instant)
+                        .await
                         .with_context(|| format!("maintain {label} collection"))?,
                 );
             }
@@ -327,7 +333,7 @@ impl MemoryStorage<'_> {
                     "Archive",
                 )?,
             })
-        })();
+        });
         Self::finish_pile(pile, result)
     }
 

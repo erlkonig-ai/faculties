@@ -385,8 +385,7 @@ fn with_files_view<T>(
             .context("register maintained Files fact collection")?;
         let before = store.snapshot().context("freeze Files source snapshot")?;
         let instant = clock::now()?;
-        let reader = facts
-            .maintain_at(store, &before, instant)
+        let reader = pollster::block_on(facts.maintain_at(store, &before, instant))
             .context("maintain Files fact collection")?;
         let space = reader
             .collection_at(facts.rank9(), instant)

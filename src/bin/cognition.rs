@@ -50,8 +50,7 @@ fn check(cli: &Cli) -> Result<()> {
             .snapshot()
             .context("freeze Cognition source snapshot")?;
         drop(
-            collection
-                .maintain_at(&mut pile, &before, instant)
+            pollster::block_on(collection.maintain_at(&mut pile, &before, instant))
                 .context("maintain Cognition fact collection")?,
         );
         drop(before);

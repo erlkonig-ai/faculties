@@ -1909,13 +1909,17 @@ impl PostureStorage<'_> {
                 .snapshot()
                 .context("freeze shared Posture source snapshot")?;
             let instant = now_epoch()?;
-            for ((_, label), collection) in scopes.iter().zip(&maintained) {
-                drop(
-                    collection
-                        .maintain_at(&mut pile, &before, instant)
-                        .with_context(|| format!("maintain Posture {label} collection"))?,
-                );
-            }
+            pollster::block_on(async {
+                for ((_, label), collection) in scopes.iter().zip(&maintained) {
+                    drop(
+                        collection
+                            .maintain_at(&mut pile, &before, instant)
+                            .await
+                            .with_context(|| format!("maintain Posture {label} collection"))?,
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
             drop(before);
 
             // Every logical view is attached through this one immutable
@@ -1978,9 +1982,13 @@ impl PostureStorage<'_> {
             let store_snapshot = pile
                 .snapshot()
                 .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
-            let (_, _, commits) =
-                faculties::storage::read_fact_collection_with_commits(collection, &store_snapshot)
-                    .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
+            let instant = clock::now()?;
+            let (_, _, commits) = faculties::storage::read_fact_collection_with_commits(
+                collection,
+                &store_snapshot,
+                instant,
+            )
+            .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
             Ok(commits
                 .iter()
                 .copied()

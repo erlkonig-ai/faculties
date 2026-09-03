@@ -46,7 +46,8 @@ fn scope(pile: &mut Pile, id: Id, signer: &ed25519_dalek::SigningKey) -> Result<
     let store_snapshot = pile
         .snapshot()
         .with_context(|| format!("freeze collection {id:x} store snapshot"))?;
-    faculties::storage::read_fact_collection(collection, &store_snapshot)
+    let instant = triblespace::core::clock::epoch_now();
+    faculties::storage::read_fact_collection(collection, &store_snapshot, instant)
         .map(|(facts, _)| facts)
         .with_context(|| format!("snapshot collection {id:x}"))
 }

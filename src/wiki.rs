@@ -1607,7 +1607,8 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let instant = triblespace::core::clock::epoch_now();
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
         .context("read Wiki collection")?;
     validate_catalog(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
@@ -1621,7 +1622,7 @@ pub fn materialize_collection(
 /// that support, then attached through one later immutable snapshot. Normal
 /// reads therefore never flatten the collection or validate a closed-world
 /// catalog before asking their actual query.
-pub fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
+pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let facts = FactCollection::new(pile, collection)
         .context("register maintained Wiki fact collection")?;
@@ -1636,10 +1637,12 @@ pub fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQueryS
     drop(
         facts
             .maintain_exact(pile, &support)
+            .await
             .context("maintain Wiki fact collection")?,
     );
     let store_snapshot = pile
         .maintain_exact::<ObserveStatesMapping>(target, &support)
+        .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let facts = store_snapshot
         .collection_exact(facts.rank9(), &support)
@@ -1664,17 +1667,19 @@ pub fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQueryS
 /// closed-world diagnostic oracle. It is deliberately not the ordinary query
 /// path; normal commands use [`query_snapshot`] and query its [`FactArchive`]
 /// directly.
-pub fn materialize_indexed_collection(
+pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let instant = triblespace::core::clock::epoch_now();
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
         .context("read Wiki collection")?;
     let target = observed_collection(pile, signer.verifying_key())?;
     let maintained = pile
         .maintain_exact::<ObserveStatesMapping>(target, &cover)
+        .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let observed = maintained
         .collection_exact(target, &cover)
@@ -1885,10 +1890,12 @@ mod tests {
         let collection =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_before = collection.admitted(&store_snapshot).unwrap();
-        let snapshot = materialize_indexed_collection(&mut pile, &signer).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let snapshot =
+            pollster::block_on(materialize_indexed_collection(&mut pile, &signer)).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_after_index = collection.admitted(&store_snapshot).unwrap();
+        let cover_after_index = collection.admitted_at(&store_snapshot, instant).unwrap();
         assert_eq!(cover_after_index, cover_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 
@@ -1966,7 +1973,8 @@ mod tests {
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &curator_key, author_fragment + revision_fragment).unwrap();
-        let snapshot = materialize_indexed_collection(&mut pile, &curator_key).unwrap();
+        let snapshot =
+            pollster::block_on(materialize_indexed_collection(&mut pile, &curator_key)).unwrap();
         assert_eq!(
             snapshot
                 .catalog()
@@ -2003,7 +2011,7 @@ mod tests {
         bad_tag += revision;
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, bad_tag).unwrap();
-        let error = match materialize_indexed_collection(&mut pile, &signer) {
+        let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
             Ok(_) => panic!("unnormalized tag unexpectedly materialized"),
             Err(error) => error,
         };
@@ -2026,7 +2034,7 @@ mod tests {
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         commit_collection(&mut pile, &signer, missing).unwrap();
-        let error = match materialize_indexed_collection(&mut pile, &signer) {
+        let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
             Ok(_) => panic!("missing revision payload unexpectedly materialized"),
             Err(error) => error,
         };

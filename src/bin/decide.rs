@@ -136,9 +136,9 @@ impl DecideStorage<'_> {
                 .context("register maintained Decide fact collection")?;
             let before = pile.snapshot().context("freeze Decide source snapshot")?;
             let instant = clock::now()?;
-            let store_snapshot = maintained
-                .maintain_at(&mut pile, &before, instant)
-                .context("maintain Decide fact collection")?;
+            let store_snapshot =
+                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
+                    .context("maintain Decide fact collection")?;
             let facts = store_snapshot
                 .collection_at(maintained.rank9(), instant)
                 .context("observe maintained Decide fact collection")?

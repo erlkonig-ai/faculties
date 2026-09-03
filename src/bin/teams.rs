@@ -10,7 +10,11 @@ use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use faculties::storage::initialize_signer;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+#[cfg(test)]
+use faculties::storage::open_secrets_collection;
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
+};
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -34,7 +38,7 @@ use faculties::collection_names::open_configured;
 use faculties::files as file_capability;
 use faculties::schemas::archive::{archive, RawBytes};
 use faculties::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
-use faculties::secrets::{self as secrets_model, storage as secrets_vaults};
+use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::teams as teams_core;
 
 #[derive(Parser)]
@@ -128,16 +132,12 @@ enum CommandMode {
             long = "client-secret",
             value_name = "@PATH|@-",
             conflicts_with = "client_secret_version",
-            help = "Read the Azure app client secret from @path or @- and encrypt it into the selected Secrets vault epoch. TEAMS_CLIENT_SECRET is the environment alternative."
+            help = "Read the Azure app client secret from @path or @- and encrypt it into the configured Secrets collection. TEAMS_CLIENT_SECRET is the environment alternative."
         )]
         client_secret_source: Option<String>,
         /// Exact existing Secrets version for the app client secret.
         #[arg(long, value_parser = parse_id, conflicts_with = "client_secret_source")]
         client_secret_version: Option<Id>,
-        /// Exact ready vault epoch receiving the new delegated-token version
-        /// and any newly supplied client secret.
-        #[arg(long, value_parser = parse_id)]
-        vault: Id,
         /// Space-delimited scopes (defaults to chat + presence + user read + offline_access).
         #[arg(
             long,
@@ -392,11 +392,13 @@ struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
     maintained: FactCollection,
+    instant: hifitime::Epoch,
     support: Support,
     facts: FactArchive,
     reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
-    secrets: secrets_vaults::VaultDiscovery,
+    secret_collection: secret_storage::SecretsCollection,
+    secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 impl TeamsSession<'_> {
@@ -425,7 +427,7 @@ impl TeamsSession<'_> {
         let auth_sources = teams_core::auth_profile_sources(fragment.facts());
         teams_core::validate_auth_secret_references_for_sources(
             &candidate,
-            self.secrets.snapshot(),
+            &self.secrets,
             auth_sources,
         )?;
 
@@ -486,23 +488,29 @@ impl TeamsSession<'_> {
             .context("observe Teams support after commit")?
             .support()
             .clone();
-        drop(
-            self.maintained
-                .maintain_exact(self.pile, &support)
-                .context("maintain Teams fact collection after commit")?,
-        );
-        self.refresh_secrets_for(support)?;
+        pollster::block_on(async {
+            drop(
+                self.maintained
+                    .maintain_exact(self.pile, &support)
+                    .await
+                    .context("maintain Teams fact collection after commit")?,
+            );
+            self.refresh_secrets_for_async(support).await
+        })?;
         Ok(Some(commit))
     }
 
     fn refresh_secrets(&mut self) -> Result<()> {
-        self.refresh_secrets_for(self.support.clone())
+        let support = self.support.clone();
+        pollster::block_on(self.refresh_secrets_for_async(support))
     }
 
-    fn refresh_secrets_for(&mut self, support: Support) -> Result<()> {
-        let secrets = secrets_vaults::discover_local_vaults(self.pile, &self.signer)
-            .context("rediscover Secrets vaults for Teams")?;
-        let reader = secrets.snapshot().store_snapshot().clone();
+    async fn refresh_secrets_for_async(&mut self, support: Support) -> Result<()> {
+        let secrets =
+            secret_storage::ensure_and_snapshot(self.pile, [self.secret_collection], self.instant)
+                .await
+                .context("refresh configured Secrets collection for Teams")?;
+        let reader = secrets.store_snapshot().clone();
         let facts = reader
             .collection_exact(self.maintained.rank9(), &support)
             .context("attach exact Teams support through Secrets snapshot")?
@@ -517,28 +525,21 @@ impl TeamsSession<'_> {
 
     fn add_secret(
         &mut self,
-        vault: Id,
         name: &str,
         plaintext: &[u8],
         observed_at: Inline<NsTAIInterval>,
     ) -> Result<Id> {
-        let location = self
-            .secrets
-            .location(vault)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("vault {vault} is not ready for this node"))?;
-        let secret = secrets_vaults::add_secret(
+        let secret = secret_storage::add_secret(
             self.pile,
             &self.signer,
-            &location,
-            self.secrets.snapshot(),
+            self.secret_collection,
             name,
             plaintext,
             observed_at,
         )
-        .with_context(|| format!("publish Teams credential in vault {vault}"))?;
+        .context("publish Teams credential in configured Secrets collection")?;
         self.refresh_secrets()?;
-        if !self.secrets.snapshot().contains(secret) {
+        if !self.secrets.contains(secret) {
             bail!("published Teams Secrets version {secret} was not rediscovered");
         }
         Ok(secret)
@@ -560,19 +561,25 @@ impl TeamsStorage<'_> {
                 .snapshot()
                 .context("freeze Teams pre-maintenance snapshot")?;
             let instant = clock::now()?;
+            let secret_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
             let support = before
                 .collection_at(maintained.source(), instant)
                 .context("observe Teams support before maintenance")?
                 .support()
                 .clone();
-            drop(
-                maintained
-                    .maintain_exact(&mut pile, &support)
-                    .context("maintain Teams fact collection")?,
-            );
-            let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
-                .context("discover Secrets vaults for Teams")?;
-            let reader = secrets.snapshot().store_snapshot().clone();
+            let secrets = pollster::block_on(async {
+                drop(
+                    maintained
+                        .maintain_exact(&mut pile, &support)
+                        .await
+                        .context("maintain Teams fact collection")?,
+                );
+                secret_storage::ensure_and_snapshot(&mut pile, [secret_collection], instant)
+                    .await
+                    .context("ensure configured Secrets collection for Teams")
+            })?;
+            let reader = secrets.store_snapshot().clone();
             let facts = reader
                 .collection_exact(maintained.rank9(), &support)
                 .context("attach exact Teams support through Secrets snapshot")?
@@ -582,10 +589,12 @@ impl TeamsStorage<'_> {
                 pile: &mut pile,
                 collection,
                 maintained,
+                instant,
                 support,
                 facts,
                 reader,
                 signer,
+                secret_collection,
                 secrets,
             })
         })();
@@ -852,7 +861,6 @@ fn main() -> Result<()> {
             client_id,
             client_secret_source,
             client_secret_version,
-            vault,
             scopes,
         } => {
             let config = build_config(&cli)?;
@@ -875,7 +883,6 @@ fn main() -> Result<()> {
                     &client_id,
                     client_secret.as_deref(),
                     client_secret_version,
-                    vault,
                     &scopes,
                 )
             })
@@ -954,7 +961,7 @@ fn resolve_auth_config(
 }
 
 fn require_exact_secret(session: &TeamsSession<'_>, id: Id, label: &str) -> Result<Id> {
-    if !session.secrets.snapshot().contains(id) {
+    if !session.secrets.contains(id) {
         bail!("unknown {label} {id:x}");
     }
     Ok(id)
@@ -963,7 +970,6 @@ fn require_exact_secret(session: &TeamsSession<'_>, id: Id, label: &str) -> Resu
 fn open_exact_secret(session: &TeamsSession<'_>, secret: Id) -> Result<Vec<u8>> {
     session
         .secrets
-        .snapshot()
         .open(secret, &session.signer)
         .with_context(|| format!("open exact Teams Secrets version {secret:x}"))
 }
@@ -1252,16 +1258,13 @@ fn get_delegated_token(
             .or(bundle.scope)
             .or_else(|| Some(config.scopes.clone())),
     };
-    let (vault, row) = session
-        .secrets
-        .snapshot()
-        .lookup(secret)
-        .ok_or_else(|| anyhow::anyhow!("exact delegated-token Secrets version disappeared"))?;
-    let name = secrets_model::read_text(session.secrets.snapshot().store_snapshot(), row.name)
-        .context("read delegated-token secret name")?;
+    if !session.secrets.contains(secret) {
+        bail!("exact delegated-token Secrets version disappeared");
+    }
+    let name = teams_secret_name(config.source_id, "delegated-token");
     let encoded =
         serde_json::to_vec(&next_bundle).context("encode refreshed Teams token bundle")?;
-    let next_secret = session.add_secret(vault, &name, &encoded, clock::point_now()?)?;
+    let next_secret = session.add_secret(&name, &encoded, clock::point_now()?)?;
     let client_repair = config
         .client_secret_version
         .map(|id| format!(" --client-secret-version {id:x}"))
@@ -1710,7 +1713,6 @@ fn login_device_code_collection(
     client_id: &str,
     client_secret: Option<&str>,
     client_secret_version: Option<Id>,
-    vault: Id,
     scopes: &str,
 ) -> Result<()> {
     let tenant = tenant.trim();
@@ -1731,10 +1733,6 @@ fn login_device_code_collection(
     let explicit_client_version = client_secret_version
         .map(|id| require_exact_secret(session, id, "client-secret version"))
         .transpose()?;
-    if session.secrets.location(vault).is_none() {
-        bail!("vault {vault} is not ready for this node");
-    }
-
     let device = request_device_code(tenant, client_id, &scopes)?;
     if let Some(message) = &device.message {
         println!("{message}");
@@ -1789,13 +1787,12 @@ fn login_device_code_collection(
     let observed_at = clock::point_now()?;
     let client_version = if let Some(client_secret) = client_secret {
         let client_version = session.add_secret(
-            vault,
             &teams_secret_name(source, "client-secret"),
             client_secret.as_bytes(),
             observed_at,
         )?;
         eprintln!(
-            "Published client-secret version {client_version:x} in vault {vault:x}; if later login publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES --client-secret-version {client_version:x}`."
+            "Published client-secret version {client_version:x}; if later login publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES --client-secret-version {client_version:x}`."
         );
         Some(client_version)
     } else {
@@ -1803,7 +1800,6 @@ fn login_device_code_collection(
     };
 
     let token_version = session.add_secret(
-        vault,
         &teams_secret_name(source, "delegated-token"),
         &encoded_bundle,
         observed_at,
@@ -1812,7 +1808,7 @@ fn login_device_code_collection(
         .map(|id| format!(" --client-secret-version {id:x}"))
         .unwrap_or_default();
     eprintln!(
-        "Published delegated-token version {token_version:x} in vault {vault:x}; if Teams profile publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES{client_repair} --delegated-token-version {token_version:x}`."
+        "Published delegated-token version {token_version:x}; if Teams profile publication is interrupted, repair with `teams auth set --tenant {source_tenant} --client-id {client_id} --user-id {user_id} --scopes @SCOPES{client_repair} --delegated-token-version {token_version:x}`."
     );
     let mut fragment = source_fragment(&source_tenant);
     let (profile, profile_id) = teams_core::auth_profile_fragment(
@@ -3799,7 +3795,7 @@ mod tests {
     const TEST_ID: &str = "01010101010101010101010101010101";
 
     #[test]
-    fn v2_credential_surface_requires_exact_vault_and_rejects_legacy_selectors() {
+    fn credential_surface_uses_configured_secrets_and_rejects_legacy_selectors() {
         assert!(Cli::try_parse_from([
             "teams",
             "--pile",
@@ -3809,8 +3805,6 @@ mod tests {
             "tenant.example",
             "--client-id",
             "client",
-            "--vault",
-            TEST_ID,
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -3822,19 +3816,8 @@ mod tests {
             "tenant.example",
             "--client-id",
             "client",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "teams",
-            "--pile",
-            TEST_PILE,
-            "login",
-            "--tenant",
-            "tenant.example",
-            "--client-id",
-            "client",
             "--vault",
-            "not-an-id",
+            TEST_ID,
         ])
         .is_err());
         assert!(Cli::try_parse_from([
@@ -3978,36 +3961,24 @@ mod tests {
     }
 
     fn assert_session_has_one_store_watermark(session: &TeamsSession<'_>) {
-        let secrets_reader = session.secrets.snapshot().store_snapshot();
+        let secrets_reader = session.secrets.store_snapshot();
         assert!(session.reader.changes_since(secrets_reader).is_empty());
         assert!(secrets_reader.changes_since(&session.reader).is_empty());
     }
 
-    fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id, Id) {
+    fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id) {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let vault = Id::new([0xE5; 16]).unwrap();
-        secrets_vaults::create_vault(
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+        let client_id = secret_storage::add_secret(
             &mut pile,
             &signer,
-            vault,
-            "teams-test",
-            clock::point_now().unwrap(),
-        )
-        .unwrap();
-        let discovery = secrets_vaults::discover_local_vaults(&mut pile, &signer).unwrap();
-        let location = *discovery.location(vault).unwrap();
-        let client_id = secrets_vaults::add_secret(
-            &mut pile,
-            &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "teams/client-secret/test",
             b"distinct-test-client-secret",
             clock::point_now().unwrap(),
         )
         .unwrap();
-        drop(discovery);
         let token_bundle = DelegatedTokenBundle {
             access_token: "distinct-test-access-token".to_owned(),
             refresh_token: Some("distinct-test-refresh-token".to_owned()),
@@ -4015,26 +3986,23 @@ mod tests {
             token_type: Some("Bearer".to_owned()),
             scope: Some("Chat.ReadWrite offline_access".to_owned()),
         };
-        let discovery = secrets_vaults::discover_local_vaults(&mut pile, &signer).unwrap();
-        let token_id = secrets_vaults::add_secret(
+        let token_id = secret_storage::add_secret(
             &mut pile,
             &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "teams/delegated-token/test",
             &serde_json::to_vec(&token_bundle).unwrap(),
             clock::point_now().unwrap(),
         )
         .unwrap();
-        drop(discovery);
         pile.close().unwrap();
-        (vault, client_id, token_id)
+        (client_id, token_id)
     }
 
     #[test]
     fn auth_profile_persists_only_exact_encrypted_secrets_references() {
         let fixture = Fixture::new();
-        let (vault, client_secret, delegated_token) = initialize_test_secrets(&fixture);
+        let (client_secret, delegated_token) = initialize_test_secrets(&fixture);
         let tenant = "tenant.example";
         let source = source_fragment(tenant).root().unwrap();
         fixture
@@ -4057,14 +4025,8 @@ mod tests {
                     teams_core::auth_profile_head(&session.facts, source),
                     teams_core::AuthProfileHead::Unique(profile_id)
                 );
-                assert_eq!(
-                    session.secrets.snapshot().lookup(client_secret).unwrap().0,
-                    vault
-                );
-                let opened_client = session
-                    .secrets
-                    .snapshot()
-                    .open(client_secret, &session.signer)?;
+                assert!(session.secrets.contains(client_secret));
+                let opened_client = session.secrets.open(client_secret, &session.signer)?;
                 assert_eq!(opened_client, b"distinct-test-client-secret");
                 Ok(())
             })
@@ -4083,27 +4045,21 @@ mod tests {
     }
 
     #[test]
-    fn session_secret_creation_targets_one_exact_vault_and_refreshes_discovery() {
+    fn session_secret_creation_targets_the_configured_collection_and_refreshes() {
         let fixture = Fixture::new();
-        let (vault, _, _) = initialize_test_secrets(&fixture);
+        initialize_test_secrets(&fixture);
         fixture
             .storage()
             .with_session(|session| {
                 assert_session_has_one_store_watermark(session);
                 let observed_at = clock::point_now()?;
                 let secret =
-                    session.add_secret(vault, "teams/session-test", b"exact-vault", observed_at)?;
+                    session.add_secret("teams/session-test", b"configured", observed_at)?;
                 assert_session_has_one_store_watermark(session);
-                assert_eq!(session.secrets.snapshot().lookup(secret).unwrap().0, vault);
                 assert_eq!(
-                    session.secrets.snapshot().open(secret, &session.signer)?,
-                    b"exact-vault"
+                    session.secrets.open(secret, &session.signer)?,
+                    b"configured"
                 );
-                let missing = Id::new([0xE6; 16]).unwrap();
-                let error = session
-                    .add_secret(missing, "teams/session-test", b"wrong-vault", observed_at)
-                    .unwrap_err();
-                assert!(error.to_string().contains("not ready for this node"));
                 Ok(())
             })
             .unwrap();
@@ -4144,7 +4100,7 @@ mod tests {
     #[test]
     fn auth_set_can_repair_a_migrated_dangling_profile() {
         let fixture = Fixture::new();
-        let (_, client_secret, delegated_token) = initialize_test_secrets(&fixture);
+        let (client_secret, delegated_token) = initialize_test_secrets(&fixture);
         let tenant = "tenant.example";
         let source_identity = source_fragment(tenant);
         let source = source_identity.root().unwrap();
@@ -4163,7 +4119,7 @@ mod tests {
         historical += dangling;
 
         // Model an additive cutover that retained Teams provenance while the
-        // old vault epoch itself was deliberately left behind.
+        // old secret representation itself was deliberately left behind.
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let collection =
@@ -4191,10 +4147,7 @@ mod tests {
                 let repaired = teams_core::auth_profile(&session.facts, head)?;
                 assert_eq!(repaired.client_secret_version, Some(client_secret));
                 assert_eq!(repaired.delegated_token_version, Some(delegated_token));
-                teams_core::validate_auth_secret_references(
-                    &session.facts,
-                    session.secrets.snapshot(),
-                )?;
+                teams_core::validate_auth_secret_references(&session.facts, &session.secrets)?;
 
                 set_auth_profile(
                     session,

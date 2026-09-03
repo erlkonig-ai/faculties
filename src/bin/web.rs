@@ -12,8 +12,10 @@ use faculties::schemas::headspace::{
     playground_config, DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID, KIND_CONFIG_ID, KIND_LIVE_RECORD,
 };
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
-use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
@@ -288,7 +290,7 @@ impl WebStorage<'_> {
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let source = open_configured(&mut pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
             let headspace = FactCollection::new(&mut pile, source)
                 .context("register maintained Headspace fact collection")?;
@@ -309,16 +311,21 @@ impl WebStorage<'_> {
             drop(
                 headspace
                     .maintain_exact(&mut pile, &support)
+                    .await
                     .context("maintain Headspace fact collection")?,
             );
 
-            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
-                .context("discover readable Secrets vaults")?;
+            let secrets_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
+            let secrets =
+                secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
+                    .await
+                    .context("ensure configured Secrets collection")?;
 
             // Secrets discovery owns a later immutable pile snapshot. Attach
             // the exact maintained Headspace support through that same world,
             // then project only the facts Web actually consumes.
-            let reader = secrets.snapshot().store_snapshot();
+            let reader = secrets.store_snapshot();
             let facts = reader
                 .collection_exact(headspace.rank9(), &support)
                 .context("attach maintained Headspace collection")?
@@ -330,7 +337,7 @@ impl WebStorage<'_> {
                 tavily: open_web_secret(&secrets, &signer, &versions.tavily, "Tavily")?,
                 exa: open_web_secret(&secrets, &signer, &versions.exa, "Exa")?,
             })
-        })();
+        });
         finish_pile(pile, result, "credential read")
     }
 
@@ -418,14 +425,14 @@ where
 /// reference that is absent from this local Secrets view therefore does not
 /// mask another usable reference asserted on the same Headspace state.
 fn open_web_secret(
-    secrets: &vaults::VaultDiscovery,
+    secrets: &SecretsSnapshot<triblespace::core::repo::pile::PileSnapshot>,
     signer: &SigningKey,
     versions: &BTreeSet<Id>,
     role: &str,
 ) -> Result<Option<String>> {
     let mut failures = Vec::new();
     for version in versions {
-        match secrets.snapshot().open(*version, signer) {
+        match secrets.open(*version, signer) {
             Ok(plaintext) => match String::from_utf8(plaintext) {
                 Ok(value) => return Ok(Some(value)),
                 Err(error) => failures.push(format!("{version:x}: not UTF-8 ({error})")),
@@ -943,7 +950,8 @@ mod tests {
         let collection = FactCollection::new(&mut pile, source).unwrap();
         let before = pile.snapshot().unwrap();
         let instant = clock::now().unwrap();
-        let store_snapshot = collection.maintain_at(&mut pile, &before, instant).unwrap();
+        let store_snapshot =
+            pollster::block_on(collection.maintain_at(&mut pile, &before, instant)).unwrap();
         let facts = store_snapshot
             .collection_at(collection.rank9(), instant)
             .unwrap()

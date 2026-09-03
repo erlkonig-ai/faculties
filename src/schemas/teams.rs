@@ -4,8 +4,8 @@
 //! immutable message/attachment observations, and causal page-coverage
 //! receipts. Public authentication configuration is represented by immutable
 //! source-scoped profile snapshots. Secret-bearing fields are never embedded
-//! here: profiles name exact encrypted versions in explicit Secrets vault
-//! epochs.
+//! here: profiles name exact encrypted versions in the configured Secrets
+//! collection.
 //!
 //! Attachment occurrence entities preserve immutable source evidence
 //! (message, source-local id/kind, and occurrence name). Source URLs are

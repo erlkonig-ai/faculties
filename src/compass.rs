@@ -1053,7 +1053,8 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let instant = triblespace::core::clock::epoch_now();
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
@@ -1061,7 +1062,7 @@ pub fn materialize_collection(
 
 /// Capture Compass facts and attach the maintained status LWW index for that
 /// exact source cover, constructing missing derived artifacts if necessary.
-pub fn materialize_indexed_collection(
+pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<CompassSnapshot> {
@@ -1080,10 +1081,12 @@ pub fn materialize_indexed_collection(
     drop(
         facts
             .maintain_exact(pile, &support)
+            .await
             .context("maintain Compass fact collection")?,
     );
     let store_snapshot = pile
         .maintain_exact::<RegisterCoordinatesMapping>(status_target, &support)
+        .await
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     let fact_archive = store_snapshot
         .collection_exact(facts.rank9(), &support)

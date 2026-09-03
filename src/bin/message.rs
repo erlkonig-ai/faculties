@@ -384,7 +384,7 @@ fn main() -> Result<()> {
     };
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
     let mut pile = open_pile_strict(&cli.pile)?;
-    let result = (|| {
+    let result = pollster::block_on(async {
         // Register every descriptor before freezing the one shared source
         // boundary used by both maintenance operations.
         let relations_source = open_configured(
@@ -404,11 +404,13 @@ fn main() -> Result<()> {
         drop(
             relations
                 .maintain_at(&mut pile, &before, instant)
+                .await
                 .context("maintain Relations fact collection")?,
         );
         drop(
             messages
                 .maintain_at(&mut pile, &before, instant)
+                .await
                 .context("maintain Message fact collection")?,
         );
 
@@ -460,6 +462,6 @@ fn main() -> Result<()> {
             Command::Ack { id, by } => cmd_ack(&mut storage, id, by),
             Command::AckAll { by, from } => cmd_ack_all(&mut storage, by, from),
         }
-    })();
+    });
     finish_pile(pile, result)
 }

@@ -19,8 +19,11 @@ use faculties::schemas::{
     decide as decide_schema, files as files_schema, mail as mail_schema,
     relations as relations_schema,
 };
-use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+    FactArchive, FactCollection,
+};
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
@@ -94,15 +97,12 @@ enum AccountCommand {
         #[arg(long)]
         username: Option<String>,
         /// Mailbox secret. Prefer MAIL_PASS rather than a visible argv value.
-        #[arg(long, env = "MAIL_PASS", hide_env_values = true, requires = "vault")]
+        #[arg(long, env = "MAIL_PASS", hide_env_values = true)]
         password: Option<String>,
         /// Exact existing Secrets version. This is the repair path when
         /// a Secrets-first account update was interrupted before Mail commit.
         #[arg(long, value_parser = parse_id, conflicts_with = "password")]
         credential_version: Option<Id>,
-        /// Exact vault epoch receiving a newly sealed mailbox password.
-        #[arg(long, value_parser = parse_id, requires = "password")]
-        vault: Option<Id>,
         #[arg(long)]
         disabled: bool,
     },
@@ -164,7 +164,7 @@ struct Views {
     files: CollectionView,
     decide: CollectionView,
     relations: CollectionView,
-    secrets: vaults::VaultDiscovery,
+    secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 struct Storage<'a> {
@@ -192,6 +192,7 @@ impl Storage<'_> {
             let pile = pile
                 .as_mut()
                 .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
+            let instant = clock::now()?;
             let mail_collection =
                 open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
             let files_collection =
@@ -200,6 +201,8 @@ impl Storage<'_> {
                 open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
             let relations_collection =
                 open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
+            let secrets_collection =
+                open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
             let mail = FactCollection::new(pile, mail_collection)
                 .context("register maintained Mail fact collection")?;
             let files = FactCollection::new(pile, files_collection)
@@ -211,7 +214,6 @@ impl Storage<'_> {
             let before = pile
                 .snapshot()
                 .context("freeze shared Mail pre-maintenance snapshot")?;
-            let instant = clock::now()?;
             // One source watermark fixes every ordinary fact collection this
             // command may observe. Maintenance may append physical views, but
             // cannot move that semantic boundary independently per scope.
@@ -236,33 +238,40 @@ impl Storage<'_> {
                 .support()
                 .clone();
             drop(before);
-            drop(
-                mail.maintain_exact(pile, &mail_support)
-                    .context("maintain Mail fact collection")?,
-            );
-            drop(
-                files
-                    .maintain_exact(pile, &files_support)
-                    .context("maintain Files fact collection")?,
-            );
-            drop(
-                decide
-                    .maintain_exact(pile, &decide_support)
-                    .context("maintain Decide fact collection")?,
-            );
-            drop(
-                relations
-                    .maintain_exact(pile, &relations_support)
-                    .context("maintain Relations fact collection")?,
-            );
+            let secrets = pollster::block_on(async {
+                drop(
+                    mail.maintain_exact(pile, &mail_support)
+                        .await
+                        .context("maintain Mail fact collection")?,
+                );
+                drop(
+                    files
+                        .maintain_exact(pile, &files_support)
+                        .await
+                        .context("maintain Files fact collection")?,
+                );
+                drop(
+                    decide
+                        .maintain_exact(pile, &decide_support)
+                        .await
+                        .context("maintain Decide fact collection")?,
+                );
+                drop(
+                    relations
+                        .maintain_exact(pile, &relations_support)
+                        .await
+                        .context("maintain Relations fact collection")?,
+                );
 
-            let secrets = vaults::discover_local_vaults(&mut *pile, &self.signer)
-                .context("discover local Secrets vault epochs")?;
-            // Secrets discovery owns the final immutable pile snapshot. Attach
+                secret_storage::ensure_and_snapshot(&mut *pile, [secrets_collection], instant)
+                    .await
+                    .context("ensure configured Secrets collection")
+            })?;
+            // Secrets attachment owns the final immutable pile snapshot. Attach
             // every exact maintained support through that same world so Mail
             // facts, file payloads, decisions, relations, and credentials can
             // never be assembled from different store prefixes.
-            let store_snapshot = secrets.snapshot().store_snapshot().clone();
+            let store_snapshot = secrets.store_snapshot().clone();
             let mail_facts = store_snapshot
                 .collection_exact(mail.rank9(), &mail_support)
                 .context("attach maintained Mail fact collection")?
@@ -313,27 +322,21 @@ impl Storage<'_> {
         })
     }
 
-    fn add_secret(&self, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
+    fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         let mut pile = self.pile.borrow_mut();
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let discovery = vaults::discover_local_vaults(&mut *pile, &self.signer)
-            .context("discover local Secrets vault epochs")?;
-        let location = discovery
-            .location(vault)
-            .copied()
-            .ok_or_else(|| anyhow!("vault {vault} is not ready for this node"))?;
-        vaults::add_secret(
+        let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
+        secret_storage::add_secret(
             &mut *pile,
             &self.signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             name,
             plaintext,
             point_now()?,
         )
-        .context("publish mailbox credential to exact vault epoch")
+        .context("publish mailbox credential to configured Secrets collection")
     }
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
@@ -465,7 +468,6 @@ fn account_set(
     username: Option<String>,
     password: Option<String>,
     credential_version: Option<Id>,
-    vault: Option<Id>,
     disabled: bool,
 ) -> Result<()> {
     let mut views = storage.views()?;
@@ -487,7 +489,7 @@ fn account_set(
         };
 
     if let Some(id) = credential_version {
-        if !views.secrets.snapshot().contains(id) {
+        if !views.secrets.contains(id) {
             bail!("unknown Secrets credential version {id:x}");
         }
     }
@@ -508,31 +510,27 @@ fn account_set(
     }
     .canonicalized()?;
 
-    let credential_id = match (password, credential_version, old_credential, vault) {
-        (None, None, Some(id), None) => id,
-        (None, None, None, None) if replacing_fork => {
+    let credential_id = match (password, credential_version, old_credential) {
+        (None, None, Some(id)) => id,
+        (None, None, None) if replacing_fork => {
             bail!("--credential-version or MAIL_PASS/--password is required to reconcile a forked account")
         }
-        (None, None, None, None) => {
+        (None, None, None) => {
             bail!("--credential-version or MAIL_PASS/--password is required for a new account")
         }
-        (None, Some(id), _, None) => id,
-        (Some(value), None, _, Some(vault)) => {
-            let id = storage.add_secret(vault, &mailbox_secret_name(anchor), value.as_bytes())?;
+        (None, Some(id), _) => id,
+        (Some(value), None, _) => {
+            let id = storage.add_secret(&mailbox_secret_name(anchor), value.as_bytes())?;
             eprintln!(
-                "Published mailbox credential {id:x} to vault {vault:x}; if Mail publication is interrupted, retry with --credential-version {id:x}"
+                "Published mailbox credential {id:x}; if Mail publication is interrupted, retry with --credential-version {id:x}"
             );
             views = storage.views()?;
-            if !views.secrets.snapshot().contains(id) {
+            if !views.secrets.contains(id) {
                 bail!("published mailbox secret {id:x} did not materialize");
             }
             id
         }
-        (Some(_), None, _, None) => {
-            bail!("--vault is required when sealing a supplied --password")
-        }
-        (None, _, _, Some(_)) => bail!("--vault only applies when sealing a supplied --password"),
-        (Some(_), Some(_), _, _) => {
+        (Some(_), Some(_), _) => {
             bail!("--password cannot be combined with --credential-version")
         }
     };
@@ -849,7 +847,7 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let account = mail::open_account(
         &views.mail.reader,
         &views.mail.facts,
-        views.secrets.snapshot(),
+        &views.secrets,
         record.account,
         &storage.signer,
     )?;
@@ -1117,7 +1115,7 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
         let account = mail::open_account(
             &views.mail.reader,
             &views.mail.facts,
-            views.secrets.snapshot(),
+            &views.secrets,
             anchor,
             &storage.signer,
         )
@@ -1166,7 +1164,6 @@ fn main() -> Result<()> {
                 username,
                 password,
                 credential_version,
-                vault,
                 disabled,
             } => account_set(
                 &storage,
@@ -1178,7 +1175,6 @@ fn main() -> Result<()> {
                 username,
                 password,
                 credential_version,
-                vault,
                 disabled,
             ),
             AccountCommand::List => account_list(&storage),
@@ -1240,7 +1236,6 @@ mod tests {
         account: Id,
         config: Id,
         credential: Id,
-        secret_vault: Id,
     }
 
     impl Fixture {
@@ -1254,28 +1249,16 @@ mod tests {
             let account = id(70);
             let signer = load_signer(&pile, Some(&key)).unwrap();
             let mut store = open_pile_strict(&pile).unwrap();
-            let secret_vault = id(120);
-            vaults::create_vault(
+            let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
+            let credential_id = secret_storage::add_secret(
                 &mut store,
                 &signer,
-                secret_vault,
-                "mail-test",
-                point_now().unwrap(),
-            )
-            .unwrap();
-            let discovery = vaults::discover_local_vaults(&mut store, &signer).unwrap();
-            let location = *discovery.location(secret_vault).unwrap();
-            let credential_id = vaults::add_secret(
-                &mut store,
-                &signer,
-                &location,
-                discovery.snapshot(),
+                collection,
                 &mailbox_secret_name(account),
                 b"mailbox password",
                 point_now().unwrap(),
             )
             .unwrap();
-            drop(discovery);
             store.close().unwrap();
             let mut fragment = Fragment::empty();
             let (config_fragment, config) = mail::account_config_fragment(
@@ -1302,7 +1285,6 @@ mod tests {
                 account,
                 config,
                 credential: credential_id,
-                secret_vault,
             };
             let storage = fixture.storage();
             storage.views().unwrap();
@@ -1323,19 +1305,19 @@ mod tests {
     }
 
     #[test]
-    fn views_share_the_secrets_discovery_snapshot() {
+    fn views_share_the_final_secrets_snapshot() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
 
-        // Leave one vault commit without its maintained representations. This
-        // makes Secrets discovery advance the pile after the ordinary Mail
+        // Leave one secret commit without its maintained representations. This
+        // makes Secrets attachment advance the pile after the ordinary Mail
         // collections have been maintained and catches cross-watermark views.
         storage
-            .add_secret(fixture.secret_vault, "snapshot-regression", b"new secret")
+            .add_secret("snapshot-regression", b"new secret")
             .unwrap();
 
         let views = storage.views().unwrap();
-        let secrets_snapshot = views.secrets.snapshot().store_snapshot();
+        let secrets_snapshot = views.secrets.store_snapshot();
         for reader in [
             &views.mail.reader,
             &views.files.reader,
@@ -1352,14 +1334,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let secrets_before = secret_rows(
-            before
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-        );
+        let secrets_before = secret_rows(before.secrets.facts().unwrap());
 
         account_set(
             &storage,
@@ -1371,23 +1346,12 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
         )
         .unwrap();
 
         let after = storage.views().unwrap();
-        assert_eq!(
-            secret_rows(
-                after
-                    .secrets
-                    .snapshot()
-                    .vault(fixture.secret_vault)
-                    .unwrap()
-                    .facts(),
-            ),
-            secrets_before
-        );
+        assert_eq!(secret_rows(after.secrets.facts().unwrap()), secrets_before);
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
             Head::Unique(id) => id,
             other => panic!("expected unique account head, got {other:?}"),
@@ -1406,15 +1370,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let versions_before = secret_rows(
-            before
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-        )
-        .len();
+        let versions_before = secret_rows(before.secrets.facts().unwrap()).len();
 
         account_set(
             &storage,
@@ -1426,22 +1382,13 @@ mod tests {
             None,
             Some("mailbox password".into()),
             None,
-            Some(fixture.secret_vault),
             false,
         )
         .unwrap();
 
         let after = storage.views().unwrap();
         assert_eq!(
-            secret_rows(
-                after
-                    .secrets
-                    .snapshot()
-                    .vault(fixture.secret_vault)
-                    .unwrap()
-                    .facts(),
-            )
-            .len(),
+            secret_rows(after.secrets.facts().unwrap()).len(),
             versions_before + 1
         );
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
@@ -1452,10 +1399,7 @@ mod tests {
             .unwrap()
             .credential;
         assert_ne!(credential, fixture.credential);
-        assert_eq!(
-            after.secrets.snapshot().lookup(credential).unwrap().0,
-            fixture.secret_vault
-        );
+        assert!(after.secrets.contains(credential));
     }
 
     #[test]
@@ -1464,21 +1408,12 @@ mod tests {
         let storage = fixture.storage();
         let credential = storage
             .add_secret(
-                fixture.secret_vault,
                 &mailbox_secret_name(fixture.account),
                 b"replacement password",
             )
             .unwrap();
         let views = storage.views().unwrap();
-        let versions = secret_rows(
-            views
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-        )
-        .len();
+        let versions = secret_rows(views.secrets.facts().unwrap()).len();
         drop(views);
 
         account_set(
@@ -1491,24 +1426,12 @@ mod tests {
             None,
             None,
             Some(credential),
-            None,
             false,
         )
         .unwrap();
 
         let after = storage.views().unwrap();
-        assert_eq!(
-            secret_rows(
-                after
-                    .secrets
-                    .snapshot()
-                    .vault(fixture.secret_vault)
-                    .unwrap()
-                    .facts(),
-            )
-            .len(),
-            versions
-        );
+        assert_eq!(secret_rows(after.secrets.facts().unwrap()).len(), versions);
         let head = match mail::account_head(&after.mail.facts, fixture.account).unwrap() {
             Head::Unique(id) => id,
             other => panic!("expected unique account head, got {other:?}"),
@@ -1531,7 +1454,6 @@ mod tests {
             None,
             None,
             Some(credential),
-            None,
             false,
         )
         .unwrap();
@@ -1552,14 +1474,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let views = storage.views().unwrap();
-        let secrets_before = secret_rows(
-            views
-                .secrets
-                .snapshot()
-                .vault(fixture.secret_vault)
-                .unwrap()
-                .facts(),
-        );
+        let secrets_before = secret_rows(views.secrets.facts().unwrap());
         drop(views);
 
         let error = account_set(
@@ -1572,45 +1487,18 @@ mod tests {
             None,
             Some("replacement password".into()),
             None,
-            Some(fixture.secret_vault),
             false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("account address"));
         let after = storage.views().unwrap();
-        assert_eq!(
-            secret_rows(
-                after
-                    .secrets
-                    .snapshot()
-                    .vault(fixture.secret_vault)
-                    .unwrap()
-                    .facts(),
-            ),
-            secrets_before
-        );
+        assert_eq!(secret_rows(after.secrets.facts().unwrap()), secrets_before);
     }
 
     #[test]
-    fn new_account_requires_an_explicit_vault_epoch() {
+    fn new_account_uses_the_configured_secrets_collection() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let error = account_set(
-            &storage,
-            None,
-            "other@example.test".into(),
-            "Other".into(),
-            "pop.example.test:995".into(),
-            "smtp.example.test:465".into(),
-            None,
-            Some("new password".into()),
-            None,
-            None,
-            false,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("--vault is required"));
-
         account_set(
             &storage,
             None,
@@ -1621,7 +1509,6 @@ mod tests {
             None,
             Some("new password".into()),
             None,
-            Some(fixture.secret_vault),
             false,
         )
         .unwrap();
@@ -1651,7 +1538,6 @@ mod tests {
             "Me".into(),
             "pop.example.test:995".into(),
             "smtp.example.test:465".into(),
-            None,
             None,
             None,
             None,
@@ -1699,8 +1585,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_password_requires_one_exact_vault_epoch() {
-        let without_vault = [
+    fn cli_password_uses_configured_secrets_collection() {
+        let command = [
             "mail",
             "--pile",
             "/tmp/not-opened-mail-test.pile",
@@ -1717,15 +1603,11 @@ mod tests {
             "--password",
             "secret",
         ];
-        assert!(Cli::try_parse_from(without_vault).is_err());
+        assert!(Cli::try_parse_from(command).is_ok());
 
-        let mut with_vault = without_vault.to_vec();
+        let mut with_vault = command.to_vec();
         with_vault.extend(["--vault", "78787878787878787878787878787878"]);
-        assert!(Cli::try_parse_from(with_vault).is_ok());
-
-        let mut malformed = without_vault.to_vec();
-        malformed.extend(["--vault", "mail-test"]);
-        assert!(Cli::try_parse_from(malformed).is_err());
+        assert!(Cli::try_parse_from(with_vault).is_err());
     }
 
     #[test]
@@ -1761,7 +1643,6 @@ mod tests {
             "Me".into(),
             "pop.example.test:995".into(),
             "smtp.example.test:465".into(),
-            None,
             None,
             None,
             None,

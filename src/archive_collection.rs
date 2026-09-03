@@ -224,17 +224,22 @@ pub struct ArchiveImportWriter {
 }
 
 impl ArchiveImportWriter {
-    pub fn open(pile_path: &std::path::Path, key_path: Option<&std::path::Path>) -> Result<Self> {
+    pub async fn open(
+        pile_path: &std::path::Path,
+        key_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let signer = load_signer(pile_path, key_path)?;
         let mut pile = open_pile_strict(pile_path)?;
-        let result = (|| {
+        let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let facts = FactCollection::new(&mut pile, source)
                 .context("register maintained Archive fact collection")?;
-            let archive = ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID)?;
+            let archive =
+                ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
             Ok((facts.source(), archive.facts))
-        })();
+        }
+        .await;
         match result {
             Ok((collection, current)) => {
                 let mut writer = Self {
@@ -480,14 +485,15 @@ pub struct SuccinctIndexReport {
 /// Succinct members are derived and merged first; the public target is their
 /// exact Rank9-accelerated image. [`ensure_bm25_index`] provides the analogous
 /// exact projection for Archive full-text search.
-pub fn ensure_succinct_index(
+pub async fn ensure_succinct_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<SuccinctIndexReport> {
     let (mut pile, facts, _signer) =
         ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-    let result = (|| {
-        let archive = ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID)?;
+    let result = async {
+        let archive =
+            ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
         let source_elements = archive.support().len();
 
         Ok(SuccinctIndexReport {
@@ -496,7 +502,8 @@ pub fn ensure_succinct_index(
             source_collection: archive.collections.source().handle(),
             target_collection: archive.collections.rank9().handle(),
         })
-    })();
+    }
+    .await;
     close_pile(
         pile,
         result,
@@ -522,21 +529,25 @@ struct EnsuredBm25 {
 
 /// Ensure and deterministically maintain a portable exact-TF cover of the
 /// frozen Archive support through exact `DERIVE` and `MERGE` equations.
-pub fn ensure_bm25_index(
+pub async fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<Bm25IndexReport> {
     let (mut pile, facts, signer) =
         ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-    let result = (|| {
+    let result = async {
         let authority = signer.verifying_key();
-        let archive = ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID)?;
-        Ok(ensure_bm25_for_snapshot(&mut pile, &archive, authority)?.report)
-    })();
+        let archive =
+            ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
+        Ok(ensure_bm25_for_snapshot(&mut pile, &archive, authority)
+            .await?
+            .report)
+    }
+    .await;
     close_pile(pile, result, "closing Archive pile after BM25 derivation")
 }
 
-fn ensure_bm25_for_snapshot(
+async fn ensure_bm25_for_snapshot(
     pile: &mut Pile,
     archive: &ArchiveSnapshot,
     authority: VerifyingKey,
@@ -551,6 +562,7 @@ fn ensure_bm25_for_snapshot(
     let source_elements = archive.support().len();
     let maintained = pile
         .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, archive.support())
+        .await
         .context("maintain exact Archive BM25 cover")?;
     let attached = maintained
         .collection_exact(target, archive.support())
@@ -586,19 +598,21 @@ pub struct ArchiveSearchSnapshot {
 }
 
 impl ArchiveSearchSnapshot {
-    pub fn ensure_local(
+    pub async fn ensure_local(
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
         let (mut pile, facts, signer) =
             ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-        let result = (|| {
+        let result = async {
             let authority = signer.verifying_key();
-            let archive = ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID)?;
+            let archive =
+                ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
             let EnsuredBm25 { index, .. } =
-                ensure_bm25_for_snapshot(&mut pile, &archive, authority)?;
+                ensure_bm25_for_snapshot(&mut pile, &archive, authority).await?;
             Ok(Self { archive, index })
-        })();
+        }
+        .await;
         close_pile(
             pile,
             result,
@@ -666,10 +680,10 @@ impl ArchiveSnapshot {
         Ok((pile, collections, signer))
     }
 
-    fn from_store(pile: &mut Pile, collections: FactCollection, scope: Id) -> Result<Self> {
+    async fn from_store(pile: &mut Pile, collections: FactCollection, scope: Id) -> Result<Self> {
         let instant = crate::clock::now()?;
         let before = pile.snapshot().context("freeze Archive source snapshot")?;
-        Self::maintain_from(pile, collections, scope, &before, instant)
+        Self::maintain_from(pile, collections, scope, &before, instant).await
     }
 
     /// Maintain and attach Archive from one caller-selected source watermark.
@@ -679,7 +693,7 @@ impl ArchiveSnapshot {
     /// then attach all maintained views through the one immutable snapshot
     /// returned by the final maintenance step. This removes cross-watermark
     /// skew without pretending that maintenance writes change the observation.
-    pub fn maintain_from(
+    pub async fn maintain_from(
         pile: &mut Pile,
         collections: FactCollection,
         scope: Id,
@@ -705,6 +719,7 @@ impl ArchiveSnapshot {
             .retain(|commit| support.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
         let store_snapshot = collections
             .maintain_exact(pile, &support)
+            .await
             .context("maintain Archive fact collection")?;
         let facts = store_snapshot
             .collection_exact(collections.rank9(), &support)
@@ -721,13 +736,13 @@ impl ArchiveSnapshot {
         })
     }
 
-    pub fn load_local(
+    pub async fn load_local(
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
         scope: Id,
     ) -> Result<Self> {
         let (mut pile, collections, _signer) = Self::open_local(pile_path, key_path, scope)?;
-        let result = Self::from_store(&mut pile, collections, scope);
+        let result = Self::from_store(&mut pile, collections, scope).await;
         close_pile(pile, result, "closing Archive pile")
     }
 
@@ -1773,7 +1788,7 @@ mod tests {
         locator: &str,
         text: &str,
     ) -> CollectionCommit {
-        let mut writer = ArchiveImportWriter::open(pile, Some(key)).unwrap();
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(pile, Some(key))).unwrap();
         writer.stage_fragment(projection(locator, text)).unwrap();
         writer.finish(Ok(())).unwrap().1.unwrap()
     }
@@ -1799,7 +1814,7 @@ mod tests {
 
         let fragment = projection("session:staged", "resident only after commit");
         let embedded = first_embedded_handle(&fragment);
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(fragment).unwrap();
 
         assert!(writer.delta_len() > 0);
@@ -1815,15 +1830,23 @@ mod tests {
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
         physical.close().unwrap();
-        let before =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let before = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert!(before.commits().is_empty());
         assert!(before.facts().iter().next().is_none());
         drop(before);
 
         let commit = writer.finish(Ok(())).unwrap().1.unwrap();
-        let after =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let after = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(after.commits(), &[commit]);
         assert_eq!(after.projection_ids().len(), 1);
     }
@@ -1843,7 +1866,7 @@ mod tests {
         let embedded = invalid.put::<RawBytes, _>(b"unreachable after rejection".to_vec());
         let embedded: Inline<Handle<UnknownBlob>> = embedded.transmute();
 
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(invalid).unwrap();
         let error = writer.finish(Ok(())).unwrap_err();
         assert!(error
@@ -1853,8 +1876,12 @@ mod tests {
         // `finish` closed the writer even on validation failure. Reopening is
         // sound, no semantic edge escaped, and the dependency is merely an
         // unreachable content-addressed record available for later GC.
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert!(snapshot.commits().is_empty());
         assert!(snapshot.facts().iter().next().is_none());
         drop(snapshot);
@@ -1916,19 +1943,23 @@ mod tests {
         initialize_archive_fixture(&pile, &key);
 
         let fragment = projection("session:one", "one");
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
         let (_, first) = writer.finish(Ok(())).unwrap();
         let first = first.unwrap();
-        let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut retry = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         let length = std::fs::metadata(&pile).unwrap().len();
         retry.stage_fragment(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
         assert_eq!(repeated, None);
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(snapshot.commits(), &[first]);
         assert_eq!(snapshot.projection_ids().len(), 1);
     }
@@ -1951,9 +1982,12 @@ mod tests {
         assert_eq!(duplicate.data(), admitted.data());
         pile.close().unwrap();
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key_path), schema::DEFAULT_SCOPE_ID)
-                .unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key_path),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(snapshot.commits(), &[admitted]);
         assert_eq!(snapshot.projection_ids().len(), 1);
         let support = snapshot.support().clone();
@@ -1987,12 +2021,16 @@ mod tests {
         )
         .unwrap();
         let expected = fragment.root().unwrap();
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(fragment).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let archive =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let archive = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(archive.source_snapshot_ids(), vec![expected]);
         assert_eq!(
             archive
@@ -2031,12 +2069,14 @@ mod tests {
 
         let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
-        let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut first_writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         first_writer.stage_fragment(first_fragment.clone()).unwrap();
         let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
 
         let second_fragment = projection("session:two", "shared");
-        let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut second_writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         second_writer.stage_fragment(first_fragment).unwrap();
         assert_eq!(second_writer.delta_len(), 0, "known fragment is a replay");
         second_writer
@@ -2050,8 +2090,12 @@ mod tests {
         let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
         assert_ne!(first.data(), second.data());
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(snapshot.commits().len(), 2);
         assert_eq!(snapshot.projection_ids().len(), 2);
         assert!(snapshot.facts().iter().count() > first_len);
@@ -2065,7 +2109,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!(
             (
                 report.source_commits,
@@ -2075,7 +2119,9 @@ mod tests {
             (0, 0, 0)
         );
 
-        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let search =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         assert!(search.archive().commits().is_empty());
         assert!(search.search("anything", 10).unwrap().is_empty());
     }
@@ -2095,8 +2141,8 @@ mod tests {
         let commit = pile.commit(collection, &signer, Fragment::empty()).unwrap();
         pile.close().unwrap();
 
-        let succinct = ensure_succinct_index(&pile_path, Some(&key)).unwrap();
-        let bm25 = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        let succinct = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
+        let bm25 = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!((succinct.source_commits, succinct.source_elements), (1, 1));
         assert_eq!(
             (
@@ -2120,12 +2166,18 @@ mod tests {
         assert_eq!(derives.len(), 2, "one empty derive per target mapping");
         pile.close().unwrap();
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(snapshot.commits(), &[commit]);
         assert!(snapshot.recent_projection_ids(10).is_empty());
         drop(snapshot);
-        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let search =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         assert!(search.search("anything", 10).unwrap().is_empty());
     }
 
@@ -2137,7 +2189,8 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         writer
             .stage_fragment(projection_at_modality(
                 "session:text",
@@ -2156,8 +2209,12 @@ mod tests {
             .unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         let complete = snapshot
             .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
             .unwrap();
@@ -2207,7 +2264,8 @@ mod tests {
         let (independent, independent_id) =
             projection_after_at("other/root", "independent", Some(7.0), &[]);
 
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         // Deliberately stage out of causal and temporal order. The collection
         // is a set; replay order must come solely from canonical semantics.
         writer.stage_fragment(regressed_child).unwrap();
@@ -2216,8 +2274,12 @@ mod tests {
         writer.stage_fragment(parent).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let snapshot =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         let timeline = snapshot
             .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
             .unwrap();
@@ -2251,18 +2313,19 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         writer
             .stage_fragment(projection("session:index", "exact succinct"))
             .unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let report = ensure_succinct_index(&pile_path, Some(&key)).unwrap();
+        let report = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
         assert_eq!(report.source_commits, 1);
         assert_eq!(report.source_elements, 1);
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
-            ensure_succinct_index(&pile_path, Some(&key)).unwrap(),
+            pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap(),
             report
         );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
@@ -2309,17 +2372,21 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, text) in [("session:alpha", "alpha"), ("session:beta", "beta")] {
-            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            let mut writer =
+                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
             writer.stage_fragment(projection(locator, text)).unwrap();
             writer.finish(Ok(())).unwrap();
         }
 
-        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!(report.source_commits, 2);
         assert_eq!(report.source_elements, 2);
         assert_eq!(report.cover_segments, 1);
         let length = std::fs::metadata(&pile_path).unwrap().len();
-        assert_eq!(ensure_bm25_index(&pile_path, Some(&key)).unwrap(), report);
+        assert_eq!(
+            pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap(),
+            report
+        );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -2344,14 +2411,17 @@ mod tests {
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_support = source.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let source_support = source.admitted_at(&store_snapshot, instant).unwrap();
         let attached = store_snapshot
             .collection_exact(target, &source_support)
             .unwrap();
         assert_eq!(attached.cover().len(), 1);
         pile.close().unwrap();
 
-        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let search =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         assert_eq!(search.search("alpha", 10).unwrap().len(), 1);
         assert_eq!(search.search("beta", 10).unwrap().len(), 1);
     }
@@ -2365,16 +2435,19 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
-            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            let mut writer =
+                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
             writer
                 .stage_fragment(projection_at(locator, "shared closure needle", seconds))
                 .unwrap();
             writer.finish(Ok(())).unwrap();
         }
 
-        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
+        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!((report.source_commits, report.source_elements), (2, 2));
-        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let search =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         let hits = search.search("shared closure needle", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
@@ -2388,29 +2461,37 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let first_fragment = projection("session:first", "alpha");
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         writer.stage_fragment(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
-        let first = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let first = pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+            .unwrap();
         assert_eq!(first.search("alpha", 10).unwrap().len(), 1);
         drop(first);
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         writer.stage_fragment(second_fragment.clone()).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let extended = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let extended =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         assert_eq!(extended.search("alpha", 10).unwrap().len(), 1);
         assert_eq!(extended.search("beta", 10).unwrap().len(), 1);
         assert_eq!(extended.search("🛰️", 1).unwrap().len(), 1);
         drop(extended);
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
-        let mut retry = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut retry =
+            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         retry.stage_fragment(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
-        let after_retry = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let after_retry =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         assert_eq!(after_retry.search("beta", 10).unwrap().len(), 1);
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
     }
@@ -2439,14 +2520,18 @@ mod tests {
         let _target = test_target(&mut pile, collection, &pile_path, &key);
         pile.close().unwrap();
 
-        let archive =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let archive = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         assert_eq!(archive.commits().len(), 2);
         assert_eq!(archive.projection_ids().len(), 1);
         drop(archive);
         let before = std::fs::metadata(&pile_path).unwrap().len();
 
-        let error = ensure_bm25_index(&pile_path, Some(&key)).unwrap_err();
+        let error = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("references absent part"), "{error}");
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
@@ -2521,7 +2606,9 @@ mod tests {
         let bm25_records_before = bm25_records(&mut pile);
         pile.close().unwrap();
 
-        let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
+        let search =
+            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
+                .unwrap();
         let hits = search.search("routed needle", 10).unwrap();
         assert_eq!(hits.len(), 1);
         let projections = search.archive().projection_ids();
@@ -2547,13 +2634,21 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let first = commit_projection(&pile_path, &key, "session:frozen", "frozen needle");
-        let frozen =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let frozen = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         let later = commit_projection(&pile_path, &key, "session:later", "later needle");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let ensured =
-            ensure_bm25_for_snapshot(&mut pile, &frozen, test_authority(&pile_path, &key)).unwrap();
+        let ensured = pollster::block_on(ensure_bm25_for_snapshot(
+            &mut pile,
+            &frozen,
+            test_authority(&pile_path, &key),
+        ))
+        .unwrap();
         assert_eq!(ensured.report.source_commits, 1);
         drop(ensured);
         pile.close().unwrap();
@@ -2585,22 +2680,34 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
-        let first_archive =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let first_archive = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         let first_support = first_archive.support().clone();
         drop(first_archive);
         commit_projection(&pile_path, &key, "session:second", "second residual");
-        let archive =
-            ArchiveSnapshot::load_local(&pile_path, Some(&key), schema::DEFAULT_SCOPE_ID).unwrap();
+        let archive = pollster::block_on(ArchiveSnapshot::load_local(
+            &pile_path,
+            Some(&key),
+            schema::DEFAULT_SCOPE_ID,
+        ))
+        .unwrap();
         let full_support = archive.support().clone();
         drop(archive);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
-        let first_snapshot = pile
-            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &first_support)
-            .unwrap();
+        let first_snapshot = pollster::block_on(
+            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                target,
+                &first_support,
+            ),
+        )
+        .unwrap();
         let first = first_snapshot
             .collection_exact(target, &first_support)
             .unwrap();
@@ -2617,9 +2724,10 @@ mod tests {
             .count();
         assert_eq!(first_derives, 1);
 
-        let full_snapshot = pile
-            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support)
-            .unwrap();
+        let full_snapshot = pollster::block_on(
+            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support),
+        )
+        .unwrap();
         let full = full_snapshot
             .collection_exact(target, &full_support)
             .unwrap();
@@ -2645,9 +2753,10 @@ mod tests {
             records_before.derives().len(),
             records_before.merges().len(),
         );
-        let retry_snapshot = pile
-            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support)
-            .unwrap();
+        let retry_snapshot = pollster::block_on(
+            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support),
+        )
+        .unwrap();
         let retry = retry_snapshot
             .collection_exact(target, &full_support)
             .unwrap();
@@ -2678,7 +2787,8 @@ mod tests {
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_support = source.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let source_support = source.admitted_at(&store_snapshot, instant).unwrap();
         let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
@@ -2695,9 +2805,13 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let ready_snapshot = pile
-            .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &source_support)
-            .unwrap();
+        let ready_snapshot = pollster::block_on(
+            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                target,
+                &source_support,
+            ),
+        )
+        .unwrap();
         let ready = ready_snapshot
             .collection_exact(target, &source_support)
             .unwrap();

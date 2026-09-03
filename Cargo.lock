@@ -3896,6 +3896,7 @@ dependencies = [
  "mary",
  "memchr",
  "mime",
+ "pollster",
  "quick-xml 0.37.5",
  "rand_core 0.6.4",
  "rayon",
@@ -3929,12 +3930,15 @@ dependencies = [
  "anybytes",
  "anyhow",
  "clap",
+ "dryoc",
  "ed25519-dalek",
  "faculties",
  "hex",
+ "hifitime",
  "tempfile",
  "triblespace",
  "triblespace-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -3946,6 +3950,7 @@ dependencies = [
  "dryoc",
  "ed25519-dalek",
  "hifitime",
+ "pollster",
  "rand_core 0.6.4",
  "tempfile",
  "triblespace",

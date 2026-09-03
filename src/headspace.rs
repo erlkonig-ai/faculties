@@ -1397,7 +1397,7 @@ fn validate_secret_references_by(
     Ok(())
 }
 
-/// Validate exact references against the aggregate of ready vault epochs.
+/// Validate exact references against the aggregate configured Secrets view.
 pub fn validate_secret_references<R>(
     catalog: &Catalog,
     secrets: &SecretsSnapshot<R>,
@@ -1547,7 +1547,9 @@ mod tests {
     use crate::collection_names::open_configured;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
-    use crate::storage::{FactArchive, FactCollection};
+    use crate::storage::{
+        open_secrets_collection, open_secrets_collection_read, FactArchive, FactCollection,
+    };
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1569,7 +1571,7 @@ mod tests {
         let collection = FactCollection::new(pile, source).unwrap();
         let instant = crate::clock::now().unwrap();
         let before = pile.snapshot().unwrap();
-        let reader = collection.maintain_at(pile, &before, instant).unwrap();
+        let reader = pollster::block_on(collection.maintain_at(pile, &before, instant)).unwrap();
         drop(before);
         let facts = reader
             .collection_at(collection.rank9(), instant)
@@ -1720,36 +1722,27 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x41; 32]);
-        let vault = test_id(0x40);
-        let location =
-            secrets::storage::create_vault(&mut pile, &signer, vault, "headspace-test", at(2))
-                .unwrap();
-        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
         let first_id = secrets::storage::add_secret(
             &mut pile,
             &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "hs/model",
             b"first",
             at(3),
         )
         .unwrap();
-        drop(discovery);
-        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
-        secrets::storage::add_secret(
+        secrets::storage::add_secret(&mut pile, &signer, collection, "hs/model", b"second", at(4))
+            .unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let collection =
+            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
+        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
             &mut pile,
-            &signer,
-            &location,
-            discovery.snapshot(),
-            "hs/model",
-            b"second",
-            at(4),
-        )
+            [collection],
+            instant,
+        ))
         .unwrap();
-        drop(discovery);
-        let discovery = secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
-        let secrets = discovery.snapshot();
 
         let anchor = test_id(0x42);
         let mut profile = default_profile(anchor, "exact");
@@ -1764,10 +1757,9 @@ mod tests {
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
-        validate_secret_references(&headspace, secrets).unwrap();
-        let opened = open_active_secrets(&headspace, secrets, &signer).unwrap();
+        validate_secret_references(&headspace, &secrets).unwrap();
+        let opened = open_active_secrets(&headspace, &secrets, &signer).unwrap();
         assert_eq!(opened.model_api_key.as_deref(), Some("first"));
-        drop(discovery);
         pile.close().unwrap();
     }
 
@@ -1786,11 +1778,14 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
-        let mut empty = Fragment::empty();
-        let secrets = SecretsSnapshot::new(
-            empty.blobs_mut().snapshot().unwrap(),
-            Vec::<(Id, TribleSet)>::new(),
-        )
+        let instant = triblespace::core::clock::epoch_now();
+        let collection =
+            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
+        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
+            &mut pile,
+            [collection],
+            instant,
+        ))
         .unwrap();
         let error = validate_secret_references(&catalog, &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));

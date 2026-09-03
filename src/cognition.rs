@@ -524,7 +524,7 @@ mod tests {
         let collection = FactCollection::new(&mut pile, source).unwrap();
         let instant = crate::clock::now().unwrap();
         let before = pile.snapshot().unwrap();
-        drop(collection.maintain_at(&mut pile, &before, instant).unwrap());
+        drop(pollster::block_on(collection.maintain_at(&mut pile, &before, instant)).unwrap());
         drop(before);
         let snapshot = pile.snapshot().unwrap();
         let facts = snapshot
