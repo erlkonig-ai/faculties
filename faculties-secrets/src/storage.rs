@@ -22,14 +22,15 @@ use triblespace::core::capability::{
 };
 use triblespace::core::collection::{
     descriptor, simplearchive_union, Collection, CollectionHandle, CollectionRead,
-    CollectionRecord, CollectionRecordSelector, CollectionStoreExt, FactCover, ACTION_WRITE,
+    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
+    ACTION_WRITE,
 };
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileSnapshot};
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
-    SnapshotSource,
+    SnapshotSource, StoreRead,
 };
 use triblespace::prelude::*;
 
@@ -533,7 +534,10 @@ where
                     None,
                     inbox.handle(),
                     None,
-                    format!("access-inbox commit {} metadata: {error}", commit.id()),
+                    format!(
+                        "access-inbox record fingerprint {} metadata: {error}",
+                        commit.fingerprint()
+                    ),
                 ));
                 continue;
             }
@@ -545,7 +549,10 @@ where
                 None,
                 inbox.handle(),
                 None,
-                format!("access-inbox commit {} metadata: {error}", commit.id()),
+                format!(
+                    "access-inbox record fingerprint {} metadata: {error}",
+                    commit.fingerprint()
+                ),
             ));
             continue;
         }
@@ -559,7 +566,10 @@ where
                     None,
                     inbox.handle(),
                     None,
-                    format!("access-inbox commit {} data: {error}", commit.id()),
+                    format!(
+                        "access-inbox record fingerprint {} data: {error}",
+                        commit.fingerprint()
+                    ),
                 ));
                 continue;
             }
@@ -573,7 +583,10 @@ where
                     None,
                     inbox.handle(),
                     None,
-                    format!("access-inbox commit {} data: {error}", commit.id()),
+                    format!(
+                        "access-inbox record fingerprint {} data: {error}",
+                        commit.fingerprint()
+                    ),
                 ));
                 continue;
             }
@@ -727,24 +740,26 @@ fn write_bundles(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityProof
 
 /// Construct the exact vault cover admitted by the collection's immutable
 /// WRITE policy and the proof evidence in this coherent snapshot.
-fn admitted_vault_cover<S>(snapshot: &S, location: VaultLocation) -> Result<FactCover>
+fn admitted_vault_cover<S>(snapshot: &S, location: VaultLocation) -> Result<Support>
 where
     S: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
-    let (cover, _commits) = location
+    let (support, _commits) = location
         .collection
         .admitted_with_commits(snapshot)
-        .context("discover policy-admitted vault cover")?;
-    Ok(cover)
+        .context("discover policy-admitted vault support")?;
+    Ok(support)
 }
 
-fn read_vault_cover<S>(snapshot: &S, cover: &FactCover) -> Result<TribleSet>
+fn read_vault_cover<S>(snapshot: &S, support: &Support) -> Result<TribleSet>
 where
-    S: BlobStoreGet + BlobStoreMeta + triblespace::core::collection::CollectionRead,
+    S: StoreRead,
 {
-    cover
-        .materialize::<TribleSet, _>(snapshot)
-        .context("read candidate-scoped vault cover")
+    snapshot
+        .collection_exact(support.collection(), support)
+        .context("attach candidate-scoped vault support")?
+        .view::<TribleSet>()
+        .context("read candidate-scoped vault support")
 }
 
 fn read_atom(collection: CollectionHandle) -> CapabilityAtom {
