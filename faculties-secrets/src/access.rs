@@ -20,6 +20,7 @@ use triblespace::core::capability::{
 };
 use triblespace::core::collection::{CollectionHandle, ACTION_WRITE};
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
@@ -204,92 +205,50 @@ pub fn build_access_envelope(
     Ok(fragment)
 }
 
-fn exactly_one<T>(id: Id, field: &str, mut values: Vec<T>) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "access envelope {id:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(values.pop().expect("length checked above"))
-}
-
-fn entity_facts(space: &TribleSet, entity: Id) -> TribleSet {
-    let mut facts = TribleSet::new();
-    for fact in space.iter().filter(|fact| fact.e() == &entity) {
-        facts.insert(fact);
-    }
-    facts
-}
-
-/// Strictly load one closed intrinsic envelope row from an inbox fact set.
+/// Project every complete, decodable access-envelope row.
 ///
-/// Facts belonging to other entities are ignored; every fact on `id` must be
-/// exactly one of the six canonical envelope facts, and `id` must be the
-/// intrinsic identity recomputed from those facts.
-pub fn load_access_envelope(space: &TribleSet, id: Id) -> Result<AccessEnvelopeRow> {
-    let custody = exactly_one(
-        id,
-        "custody_public_key",
-        find!(
-            value: Inline<inlineencodings::ED25519PublicKey>,
-            pattern!(space, [{ id @ custody_public_key: ?value }])
-        )
-        .collect(),
-    )?;
-    let custody_key = VerifyingKey::from_bytes(&custody.raw)
-        .context("access envelope has an invalid custody Ed25519 public key")?;
-    let row = AccessEnvelopeRow {
-        id,
-        custody_public_key: custody_key,
-        vault: exactly_one(
-            id,
-            "access_vault",
-            find!(
-                value: CollectionHandle,
-                pattern!(space, [{ id @ access_vault: ?value }])
-            )
-            .collect(),
-        )?,
-        read_proof: exactly_one(
-            id,
-            "access_read_proof",
-            find!(
-                value: CapabilityProofId,
-                pattern!(space, [{ id @ access_read_proof: ?value }])
-            )
-            .collect(),
-        )?,
-        write_proof: exactly_one(
-            id,
-            "access_write_proof",
-            find!(
-                value: CapabilityProofId,
-                pattern!(space, [{ id @ access_write_proof: ?value }])
-            )
-            .collect(),
-        )?,
-        sealed_seed: exactly_one(
-            id,
-            "access_sealed_seed",
-            find!(
-                value: BytesHandle,
-                pattern!(space, [{ id @ access_sealed_seed: ?value }])
-            )
-            .collect(),
-        )?,
-    };
-    let canonical = envelope_record(
-        row.custody_public_key,
-        row.vault,
-        row.read_proof,
-        row.write_proof,
-        row.sealed_seed,
-    );
-    if canonical.root() != Some(id) || entity_facts(space, id) != *canonical.facts() {
-        bail!("access envelope {id:x} is not one canonical intrinsic record");
-    }
-    Ok(row)
+/// The entity id is opaque.  Authenticity comes from the inbox COMMIT, proof
+/// closures, and context-bound ciphertext checked by [`open_access_envelope`],
+/// never from recomputing an intrinsic id. Unknown facts and partial rows are
+/// ignored at this typed query boundary.
+pub fn access_envelopes<P>(space: &P) -> Vec<AccessEnvelopeRow>
+where
+    P: TriblePattern,
+{
+    find!(
+        (
+            id: Id,
+            custody: Inline<inlineencodings::ED25519PublicKey>,
+            vault: CollectionHandle,
+            read_proof: CapabilityProofId,
+            write_proof: CapabilityProofId,
+            sealed_seed: BytesHandle
+        ),
+        pattern!(space, [{
+            ?id @
+                metadata::tag: KIND_ACCESS_ENVELOPE,
+                custody_public_key: ?custody,
+                access_vault: ?vault,
+                access_read_proof: ?read_proof,
+                access_write_proof: ?write_proof,
+                access_sealed_seed: ?sealed_seed,
+        }])
+    )
+    .filter_map(
+        |(id, custody, vault, read_proof, write_proof, sealed_seed)| {
+            VerifyingKey::from_bytes(&custody.raw)
+                .ok()
+                .map(|custody_key| AccessEnvelopeRow {
+                    id,
+                    custody_public_key: custody_key,
+                    vault,
+                    read_proof,
+                    write_proof,
+                    sealed_seed,
+                })
+        },
+    )
+    .collect()
 }
 
 fn take_word(bytes: &[u8], offset: &mut usize) -> [u8; FRAME_WORD_BYTES] {
@@ -430,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_round_trip_is_intrinsic_exact_and_context_bound() {
+    fn envelope_round_trip_is_context_bound() {
         let root = key(1);
         let subject = key(2);
         let writer = key(3);
@@ -451,9 +410,11 @@ mod tests {
             instant,
         )
         .expect("build envelope");
-        let id = fragment.root().expect("intrinsic row root");
         let (_, facts, _, mut blobs) = fragment.into_parts();
-        let row = load_access_envelope(&facts, id).expect("strict row");
+        let row = access_envelopes(&facts)
+            .into_iter()
+            .next()
+            .expect("typed envelope row");
         let reader = blobs.snapshot().expect("blob snapshot");
         let opened = open_access_envelope(
             &reader,
@@ -515,9 +476,11 @@ mod tests {
             instant,
         )
         .expect("build envelope");
-        let id = fragment.root().expect("intrinsic row root");
         let (_, facts, _, mut blobs) = fragment.into_parts();
-        let row = load_access_envelope(&facts, id).expect("strict row");
+        let row = access_envelopes(&facts)
+            .into_iter()
+            .next()
+            .expect("typed envelope row");
         let reader = blobs.snapshot().expect("blob snapshot");
 
         assert!(open_access_envelope(

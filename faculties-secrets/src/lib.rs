@@ -25,9 +25,14 @@ use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, ACTION_WRITE,
 };
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
+
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchive, UnionArchive,
+};
 
 pub mod access;
 pub mod schema;
@@ -64,6 +69,12 @@ pub type RecipientPublicKey = [u8; 32];
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
+
+/// Shard-preserving logical view used for ordinary vault queries.
+///
+/// Vault discovery attaches this to the maintained Rank9 collection.  It is
+/// intentionally a query surface rather than a materialized Rust catalog.
+pub type VaultFacts = UnionArchive<OrderedUniverse>;
 
 /// Canonical fixed-width collection name of one nonzero vault id.
 pub fn vault_name(vault: Id) -> String {
@@ -147,6 +158,10 @@ pub struct WrapRow {
     pub sealed_dek: BytesHandle,
 }
 
+/// Strict stopped-world projection retained for explicit migration and tests.
+///
+/// Ordinary vault reads query [`VaultFacts`] directly instead of reconstructing
+/// this catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultCatalog {
     pub header: VaultHeader,
@@ -174,16 +189,15 @@ impl VaultCatalog {
     }
 }
 
-/// One validated vault epoch retained exactly as it was materialized.
+/// One immutable, collection-scoped vault view.
 ///
-/// The facts remain available beside their projection so a later mutation can
-/// validate the prospective monotone union before publishing it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VaultSnapshot {
+/// This owns the maintained query surface only.  Rows are projected where an
+/// operation needs them; there is no eagerly reconstructed vault catalog.
+#[derive(Clone)]
+pub struct VaultView {
     vault: Id,
     collection: Option<CollectionHandle>,
-    facts: TribleSet,
-    catalog: VaultCatalog,
+    facts: VaultFacts,
 }
 
 /// Exact local evidence needed to use one vault epoch.
@@ -310,7 +324,7 @@ impl VaultAccess {
     }
 }
 
-impl VaultSnapshot {
+impl VaultView {
     /// Vault-local graph identity carried by the canonical header.
     pub const fn id(&self) -> Id {
         self.vault
@@ -322,18 +336,170 @@ impl VaultSnapshot {
         self.collection
     }
 
-    /// Complete canonical facts of this exact vault epoch.
-    pub fn facts(&self) -> &TribleSet {
+    /// Maintained facts admitted for this exact vault collection.
+    pub fn facts(&self) -> &VaultFacts {
         &self.facts
-    }
-
-    /// Strict vault projection of [`Self::facts`].
-    pub fn catalog(&self) -> &VaultCatalog {
-        &self.catalog
     }
 }
 
-/// Storage-agnostic aggregate over validated vault epochs.
+/// Project every complete, decodable header row for one vault identity.
+///
+/// Extra facts and partial rows are intentionally irrelevant.  The operation
+/// which needs a header decides which projected value is useful rather than
+/// imposing a closed-world shape on the collection.
+pub fn vault_headers<P>(facts: &P, vault: Id) -> Vec<VaultHeader>
+where
+    P: TriblePattern,
+{
+    find!(
+        (created_at: IntervalValue, name: TextHandle),
+        pattern!(facts, [{
+            vault @
+                metadata::tag: KIND_VAULT,
+                metadata::created_at: ?created_at,
+                metadata::name: ?name,
+        }])
+    )
+    .filter_map(|(created_at, name)| {
+        point_value("vault creation time", created_at)
+            .is_ok()
+            .then_some(VaultHeader {
+                id: vault,
+                created_at,
+                name,
+            })
+    })
+    .collect()
+}
+
+/// Project every complete custody declaration visible in a vault view.
+pub fn custody_rows<P>(facts: &P) -> Vec<CustodyRow>
+where
+    P: TriblePattern,
+{
+    find!(
+        (id: Id, public_key: Inline<inlineencodings::ED25519PublicKey>),
+        pattern!(facts, [{
+            ?id @
+                metadata::tag: KIND_VAULT_CUSTODY,
+                custody_public_key: ?public_key,
+        }])
+    )
+    .filter_map(|(id, public_key)| {
+        box_pk_from_ed25519(&public_key.raw)
+            .is_ok()
+            .then_some(CustodyRow {
+                id,
+                public_key: public_key.raw,
+            })
+    })
+    .collect()
+}
+
+/// Whether one complete custody declaration names `public_key`.
+pub fn has_custody<P>(facts: &P, public_key: RecipientPublicKey) -> bool
+where
+    P: TriblePattern,
+{
+    let value = Inline::<inlineencodings::ED25519PublicKey>::new(public_key);
+    exists!(pattern!(facts, [{
+        _?id @
+            metadata::tag: KIND_VAULT_CUSTODY,
+            custody_public_key: value,
+    }]))
+}
+
+/// Project every complete, decodable immutable-secret row.
+pub fn secret_rows<P>(facts: &P) -> Vec<SecretRow>
+where
+    P: TriblePattern,
+{
+    find!(
+        (
+            id: Id,
+            created_at: IntervalValue,
+            name: TextHandle,
+            body: BytesHandle
+        ),
+        pattern!(facts, [{
+            ?id @
+                metadata::tag: KIND_SECRET,
+                metadata::created_at: ?created_at,
+                metadata::name: ?name,
+                secret_body: ?body,
+        }])
+    )
+    .filter_map(|(id, created_at, name, body)| {
+        point_value("secret creation time", created_at)
+            .is_ok()
+            .then_some(SecretRow {
+                id,
+                created_at,
+                name,
+                body,
+            })
+    })
+    .collect()
+}
+
+/// Project every complete, decodable row for one exact opaque secret id.
+pub fn secret_rows_for<P>(facts: &P, secret: Id) -> Vec<SecretRow>
+where
+    P: TriblePattern,
+{
+    find!(
+        (
+            created_at: IntervalValue,
+            name: TextHandle,
+            body: BytesHandle
+        ),
+        pattern!(facts, [{
+            secret @
+                metadata::tag: KIND_SECRET,
+                metadata::created_at: ?created_at,
+                metadata::name: ?name,
+                secret_body: ?body,
+        }])
+    )
+    .filter_map(|(created_at, name, body)| {
+        point_value("secret creation time", created_at)
+            .is_ok()
+            .then_some(SecretRow {
+                id: secret,
+                created_at,
+                name,
+                body,
+            })
+    })
+    .collect()
+}
+
+/// Project every complete, decodable wrap row for one secret and recipient.
+pub fn recipient_wraps<P>(facts: &P, secret: Id, recipient: RecipientPublicKey) -> Vec<WrapRow>
+where
+    P: TriblePattern,
+{
+    let recipient_value = Inline::<inlineencodings::ED25519PublicKey>::new(recipient);
+    find!(
+        (id: Id, sealed_dek: BytesHandle),
+        pattern!(facts, [{
+            ?id @
+                metadata::tag: KIND_WRAP,
+                wrap_secret: secret,
+                wrap_recipient_key: recipient_value,
+                wrap_dek: ?sealed_dek,
+        }])
+    )
+    .map(|(id, sealed_dek)| WrapRow {
+        id,
+        secret,
+        recipient,
+        sealed_dek,
+    })
+    .collect()
+}
+
+/// Storage-agnostic aggregate over admitted, maintained vault views.
 ///
 /// Access-discovered vaults retain their exact collection identity. Bare vault
 /// and secret ids are conveniences only when unique in this snapshot; exact
@@ -344,7 +510,7 @@ impl VaultSnapshot {
 /// arbitration.
 pub struct SecretsSnapshot<R> {
     store_snapshot: R,
-    vaults: Vec<VaultSnapshot>,
+    vaults: Vec<VaultView>,
     access: BTreeMap<CollectionHandle, VaultAccess>,
 }
 
@@ -354,16 +520,16 @@ impl<R> SecretsSnapshot<R> {
         &self.store_snapshot
     }
 
-    /// Every validated vault, ordered by construction input.
-    pub fn vaults(&self) -> &[VaultSnapshot] {
+    /// Every ready vault, ordered by construction input.
+    pub fn vaults(&self) -> &[VaultView] {
         &self.vaults
     }
 
-    /// Facts and catalog for a unique graph-local vault id.
+    /// Maintained facts for a unique graph-local vault id.
     ///
     /// Returns `None` both when absent and when multiple exact collections use
     /// the id. Use [`Self::vault_exact`] when collection identity is known.
-    pub fn vault(&self, vault: Id) -> Option<&VaultSnapshot> {
+    pub fn vault(&self, vault: Id) -> Option<&VaultView> {
         let mut matching = self
             .vaults
             .iter()
@@ -372,8 +538,8 @@ impl<R> SecretsSnapshot<R> {
         matching.next().is_none().then_some(first)
     }
 
-    /// Facts and catalog for one exact access-discovered collection.
-    pub fn vault_exact(&self, collection: CollectionHandle) -> Option<&VaultSnapshot> {
+    /// Maintained facts for one exact access-discovered collection.
+    pub fn vault_exact(&self, collection: CollectionHandle) -> Option<&VaultView> {
         self.vaults
             .iter()
             .find(|snapshot| snapshot.collection == Some(collection))
@@ -383,18 +549,17 @@ impl<R> SecretsSnapshot<R> {
     pub fn contains(&self, secret: Id) -> bool {
         self.vaults
             .iter()
-            .any(|vault| vault.catalog.secrets.contains_key(&secret))
+            .any(|vault| !secret_rows_for(&vault.facts, secret).is_empty())
     }
 
     /// Locate a globally unique immutable secret as `(vault_id, row)`.
     ///
     /// Returns `None` when more than one exact collection contains the id.
-    pub fn lookup(&self, secret: Id) -> Option<(Id, &SecretRow)> {
+    pub fn lookup(&self, secret: Id) -> Option<(Id, SecretRow)> {
         let mut matching = self.vaults.iter().filter_map(|vault| {
-            vault
-                .catalog
-                .secrets
-                .get(&secret)
+            secret_rows_for(&vault.facts, secret)
+                .into_iter()
+                .next()
                 .map(|row| (vault.vault, row))
         });
         let first = matching.next()?;
@@ -402,8 +567,10 @@ impl<R> SecretsSnapshot<R> {
     }
 
     /// Locate one immutable secret inside an exact collection.
-    pub fn lookup_exact(&self, collection: CollectionHandle, secret: Id) -> Option<&SecretRow> {
-        self.vault_exact(collection)?.catalog.secrets.get(&secret)
+    pub fn lookup_exact(&self, collection: CollectionHandle, secret: Id) -> Option<SecretRow> {
+        secret_rows_for(&self.vault_exact(collection)?.facts, secret)
+            .into_iter()
+            .next()
     }
 
     /// Verified local access evidence for a unique graph-local vault id.
@@ -419,7 +586,7 @@ impl<R> SecretsSnapshot<R> {
 }
 
 impl<R: BlobStoreGet> SecretsSnapshot<R> {
-    /// Validate and index an exact set of materialized vault epochs.
+    /// Strictly validate explicit stopped-world vault inputs.
     ///
     /// Both duplicate vault inputs and secret ids shared across vaults are
     /// rejected rather than silently coalesced.
@@ -441,11 +608,10 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
                     bail!("secret {secret} occurs in both vault {previous} and vault {vault}");
                 }
             }
-            snapshots.push(VaultSnapshot {
+            snapshots.push(VaultView {
                 vault,
                 collection: None,
-                facts,
-                catalog,
+                facts: VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
             });
         }
         Ok(Self {
@@ -470,13 +636,12 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             if !collections.insert(collection) {
                 bail!("collection {collection:?} was supplied more than once");
             }
-            let catalog = validate_catalog(&reader, vault, &facts)
+            validate_catalog(&reader, vault, &facts)
                 .with_context(|| format!("validate vault {vault}"))?;
-            snapshots.push(VaultSnapshot {
+            snapshots.push(VaultView {
                 vault,
                 collection: Some(collection),
-                facts,
-                catalog,
+                facts: VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
             });
         }
         Ok(Self {
@@ -486,16 +651,14 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
         })
     }
 
-    /// Validate and index vault epochs together with explicit local access.
+    /// Attach maintained vault views together with explicit local access.
     pub(crate) fn new_accessible<I>(reader: R, vaults: I) -> Result<Self>
     where
-        I: IntoIterator<Item = (Id, TribleSet, VaultAccess)>,
+        I: IntoIterator<Item = (Id, VaultFacts, VaultAccess)>,
     {
         let mut snapshots = Vec::new();
         let mut by_access = BTreeMap::new();
         for (vault, facts, access) in vaults {
-            let catalog = validate_catalog(&reader, vault, &facts)
-                .with_context(|| format!("validate vault {vault}"))?;
             if access.vault != vault {
                 bail!(
                     "vault {vault} access evidence is bound to vault {}",
@@ -503,20 +666,17 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
                 );
             }
             let collection = access.collection.handle();
-            let custody = catalog
-                .custody
-                .context("an accessible vault must declare one custody key")?;
-            if access.custody.verifying_key().to_bytes() != custody.public_key {
+            let custody = access.custody.verifying_key().to_bytes();
+            if !has_custody(&facts, custody) {
                 bail!("vault {vault} access envelope opens to a different custody key");
             }
             if by_access.insert(collection, access).is_some() {
                 bail!("collection {collection:?} was supplied more than once");
             }
-            snapshots.push(VaultSnapshot {
+            snapshots.push(VaultView {
                 vault,
                 collection: Some(collection),
                 facts,
-                catalog,
             });
         }
         Ok(Self {
@@ -531,7 +691,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
         let mut matching = self
             .vaults
             .iter()
-            .filter(|vault| vault.catalog.secrets.contains_key(&secret));
+            .filter(|vault| !secret_rows_for(&vault.facts, secret).is_empty());
         let snapshot = matching
             .next()
             .ok_or_else(|| anyhow!("secret {secret} not found in any vault"))?;
@@ -551,9 +711,9 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             bail!("the supplied signing key is not the access-envelope subject");
         }
         access.verify_read_at(triblespace::core::clock::epoch_now())?;
-        open_version(
+        open_version_from_facts(
             &self.store_snapshot,
-            &snapshot.catalog,
+            &snapshot.facts,
             secret,
             &access.custody,
         )
@@ -570,7 +730,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
         let snapshot = self
             .vault_exact(collection)
             .ok_or_else(|| anyhow!("vault collection {collection:?} is not present"))?;
-        if !snapshot.catalog.secrets.contains_key(&secret) {
+        if secret_rows_for(&snapshot.facts, secret).is_empty() {
             bail!("secret {secret} is not present in vault collection {collection:?}");
         }
         let access = self
@@ -580,9 +740,9 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             bail!("the supplied signing key is not the access-envelope subject");
         }
         access.verify_read_at(triblespace::core::clock::epoch_now())?;
-        open_version(
+        open_version_from_facts(
             &self.store_snapshot,
-            &snapshot.catalog,
+            &snapshot.facts,
             secret,
             &access.custody,
         )
@@ -1104,6 +1264,117 @@ fn decrypt_secret_body<R: BlobStoreGet>(
         .map_err(|_| anyhow!("decrypt secret body failed"))
 }
 
+fn recover_dek_from_facts<R, P>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    signing_key: &SigningKey,
+) -> Result<Key>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
+    if secret_rows_for(facts, secret).is_empty() {
+        bail!("secret {secret} not found");
+    }
+    let recipient = signing_key.verifying_key().to_bytes();
+    let wraps = recipient_wraps(facts, secret, recipient);
+    if wraps.is_empty() {
+        bail!("no wrap for this signing key on secret {secret}");
+    }
+    let keypair = box_keypair_from_signing_key(signing_key)?;
+    let mut recovered: Option<Zeroizing<Vec<u8>>> = None;
+    for wrap in wraps {
+        let sealed = read_bytes(reader, wrap.sealed_dek)
+            .with_context(|| format!("read wrap {}", wrap.id))?;
+        validate_sealed_dek(&sealed)?;
+        let bytes = Zeroizing::new(
+            DryocBox::from_sealed_bytes(&sealed)
+                .map_err(|error| anyhow!("parse wrap {}: {error:?}", wrap.id))?
+                .unseal_to_vec(&keypair)
+                .map_err(|_| anyhow!("unseal wrap {} failed", wrap.id))?,
+        );
+        if bytes.len() != 32 {
+            bail!("wrap {} opened to a malformed DEK", wrap.id);
+        }
+        if recovered
+            .as_ref()
+            .is_some_and(|previous| previous.as_slice() != bytes.as_slice())
+        {
+            bail!("independent wraps for secret {secret} and one recipient open to competing DEKs");
+        }
+        if recovered.is_none() {
+            recovered = Some(bytes);
+        }
+    }
+    let bytes = recovered.expect("at least one wrap checked above");
+    Key::try_from(&bytes[..]).context("decode DEK")
+}
+
+fn decrypt_secret_body_from_facts<R, P>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    dek: &Key,
+) -> Result<Vec<u8>>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
+    let bodies = secret_rows_for(facts, secret)
+        .into_iter()
+        .map(|row| row.body)
+        .collect::<BTreeSet<_>>();
+    if bodies.is_empty() {
+        bail!("secret {secret} not found");
+    }
+
+    let mut plaintext = None::<Vec<u8>>;
+    for body in bodies {
+        let body = read_bytes(reader, body).context("read encrypted secret body")?;
+        validate_encrypted_body(&body)?;
+        let nonce = Nonce::try_from(&body[..24]).context("secret nonce")?;
+        let candidate = DryocSecretBox::from_bytes(&body[24..])
+            .map_err(|error| anyhow!("parse secret body: {error:?}"))?
+            .decrypt_to_vec(&nonce, dek)
+            .map_err(|_| anyhow!("decrypt secret body failed"))?;
+        if plaintext
+            .as_ref()
+            .is_some_and(|previous| previous != &candidate)
+        {
+            bail!("secret {secret} contains competing decryptable bodies");
+        }
+        if plaintext.is_none() {
+            plaintext = Some(candidate);
+        }
+    }
+    Ok(plaintext.expect("at least one body checked above"))
+}
+
+/// Open one exact immutable version through a maintained vault query view.
+///
+/// Only the header facts needed by this operation are projected. Additional
+/// facts and independently malformed rows do not turn the surrounding vault
+/// into a closed record; cryptographic conflicts for the selected secret do
+/// remain hard failures.
+pub fn open_version_from_facts<R, P>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    custody: &SigningKey,
+) -> Result<Vec<u8>>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
+    let expected = custody.verifying_key().to_bytes();
+    if !has_custody(facts, expected) {
+        bail!("supplied custody seed does not match any vault custody declaration");
+    }
+    let dek = recover_dek_from_facts(reader, facts, secret, custody)?;
+    decrypt_secret_body_from_facts(reader, facts, secret, &dek)
+}
+
 /// Encrypt one immutable version and seal its DEK exactly once to the vault
 /// epoch's custody key.
 pub fn seal_version(
@@ -1587,9 +1858,15 @@ mod tests {
         assert_eq!(admitted, facts);
 
         let reader = fragment.blobs_mut().snapshot().unwrap();
-        let snapshot =
-            SecretsSnapshot::new_accessible(reader.clone(), [(vault, facts.clone(), access)])
-                .unwrap();
+        let snapshot = SecretsSnapshot::new_accessible(
+            reader.clone(),
+            [(
+                vault,
+                VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
+                access,
+            )],
+        )
+        .unwrap();
         assert_eq!(snapshot.open(secret, &subject).unwrap(), b"hunter2");
         assert!(snapshot.open(secret, &outsider).is_err());
 
@@ -1642,7 +1919,11 @@ mod tests {
         .unwrap();
         assert!(SecretsSnapshot::new_accessible(
             reader.clone(),
-            [(vault, facts.clone(), wrong_custody_access)],
+            [(
+                vault,
+                VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
+                wrong_custody_access,
+            )],
         )
         .is_err());
 

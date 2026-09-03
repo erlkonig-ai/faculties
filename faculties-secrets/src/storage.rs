@@ -14,11 +14,17 @@ use dryoc::types::{ByteArray, NewByteArray};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
     CapabilityProofId, CapabilityRequest, CapabilityResource,
+};
+use triblespace::core::collection::succinctarchive_union::{
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace::core::collection::{
     descriptor, simplearchive_union, Collection, CollectionHandle, CollectionRead,
@@ -26,20 +32,22 @@ use triblespace::core::collection::{
     ACTION_WRITE,
 };
 use triblespace::core::inline::encodings::hash::Handle;
+#[cfg(test)]
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{GetBlobError, Pile, PileSnapshot};
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
-    SnapshotSource, StoreRead,
+    SnapshotSource, Store,
 };
 use triblespace::prelude::*;
 
-use super::access::{build_access_envelope, load_access_envelope, open_access_envelope};
-use super::schema::{KIND_ACCESS_ENVELOPE, KIND_VAULT};
+use super::access::{access_envelopes, build_access_envelope, open_access_envelope};
+#[cfg(test)]
+use super::schema::KIND_ACCESS_ENVELOPE;
 use super::{
-    load_catalog, parse_vault_name, seal_version, validate_catalog, vault_header_fragment,
-    vault_name, vault_policy, IntervalValue, SecretsSnapshot, VaultAccess, VaultCatalog,
-    ACTION_READ,
+    custody_rows, has_custody, parse_vault_name, seal_version, vault_header_fragment,
+    vault_headers, vault_name, vault_policy, IntervalValue, SecretsSnapshot, VaultAccess,
+    VaultFacts, ACTION_READ,
 };
 
 const ACCESS_INBOX_NAME: &str = "secrets-access";
@@ -81,6 +89,50 @@ impl VaultLocation {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MaintainedVault {
+    location: VaultLocation,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+}
+
+impl MaintainedVault {
+    fn register<S>(store: &mut S, location: VaultLocation) -> Result<Self>
+    where
+        S: CollectionStoreExt,
+    {
+        let policy = vault_policy(location.authority);
+        let succinct = store
+            .derive(location.collection, SimpleToSuccinctMapping, policy.clone())
+            .context("register Succinct Secrets vault collection")?;
+        let rank9 = store
+            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .context("register Rank9 Secrets vault collection")?;
+        Ok(Self {
+            location,
+            succinct,
+            rank9,
+        })
+    }
+
+    fn maintain_exact<S>(&self, store: &mut S, support: &Support) -> Result<()>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        drop(
+            store
+                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .context("maintain Succinct Secrets vault collection")?,
+        );
+        drop(
+            store
+                .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+                .context("maintain Rank9 Secrets vault collection")?,
+        );
+        Ok(())
+    }
+}
+
 /// Classification of one inbox candidate that did not become a ready vault.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum VaultDiscoveryIssueKind {
@@ -89,7 +141,6 @@ pub enum VaultDiscoveryIssueKind {
     InvalidDescriptor,
     MaterializationFailed,
     MissingHeader,
-    InvalidVault,
     CustodyMismatch,
 }
 
@@ -229,16 +280,8 @@ fn descriptor_facts(
 
 fn decode_descriptor_facts(
     blob: Blob<SimpleArchive>,
-    collection: CollectionHandle,
+    _collection: CollectionHandle,
 ) -> std::result::Result<TribleSet, DescriptorReadError> {
-    let actual = blob.get_handle();
-    if actual != collection {
-        return Err(DescriptorReadError::Invalid(format!(
-            "descriptor bytes hash to {} instead of {}",
-            bytes_hex(&actual.raw),
-            bytes_hex(&collection.raw)
-        )));
-    }
     TribleSet::try_from_blob(blob)
         .map_err(|error| DescriptorReadError::Invalid(format!("decode descriptor: {error}")))
 }
@@ -352,14 +395,6 @@ fn issue(
         vault,
         detail: detail.into(),
     }
-}
-
-fn header_count(facts: &TribleSet) -> usize {
-    find!(
-        (header: Id),
-        pattern!(facts, [{ ?header @ metadata::tag: KIND_VAULT }])
-    )
-    .count()
 }
 
 fn load_proof_bundle<R>(
@@ -516,11 +551,10 @@ where
     let mut candidates = Vec::new();
     let mut issues = Vec::new();
 
-    // Materialize each admitted leaf independently. The aggregate union
-    // remains the collection's value, but commit-local boundaries prevent an
-    // unavailable or malformed leaf from poisoning earlier valid delivery.
-    // Rows inside one signed leaf are atomic: multi-writer grants deliberately
-    // publish their complete writer-proof set in one COMMIT.
+    // Materialize each signed leaf independently so an unavailable attachment
+    // cannot hide earlier valid delivery. Complete typed rows remain
+    // independent candidates: an unrelated or malformed row is not allowed to
+    // impose a closed-world shape on the rest of the commit.
     for commit in commits {
         let publisher = VerifyingKey::from_bytes(&commit.public_key().raw)
             .expect("collection discovery strictly verifies commit signer keys");
@@ -591,33 +625,11 @@ where
                 continue;
             }
         };
-        let ids = find!(
-            id: Id,
-            pattern!(&facts, [{ ?id @ metadata::tag: KIND_ACCESS_ENVELOPE }])
-        )
-        .collect::<BTreeSet<_>>();
-        let mut commit_candidates = Vec::new();
-        let mut commit_valid = true;
-        for id in ids {
-            let row = match load_access_envelope(&facts, id) {
-                Ok(row) => row,
-                Err(error) => {
-                    commit_valid = false;
-                    issues.push(issue(
-                        VaultDiscoveryIssueKind::InvalidEnvelope,
-                        Some(id),
-                        None,
-                        inbox.handle(),
-                        None,
-                        error.to_string(),
-                    ));
-                    continue;
-                }
-            };
+        for row in access_envelopes(&facts) {
+            let id = row.id;
             let parsed = match parse(&snapshot, row.vault) {
                 Ok(parsed) => parsed,
                 Err((kind, detail)) => {
-                    commit_valid = false;
                     issues.push(issue(kind, Some(id), None, row.vault, None, detail));
                     continue;
                 }
@@ -625,7 +637,6 @@ where
             let location = match VaultLocation::open(store, parsed.vault, parsed.authority) {
                 Ok(location) if location.collection.handle() == parsed.collection => location,
                 Ok(_) => {
-                    commit_valid = false;
                     issues.push(issue(
                         VaultDiscoveryIssueKind::InvalidDescriptor,
                         Some(id),
@@ -637,7 +648,6 @@ where
                     continue;
                 }
                 Err(error) => {
-                    commit_valid = false;
                     issues.push(issue(
                         VaultDiscoveryIssueKind::InvalidDescriptor,
                         Some(id),
@@ -652,7 +662,6 @@ where
             let read_bundle = match load_proof_bundle(&snapshot, row.read_proof, "READ") {
                 Ok(bundle) => bundle,
                 Err(error) => {
-                    commit_valid = false;
                     issues.push(issue(
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
@@ -667,7 +676,6 @@ where
             let write_bundle = match load_proof_bundle(&snapshot, row.write_proof, "WRITE") {
                 Ok(bundle) => bundle,
                 Err(error) => {
-                    commit_valid = false;
                     issues.push(issue(
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
@@ -690,7 +698,6 @@ where
             ) {
                 Ok(opened) => opened,
                 Err(error) => {
-                    commit_valid = false;
                     issues.push(issue(
                         VaultDiscoveryIssueKind::InvalidEnvelope,
                         Some(id),
@@ -703,7 +710,6 @@ where
                 }
             };
             if publisher != opened.read_issuer {
-                commit_valid = false;
                 issues.push(issue(
                     VaultDiscoveryIssueKind::InvalidEnvelope,
                     Some(id),
@@ -714,7 +720,7 @@ where
                 ));
                 continue;
             }
-            commit_candidates.push(ValidatedAccessCandidate {
+            candidates.push(ValidatedAccessCandidate {
                 id,
                 publisher,
                 location,
@@ -723,9 +729,6 @@ where
                 writer: opened.writer,
                 write_bundle: opened.write_bundle,
             });
-        }
-        if commit_valid {
-            candidates.extend(commit_candidates);
         }
     }
     Ok((candidates, issues))
@@ -736,30 +739,6 @@ fn write_bundles(candidates: &[ValidatedAccessCandidate]) -> Vec<CapabilityProof
         .iter()
         .map(|candidate| candidate.write_bundle.clone())
         .collect()
-}
-
-/// Construct the exact vault cover admitted by the collection's immutable
-/// WRITE policy and the proof evidence in this coherent snapshot.
-fn admitted_vault_cover<S>(snapshot: &S, location: VaultLocation) -> Result<Support>
-where
-    S: BlobStoreGet + CapabilityProofRead + CollectionRead,
-{
-    let (support, _commits) = location
-        .collection
-        .admitted_with_commits(snapshot)
-        .context("discover policy-admitted vault support")?;
-    Ok(support)
-}
-
-fn read_vault_cover<S>(snapshot: &S, support: &Support) -> Result<TribleSet>
-where
-    S: StoreRead,
-{
-    snapshot
-        .collection_exact(support.collection(), support)
-        .context("attach candidate-scoped vault support")?
-        .view::<TribleSet>()
-        .context("read candidate-scoped vault support")
 }
 
 fn read_atom(collection: CollectionHandle) -> CapabilityAtom {
@@ -858,10 +837,10 @@ pub fn publish_access_envelope(
 ///
 /// Candidate failures are isolated.  In particular, stale pre-commit
 /// envelopes merely report `MissingHeader`, and envelopes with the wrong
-/// custody key are discarded only after the real vault catalog is known.
+/// custody key are discarded only after the maintained vault view is known.
 pub fn discover_local_vaults<S>(store: &mut S, signing_key: &SigningKey) -> Result<VaultDiscovery>
 where
-    S: CollectionStoreExt + CapabilityProofStore + SnapshotSource<Snapshot = PileSnapshot>,
+    S: Store + CollectionStoreExt + CapabilityProofStore + SnapshotSource<Snapshot = PileSnapshot>,
 {
     let (candidates, mut issues) = discover_access_candidates(store, signing_key)?;
     let mut by_collection = BTreeMap::<CollectionHandle, Vec<ValidatedAccessCandidate>>::new();
@@ -872,14 +851,34 @@ where
             .push(candidate);
     }
 
-    let store_snapshot = store
-        .snapshot()
-        .context("freeze shared vault store snapshot")?;
-    let mut materialized = Vec::new();
+    // Register every descriptor before freezing the semantic watermark.  All
+    // vaults are then admitted from this one source snapshot, maintained
+    // explicitly, and attached through one later immutable snapshot.
+    let mut registered = Vec::new();
     for candidates in by_collection.into_values() {
         let location = candidates[0].location;
-        let cover = match admitted_vault_cover(&store_snapshot, location) {
-            Ok(cover) => cover,
+        match MaintainedVault::register(store, location) {
+            Ok(collections) => registered.push((collections, candidates)),
+            Err(error) => issues.push(issue(
+                VaultDiscoveryIssueKind::InvalidDescriptor,
+                candidates.first().map(|candidate| candidate.id),
+                Some(location.authority),
+                location.collection.handle(),
+                Some(location.vault),
+                error.to_string(),
+            )),
+        }
+    }
+
+    let before = store
+        .snapshot()
+        .context("freeze shared Secrets pre-maintenance snapshot")?;
+    let instant = triblespace::core::clock::epoch_now();
+    let mut requested = Vec::new();
+    for (collections, candidates) in registered {
+        let location = collections.location;
+        let support = match before.collection_at(location.collection, instant) {
+            Ok(observed) => observed.support().clone(),
             Err(error) => {
                 issues.push(issue(
                     VaultDiscoveryIssueKind::MaterializationFailed,
@@ -892,8 +891,50 @@ where
                 continue;
             }
         };
-        let facts = match read_vault_cover(&store_snapshot, &cover) {
-            Ok(facts) => facts,
+        requested.push((collections, support, candidates));
+    }
+
+    let mut maintained = Vec::new();
+    for (collections, support, candidates) in requested {
+        let location = collections.location;
+        match collections.maintain_exact(store, &support) {
+            Ok(()) => maintained.push((collections, support, candidates)),
+            Err(error) => {
+                issues.push(issue(
+                    VaultDiscoveryIssueKind::MaterializationFailed,
+                    candidates.first().map(|candidate| candidate.id),
+                    Some(location.authority),
+                    location.collection.handle(),
+                    Some(location.vault),
+                    error.to_string(),
+                ));
+                continue;
+            }
+        }
+    }
+
+    let store_snapshot = store
+        .snapshot()
+        .context("freeze shared maintained Secrets snapshot")?;
+    let mut ready = Vec::<(Id, VaultFacts, VaultAccess)>::new();
+    let mut locations = BTreeMap::new();
+    for (collections, support, candidates) in maintained {
+        let location = collections.location;
+        let facts = match store_snapshot.collection_exact(collections.rank9, &support) {
+            Ok(observed) => match observed.view::<VaultFacts>() {
+                Ok(facts) => facts,
+                Err(error) => {
+                    issues.push(issue(
+                        VaultDiscoveryIssueKind::MaterializationFailed,
+                        candidates.first().map(|candidate| candidate.id),
+                        Some(location.authority),
+                        location.collection.handle(),
+                        Some(location.vault),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            },
             Err(error) => {
                 issues.push(issue(
                     VaultDiscoveryIssueKind::MaterializationFailed,
@@ -906,7 +947,7 @@ where
                 continue;
             }
         };
-        if header_count(&facts) == 0 {
+        if vault_headers(&facts, location.vault).is_empty() {
             issues.push(issue(
                 VaultDiscoveryIssueKind::MissingHeader,
                 candidates.first().map(|candidate| candidate.id),
@@ -917,39 +958,13 @@ where
             ));
             continue;
         }
-        materialized.push((location, facts, candidates));
-    }
-
-    let mut ready = Vec::<(VaultLocation, TribleSet, VaultAccess)>::new();
-    for (location, facts, candidates) in materialized {
-        let catalog = match validate_catalog(&store_snapshot, location.vault, &facts) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                issues.push(issue(
-                    VaultDiscoveryIssueKind::InvalidVault,
-                    candidates.first().map(|candidate| candidate.id),
-                    Some(location.authority),
-                    location.collection.handle(),
-                    Some(location.vault),
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let Some(custody) = catalog.custody else {
-            issues.push(issue(
-                VaultDiscoveryIssueKind::InvalidVault,
-                candidates.first().map(|candidate| candidate.id),
-                Some(location.authority),
-                location.collection.handle(),
-                Some(location.vault),
-                "capability-native vault has no custody declaration",
-            ));
-            continue;
-        };
+        let custody = custody_rows(&facts)
+            .into_iter()
+            .map(|row| row.public_key)
+            .collect::<BTreeSet<_>>();
         let mut matching = Vec::new();
         for candidate in &candidates {
-            if candidate.custody.verifying_key().to_bytes() == custody.public_key {
+            if custody.contains(&candidate.custody.verifying_key().to_bytes()) {
                 matching.push(candidate);
             } else {
                 issues.push(issue(
@@ -990,19 +1005,12 @@ where
                 continue;
             }
         };
-        ready.push((location, facts, access));
+        locations.insert(location.collection.handle(), location);
+        ready.push((location.vault, facts, access));
     }
 
-    let mut locations = BTreeMap::new();
-    let ready = ready
-        .into_iter()
-        .map(|(location, facts, access)| {
-            locations.insert(location.collection.handle(), location);
-            (location.vault, facts, access)
-        })
-        .collect::<Vec<_>>();
     let snapshot = SecretsSnapshot::new_accessible(store_snapshot, ready)
-        .context("construct aggregate from independently validated vaults")?;
+        .context("construct aggregate from maintained vault views")?;
     issues.sort_by_key(|issue| (issue.vault, issue.collection, issue.candidate, issue.kind));
     Ok(VaultDiscovery {
         snapshot,
@@ -1061,30 +1069,45 @@ pub fn create_vault(
         .cloned()
         .collect::<Vec<_>>();
 
-    let store_snapshot = store
+    let maintained = MaintainedVault::register(store, location)?;
+    let before = store
         .snapshot()
-        .context("freeze vault store snapshot before creation")?;
-    let cover =
-        admitted_vault_cover(&store_snapshot, location).context("admit vault before creation")?;
-    let existing = read_vault_cover(&store_snapshot, &cover)
-        .context("inspect policy-admitted vault before creation")?;
-    if !existing.is_empty() {
-        let catalog = validate_catalog(&store_snapshot, vault, &existing)
-            .context("validate existing vault during idempotent create")?;
-        let custody = catalog
-            .custody
-            .context("existing capability-native vault has no custody declaration")?;
-        let expected = load_catalog(
-            vault,
-            vault_header_fragment(vault, name, catalog.header.created_at, custody.public_key)?
-                .facts(),
-        )?;
-        if catalog.header != expected.header || catalog.custody != expected.custody {
-            bail!("vault id already exists with a different header or custody declaration");
+        .context("freeze vault pre-maintenance snapshot before creation")?;
+    let support = before
+        .collection_at(location.collection, instant)
+        .context("observe vault before creation")?
+        .support()
+        .clone();
+    if !support.is_empty() {
+        maintained
+            .maintain_exact(store, &support)
+            .context("maintain existing vault before idempotent create")?;
+        let store_snapshot = store
+            .snapshot()
+            .context("freeze maintained vault snapshot before creation")?;
+        let facts = store_snapshot
+            .collection_exact(maintained.rank9, &support)
+            .context("attach maintained vault before creation")?
+            .view::<VaultFacts>()
+            .context("read maintained vault before creation")?;
+
+        let mut named = false;
+        for header in vault_headers(&facts, vault) {
+            let existing_name = super::read_text(&store_snapshot, header.name)
+                .context("read existing vault name")?;
+            named |= existing_name == name;
         }
+        if !named {
+            bail!("vault id already exists without the requested header name");
+        }
+
+        let declared = custody_rows(&facts)
+            .into_iter()
+            .map(|row| row.public_key)
+            .collect::<BTreeSet<_>>();
         if !suitable
             .iter()
-            .any(|candidate| candidate.custody.verifying_key().to_bytes() == custody.public_key)
+            .any(|candidate| declared.contains(&candidate.custody.verifying_key().to_bytes()))
         {
             bail!("existing vault has no usable founder access envelope in the local inbox");
         }
@@ -1119,17 +1142,16 @@ pub fn create_vault(
 
     let header =
         vault_header_fragment(vault, name, created_at, custody.verifying_key().to_bytes())?;
-    load_catalog(vault, header.facts()).context("validate vault genesis")?;
     store
         .commit(collection, signing_key, header)
         .context("publish capability-anchored vault genesis")?;
     Ok(location)
 }
 
-fn checked_vault<'a, R>(
+fn checked_access<'a, R>(
     snapshot: &'a SecretsSnapshot<R>,
     location: &VaultLocation,
-) -> Result<&'a VaultCatalog> {
+) -> Result<&'a VaultAccess> {
     let access = snapshot
         .access_exact(location.collection.handle())
         .ok_or_else(|| anyhow!("vault {} has no verified local access", location.vault))?;
@@ -1138,17 +1160,14 @@ fn checked_vault<'a, R>(
     {
         bail!("vault location disagrees with its verified access evidence");
     }
-    snapshot
+    let vault = snapshot
         .vault_exact(location.collection.handle())
-        .map(|vault| vault.catalog())
-        .ok_or_else(|| anyhow!("vault {} is not ready in this snapshot", location.vault))
-}
-
-fn validate_prospective_union(vault: Id, current: &TribleSet, candidate: &Fragment) -> Result<()> {
-    let mut prospective = current.clone();
-    prospective += candidate.facts().clone();
-    load_catalog(vault, &prospective).context("validate prospective vault union")?;
-    Ok(())
+        .ok_or_else(|| anyhow!("vault {} is not ready in this snapshot", location.vault))?;
+    let custody = access.custody().verifying_key().to_bytes();
+    if !has_custody(vault.facts(), custody) {
+        bail!("verified access custody is absent from the selected vault view");
+    }
+    Ok(access)
 }
 
 /// Seal one immutable secret to the vault's single custody key and publish it.
@@ -1164,16 +1183,13 @@ pub fn add_secret<R: BlobStoreGet>(
     plaintext: &[u8],
     created_at: IntervalValue,
 ) -> Result<Id> {
-    let catalog = checked_vault(snapshot, location)?;
-    let custody = catalog
-        .custody
-        .context("capability-native vault has no custody declaration")?;
-    let sealed = seal_version(name, plaintext, custody.public_key, created_at)?;
-    let current = snapshot
-        .vault_exact(location.collection.handle())
-        .expect("checked vault above")
-        .facts();
-    validate_prospective_union(location.vault, current, &sealed.fragment)?;
+    let access = checked_access(snapshot, location)?;
+    let sealed = seal_version(
+        name,
+        plaintext,
+        access.custody().verifying_key().to_bytes(),
+        created_at,
+    )?;
     let secret = sealed.secret;
     store
         .commit(location.collection, signing_key, sealed.fragment)
@@ -1233,10 +1249,7 @@ pub fn grant_vault_read<R: BlobStoreGet>(
     snapshot: &SecretsSnapshot<R>,
     recipient: VerifyingKey,
 ) -> Result<Vec<Id>> {
-    checked_vault(snapshot, location)?;
-    let access = snapshot
-        .access_exact(location.collection.handle())
-        .expect("checked_vault requires access");
+    let access = checked_access(snapshot, location)?;
     let instant = triblespace::core::clock::epoch_now();
     let child_read = delegating_read_bundle(access, signing_key, recipient, instant)?;
     let mut envelope_ids = Vec::new();
@@ -1393,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_ambient_writer_participates_in_policy_admission() {
+    fn authorized_ambient_writer_cannot_poison_open_world_vault() {
         let files = TestPile::new();
         let founder = key(35);
         let ambient = key(36);
@@ -1421,16 +1434,13 @@ mod tests {
         .unwrap();
         pile.commit(location.collection, &ambient, poison).unwrap();
 
-        assert!(create_vault(&mut pile, &founder, vault, "stable", at(999)).is_err());
+        create_vault(&mut pile, &founder, vault, "stable", at(999)).unwrap();
         let discovery = discover_local_vaults(&mut pile, &founder).unwrap();
-        assert!(discovery
-            .issues()
-            .iter()
-            .any(|issue| issue.kind() == VaultDiscoveryIssueKind::InvalidVault));
+        assert!(discovery.issues().is_empty());
         assert!(discovery
             .snapshot()
             .vault_exact(location.collection())
-            .is_none());
+            .is_some());
         pile.close().unwrap();
     }
 
@@ -1820,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_sibling_rejects_one_atomic_inbox_commit() {
+    fn partial_sibling_is_irrelevant_to_typed_inbox_query() {
         let files = TestPile::new();
         let founder = key(13);
         let mut pile = files.open();
@@ -1846,9 +1856,8 @@ mod tests {
         let inbox = register_access_inbox(&mut pile, founder.verifying_key()).unwrap();
         pile.commit(inbox, &founder, delivery).unwrap();
         let (candidates, issues) = discover_access_candidates(&mut pile, &founder).unwrap();
-        assert!(candidates.is_empty());
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].kind(), VaultDiscoveryIssueKind::InvalidEnvelope);
+        assert_eq!(candidates.len(), 1);
+        assert!(issues.is_empty());
         pile.close().unwrap();
     }
 

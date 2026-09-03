@@ -275,16 +275,17 @@ fn cmd_vault_list(storage: SecretsStorage<'_>) -> Result<()> {
                 .snapshot()
                 .vault_exact(*collection)
                 .expect("every ready location has one aggregate snapshot");
-            let name = secrets::read_text(
-                discovery.snapshot().store_snapshot(),
-                snapshot.catalog().header.name,
-            )?;
+            let header = secrets::vault_headers(snapshot.facts(), location.vault())
+                .into_iter()
+                .next()
+                .context("ready vault has no decodable header")?;
+            let name = secrets::read_text(discovery.snapshot().store_snapshot(), header.name)?;
             println!(
                 "{}  collection {}  {}  ({} secret(s))",
                 fmt_id(location.vault()),
                 fmt_collection(*collection),
                 name,
-                snapshot.catalog().secrets.len()
+                secrets::secret_rows(snapshot.facts()).len()
             );
         }
         print_issues(&discovery);
@@ -377,7 +378,7 @@ fn cmd_secret_list(storage: SecretsStorage<'_>) -> Result<()> {
             let collection = snapshot
                 .collection()
                 .expect("every discovered vault snapshot retains its exact collection");
-            for secret in snapshot.catalog().secrets.values() {
+            for secret in secrets::secret_rows(snapshot.facts()) {
                 let name = secrets::read_text(discovery.snapshot().store_snapshot(), secret.name)?;
                 println!(
                     "{}  vault {}  collection {}  {name}",
