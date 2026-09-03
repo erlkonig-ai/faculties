@@ -187,7 +187,7 @@ impl Storage<'_> {
     }
 
     fn views(&self) -> Result<Views> {
-        let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot) = {
+        let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
             let mut pile = self.pile.borrow_mut();
             let pile = pile
                 .as_mut()
@@ -212,46 +212,75 @@ impl Storage<'_> {
                 .snapshot()
                 .context("freeze shared Mail pre-maintenance snapshot")?;
             let instant = clock::now()?;
+            // One source watermark fixes every ordinary fact collection this
+            // command may observe. Maintenance may append physical views, but
+            // cannot move that semantic boundary independently per scope.
+            let mail_support = before
+                .collection_at(mail.source(), instant)
+                .context("observe resident Mail collection")?
+                .support()
+                .clone();
+            let files_support = before
+                .collection_at(files.source(), instant)
+                .context("observe resident Files collection")?
+                .support()
+                .clone();
+            let decide_support = before
+                .collection_at(decide.source(), instant)
+                .context("observe resident Decide collection")?
+                .support()
+                .clone();
+            let relations_support = before
+                .collection_at(relations.source(), instant)
+                .context("observe resident Relations collection")?
+                .support()
+                .clone();
+            drop(before);
             drop(
-                mail.maintain_at(pile, &before, instant)
+                mail.maintain_exact(pile, &mail_support)
                     .context("maintain Mail fact collection")?,
             );
             drop(
                 files
-                    .maintain_at(pile, &before, instant)
+                    .maintain_exact(pile, &files_support)
                     .context("maintain Files fact collection")?,
             );
             drop(
                 decide
-                    .maintain_at(pile, &before, instant)
+                    .maintain_exact(pile, &decide_support)
                     .context("maintain Decide fact collection")?,
             );
             drop(
                 relations
-                    .maintain_at(pile, &before, instant)
+                    .maintain_exact(pile, &relations_support)
                     .context("maintain Relations fact collection")?,
             );
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze shared maintained Mail snapshot")?;
+
+            let secrets = vaults::discover_local_vaults(&mut *pile, &self.signer)
+                .context("discover local Secrets vault epochs")?;
+            // Secrets discovery owns the final immutable pile snapshot. Attach
+            // every exact maintained support through that same world so Mail
+            // facts, file payloads, decisions, relations, and credentials can
+            // never be assembled from different store prefixes.
+            let store_snapshot = secrets.snapshot().store_snapshot().clone();
             let mail_facts = store_snapshot
-                .collection_at(mail.rank9(), instant)
-                .context("observe maintained Mail fact collection")?
+                .collection_exact(mail.rank9(), &mail_support)
+                .context("attach maintained Mail fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Mail fact collection")?;
             let files_facts = store_snapshot
-                .collection_at(files.rank9(), instant)
-                .context("observe maintained Files fact collection")?
+                .collection_exact(files.rank9(), &files_support)
+                .context("attach maintained Files fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Files fact collection")?;
             let decide_facts = store_snapshot
-                .collection_at(decide.rank9(), instant)
-                .context("observe maintained Decide fact collection")?
+                .collection_exact(decide.rank9(), &decide_support)
+                .context("attach maintained Decide fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Decide fact collection")?;
             let relations_facts = store_snapshot
-                .collection_at(relations.rank9(), instant)
-                .context("observe maintained Relations fact collection")?
+                .collection_exact(relations.rank9(), &relations_support)
+                .context("attach maintained Relations fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Relations fact collection")?;
             (
@@ -260,15 +289,8 @@ impl Storage<'_> {
                 decide_facts,
                 relations_facts,
                 store_snapshot,
+                secrets,
             )
-        };
-        let secrets = {
-            let mut pile = self.pile.borrow_mut();
-            let pile = pile
-                .as_mut()
-                .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-            vaults::discover_local_vaults(&mut *pile, &self.signer)
-                .context("discover local Secrets vault epochs")?
         };
         Ok(Views {
             mail: CollectionView {
@@ -1195,6 +1217,7 @@ mod tests {
     use std::rc::Rc;
 
     use faculties::storage::{initialize_signer, publish_fragment};
+    use triblespace::core::repo::StoreSnapshot;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -1296,6 +1319,31 @@ mod tests {
             "From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <{message_id}>\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nSubject: Hello\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n--test\r\nContent-Type: text/plain\r\n\r\nbody\r\n--test\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--test--\r\n"
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn views_share_the_secrets_discovery_snapshot() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+
+        // Leave one vault commit without its maintained representations. This
+        // makes Secrets discovery advance the pile after the ordinary Mail
+        // collections have been maintained and catches cross-watermark views.
+        storage
+            .add_secret(fixture.secret_vault, "snapshot-regression", b"new secret")
+            .unwrap();
+
+        let views = storage.views().unwrap();
+        let secrets_snapshot = views.secrets.snapshot().store_snapshot();
+        for reader in [
+            &views.mail.reader,
+            &views.files.reader,
+            &views.decide.reader,
+            &views.relations.reader,
+        ] {
+            assert!(reader.changes_since(secrets_snapshot).is_empty());
+            assert!(secrets_snapshot.changes_since(reader).is_empty());
+        }
     }
 
     #[test]
