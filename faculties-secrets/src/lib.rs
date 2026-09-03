@@ -197,6 +197,7 @@ impl VaultCatalog {
 pub struct VaultView {
     vault: Id,
     collection: Option<CollectionHandle>,
+    support: Option<Support>,
     facts: VaultFacts,
 }
 
@@ -334,6 +335,14 @@ impl VaultView {
     /// access discovery rather than an offline unscoped validation input.
     pub const fn collection(&self) -> Option<CollectionHandle> {
         self.collection
+    }
+
+    /// Exact foundational support retained by access discovery.
+    ///
+    /// Offline validation inputs carry no collection observation and return
+    /// `None` instead.
+    pub fn support(&self) -> Option<&Support> {
+        self.support.as_ref()
     }
 
     /// Maintained facts admitted for this exact vault collection.
@@ -611,6 +620,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             snapshots.push(VaultView {
                 vault,
                 collection: None,
+                support: None,
                 facts: VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
             });
         }
@@ -641,6 +651,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             snapshots.push(VaultView {
                 vault,
                 collection: Some(collection),
+                support: None,
                 facts: VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
             });
         }
@@ -654,11 +665,11 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
     /// Attach maintained vault views together with explicit local access.
     pub(crate) fn new_accessible<I>(reader: R, vaults: I) -> Result<Self>
     where
-        I: IntoIterator<Item = (Id, VaultFacts, VaultAccess)>,
+        I: IntoIterator<Item = (Id, Support, VaultFacts, VaultAccess)>,
     {
         let mut snapshots = Vec::new();
         let mut by_access = BTreeMap::new();
-        for (vault, facts, access) in vaults {
+        for (vault, support, facts, access) in vaults {
             if access.vault != vault {
                 bail!(
                     "vault {vault} access evidence is bound to vault {}",
@@ -676,6 +687,7 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
             snapshots.push(VaultView {
                 vault,
                 collection: Some(collection),
+                support: Some(support),
                 facts,
             });
         }
@@ -1856,17 +1868,27 @@ mod tests {
         let store_snapshot = authorized.snapshot().unwrap();
         let admitted: TribleSet = collection.read(&store_snapshot).unwrap();
         assert_eq!(admitted, facts);
+        let support = store_snapshot
+            .collection_at(collection, triblespace::core::clock::epoch_now())
+            .unwrap()
+            .support()
+            .clone();
 
         let reader = fragment.blobs_mut().snapshot().unwrap();
         let snapshot = SecretsSnapshot::new_accessible(
             reader.clone(),
             [(
                 vault,
+                support.clone(),
                 VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
                 access,
             )],
         )
         .unwrap();
+        assert_eq!(
+            snapshot.vault_exact(collection_handle).unwrap().support(),
+            Some(&support)
+        );
         assert_eq!(snapshot.open(secret, &subject).unwrap(), b"hunter2");
         assert!(snapshot.open(secret, &outsider).is_err());
 
@@ -1921,6 +1943,7 @@ mod tests {
             reader.clone(),
             [(
                 vault,
+                support,
                 VaultFacts::new(vec![SuccinctArchive::from(&facts)]),
                 wrong_custody_access,
             )],

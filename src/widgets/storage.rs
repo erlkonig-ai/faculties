@@ -140,39 +140,37 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 pub struct DatasetRevision([u8; 32]);
 
 impl DatasetRevision {
-    fn from_collection(collection: CollectionHandle, support: &Support) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.dataset-revision.v2");
+    fn hash_collection_support(
+        hasher: &mut blake3::Hasher,
+        collection: CollectionHandle,
+        support: &Support,
+    ) {
         hasher.update(&collection.raw);
         for member in support.members() {
             hasher.update(&member.raw);
         }
         hasher.update(&(support.len() as u128).to_le_bytes());
+    }
+
+    fn from_collection(collection: CollectionHandle, support: &Support) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faculties.viewer.dataset-revision.v2");
+        Self::hash_collection_support(&mut hasher, collection, support);
         Self(*hasher.finalize().as_bytes())
     }
 
     fn from_secrets(discovery: &vaults::VaultDiscovery) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.secrets-revision.v2");
-        for (collection, location) in discovery.locations() {
-            let snapshot = discovery
+        hasher.update(b"faculties.viewer.secrets-revision.v3");
+        for collection in discovery.locations().keys() {
+            let vault = discovery
                 .snapshot()
                 .vault_exact(*collection)
                 .expect("every ready vault location has one snapshot");
-            hasher.update(&location.vault().raw());
-            hasher.update(&location.authority().to_bytes());
-            hasher.update(&location.collection().raw);
-            match snapshot.facts().fingerprint().as_u128() {
-                Some(fingerprint) => {
-                    hasher.update(&[1]);
-                    hasher.update(&fingerprint.to_le_bytes());
-                }
-                None => {
-                    hasher.update(&[0]);
-                    hasher.update(&[0; 16]);
-                }
-            }
-            hasher.update(&(snapshot.facts().len() as u128).to_le_bytes());
+            let support = vault
+                .support()
+                .expect("every access-discovered vault retains exact support");
+            Self::hash_collection_support(&mut hasher, *collection, support);
         }
         Self(*hasher.finalize().as_bytes())
     }

@@ -916,7 +916,7 @@ where
     let store_snapshot = store
         .snapshot()
         .context("freeze shared maintained Secrets snapshot")?;
-    let mut ready = Vec::<(Id, VaultFacts, VaultAccess)>::new();
+    let mut ready = Vec::<(Id, Support, VaultFacts, VaultAccess)>::new();
     let mut locations = BTreeMap::new();
     for (collections, support, candidates) in maintained {
         let location = collections.location;
@@ -1006,7 +1006,7 @@ where
             }
         };
         locations.insert(location.collection.handle(), location);
-        ready.push((location.vault, facts, access));
+        ready.push((location.vault, support, facts, access));
     }
 
     let snapshot = SecretsSnapshot::new_accessible(store_snapshot, ready)
