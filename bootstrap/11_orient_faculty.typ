@@ -1,11 +1,12 @@
 = Orient: The Situation-Snapshot Faculty
 
-`orient` has four deliberately different modes. Use `wake` at session start or
+`orient` has five deliberately different modes. Use `wake` at session start or
 after context compaction to recover the whole self: memory cover, cover-tagged
 beliefs, and goals. Use `show` mid-session for the much smaller answer to "what
 is going on right now?"; it deliberately contains neither memories nor Wiki
 entries. `wait` blocks and also sweeps timer-driven Habits; `poll` performs the
-pile-backed checkpoint check once without blocking.
+same relational attention check once without blocking; `baseline` explicitly
+marks the current attention set as already presented.
 
 == What it shows
 
@@ -20,8 +21,8 @@ pile-backed checkpoint check once without blocking.
 
 Defaults to ten messages, five doing goals, and five todo goals. The
 `--message-limit`, `--doing-limit`, and `--todo-limit` flags tune those limits.
-When a persona is set, `show` also advances that persona's checkpoint used by
-`poll` and `wait`.
+When a persona is set, `show` records the attention events it actually renders
+as presented, after the complete report has been flushed.
 
 == When to use it
 
@@ -29,11 +30,13 @@ When a persona is set, `show` also advances that persona's checkpoint used by
   - `orient show` after a pause or before context-switching
   - `orient poll` from non-blocking per-turn hooks
   - `orient wait` as the idle point of a self-paced loop
+  - `orient baseline` for an explicit quiet starting point
 
 == `orient wait`
 
-`orient wait` blocks until the watched collection snapshot contains news for
-this persona, rather than waking on every raw pile append. Directed news includes unread
+`orient wait` blocks until the separately maintained target collections at one
+immutable pile snapshot contain news for this persona, rather than reporting
+every raw pile append. Directed news includes unread
 inbox or group messages, relevant goal transitions, new goals tagged with the
 persona or any Relations group containing it, newly status-bearing windows,
 newly visible Compass notes, and unread Mail. A foreign or unattributed note is visible
@@ -41,13 +44,11 @@ when its goal involves the persona or carries such an attention tag itself;
 the persona's own attributed notes, status edits, and message acknowledgements
 stay quiet.
 
-Each checkpoint is an immutable event containing the complete canonical
-`WatchedView` observed for that persona—not a cursor and not a delta of note
-IDs. Readers select the latest event by `(point time, event id)` and diff its
-view against a newly computed snapshot. That deterministic total order makes
-concurrent observations visible in history without pretending the checkpoint
-itself is a union or lock. A first non-peek poll records the current view as a
-quiet baseline.
+Orient owns no cursor, checkpoint, or shadow catalog. It derives the current
+attention set directly from maintained collection snapshots and subtracts the
+grow-only relational set `Presented(persona, event)`. A complete report is
+flushed before its exact events are recorded as presented. `baseline` performs
+that presentation explicitly without printing the backlog.
 
 Wait recomputes the persona-visible semantic view after pile changes and also
 sweeps Habits as wall time advances. A cooldown becoming due or a Habit entering
@@ -55,8 +56,8 @@ an attention state can therefore wake it without any pile growth. The current
 `pile net sync` can repair native collection records and requested blobs for an
 explicitly activated descriptor, but `orient wait` is still what turns newly
 arrived state into a local notification. `orient poll` performs that pile-backed
-news check without blocking;
-`--peek` reports without consuming the checkpoint.
+news check without blocking; `--peek` reports without adding any `Presented`
+facts.
 
 == When not to use it
 

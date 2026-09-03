@@ -25,7 +25,7 @@ fi
 
 # Codex currently fires UserPromptSubmit for root and subagents without
 # exposing which one fired it. Peek is therefore essential: a worker can see
-# the same news, but can never advance or initialize the configured checkpoint.
+# the same news, but can never record it as presented for the root persona.
 news=$(
     "$orient" --pile "$pile" --persona "$persona" poll --peek 2>/dev/null
 ) || exit 0
@@ -40,7 +40,7 @@ jq -n --arg news "$news" '{
     "additionalContext": (
       "=== ORIENT NEWS (poll --peek) ===\n" +
       $news +
-      "\n\nProcess relevant news during this turn. Peek did not consume the persona checkpoint; the blocking root watcher still owns that responsibility."
+      "\n\nProcess relevant news during this turn. Peek recorded no Presented facts; the blocking root watcher still owns that responsibility."
     )
   }
 }'

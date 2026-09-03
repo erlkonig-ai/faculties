@@ -24,7 +24,7 @@ this fragment extends.
   + *Poll* — `orient --persona <you> poll` (faculties
     `f1a237c`) is the non-blocking sibling for *per-turn*
     hooks: it prints the same terse news `wait` would print
-    and advances the persona's checkpoint, or prints *nothing*
+    and records exactly the reported events as `Presented`, or prints *nothing*
     when quiet. Wired into a turn-boundary hook it gives a
     busy session passive news ingestion — you hear the team
     while working, without ever blocking on it.
@@ -131,7 +131,7 @@ Codex currently fires `UserPromptSubmit` hooks for root and
 subagents alike without exposing which one fired
 (openai/codex#16226). The prompt hook therefore uses
 `orient poll --peek`: it reports the same directed news but
-never advances or initializes the persona checkpoint. A
+never adds `Presented` facts. A
 worker may see repeated news, but cannot steal it from the
 root watcher. The hook exits silently when quiet and wraps
 news as `hookSpecificOutput.additionalContext` when present.

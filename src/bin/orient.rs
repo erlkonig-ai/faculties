@@ -283,49 +283,45 @@ impl OrientSource {
         })
     }
 
-    fn admitted(
+    fn maintain_at(
         &self,
+        pile: &mut Pile,
         snapshot: &PileSnapshot,
         instant: Epoch,
-    ) -> Result<std::result::Result<Support, PhysicalCoverIncompleteness>> {
-        let cover = self
-            .source
-            .admitted_at(snapshot, instant)
-            .map_err(|error| anyhow!("admit {} collection: {error}", self.label))?;
-        let available = cover
-            .available(snapshot)
-            .map_err(|error| anyhow!("inspect {} collection residency: {error}", self.label))?;
-        if available == cover {
-            return Ok(Ok(cover));
-        }
-        let missing = cover
-            .difference(&available)
-            .expect("availability remains in the admitted collection lattice");
-        Ok(Err(PhysicalCoverIncompleteness {
-            collection: self.label,
-            missing,
-        }))
-    }
-
-    fn maintain(&self, pile: &mut Pile, support: &Support) -> Result<()> {
+    ) -> Result<Support> {
+        let support = snapshot
+            .collection_at(self.source, instant)
+            .map_err(|error| anyhow!("observe resident {} collection: {error}", self.label))?
+            .support()
+            .clone();
         drop(
-            pile.maintain_exact::<SimpleToSuccinctMapping>(self.raw, support)
+            pile.maintain_exact::<SimpleToSuccinctMapping>(self.raw, &support)
                 .with_context(|| format!("maintain {} raw Succinct projection", self.label))?,
         );
         drop(
-            pile.maintain_exact::<RawToRank9AcceleratedMapping>(self.accelerated, support)
+            pile.maintain_exact::<RawToRank9AcceleratedMapping>(self.accelerated, &support)
                 .with_context(|| format!("maintain {} Rank9 projection", self.label))?,
         );
-        Ok(())
+        Ok(support)
     }
 
-    fn attach(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
+    fn attach_at(&self, snapshot: &PileSnapshot, instant: Epoch) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_exact(self.accelerated, support)
+            .collection_at(self.accelerated, instant)
             .with_context(|| format!("observe {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
             .with_context(|| format!("read {} Rank9 projection", self.label))?;
+        Ok(OrientFact { collection, view })
+    }
+
+    fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
+        let collection = snapshot
+            .collection_exact(self.accelerated, support)
+            .with_context(|| format!("observe exact {} Rank9 projection", self.label))?;
+        let view = collection
+            .view::<FactArchive>()
+            .with_context(|| format!("read exact {} Rank9 projection", self.label))?;
         Ok(OrientFact { collection, view })
     }
 }
@@ -392,20 +388,12 @@ struct OrientFacts {
     presentations: OrientFact,
 }
 
-/// One coherent semantic observation. Each source stays in its own admitted
-/// lattice and its own Rank9 query view; shared vocabulary never turns those
+/// One coherent semantic observation. Each source stays in its own resident
+/// target collection and Rank9 query view; shared vocabulary never turns those
 /// authority boundaries into an accidental global fact union.
 struct OrientObservation {
-    /// Exact pile prefix from which collection admission was computed.
-    ///
-    /// This remains the wait watermark even when maintaining derived views
-    /// appends records before `resident_snapshot` is frozen. Advancing the
-    /// watermark to that later snapshot could otherwise hide an external
-    /// append which raced the maintenance writes.
-    source_snapshot: PileSnapshot,
-    /// Later snapshot from which every attached view and selected payload is
-    /// read. This includes the DERIVE/MERGE exhaust produced while preparing
-    /// the observation.
+    /// Exact immutable store boundary from which every collection view and
+    /// selected payload is read.
     snapshot: PileSnapshot,
     facts: OrientFacts,
     compass_status: LwwIndex,
@@ -429,131 +417,65 @@ impl OrientObservation {
     }
 }
 
-#[derive(Clone, Debug)]
-struct PhysicalCoverIncompleteness {
-    collection: &'static str,
-    missing: Support,
-}
-
-impl std::fmt::Display for PhysicalCoverIncompleteness {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} collection awaits {} cover member(s)",
-            self.collection,
-            self.missing.len(),
-        )
-    }
-}
-
-struct PendingObservation {
-    snapshot: PileSnapshot,
-    next_authorization_change: Option<Epoch>,
-    incomplete: PhysicalCoverIncompleteness,
-}
-
-enum ObservationReadiness {
-    Ready(OrientObservation),
-    Pending(PendingObservation),
-}
-
-/// Capture the admitted Covers of every requested source at one exact pile
-/// snapshot and one exact authorization instant. No logical value is loaded.
-fn observe_sources(pile: &mut Pile, sources: &OrientSources) -> Result<ObservationReadiness> {
-    let snapshot = pile
-        .snapshot()
-        .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    observe_sources_at(pile, snapshot, sources, clock::now()?)
-}
-
-fn observe_sources_at(
+/// Maintain the resident support visible in one immutable source snapshot.
+///
+/// Missing source blobs are simply outside that snapshot's collection value;
+/// a later append creates a later snapshot and another maintenance chance.
+fn maintain_sources_at(
     pile: &mut Pile,
-    snapshot: PileSnapshot,
+    snapshot: &PileSnapshot,
     sources: &OrientSources,
     instant: Epoch,
-) -> Result<ObservationReadiness> {
-    let next_authorization_change = next_authorization_change_at(&snapshot, instant)
-        .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
-
-    macro_rules! ready {
-        ($source:expr) => {
-            match $source.admitted(&snapshot, instant)? {
-                Ok(cover) => cover,
-                Err(incomplete) => {
-                    return Ok(ObservationReadiness::Pending(PendingObservation {
-                        snapshot,
-                        next_authorization_change,
-                        incomplete,
-                    }));
-                }
-            }
-        };
+) -> Result<Support> {
+    sources.messages.maintain_at(pile, snapshot, instant)?;
+    sources.mail.maintain_at(pile, snapshot, instant)?;
+    sources.teams.maintain_at(pile, snapshot, instant)?;
+    let compass_support = sources.compass.maintain_at(pile, snapshot, instant)?;
+    sources.relations.maintain_at(pile, snapshot, instant)?;
+    sources.status.maintain_at(pile, snapshot, instant)?;
+    if let Some(source) = sources.habits.as_ref() {
+        source.maintain_at(pile, snapshot, instant)?;
     }
-
-    let habit_support = match sources.habits.as_ref() {
-        Some(source) => Some(ready!(source)),
-        None => None,
-    };
-    let message_support = ready!(&sources.messages);
-    let mail_support = ready!(&sources.mail);
-    let teams_support = ready!(&sources.teams);
-    let compass_support = ready!(&sources.compass);
-    let relations_support = ready!(&sources.relations);
-    let status_support = ready!(&sources.status);
-    let presentations_support = ready!(&sources.presentations);
-
-    sources.messages.maintain(pile, &message_support)?;
-    sources.mail.maintain(pile, &mail_support)?;
-    sources.teams.maintain(pile, &teams_support)?;
-    sources.compass.maintain(pile, &compass_support)?;
-    sources.relations.maintain(pile, &relations_support)?;
-    sources.status.maintain(pile, &status_support)?;
-    match (sources.habits.as_ref(), habit_support.as_ref()) {
-        (Some(source), Some(support)) => source.maintain(pile, support)?,
-        (None, None) => {}
-        _ => unreachable!("Habit source and cover are created together"),
-    }
-    sources
-        .presentations
-        .maintain(pile, &presentations_support)?;
+    sources.presentations.maintain_at(pile, snapshot, instant)?;
     drop(
         pile.maintain_exact::<RegisterCoordinatesMapping>(sources.compass_status, &compass_support)
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
+    Ok(compass_support)
+}
 
-    // This is the sole post-maintenance observation. Every physical cover and
-    // logical view below is attached to this exact immutable store boundary.
-    let resident_snapshot = pile
-        .snapshot()
-        .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
-    let messages = sources
-        .messages
-        .attach(&resident_snapshot, &message_support)?;
-    let mail = sources.mail.attach(&resident_snapshot, &mail_support)?;
-    let teams = sources.teams.attach(&resident_snapshot, &teams_support)?;
-    let compass = sources
-        .compass
-        .attach(&resident_snapshot, &compass_support)?;
-    let relations = sources
-        .relations
-        .attach(&resident_snapshot, &relations_support)?;
-    let status = sources.status.attach(&resident_snapshot, &status_support)?;
-    let habits = match (sources.habits.as_ref(), habit_support.as_ref()) {
-        (Some(source), Some(support)) => Some(source.attach(&resident_snapshot, support)?),
-        (None, None) => None,
-        _ => unreachable!("Habit source and support are created together"),
-    };
-    let presentations = sources
-        .presentations
-        .attach(&resident_snapshot, &presentations_support)?;
-    let compass_status = resident_snapshot
-        .collection_exact(sources.compass_status, &compass_support)
+/// Read every target collection as it actually exists at one immutable store
+/// boundary and one authorization instant. This function performs no writes.
+fn observe_sources_at(
+    snapshot: PileSnapshot,
+    sources: &OrientSources,
+    compass_support: &Support,
+    instant: Epoch,
+) -> Result<OrientObservation> {
+    let next_authorization_change = next_authorization_change_at(&snapshot, instant)
+        .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
+    let messages = sources.messages.attach_at(&snapshot, instant)?;
+    let mail = sources.mail.attach_at(&snapshot, instant)?;
+    let teams = sources.teams.attach_at(&snapshot, instant)?;
+    // Compass facts and their maintained LWW index are one logical query
+    // substrate. Pin both to the same resident foundational support so a
+    // concurrent maintainer cannot expose one half of a newer support here.
+    let compass = sources.compass.attach_exact(&snapshot, compass_support)?;
+    let relations = sources.relations.attach_at(&snapshot, instant)?;
+    let status = sources.status.attach_at(&snapshot, instant)?;
+    let habits = sources
+        .habits
+        .as_ref()
+        .map(|source| source.attach_at(&snapshot, instant))
+        .transpose()?;
+    let presentations = sources.presentations.attach_at(&snapshot, instant)?;
+    let compass_status = snapshot
+        .collection_exact(sources.compass_status, compass_support)
         .map_err(|error| anyhow!("observe Compass status register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Compass status register: {error}"))?;
-    Ok(ObservationReadiness::Ready(OrientObservation {
-        source_snapshot: snapshot,
-        snapshot: resident_snapshot,
+    Ok(OrientObservation {
+        snapshot,
         facts: OrientFacts {
             messages,
             mail,
@@ -566,27 +488,33 @@ fn observe_sources_at(
         },
         compass_status,
         next_authorization_change,
-    }))
+    })
 }
 
-fn observe_sources_exact(pile: &mut Pile, sources: &OrientSources) -> Result<OrientObservation> {
-    match observe_sources(pile, sources)? {
-        ObservationReadiness::Ready(observation) => Ok(observation),
-        ObservationReadiness::Pending(pending) => Err(anyhow!(
-            "physical collection cover is incomplete: {}",
-            pending.incomplete
-        )),
-    }
+/// Maintain from one frozen source boundary, then observe only the target
+/// state resident in the later boundary. `source_snapshot` remains the
+/// caller's polling watermark; it is not part of the semantic observation.
+fn maintain_and_observe_sources_at(
+    pile: &mut Pile,
+    source_snapshot: &PileSnapshot,
+    sources: &OrientSources,
+    instant: Epoch,
+) -> Result<OrientObservation> {
+    let compass_support = maintain_sources_at(pile, source_snapshot, sources, instant)?;
+    let snapshot = pile
+        .snapshot()
+        .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
+    observe_sources_at(snapshot, sources, &compass_support, instant)
 }
 
-fn observe_sources_if_available(
+fn maintain_and_observe_sources(
     pile: &mut Pile,
     sources: &OrientSources,
-) -> Result<Option<OrientObservation>> {
-    match observe_sources(pile, sources)? {
-        ObservationReadiness::Ready(observation) => Ok(Some(observation)),
-        ObservationReadiness::Pending(_) => Ok(None),
-    }
+) -> Result<OrientObservation> {
+    let source_snapshot = pile
+        .snapshot()
+        .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
+    maintain_and_observe_sources_at(pile, &source_snapshot, sources, clock::now()?)
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -1189,29 +1117,32 @@ fn native_teams_messages(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
     )
     .collect();
 
-    let mut present = BTreeSet::new();
-    let mut deleted = BTreeSet::new();
-    for (message, state) in find!(
-        (message: Id, state: Inline<inlineencodings::ShortString>),
+    let present_state: Inline<inlineencodings::ShortString> = "present"
+        .try_to_inline()
+        .expect("Teams present state fits ShortString");
+    let deleted_state: Inline<inlineencodings::ShortString> = "deleted"
+        .try_to_inline()
+        .expect("Teams deleted state fits ShortString");
+    let mut present: BTreeSet<Id> = find!(
+        message: Id,
         pattern!(query.teams, [{
             _?observation @
             metadata::tag: teams::kind_message_observation,
             teams::message: ?message,
-            teams::message_state: ?state,
+            teams::message_state: &present_state,
         }])
-    ) {
-        let state = String::try_from_inline(&state)
-            .map_err(|error| anyhow!("decode Teams observation state: {error:?}"))?;
-        match state.as_str() {
-            "present" => {
-                present.insert(message);
-            }
-            "deleted" => {
-                deleted.insert(message);
-            }
-            other => bail!("unknown Teams observation state '{other}'"),
-        }
-    }
+    )
+    .collect();
+    let mut deleted: BTreeSet<Id> = find!(
+        message: Id,
+        pattern!(query.teams, [{
+            _?observation @
+            metadata::tag: teams::kind_message_observation,
+            teams::message: ?message,
+            teams::message_state: &deleted_state,
+        }])
+    )
+    .collect();
     for message in find!(
         message: Id,
         pattern!(query.teams, [{
@@ -1239,6 +1170,7 @@ fn native_teams_messages(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
             metadata::tag: teams::kind_message_observation,
             teams::message: ?message,
             archive::author: ?author,
+            teams::message_state: &present_state,
         }])
     ) {
         if own_authors.contains(&author) {
@@ -1266,6 +1198,9 @@ fn teams_message_detail_handles(
     query: &OrientQuery<'_>,
     message: Id,
 ) -> Result<TeamsMessageDetailHandles> {
+    let present_state: Inline<inlineencodings::ShortString> = "present"
+        .try_to_inline()
+        .expect("Teams present state fits ShortString");
     let newest = find!(
         (modified: IntervalValue, observation: Id),
         pattern!(query.teams, [{
@@ -1273,6 +1208,7 @@ fn teams_message_detail_handles(
             metadata::tag: teams::kind_message_observation,
             teams::message: message,
             teams::modified_at: ?modified,
+            teams::message_state: &present_state,
         }])
     )
     .map(|(modified, observation)| (interval_key(modified), observation))
@@ -1839,6 +1775,21 @@ fn render_habit_transitions(
     Some(out)
 }
 
+#[derive(Debug)]
+struct PersonaNotFound(String);
+
+impl std::fmt::Display for PersonaNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "no person matches '{}'", self.0)
+    }
+}
+
+impl std::error::Error for PersonaNotFound {}
+
+fn is_persona_not_found(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PersonaNotFound>().is_some()
+}
+
 fn resolve_native_persona(query: &OrientQuery<'_>, input: &str) -> Result<Id> {
     let input = input.trim();
     if let Some(id) = Id::from_hex(input) {
@@ -1882,7 +1833,7 @@ fn resolve_native_persona(query: &OrientQuery<'_>, input: &str) -> Result<Id> {
     }
     match settled.as_slice() {
         [person] => Ok(*person),
-        [] => bail!("no person matches '{input}'"),
+        [] => Err(PersonaNotFound(input.to_owned()).into()),
         _ => bail!(
             "multiple people match '{input}': {}",
             settled
@@ -2184,7 +2135,7 @@ fn cmd_baseline(pile_path: &Path, key: Option<&Path>, persona: Option<&str>) -> 
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let observation = observe_sources_exact(&mut pile, &sources)?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
         let query = observation.query();
         let persona = resolve_native_persona(&query, input)?;
         let view = load_attention_view(&query, persona)?;
@@ -2211,7 +2162,7 @@ fn cmd_show(
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
         let sources = OrientSources::open(&mut pile, &signer, true)?;
-        let observation = observe_sources_exact(&mut pile, &sources)?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
@@ -2574,13 +2525,13 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let Some(observation) = observe_sources_if_available(&mut pile, &sources)? else {
-            return Ok(());
-        };
+        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
         let query = observation.query();
         let persona_id = match resolve_native_persona(&query, input) {
             Ok(persona) => persona,
-            Err(error) if is_payload_pending(&error) => return Ok(()),
+            Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
+                return Ok(())
+            }
             Err(error) => return Err(error),
         };
         check_news_once(&mut pile, &signer, &query, persona_id, peek)?;
@@ -2591,12 +2542,12 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
 
 struct WaitOutcome {
     news_printed: bool,
-    incomplete: Option<PhysicalCoverIncompleteness>,
-    payload_pending: bool,
-    had_coherent_observation: bool,
+    view_pending: bool,
+    had_ready_frame: bool,
 }
 
 struct WaitFrame {
+    watermark: PileSnapshot,
     observation: OrientObservation,
     persona: Id,
     habits: HabitObservation,
@@ -2604,17 +2555,15 @@ struct WaitFrame {
 }
 
 struct PendingWaitFrame {
-    snapshot: PileSnapshot,
+    watermark: PileSnapshot,
     next_authorization_change: Option<Epoch>,
-    incomplete: Option<PhysicalCoverIncompleteness>,
 }
 
 impl PendingWaitFrame {
-    fn awaiting_payload(observation: &OrientObservation) -> Self {
+    fn awaiting_view(watermark: PileSnapshot, observation: &OrientObservation) -> Self {
         Self {
-            snapshot: observation.source_snapshot.clone(),
+            watermark,
             next_authorization_change: observation.next_authorization_change,
-            incomplete: None,
         }
     }
 }
@@ -2627,8 +2576,8 @@ enum WaitFrameLoad {
 impl WaitFrameLoad {
     fn watermark_snapshot(&self) -> &PileSnapshot {
         match self {
-            Self::Pending(pending) => &pending.snapshot,
-            Self::Ready(frame) => &frame.observation.source_snapshot,
+            Self::Pending(pending) => &pending.watermark,
+            Self::Ready(frame) => &frame.watermark,
         }
     }
 
@@ -2648,21 +2597,13 @@ fn load_wait_frame(
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    let observation = match observe_sources_at(pile, snapshot, sources, instant)? {
-        ObservationReadiness::Pending(pending) => {
-            return Ok(WaitFrameLoad::Pending(PendingWaitFrame {
-                snapshot: pending.snapshot,
-                next_authorization_change: pending.next_authorization_change,
-                incomplete: Some(pending.incomplete),
-            }));
-        }
-        ObservationReadiness::Ready(observation) => observation,
-    };
+    let observation = maintain_and_observe_sources_at(pile, &snapshot, sources, instant)?;
     let query = observation.query();
     let persona = match resolve_native_persona(&query, persona_input) {
         Ok(persona) => persona,
-        Err(error) if is_payload_pending(&error) => {
-            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_payload(
+        Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
+            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
+                snapshot,
                 &observation,
             )));
         }
@@ -2678,7 +2619,8 @@ fn load_wait_frame(
     ) {
         Ok(habits) => habits,
         Err(error) if is_payload_pending(&error) => {
-            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_payload(
+            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
+                snapshot,
                 &observation,
             )));
         }
@@ -2686,11 +2628,13 @@ fn load_wait_frame(
     };
     let news = prepare_news_once(&query, persona)?;
     if matches!(news, News::Pending) {
-        return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_payload(
+        return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
+            snapshot,
             &observation,
         )));
     }
     Ok(WaitFrameLoad::Ready(WaitFrame {
+        watermark: snapshot,
         observation,
         persona,
         habits,
@@ -2732,12 +2676,11 @@ fn cmd_wait(
         let sources = OrientSources::open(&mut pile, &signer, true)?;
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
-        let mut incomplete;
-        let mut payload_pending;
+        let mut view_pending;
 
-        // `observed_snapshot` is the latest prefix we attempted, while the
-        // frame retained below is the latest physically coherent semantic
-        // observation. They intentionally diverge while sync closes a gap.
+        // `observed_snapshot` is the pre-maintenance prefix we attempted. It
+        // deliberately remains the polling watermark after derived writes so
+        // a concurrent source append cannot be swallowed by those writes.
         let first_snapshot = pile
             .snapshot()
             .map_err(|error| anyhow!("freeze initial Orient wait snapshot: {error}"))?;
@@ -2758,22 +2701,19 @@ fn cmd_wait(
                 let WaitFrameLoad::Ready(frame) = attempt else {
                     unreachable!()
                 };
-                incomplete = None;
-                payload_pending = false;
+                view_pending = false;
                 break frame;
             }
-            let WaitFrameLoad::Pending(pending) = &attempt else {
+            let WaitFrameLoad::Pending(_) = &attempt else {
                 unreachable!()
             };
-            payload_pending = pending.incomplete.is_none();
-            incomplete = pending.incomplete.clone();
+            view_pending = true;
 
             if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
                 return Ok(WaitOutcome {
                     news_printed: false,
-                    incomplete,
-                    payload_pending,
-                    had_coherent_observation: false,
+                    view_pending,
+                    had_ready_frame: false,
                 });
             }
             std::thread::sleep(poll);
@@ -2798,6 +2738,7 @@ fn cmd_wait(
         };
 
         let WaitFrame {
+            watermark: _,
             observation: mut current,
             persona: persona_id,
             habits: mut habit_seen,
@@ -2807,6 +2748,7 @@ fn cmd_wait(
         // rearmed one-shot watcher therefore waits for a transition instead
         // of reporting the same unsatisfied intention forever.
         let mut last_habit_sweep = Instant::now();
+        let mut current_authorization_valid = true;
 
         let stdout = io::stdout();
         let mut output = stdout.lock();
@@ -2823,9 +2765,8 @@ fn cmd_wait(
         if initial_report {
             return Ok(WaitOutcome {
                 news_printed: true,
-                incomplete: None,
-                payload_pending: false,
-                had_coherent_observation: true,
+                view_pending: false,
+                had_ready_frame: true,
             });
         }
 
@@ -2834,9 +2775,8 @@ fn cmd_wait(
                 if start.elapsed() >= timeout {
                     return Ok(WaitOutcome {
                         news_printed: false,
-                        incomplete,
-                        payload_pending,
-                        had_coherent_observation: true,
+                        view_pending,
+                        had_ready_frame: true,
                     });
                 }
             }
@@ -2868,8 +2808,8 @@ fn cmd_wait(
                 next_authorization_change = attempt.next_authorization_change();
                 match attempt {
                     WaitFrameLoad::Ready(candidate) => {
-                        incomplete = None;
-                        payload_pending = false;
+                        view_pending = false;
+                        current_authorization_valid = true;
                         let habit_report = render_habit_transitions(&habit_seen, &candidate.habits)
                             .unwrap_or_default();
                         let habit_fired = !habit_report.is_empty();
@@ -2886,9 +2826,8 @@ fn cmd_wait(
                         if habit_fired || ordinary_fired {
                             return Ok(WaitOutcome {
                                 news_printed: true,
-                                incomplete: None,
-                                payload_pending: false,
-                                had_coherent_observation: true,
+                                view_pending: false,
+                                had_ready_frame: true,
                             });
                         }
                         current = candidate.observation;
@@ -2896,16 +2835,26 @@ fn cmd_wait(
                         last_habit_sweep = Instant::now();
                         continue;
                     }
-                    WaitFrameLoad::Pending(pending) => {
-                        payload_pending = pending.incomplete.is_none();
-                        incomplete = pending.incomplete;
+                    WaitFrameLoad::Pending(_) => {
+                        view_pending = true;
+                        if authorization_changed {
+                            current_authorization_valid = false;
+                        }
                     }
                 }
             }
 
-            // A physically incomplete newer frame never replaces `current`.
-            // Time-driven Habit transitions therefore remain observable from
-            // the last complete frame while sync closes the append.
+            // Once this frame's authorization boundary has elapsed, its old
+            // facts cannot drive new time-based Habit reports. Retain it only
+            // as a presentation baseline until a readable replacement arrives.
+            if !current_authorization_valid {
+                last_habit_sweep = Instant::now();
+                continue;
+            }
+
+            // A newer observation with a missing selected payload never
+            // replaces `current`. Time-driven Habit transitions therefore
+            // remain observable from the last fully readable frame.
             let current_habits = observe_habits_in_observation(&current, pile_path, now_secs)?;
             let habit_report =
                 render_habit_transitions(&habit_seen, &current_habits).unwrap_or_default();
@@ -2918,9 +2867,8 @@ fn cmd_wait(
             if habit_fired {
                 return Ok(WaitOutcome {
                     news_printed: true,
-                    incomplete,
-                    payload_pending,
-                    had_coherent_observation: true,
+                    view_pending,
+                    had_ready_frame: true,
                 });
             }
         }
@@ -2931,27 +2879,13 @@ fn cmd_wait(
         // printed inside the wait loop — don't re-dump the full snapshot.
         return Ok(());
     }
-    if let Some(incomplete) = outcome.incomplete {
-        if outcome.had_coherent_observation {
+    if outcome.view_pending {
+        if outcome.had_ready_frame {
             println!(
-                "The latest pile prefix is awaiting sync closure ({incomplete}); the watcher retained its last coherent snapshot."
+                "The latest pile prefix does not yet provide a readable attention view; the watcher retained its last readable snapshot."
             );
         } else {
-            println!(
-                "No coherent snapshot became available before wait ended; the latest pile prefix is awaiting sync closure ({incomplete})."
-            );
-        }
-        return Ok(());
-    }
-    if outcome.payload_pending {
-        if outcome.had_coherent_observation {
-            println!(
-                "The latest pile prefix is awaiting selected payload closure; the watcher retained its last coherent snapshot."
-            );
-        } else {
-            println!(
-                "No coherent snapshot became available before wait ended; selected payloads are still awaiting sync closure."
-            );
+            println!("No fully readable attention view became available before wait ended.");
         }
         return Ok(());
     }
@@ -3015,7 +2949,7 @@ fn cmd_wake(
                 .context("read Memory collection")?;
         let wiki = wiki_model::materialize_indexed_collection(&mut storage, &signer)
             .map_err(|error| anyhow!("materialize indexed Wiki collection: {error:#}"))?;
-        let observation = observe_sources_exact(&mut storage, &sources)?;
+        let observation = maintain_and_observe_sources(&mut storage, &sources)?;
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
@@ -3209,16 +3143,29 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_does_not_swallow_an_append_beyond_the_admission_watermark() {
+    fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark() {
         let fixture = TestPile::new();
         let mut pile = open_pile_strict(&fixture.path).unwrap();
-        let sources = OrientSources::open(&mut pile, &fixture.signer, false).unwrap();
-        let admission_snapshot = pile.snapshot().unwrap();
+        let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
+        let persona = id(42);
+        let profile = faculties::relations::ProfileInput {
+            label: "test-persona".to_owned(),
+            ..Default::default()
+        };
+        let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
+        pile.commit(sources.relations.source, &fixture.signer, person)
+            .unwrap();
+        let watermark = pile.snapshot().unwrap();
+        let instant = clock::now().unwrap();
+        let expected_support = watermark
+            .collection_at(sources.messages.source, instant)
+            .unwrap()
+            .support()
+            .clone();
 
-        // This commit arrives after collection admission was frozen but before
-        // maintaining the corresponding Succinct views takes its later reader
-        // snapshot. It must remain beyond the wait watermark even though that
-        // reader snapshot includes it.
+        // This commit arrives after the wait watermark was frozen. Maintenance
+        // may append derived records, but it must neither incorporate this
+        // source future nor advance the caller's polling watermark past it.
         let message_collection = sources.messages.source;
         pile.commit(
             message_collection,
@@ -3226,37 +3173,44 @@ mod tests {
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        let instant = clock::now().unwrap();
-        let observation =
-            match observe_sources_at(&mut pile, admission_snapshot, &sources, instant).unwrap() {
-                ObservationReadiness::Ready(observation) => observation,
-                ObservationReadiness::Pending(pending) => {
-                    panic!("unexpected incomplete observation: {}", pending.incomplete)
-                }
-            };
+        let attempt = load_wait_frame(
+            &mut pile,
+            &sources,
+            watermark.clone(),
+            instant,
+            &fixture.path,
+            "test-persona",
+        )
+        .unwrap();
+        let WaitFrameLoad::Ready(frame) = attempt else {
+            panic!("resident persona payload unexpectedly pending")
+        };
 
         let admitted_after = message_collection
-            .admitted_at(&observation.snapshot, instant)
+            .admitted_at(&frame.observation.snapshot, instant)
             .unwrap();
+        assert_eq!(
+            frame.observation.facts.messages.support(),
+            &expected_support,
+            "maintenance must derive only the source support resident at its input watermark",
+        );
         assert_ne!(
-            &admitted_after,
-            observation.facts.messages.support(),
-            "the prepared view intentionally represents the earlier admission snapshot",
+            &admitted_after, &expected_support,
+            "the later observation must contain the racing source commit without pretending its target was already derived",
+        );
+        assert_eq!(frame.observation.facts.messages.view().iter().count(), 0);
+        assert!(
+            frame.watermark.changes_since(&watermark).is_empty()
+                && watermark.changes_since(&frame.watermark).is_empty(),
+            "the production wait frame must retain the exact input watermark",
         );
         assert!(
-            !observation
+            !frame
+                .observation
                 .snapshot
-                .changes_since(&observation.source_snapshot)
+                .changes_since(&frame.watermark)
                 .is_empty(),
-            "the racing commit must remain visible beyond the wait watermark",
-        );
-        let pending = PendingWaitFrame::awaiting_payload(&observation);
-        assert!(
-            !observation
-                .snapshot
-                .changes_since(&pending.snapshot)
-                .is_empty(),
-            "payload pending must retain the admission watermark too",
+            "the post-maintenance observation must not replace its polling watermark",
         );
         pile.close().unwrap();
     }

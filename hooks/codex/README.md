@@ -19,8 +19,8 @@ cohort.
   explicitly instead of killing it speculatively.
 - `orient_prompt_submit.sh` injects directed Orient news on every prompt using
   `orient poll --peek`. Codex fires prompt hooks for root and subagents without
-  identifying which fired, so peek deliberately never advances or initializes
-  the configured persona checkpoint.
+  identifying which fired, so peek deliberately records no `Presented` facts
+  for the configured persona.
 - `orient_stop.sh` allows Stop only while a watcher is live. If it is absent,
   Codex gets one automatic continuation to poll, process, and rearm it; a second
   failed Stop remains visible but does not loop forever.

@@ -6,15 +6,17 @@ All notable changes to this project will be documented in this file.
 
 - **Orient reads maintained Succinct collection snapshots directly.** Messages,
   Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations
-  remain separately admitted and queryable instead of being copied into one
-  temporary `TribleSet` or retained in a Rust catalog. Each observation freezes
-  foundational `Support`, maintains the raw and Rank9 mapping hops explicitly
-  over that same support, then attaches every target cover to one final
-  immutable pile snapshot. Durable acknowledgement is the relational
+  remain separately queryable instead of being copied into one temporary
+  `TribleSet` or retained in a Rust catalog. Maintenance freezes one pile
+  snapshot and advances the raw and Rank9 mappings over only the foundational
+  support resident there; observation then attaches each target collection to
+  one later immutable pile snapshot and reads exactly the support represented
+  by its resident target cover. Durable acknowledgement is the relational
   `Presented(persona, event)` set, and output is flushed before presentation is
-  recorded. Wait keeps its last coherent view through incomplete sync and uses
-  the exact admission snapshot as its change watermark, so maintenance writes
-  cannot hide a concurrently arriving commit. Compass's maintained status
+  recorded. Wait keeps its last readable view while a selected payload is
+  missing and retains the exact pre-maintenance pile snapshot as its polling
+  watermark, so maintenance writes cannot hide a concurrently arriving commit.
+  Compass's maintained status
   register now inherits the configured source collection policy.
 
 - **Runtime collection opens no longer probe retired Repository history.**
@@ -25,10 +27,10 @@ All notable changes to this project will be documented in this file.
   scan.
 
 - **Orient validates the data it observes, not every historical row.** `show`,
-  `wait`, and `poll` still require exact resident collection covers and reject
-  malformed archive bytes, but typed query paths now decode only selected
-  payloads. A discarded malformed checkpoint therefore cannot poison every
-  future observation merely by remaining in the append-only history.
+  `wait`, and `poll` select the maximal resident target covers in one immutable
+  snapshot and typed query paths decode only selected payloads. A historical
+  row outside those typed views therefore cannot poison every future
+  observation merely by remaining in the append-only history.
 
 - **A one-shot descriptor-authority migration re-seats ordinary faculty
   roots.** It registers each UTF-8-name, mandatory-authority descriptor,
@@ -45,12 +47,6 @@ All notable changes to this project will be documented in this file.
   replay API is retained only for migrations and fixtures. Portable bootstrap
   now uses the same constructors and no longer preflights Compass for random-id
   collisions before publication.
-
-- **Orient checkpoint reads now use an exact maintained LWW register.** Each
-  persona's latest checkpoint is selected from a derived index attached to the
-  exact Orient collection ticket, while the checkpoint events remain available
-  for history and validation. A first read may publish missing cache artifacts;
-  semantic checkpoint commits remain independent of that maintenance work.
 
 - **Compass status reads now attach an exact maintained LWW index.** The
   Compass CLI, Orient, and the viewer consume the same exact snapshot rather
@@ -314,7 +310,8 @@ All notable changes to this project will be documented in this file.
   watching it, and the only thing noticing was an ad-hoc polling loop. Teams
   is now part of Orient's news. It has no per-reader read state to diff, so
   attention is the *growth* of the set of present logical messages written by
-  somebody other than us, checkpointed per persona exactly like unread Mail;
+  somebody other than us, with already reported events subtracted through the
+  same relational `Presented(persona, event)` facts as other attention items;
   an edit re-observes a message we already know and is therefore silent, and a
   deletion never announces a tombstone. Two things are deliberately not news.
   Our own sends come back through the next delta pull, and they are filtered
@@ -334,9 +331,7 @@ All notable changes to this project will be documented in this file.
   pile, and a Teams message nobody has synced still cannot wake anybody.
   Reading the Teams collection costs about 3 ms of materialization and 0.2 ms
   of projection on the live 12.8 GB pile, against ~5 s for the command as a
-  whole. The Orient checkpoint view is now version 3; a version 1 or 2
-  checkpoint still parses, and its empty Teams set means the first check after
-  the upgrade reports the standing conversation once.
+  whole.
 
 - **Secrets vaults now separate authority, custody, and private discovery.** One
   vault epoch is one capability-anchored private collection with a random
@@ -746,10 +741,8 @@ All notable changes to this project will be documented in this file.
   hiding history or creating workflow. Inline `faculty:hex` links materialize
   references as exhaust. Orient wakes once for newly visible foreign or
   unattributed notes on relevant goals (or directly tagged notes), keeps own
-  notes quiet, upgrades legacy checkpoints without a flood, and unions seen
-  note-ID deltas across persona checkpoints. This prevents later replay after
-  divergent checkpoints are committed without claiming a simultaneous
-  exactly-once delivery lock, and keeps persisted note history linear.
+  notes quiet, and records the exact reported note events as grow-only
+  `Presented` facts without claiming a simultaneous exactly-once delivery lock.
 - **Codex can enforce orient-watcher continuity and ingest news while busy.**
   Versioned SessionStart, UserPromptSubmit, and Stop hook helpers under
   `hooks/codex/` report the configured persona watcher to each new primary
