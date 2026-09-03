@@ -18,11 +18,13 @@ use triblespace::core::collection::{
     collection_read_audience_at, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt,
 };
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreSnapshot};
+use triblespace::macros::{find, pattern};
 
 use super::{
-    add_recipient_envelopes_from_facts, seal_version, secret_rows, IntervalValue, SecretsFacts,
-    SecretsSnapshot, SecretsView,
+    add_recipient_envelopes_for_target, seal_version, IntervalValue, SecretsFacts, SecretsSnapshot,
+    SecretsView,
 };
 
 /// One logical Secrets policy boundary and its ordinary maintained encodings.
@@ -59,6 +61,35 @@ impl SecretsCollection {
         })
     }
 
+    /// Attach the canonical maintained encodings above one existing source.
+    ///
+    /// The source descriptor remains the policy boundary and identity. The
+    /// two derived descriptors inherit that exact immutable policy.
+    pub fn from_source<S>(store: &mut S, source: Collection<SimpleArchive>) -> Result<Self>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: BlobStoreGet,
+    {
+        let snapshot = store
+            .snapshot()
+            .context("freeze Secrets source descriptor snapshot")?;
+        let policy = source
+            .policy(&snapshot)
+            .context("read Secrets source collection policy")?;
+        drop(snapshot);
+        let succinct = store
+            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
+        let rank9 = store
+            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
+        Ok(Self {
+            source,
+            succinct,
+            rank9,
+        })
+    }
+
     pub const fn source(self) -> Collection<SimpleArchive> {
         self.source
     }
@@ -73,6 +104,44 @@ impl SecretsCollection {
 
     pub const fn rank9(self) -> Collection<Rank9AcceleratedSuccinctArchiveBlob> {
         self.rank9
+    }
+
+    /// Ensure both physical encodings for one exact foundational support.
+    ///
+    /// This constructs only what the requested support needs. It does not run
+    /// LSM compaction policy and is therefore the normal foreground read path.
+    pub fn ensure_exact<S>(
+        self,
+        store: &mut S,
+        support: &triblespace::core::collection::Support,
+    ) -> Result<S::Snapshot>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        drop(
+            store
+                .ensure_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .context("ensure Succinct Secrets collection")?,
+        );
+        store
+            .ensure_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .context("ensure Rank9 Secrets collection")
+    }
+
+    /// Ensure the current admitted source support without compacting it.
+    pub fn ensure<S>(self, store: &mut S) -> Result<S::Snapshot>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        let before = store
+            .snapshot()
+            .context("freeze Secrets support before ensure")?;
+        let support = self
+            .source
+            .admitted(&before)
+            .context("admit Secrets source support")?;
+        drop(before);
+        self.ensure_exact(store, &support)
     }
 
     /// Maintain both derived lattices for one frozen admitted support.
@@ -150,6 +219,42 @@ where
     snapshot(store_snapshot, collections)
 }
 
+/// Ensure each explicit policy boundary, then attach one shared snapshot.
+///
+/// All source supports are selected from one frozen prefix. This is the
+/// ordinary consumer path; unlike [`maintain_and_snapshot`] it performs no
+/// opportunistic LSM compaction.
+pub fn ensure_and_snapshot<S, I>(
+    store: &mut S,
+    collections: I,
+) -> Result<SecretsSnapshot<S::Snapshot>>
+where
+    S: Store + CollectionStoreExt,
+    I: IntoIterator<Item = SecretsCollection>,
+{
+    let collections = collections.into_iter().collect::<Vec<_>>();
+    let before = store
+        .snapshot()
+        .context("freeze Secrets supports before ensure")?;
+    let supports = collections
+        .iter()
+        .map(|collection| {
+            collection
+                .source
+                .admitted(&before)
+                .context("admit Secrets source support")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(before);
+    for (collection, support) in collections.iter().zip(&supports) {
+        drop(collection.ensure_exact(store, support)?);
+    }
+    let store_snapshot = store
+        .snapshot()
+        .context("freeze ensured Secrets snapshot")?;
+    snapshot(store_snapshot, collections)
+}
+
 fn admitted_readers<R>(snapshot: &R, collection: SecretsCollection) -> Result<Vec<VerifyingKey>>
 where
     R: BlobStoreGet + CapabilityProofRead,
@@ -190,6 +295,13 @@ where
     let snapshot = store
         .snapshot()
         .context("freeze Secrets audience before publication")?;
+    if !collection
+        .source
+        .writer_is_admitted(&snapshot, signing_key.verifying_key())
+        .map_err(|error| anyhow!("check Secrets writer admission: {error}"))?
+    {
+        bail!("signer is not admitted to WRITE the configured Secrets collection");
+    }
     let recipients = admitted_readers(&snapshot, collection)?;
     drop(snapshot);
     let sealed = seal_version(name, plaintext, recipients, created_at)?;
@@ -205,17 +317,17 @@ where
 /// One frozen post-maintenance store snapshot supplies both the immutable fact
 /// view and admitted audience. New evidence arriving later cannot split the
 /// decision across temporal boundaries; another maintenance call observes it.
-pub fn maintain_recipient_envelopes<S>(
+pub fn maintain_recipient_envelopes<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
+    secrets: &SecretsSnapshot<R>,
     collection: SecretsCollection,
     holder: &SigningKey,
 ) -> Result<usize>
 where
     S: Store + CollectionStoreExt,
+    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
 {
-    let store_snapshot = collection.maintain(store)?;
-    let secrets = snapshot(store_snapshot, [collection])?;
     let Some(view) = secrets
         .collections()
         .iter()
@@ -223,16 +335,30 @@ where
     else {
         return Ok(0);
     };
+    let Some(facts) = secrets.facts() else {
+        return Ok(0);
+    };
     let recipients = admitted_readers(secrets.store_snapshot(), collection)?;
-    let secret_ids = secret_rows(view.facts())
-        .into_iter()
-        .map(|row| row.id)
-        .collect::<std::collections::BTreeSet<_>>();
+    if !collection
+        .source
+        .writer_is_admitted(secrets.store_snapshot(), signing_key.verifying_key())
+        .map_err(|error| anyhow!("check Secrets envelope writer admission: {error}"))?
+    {
+        bail!("signer is not admitted to WRITE the configured Secrets collection");
+    }
+    let secret_ids = find!(
+        id: triblespace::core::id::Id,
+        pattern!(view.facts(), [{
+            ?id @ triblespace::core::metadata::tag: super::schema::KIND_SECRET,
+        }])
+    )
+    .collect::<std::collections::BTreeSet<_>>();
     let mut fragment = triblespace::core::trible::Fragment::empty();
     let mut count = 0usize;
     for secret in secret_ids {
-        let envelopes = add_recipient_envelopes_from_facts(
+        let envelopes = add_recipient_envelopes_for_target(
             secrets.store_snapshot(),
+            facts,
             view.facts(),
             secret,
             holder,
@@ -338,11 +464,75 @@ mod tests {
 
         grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
             .unwrap();
-        let added = maintain_recipient_envelopes(&mut store, &alice, collection, &alice).unwrap();
+        let current = maintain_and_snapshot(&mut store, [collection]).unwrap();
+        let added =
+            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap();
         assert_eq!(added, 2);
 
         let after = maintain_and_snapshot(&mut store, [collection]).unwrap();
         assert_eq!(after.open(first, &bob).unwrap(), b"value");
         assert_eq!(after.open(second, &bob).unwrap(), b"other");
+    }
+
+    #[test]
+    fn configured_collection_views_conjoin_before_querying() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let policy = direct_policy(alice.verifying_key());
+        let mut store = MemoryRepo::default();
+        let left = SecretsCollection::register(&mut store, "split-secret", policy.clone()).unwrap();
+        let right = SecretsCollection::register(&mut store, "split-wrap", policy).unwrap();
+        let sealed =
+            seal_version("split", b"still one entity", [alice.verifying_key()], at(5)).unwrap();
+        let secret = sealed.secret;
+        let (_, facts, metafacts, blobs) = sealed.fragment.into_parts();
+        let mut secret_facts = triblespace::core::trible::TribleSet::new();
+        let mut wrap_facts = triblespace::core::trible::TribleSet::new();
+        for fact in facts.iter() {
+            if fact.e() == &secret {
+                secret_facts.insert(fact);
+            } else {
+                wrap_facts.insert(fact);
+            }
+        }
+        let wrap = *wrap_facts
+            .iter()
+            .next()
+            .expect("sealed version has a wrap")
+            .e();
+        store
+            .commit(
+                left.source(),
+                &alice,
+                triblespace::core::trible::Fragment::rooted_from_parts(
+                    secret,
+                    secret_facts,
+                    metafacts.clone(),
+                    blobs.clone(),
+                ),
+            )
+            .unwrap();
+        store
+            .commit(
+                right.source(),
+                &alice,
+                triblespace::core::trible::Fragment::rooted_from_parts(
+                    wrap, wrap_facts, metafacts, blobs,
+                ),
+            )
+            .unwrap();
+
+        grant_collection_read(&mut store, left.handle(), &alice, bob.verifying_key()).unwrap();
+        let secrets = maintain_and_snapshot(&mut store, [left, right]).unwrap();
+        assert!(secrets.contains(secret));
+        assert_eq!(secrets.open(secret, &alice).unwrap(), b"still one entity");
+
+        let added =
+            maintain_recipient_envelopes(&mut store, &alice, &secrets, left, &alice).unwrap();
+        assert_eq!(added, 2);
+        drop(secrets);
+
+        let left_only = ensure_and_snapshot(&mut store, [left]).unwrap();
+        assert_eq!(left_only.open(secret, &bob).unwrap(), b"still one entity");
     }
 }

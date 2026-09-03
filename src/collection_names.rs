@@ -35,6 +35,7 @@ use crate::schemas::{
     headspace, mail, memory, message, orient, planner, posture, relations, status, teams, voice,
     web, wiki,
 };
+use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 
 /// Every root collection this build writes: the scope that used to anchor it,
 /// and the name it is known by.
@@ -77,6 +78,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy"),
         (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan"),
         (relations::DEFAULT_SCOPE_ID, "relations"),
+        (SECRETS_SCOPE_ID, "secrets"),
         (status::DEFAULT_SCOPE_ID, "status"),
         (teams::DEFAULT_SCOPE_ID, "teams"),
         (voice::COLLECTION_SCOPE_ID, "voice"),
@@ -194,6 +196,31 @@ where
     open_exact_in(&snapshot, scope, authority, handle)
 }
 
+/// Open the operator-selected exact descriptor for a reader, or construct the
+/// ordinary signer-private descriptor when no override is present.
+///
+/// Unlike [`open_configured`], an exact override requires READ rather than
+/// WRITE admission. This is the appropriate boundary for consumers of a
+/// shared collection which never publish to it.
+pub fn open_configured_read<S>(
+    storage: &mut S,
+    scope: Id,
+    subject: VerifyingKey,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+{
+    let Some(handle) = configured_handle(scope)? else {
+        return open(storage, scope, subject).context("register signer-private descriptor");
+    };
+
+    let snapshot = storage
+        .snapshot()
+        .context("freeze store while opening configured collection descriptor")?;
+    open_exact_read_in(&snapshot, scope, subject, handle)
+}
+
 /// Open and validate one exact faculty descriptor in an existing snapshot.
 ///
 /// This is the coherent read-boundary form used by callers which already froze
@@ -208,6 +235,54 @@ pub fn open_exact_in<S>(
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
     S: BlobStoreGet + CapabilityProofRead,
+{
+    let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
+    let expected = require_name(scope);
+    if !collection
+        .writer_is_admitted(snapshot, authority)
+        .context("check configured collection WRITE admission")?
+    {
+        bail!(
+            "durable signer {} is not admitted to WRITE configured collection {:?}",
+            hex::encode(authority.to_bytes()),
+            expected,
+        );
+    }
+    Ok(collection)
+}
+
+/// Open and validate one exact faculty descriptor for a READ-only consumer.
+pub fn open_exact_read_in<S>(
+    snapshot: &S,
+    scope: Id,
+    subject: VerifyingKey,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: BlobStoreGet + CapabilityProofRead,
+{
+    let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
+    let expected = require_name(scope);
+    if !collection
+        .reader_is_admitted(snapshot, subject)
+        .context("check configured collection READ admission")?
+    {
+        bail!(
+            "durable signer {} is not admitted to READ configured collection {:?}",
+            hex::encode(subject.to_bytes()),
+            expected,
+        );
+    }
+    Ok(collection)
+}
+
+fn open_exact_descriptor_in<S>(
+    snapshot: &S,
+    scope: Id,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: BlobStoreGet,
 {
     let collection = Collection::open(snapshot, handle).with_context(|| {
         format!(
@@ -233,16 +308,6 @@ where
             "{} names collection {:?}, not expected faculty collection {:?}",
             override_env_name(scope),
             &*name,
-            expected,
-        );
-    }
-    if !collection
-        .writer_is_admitted(snapshot, authority)
-        .context("check configured collection WRITE admission")?
-    {
-        bail!(
-            "durable signer {} is not admitted to WRITE configured collection {:?}",
-            hex::encode(authority.to_bytes()),
             expected,
         );
     }

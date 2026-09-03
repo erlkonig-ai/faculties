@@ -29,6 +29,8 @@ use zeroize::Zeroizing;
 pub mod schema;
 pub mod storage;
 
+pub use self::schema::DEFAULT_SCOPE_ID;
+
 use self::schema::{
     secret_body, wrap_dek, wrap_recipient_key, wrap_secret, KIND_SECRET, KIND_WRAP,
 };
@@ -261,6 +263,38 @@ where
     .collect()
 }
 
+/// Every recipient whose wrap attachment is resident and structurally valid.
+///
+/// A typed fact row alone is not evidence that an envelope is usable. In an
+/// open-world store a malformed or missing attachment must not suppress a
+/// later additive repair for the same recipient.
+fn resident_wrap_recipients<R, P>(reader: &R, facts: &P, secret: Id) -> BTreeSet<RecipientPublicKey>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+{
+    find!(
+        (
+            recipient: Inline<inlineencodings::ED25519PublicKey>,
+            sealed_dek: BytesHandle
+        ),
+        pattern!(facts, [{
+            _?id @
+                metadata::tag: KIND_WRAP,
+                wrap_secret: secret,
+                wrap_recipient_key: ?recipient,
+                wrap_dek: ?sealed_dek,
+        }])
+    )
+    .filter_map(|(recipient, sealed_dek)| {
+        read_bytes(reader, sealed_dek)
+            .ok()
+            .filter(|sealed| validate_sealed_dek(sealed).is_ok())
+            .map(|_| recipient.raw)
+    })
+    .collect()
+}
+
 pub fn read_text<R: BlobStoreGet>(reader: &R, handle: TextHandle) -> Result<String> {
     let value: anybytes::View<str> = reader.get(handle).context("read UTF-8 string blob")?;
     Ok(value.as_ref().to_owned())
@@ -479,17 +513,21 @@ where
     let keypair = box_keypair_from_signing_key(signing_key)?;
     let mut recovered = None::<Zeroizing<Vec<u8>>>;
     for wrap in wraps {
-        let sealed = read_bytes(reader, wrap.sealed_dek)
-            .with_context(|| format!("read wrap {}", wrap.id))?;
-        validate_sealed_dek(&sealed)?;
-        let bytes = Zeroizing::new(
-            DryocBox::from_sealed_bytes(&sealed)
-                .map_err(|error| anyhow!("parse wrap {}: {error:?}", wrap.id))?
-                .unseal_to_vec(&keypair)
-                .map_err(|_| anyhow!("unseal wrap {} failed", wrap.id))?,
-        );
+        let Ok(sealed) = read_bytes(reader, wrap.sealed_dek) else {
+            continue;
+        };
+        if validate_sealed_dek(&sealed).is_err() {
+            continue;
+        }
+        let Ok(boxed) = DryocBox::from_sealed_bytes(&sealed) else {
+            continue;
+        };
+        let Ok(opened) = boxed.unseal_to_vec(&keypair) else {
+            continue;
+        };
+        let bytes = Zeroizing::new(opened);
         if bytes.len() != 32 {
-            bail!("wrap {} opened to a malformed DEK", wrap.id);
+            continue;
         }
         if recovered
             .as_ref()
@@ -501,7 +539,9 @@ where
             recovered = Some(bytes);
         }
     }
-    let bytes = recovered.expect("at least one wrap checked above");
+    let Some(bytes) = recovered else {
+        return Ok(None);
+    };
     Ok(Some(Key::try_from(&bytes[..]).context("decode DEK")?))
 }
 
@@ -592,12 +632,35 @@ where
     P: TriblePattern,
     I: IntoIterator<Item = VerifyingKey>,
 {
-    if secret_rows_for(facts, secret).is_empty() {
+    add_recipient_envelopes_for_target(reader, facts, facts, secret, holder, recipients)
+}
+
+/// Build missing envelopes for `target_facts`, recovering the existing DEK
+/// from a possibly wider aggregate `recovery_facts` view.
+///
+/// This is the collection-boundary primitive: cross-collection facts may help
+/// recover a split historical version, while an envelope only counts as
+/// already published when it is resident in the explicit target collection.
+pub fn add_recipient_envelopes_for_target<R, P, Q, I>(
+    reader: &R,
+    recovery_facts: &P,
+    target_facts: &Q,
+    secret: Id,
+    holder: &SigningKey,
+    recipients: I,
+) -> Result<RecipientEnvelopes>
+where
+    R: BlobStoreGet,
+    P: TriblePattern,
+    Q: TriblePattern,
+    I: IntoIterator<Item = VerifyingKey>,
+{
+    if secret_rows_for(recovery_facts, secret).is_empty() {
         bail!("secret {secret} not found");
     }
-    let dek = recover_dek_from_facts(reader, facts, secret, holder)?
+    let dek = recover_dek_from_facts(reader, recovery_facts, secret, holder)?
         .ok_or_else(|| anyhow!("holder has no wrap on secret {secret}"))?;
-    let existing = wrap_recipients(facts, secret);
+    let existing = resident_wrap_recipients(reader, target_facts, secret);
     let recipients = deduplicated_recipients(recipients);
     let mut fragment = Fragment::empty();
     let mut added = Vec::new();
@@ -708,6 +771,29 @@ mod tests {
             open_version_from_facts(&reader, sealed.fragment.facts(), secret, &bob).unwrap(),
             b"unchanged ciphertext"
         );
+    }
+
+    #[test]
+    fn missing_wrap_attachment_does_not_suppress_additive_repair() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let mut sealed =
+            seal_version("database", b"value", [alice.verifying_key()], at(3)).unwrap();
+        let secret = sealed.secret;
+        let missing = Inline::<inlineencodings::Handle<blobencodings::RawBytes>>::new([0x55; 32]);
+        sealed.fragment += wrap_record(genid().id, secret, bob.verifying_key().to_bytes(), missing);
+
+        let reader = sealed.fragment.blobs_mut().snapshot().unwrap();
+        let added = add_recipient_envelopes_from_facts(
+            &reader,
+            sealed.fragment.facts(),
+            secret,
+            &alice,
+            [bob.verifying_key()],
+        )
+        .unwrap();
+
+        assert_eq!(added.recipients, vec![bob.verifying_key()]);
     }
 
     #[test]

@@ -50,6 +50,30 @@ use triblespace::core::trible::{Fragment, TribleSet};
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
 
+/// Open the explicitly configured Secrets policy boundary for this process.
+///
+/// `TRIBLESPACE_COLLECTION_SECRETS` selects an exact shared source descriptor;
+/// otherwise the usual signer-private `secrets` descriptor is registered.
+/// READ admission is sufficient to attach it. Mutation APIs independently
+/// require the signer to satisfy WRITE admission before publishing.
+pub fn open_secrets_collection<S>(
+    store: &mut S,
+    subject: VerifyingKey,
+) -> Result<crate::secrets::storage::SecretsCollection>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet + CapabilityProofRead,
+{
+    let source = crate::collection_names::open_configured_read(
+        store,
+        crate::secrets::DEFAULT_SCOPE_ID,
+        subject,
+    )
+    .context("open configured Secrets source collection")?;
+    crate::secrets::storage::SecretsCollection::from_source(store, source)
+        .context("register maintained Secrets collection descriptors")
+}
+
 /// The three typed lattice coordinates of one maintained Faculty fact collection.
 ///
 /// This value owns no facts and performs no reads. It is only the canonical

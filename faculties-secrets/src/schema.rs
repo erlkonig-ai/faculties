@@ -3,6 +3,13 @@
 use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
 
+/// Stable faculty scope used only to select the self-describing `secrets`
+/// source collection through the shared collection-name/configuration layer.
+///
+/// Minted with `trible genid` on 2026-09-03:
+/// `0A33FEA863F9A2F460F98B8F6EE7F0A3`.
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("0A33FEA863F9A2F460F98B8F6EE7F0A3");
+
 // These records retain their already-published wire meaning across the
 // custody-vault removal. Old vault headers and access envelopes remain inert
 // facts; readers only ask for these two shapes.
