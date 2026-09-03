@@ -2393,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_derives_repeated_content_from_each_naturally_authored_leaf() {
+    fn bm25_collapses_repeated_content_to_its_canonical_block() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2412,8 +2412,7 @@ mod tests {
         assert_eq!((report.source_commits, report.source_elements), (2, 2));
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
         let hits = search.search("shared closure needle", 10).unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_ne!(hits[0].block, hits[1].block);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
