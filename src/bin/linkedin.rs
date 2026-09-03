@@ -44,12 +44,12 @@ use faculties::schemas::linkedin;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use faculties::storage;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::macros::entity;
@@ -198,14 +198,14 @@ struct RelationsStorage<'a> {
 
 #[derive(Clone)]
 struct RelationsView {
-    facts: TribleSet,
+    facts: FactArchive,
     reader: PileSnapshot,
 }
 
 impl RelationsStorage<'_> {
-    /// Keep planning, union validation, and publication on one observed pile
-    /// prefix. No repository workspace, branch head, CAS cell, or reopen sits
-    /// between the semantic decision and its signed collection commit.
+    /// Maintain and attach one immutable Relations view before planning. No
+    /// repository workspace, branch head, CAS cell, or reopen sits between the
+    /// semantic decision and its signed collection commit.
     fn with_store<T>(
         &self,
         operation: impl FnOnce(
@@ -219,14 +219,29 @@ impl RelationsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Relations store snapshot")?;
-            let (facts, _) = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .context("materialize authored Relations collection")?;
-            relations::validate_catalog(&store_snapshot, &facts)
-                .context("validate authored Relations collection")?;
+            let maintained = FactCollection::new(&mut pile, collection)
+                .context("register maintained Relations fact collection")?;
+            let before = pile
+                .snapshot()
+                .context("freeze Relations pre-maintenance snapshot")?;
+            let instant = clock::now()?;
+            drop(
+                maintained
+                    .maintain_at(&mut pile, &before, instant)
+                    .context("maintain Relations fact collection")?,
+            );
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze maintained Relations snapshot")?;
+            let observed = store_snapshot
+                .collection_at(maintained.rank9(), instant)
+                .context("observe Relations Rank9 projection")?;
+            let facts = observed
+                .view::<FactArchive>()
+                .context("read Relations Rank9 projection")?;
             operation(
                 &mut pile,
-                collection,
+                maintained.source(),
                 &signer,
                 &RelationsView {
                     facts,
@@ -241,7 +256,7 @@ impl RelationsStorage<'_> {
         self.with_store(|_, _, _, view| operation(view))
     }
 
-    /// Validate and publish at most one complete Relations fragment.
+    /// Publish at most one complete, locally constructed Relations fragment.
     fn update<T>(
         &self,
         description: &'static str,
@@ -250,8 +265,6 @@ impl RelationsStorage<'_> {
         self.with_store(|pile, collection, signer, view| {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
-                relations::validate_catalog_union(&view.reader, &view.facts, &fragment)
-                    .context("preflight authored Relations union")?;
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
@@ -305,15 +318,7 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-// ── existing-people lookup maps ─────────────────────────────────────────────
-
-struct Lookup {
-    by_url: HashMap<String, BTreeSet<Id>>,
-    by_email: HashMap<String, BTreeSet<Id>>,
-    profiles: BTreeMap<Id, PlannedProfile>,
-    forked_profiles: BTreeMap<Id, Vec<Id>>,
-    identities: relations::IdentityComponents,
-}
+// ── batch-local planning over the maintained Relations view ─────────────────
 
 #[derive(Clone)]
 struct PlannedProfile {
@@ -322,61 +327,149 @@ struct PlannedProfile {
     dirty: bool,
 }
 
-fn index_key(map: &mut HashMap<String, BTreeSet<Id>>, key: Option<String>, person: Id) {
-    if let Some(key) = key {
-        map.entry(key).or_default().insert(person);
-    }
+/// Input-shaped projection of the existing Relations view. It retains only
+/// keys which this batch actually asks about, never complete profiles or an
+/// independently validated catalog.
+#[derive(Default)]
+struct ImportProjection {
+    by_url: BTreeMap<String, BTreeSet<Id>>,
+    by_email: BTreeMap<String, BTreeSet<Id>>,
+    by_label: BTreeMap<String, BTreeSet<Id>>,
+    matching_forks: BTreeSet<Id>,
 }
 
-fn index_profile_keys(
-    by_url: &mut HashMap<String, BTreeSet<Id>>,
-    by_email: &mut HashMap<String, BTreeSet<Id>>,
+fn index_requested_key(
+    index: &mut BTreeMap<String, BTreeSet<Id>>,
+    requested: &BTreeSet<String>,
+    key: Option<String>,
     person: Id,
-    value: &ProfileInput,
-) {
-    for url in &value.profile_urls {
-        index_key(by_url, normalize_url(url), person);
-    }
-    for email in &value.emails {
-        index_key(by_email, name_key(email), person);
-    }
+) -> bool {
+    let Some(key) = key.filter(|key| requested.contains(key)) else {
+        return false;
+    };
+    index.entry(key).or_default().insert(person);
+    true
 }
 
-fn build_lookup(view: &RelationsView) -> Result<Lookup> {
-    let mut lookup = Lookup {
-        by_url: HashMap::new(),
-        by_email: HashMap::new(),
-        profiles: BTreeMap::new(),
-        forked_profiles: BTreeMap::new(),
-        identities: relations::IdentityComponents::from_facts(&view.facts)?,
-    };
+fn index_requested_profile_keys(
+    projection: &mut ImportProjection,
+    requested_urls: &BTreeSet<String>,
+    requested_emails: &BTreeSet<String>,
+    person: Id,
+    profile: &ProfileInput,
+) -> bool {
+    let mut matched = false;
+    for url in &profile.profile_urls {
+        matched |= index_requested_key(
+            &mut projection.by_url,
+            requested_urls,
+            normalize_url(url),
+            person,
+        );
+    }
+    for email in &profile.emails {
+        matched |= index_requested_key(
+            &mut projection.by_email,
+            requested_emails,
+            name_key(email),
+            person,
+        );
+    }
+    matched
+}
+
+/// Query current profile tracks once for the exact URL, email, and label keys
+/// present in this import. Historical profiles which are no longer heads
+/// cannot match, and unrelated malformed or forked anchors stay outside the
+/// projection.
+fn import_projection(
+    view: &RelationsView,
+    components: &[ImportComponent],
+) -> Result<ImportProjection> {
+    let requested_urls: BTreeSet<String> = components
+        .iter()
+        .flat_map(|component| component.urls.iter().cloned())
+        .collect();
+    let requested_emails: BTreeSet<String> = components
+        .iter()
+        .flat_map(|component| component.emails.iter().cloned())
+        .collect();
+    let requested_labels: BTreeSet<String> = components
+        .iter()
+        .filter_map(|component| component.name.as_ref())
+        .map(|name| relations::lookup_key(&name.full))
+        .collect();
+    let mut projection = ImportProjection::default();
     for person in relations::person_anchors(&view.facts) {
         match relations::profile_head(&view.facts, person)? {
-            Head::Missing => bail!("validated Relations person {person:x} has no profile"),
+            Head::Missing => {}
             Head::Unique(id) => {
                 let snapshot = relations::profile_snapshot(&view.facts, id)?;
-                let value = relations::profile_input(&view.reader, &snapshot)?;
-                index_profile_keys(&mut lookup.by_url, &mut lookup.by_email, person, &value);
-                lookup.profiles.insert(
+                let profile = relations::profile_input(&view.reader, &snapshot)?;
+                index_requested_profile_keys(
+                    &mut projection,
+                    &requested_urls,
+                    &requested_emails,
                     person,
-                    PlannedProfile {
-                        predecessor: Some(id),
-                        value,
-                        dirty: false,
-                    },
+                    &profile,
                 );
+                for label in std::iter::once(&profile.label).chain(profile.aliases.iter()) {
+                    let key = relations::lookup_key(label);
+                    if requested_labels.contains(&key) {
+                        projection.by_label.entry(key).or_default().insert(person);
+                    }
+                }
             }
             Head::Forked(heads) => {
-                for &id in &heads {
+                let mut matched = false;
+                for id in heads {
                     let snapshot = relations::profile_snapshot(&view.facts, id)?;
-                    let value = relations::profile_input(&view.reader, &snapshot)?;
-                    index_profile_keys(&mut lookup.by_url, &mut lookup.by_email, person, &value);
+                    let profile = relations::profile_input(&view.reader, &snapshot)?;
+                    matched |= index_requested_profile_keys(
+                        &mut projection,
+                        &requested_urls,
+                        &requested_emails,
+                        person,
+                        &profile,
+                    );
                 }
-                lookup.forked_profiles.insert(person, heads);
+                if matched {
+                    projection.matching_forks.insert(person);
+                }
             }
         }
     }
-    Ok(lookup)
+    Ok(projection)
+}
+
+fn profile_for_planning(view: &RelationsView, person: Id) -> Result<Option<PlannedProfile>> {
+    match relations::profile_head(&view.facts, person)? {
+        Head::Missing => Ok(None),
+        Head::Unique(id) => {
+            let snapshot = relations::profile_snapshot(&view.facts, id)?;
+            Ok(Some(PlannedProfile {
+                predecessor: Some(id),
+                value: relations::profile_input(&view.reader, &snapshot)?,
+                dirty: false,
+            }))
+        }
+        Head::Forked(heads) => bail!(
+            "LinkedIn match expands to same-person anchor {} whose profile is forked across {} heads",
+            fmt_id(person),
+            heads.len()
+        ),
+    }
+}
+
+fn matched_anchors(
+    index: &BTreeMap<String, BTreeSet<Id>>,
+    keys: &BTreeSet<String>,
+) -> BTreeSet<Id> {
+    keys.iter()
+        .filter_map(|key| index.get(key))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -725,18 +818,18 @@ fn enrich_profile(planned: &mut PlannedProfile, component: &ImportComponent) -> 
     Ok(())
 }
 
-fn matched_anchors(map: &HashMap<String, BTreeSet<Id>>, keys: &BTreeSet<String>) -> BTreeSet<Id> {
-    keys.iter()
-        .filter_map(|key| map.get(key))
-        .flatten()
-        .copied()
-        .collect()
-}
-
-fn settled_identity_component(lookup: &Lookup, raw: &BTreeSet<Id>) -> Result<BTreeSet<Id>> {
+fn settled_identity_component(
+    view: &RelationsView,
+    identities: &relations::IdentityComponents,
+    raw: &BTreeSet<Id>,
+    matching_forks: &BTreeSet<Id>,
+) -> Result<BTreeSet<Id>> {
     let first = *raw.iter().next().expect("called only for matched anchors");
     for person in raw {
-        if let Some(heads) = lookup.forked_profiles.get(person) {
+        if matching_forks.contains(person) {
+            let Head::Forked(heads) = relations::profile_head(&view.facts, *person)? else {
+                unreachable!("matching fork was observed from the same immutable view")
+            };
             bail!(
                 "LinkedIn key matches person {} whose profile is forked across {} heads",
                 fmt_id(*person),
@@ -744,11 +837,10 @@ fn settled_identity_component(lookup: &Lookup, raw: &BTreeSet<Id>) -> Result<BTr
             );
         }
     }
-    let component = lookup.identities.component(first).with_context(|| {
+    let component = identities.component(first).with_context(|| {
         format!("LinkedIn key match touches unsettled identity around {first:x}")
     })?;
-    if lookup
-        .identities
+    if identities
         .mixed_forked_pairs()
         .iter()
         .any(|(low, high)| component.contains(low) || component.contains(high))
@@ -758,7 +850,7 @@ fn settled_identity_component(lookup: &Lookup, raw: &BTreeSet<Id>) -> Result<BTr
         );
     }
     for &person in raw.iter().skip(1) {
-        let other = lookup.identities.component(person).with_context(|| {
+        let other = identities.component(person).with_context(|| {
             format!("LinkedIn key match touches unsettled identity around {person:x}")
         })?;
         if other != component {
@@ -771,19 +863,24 @@ fn settled_identity_component(lookup: &Lookup, raw: &BTreeSet<Id>) -> Result<BTr
             );
         }
     }
+    let mut usable = BTreeSet::new();
     for person in &component {
-        if let Some(heads) = lookup.forked_profiles.get(person) {
-            bail!(
+        match relations::profile_head(&view.facts, *person)? {
+            Head::Missing => {
+                // An anchor without the typed profile projection this reader
+                // understands is simply outside the writable view.
+            }
+            Head::Unique(_) => {
+                usable.insert(*person);
+            }
+            Head::Forked(heads) => bail!(
                 "LinkedIn match expands to same-person anchor {} whose profile is forked across {} heads",
                 fmt_id(*person),
                 heads.len()
-            );
-        }
-        if !lookup.profiles.contains_key(person) {
-            bail!("LinkedIn identity component contains missing person profile {person:x}");
+            ),
         }
     }
-    Ok(component)
+    Ok(usable)
 }
 
 // ── import ──────────────────────────────────────────────────────────────────
@@ -834,11 +931,11 @@ fn plan_import(view: &RelationsView, conns: &[Conn]) -> Result<IngestPlan> {
         components,
         skipped,
     } = canonical_input(conns)?;
-    let mut lookup = build_lookup(view)?;
-    let mut labels: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
-    for (&person, profile) in &lookup.profiles {
-        index_profile_labels(&mut labels, person, &profile.value);
-    }
+    // Existing Relations facts stay in their maintained query representation.
+    // This map contains only profiles the input batch actually touches.
+    let mut profiles = BTreeMap::new();
+    let mut projection = import_projection(view, &components)?;
+    let identities = relations::IdentityComponents::from_facts(&view.facts)?;
 
     let mut created = 0;
     let mut matched_by_url = 0;
@@ -847,19 +944,29 @@ fn plan_import(view: &RelationsView, conns: &[Conn]) -> Result<IngestPlan> {
     let mut prospective_collisions = BTreeSet::new();
 
     for component in components {
-        let url_matches = matched_anchors(&lookup.by_url, &component.urls);
-        let email_matches = matched_anchors(&lookup.by_email, &component.emails);
+        let url_matches = matched_anchors(&projection.by_url, &component.urls);
+        let email_matches = matched_anchors(&projection.by_email, &component.emails);
         let raw_matches: BTreeSet<Id> = url_matches.union(&email_matches).copied().collect();
 
         if !raw_matches.is_empty() {
             matched_by_url += usize::from(!url_matches.is_empty());
             matched_by_email += usize::from(!email_matches.is_empty());
-            let settled = settled_identity_component(&lookup, &raw_matches)?;
+            let settled = settled_identity_component(
+                view,
+                &identities,
+                &raw_matches,
+                &projection.matching_forks,
+            )?;
             for person in settled {
-                let profile = lookup
-                    .profiles
+                if !profiles.contains_key(&person) {
+                    let Some(profile) = profile_for_planning(view, person)? else {
+                        continue;
+                    };
+                    profiles.insert(person, profile);
+                }
+                let profile = profiles
                     .get_mut(&person)
-                    .expect("settled identity component contains a current profile");
+                    .expect("profile was inserted above");
                 enrich_profile(profile, &component)
                     .with_context(|| format!("enrich Relations person {}", fmt_id(person)))?;
             }
@@ -873,23 +980,26 @@ fn plan_import(view: &RelationsView, conns: &[Conn]) -> Result<IngestPlan> {
                 genid().id
             }
         };
-        if lookup.profiles.contains_key(&person) || lookup.forked_profiles.contains_key(&person) {
-            bail!(
-                "derived LinkedIn person anchor {} already exists without matching its canonical URL/email key",
-                fmt_id(person)
-            );
-        }
 
         let value = new_profile(&component);
         if component.name.is_some() {
             let label_key = relations::lookup_key(&value.label);
-            for &existing in labels.get(&label_key).into_iter().flatten() {
+            for existing in projection
+                .by_label
+                .get(&label_key)
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                if existing == person {
+                    continue;
+                }
                 let (first, second) = ordered_pair(person, existing);
                 prospective_collisions.insert((first, second, value.label.clone()));
             }
         }
-        index_profile_labels(&mut labels, person, &value);
-        lookup.profiles.insert(
+        index_profile_labels(&mut projection.by_label, person, &value);
+        profiles.insert(
             person,
             PlannedProfile {
                 predecessor: None,
@@ -901,7 +1011,7 @@ fn plan_import(view: &RelationsView, conns: &[Conn]) -> Result<IngestPlan> {
     }
 
     let mut fragment = Fragment::empty();
-    for (person, planned) in lookup.profiles {
+    for (person, planned) in profiles {
         if !planned.dirty {
             continue;
         }
@@ -950,12 +1060,6 @@ fn ingest(storage: RelationsStorage<'_>, conns: &[Conn], dry_run: bool) -> Resul
             prospective_collisions,
         } = plan_import(view, conns)?;
         let committed = !dry_run && !fragment.facts().is_empty();
-        if !committed {
-            // Dry runs and semantic no-ops still validate the exact
-            // prospective union, including staged text payloads.
-            relations::validate_catalog_union(&view.reader, &view.facts, &fragment)
-                .context("preflight LinkedIn import")?;
-        }
         Ok((
             committed.then_some(fragment),
             IngestReport {
@@ -1107,7 +1211,7 @@ fn describe(view: &RelationsView, id: Id) -> Result<String> {
     Ok(parts.join("\n"))
 }
 
-fn direct_verdict_is_mixed(facts: &TribleSet, first: Id, second: Id) -> Result<bool> {
+fn direct_verdict_is_mixed(facts: &FactArchive, first: Id, second: Id) -> Result<bool> {
     let Head::Forked(heads) = relations::identity_head(facts, first, second)? else {
         return Ok(false);
     };
@@ -1181,7 +1285,7 @@ fn cmd_review(storage: RelationsStorage<'_>, limit: usize) -> Result<()> {
 
 // ── resolve ─────────────────────────────────────────────────────────────────
 
-fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
+fn resolve_person_id(space: &FactArchive, raw: &str) -> Result<Id> {
     let prefix = raw.trim().to_lowercase();
     if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("person id must be hex (got '{raw}')");
@@ -1499,6 +1603,27 @@ mod tests {
             first_head
         );
         assert_eq!(fixture.commit_count(), first_commits);
+    }
+
+    #[test]
+    fn unrelated_anchor_without_a_profile_does_not_block_import() {
+        let fixture = Fixture::new();
+        let unrelated = genid().id;
+        fixture.publish(entity! { ExclusiveId::force_ref(&unrelated) @
+            metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
+        });
+
+        let row = connection("Ada Lovelace", "linkedin.com/in/ada", "");
+        ingest(fixture.storage(), &[row], false).unwrap();
+
+        let view = fixture.view();
+        let anchors = relations::person_anchors(&view.facts);
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.contains(&unrelated));
+        assert!(matches!(
+            relations::profile_head(&view.facts, unrelated).unwrap(),
+            Head::Missing
+        ));
     }
 
     #[test]
