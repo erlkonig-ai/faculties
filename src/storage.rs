@@ -23,8 +23,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hifitime::Epoch;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
+use triblespace::core::collection::succinctarchive_union::{
+    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
+};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
@@ -32,9 +39,119 @@ use triblespace::core::collection::{
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::{Pile, ReadError};
+use triblespace::core::repo::Store;
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource, StoreRead};
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
+
+/// The shard-preserving logical view used for ordinary Faculty fact queries.
+pub type FactArchive = UnionArchive<OrderedUniverse>;
+
+/// The three typed lattice coordinates of one maintained Faculty fact collection.
+///
+/// This value owns no facts and performs no reads. It is only the canonical
+/// descriptor chain from authored [`SimpleArchive`] commits, through portable
+/// Succinct archives, to Rank9-accelerated Succinct archives. Keeping those
+/// handles together prevents every Faculty from growing its own lifecycle
+/// facade while leaving the actual write/read boundary explicit:
+/// [`Self::maintain_at`] may append derivations, and callers subsequently use
+/// [`CollectionSnapshotExt::collection_at`] on one immutable store snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FactCollection {
+    source: Collection<SimpleArchive>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+}
+
+impl FactCollection {
+    /// Register the two canonical derived descriptors above an existing root.
+    ///
+    /// Descriptor registration is content-addressed and idempotent. Both
+    /// derived collections inherit the root's immutable admission policy; this
+    /// function does not maintain either target or materialize any facts.
+    pub fn new<S>(store: &mut S, source: Collection<SimpleArchive>) -> Result<Self>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: BlobStoreGet,
+    {
+        let snapshot = store
+            .snapshot()
+            .context("freeze fact collection descriptor snapshot")?;
+        let policy = source
+            .policy(&snapshot)
+            .context("read fact collection policy")?;
+        drop(snapshot);
+        let succinct = store
+            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .context("register Succinct fact collection")?;
+        let rank9 = store
+            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .context("register Rank9 fact collection")?;
+        Ok(Self {
+            source,
+            succinct,
+            rank9,
+        })
+    }
+
+    /// Authored foundational collection.
+    pub const fn source(self) -> Collection<SimpleArchive> {
+        self.source
+    }
+
+    /// Portable Succinct collection derived directly from [`Self::source`].
+    pub const fn succinct(self) -> Collection<SuccinctArchiveBlob> {
+        self.succinct
+    }
+
+    /// Rank9-accelerated Succinct collection used by normal readers.
+    pub const fn rank9(self) -> Collection<Rank9AcceleratedSuccinctArchiveBlob> {
+        self.rank9
+    }
+
+    /// Maintain both derivation hops for source support resident in `before`.
+    ///
+    /// The one pre-work snapshot is the semantic watermark. Admitted commits
+    /// whose payloads are not resident there are deliberately absent, while a
+    /// later returned snapshot truthfully includes all compatible concurrent
+    /// work visible after maintenance. The same foundational support crosses
+    /// both mapping edges; a downstream edge never constructs its source.
+    pub fn maintain_at<S>(
+        self,
+        store: &mut S,
+        before: &S::Snapshot,
+        instant: Epoch,
+    ) -> Result<S::Snapshot>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        let support = before
+            .collection_at(self.source, instant)
+            .context("observe resident fact collection")?
+            .support()
+            .clone();
+        self.maintain_exact(store, &support)
+    }
+
+    /// Maintain both derivation hops for one explicit foundational support.
+    ///
+    /// This is useful when several physical views must be pinned to the same
+    /// denotational support. It performs no admission or source observation of
+    /// its own.
+    pub fn maintain_exact<S>(self, store: &mut S, support: &Support) -> Result<S::Snapshot>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        drop(
+            store
+                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .context("maintain Succinct fact collection")?,
+        );
+        store
+            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .context("maintain Rank9 fact collection")
+    }
+}
 
 /// Canonical records currently known for one scoped target collection.
 ///
@@ -459,6 +576,38 @@ mod tests {
             !store.blobs.is_empty(),
             "registration retains the descriptor attachment closure"
         );
+    }
+
+    #[test]
+    fn fact_collection_maintains_a_shard_preserving_rank9_view() {
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let mut store = MemoryRepo::default();
+        let source = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let maintained = FactCollection::new(&mut store, source).unwrap();
+        let fragment = entity! {
+            metadata::tag: &id(9),
+            metadata::name: "maintained facts",
+        };
+        let expected = fragment.facts().clone();
+        store.commit(source, &signer, fragment).unwrap();
+
+        let instant = triblespace::core::clock::epoch_now();
+        let before = store.snapshot().unwrap();
+        let after = maintained
+            .maintain_at(&mut store, &before, instant)
+            .unwrap();
+        let observed = after.collection_at(maintained.rank9(), instant).unwrap();
+        let view = observed.view::<FactArchive>().unwrap();
+        let actual: TribleSet = view.iter().collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(observed.support().len(), 1);
+        assert_eq!(view.segment_count(), 1);
     }
 
     #[test]

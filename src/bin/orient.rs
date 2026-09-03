@@ -35,7 +35,7 @@ use faculties::schemas::relations::{
 use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use faculties::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
     teams as teams_model, wiki as wiki_model,
@@ -45,15 +45,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-};
+use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::lww_register::{
     LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
-};
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
 };
 use triblespace::core::collection::{
     next_authorization_change_at, Collection, CollectionSnapshot, CollectionSnapshotExt,
@@ -249,13 +243,9 @@ fn visible_notes<P: TriblePattern>(
     notes
 }
 
-type FactArchive = UnionArchive<OrderedUniverse>;
-
 /// One authored fact collection and its maintained Succinct projection.
 struct OrientSource {
-    source: Collection<SimpleArchive>,
-    raw: Collection<SuccinctArchiveBlob>,
-    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    facts: FactCollection,
     label: &'static str,
 }
 
@@ -263,24 +253,9 @@ impl OrientSource {
     fn open(pile: &mut Pile, signer: &SigningKey, scope: Id, label: &'static str) -> Result<Self> {
         let authority = signer.verifying_key();
         let collection = open_configured(pile, scope, authority)?;
-        let snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("freeze {label} descriptor snapshot: {error}"))?;
-        let policy = collection
-            .policy(&snapshot)
-            .map_err(|error| anyhow!("read {label} collection policy: {error}"))?;
-        let raw = pile
-            .derive(collection, SimpleToSuccinctMapping, policy.clone())
-            .with_context(|| format!("register {label} raw Succinct projection"))?;
-        let accelerated = pile
-            .derive(raw, RawToRank9AcceleratedMapping, policy)
-            .with_context(|| format!("register {label} Rank9 projection"))?;
-        Ok(Self {
-            source: collection,
-            raw,
-            accelerated,
-            label,
-        })
+        let facts = FactCollection::new(pile, collection)
+            .with_context(|| format!("register {label} maintained fact collection"))?;
+        Ok(Self { facts, label })
     }
 
     fn maintain_at(
@@ -290,24 +265,21 @@ impl OrientSource {
         instant: Epoch,
     ) -> Result<Support> {
         let support = snapshot
-            .collection_at(self.source, instant)
+            .collection_at(self.facts.source(), instant)
             .map_err(|error| anyhow!("observe resident {} collection: {error}", self.label))?
             .support()
             .clone();
         drop(
-            pile.maintain_exact::<SimpleToSuccinctMapping>(self.raw, &support)
-                .with_context(|| format!("maintain {} raw Succinct projection", self.label))?,
-        );
-        drop(
-            pile.maintain_exact::<RawToRank9AcceleratedMapping>(self.accelerated, &support)
-                .with_context(|| format!("maintain {} Rank9 projection", self.label))?,
+            self.facts
+                .maintain_exact(pile, &support)
+                .with_context(|| format!("maintain {} fact collection", self.label))?,
         );
         Ok(support)
     }
 
     fn attach_at(&self, snapshot: &PileSnapshot, instant: Epoch) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_at(self.accelerated, instant)
+            .collection_at(self.facts.rank9(), instant)
             .with_context(|| format!("observe {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
@@ -317,7 +289,7 @@ impl OrientSource {
 
     fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_exact(self.accelerated, support)
+            .collection_exact(self.facts.rank9(), support)
             .with_context(|| format!("observe exact {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
@@ -2670,7 +2642,8 @@ fn retained_habit_support_is_admitted_at(
         return Ok(true);
     };
     let admitted = source
-        .source
+        .facts
+        .source()
         .admitted_at(snapshot, instant)
         .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
     facts
@@ -3111,7 +3084,9 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        OrderedUniverse, SuccinctArchive, UnionArchive,
+    };
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
@@ -3203,12 +3178,12 @@ mod tests {
             ..Default::default()
         };
         let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
-        pile.commit(sources.relations.source, &fixture.signer, person)
+        pile.commit(sources.relations.facts.source(), &fixture.signer, person)
             .unwrap();
         let watermark = pile.snapshot().unwrap();
         let instant = clock::now().unwrap();
         let expected_support = watermark
-            .collection_at(sources.messages.source, instant)
+            .collection_at(sources.messages.facts.source(), instant)
             .unwrap()
             .support()
             .clone();
@@ -3216,7 +3191,7 @@ mod tests {
         // This commit arrives after the wait watermark was frozen. Maintenance
         // may append derived records, but it must neither incorporate this
         // source future nor advance the caller's polling watermark past it.
-        let message_collection = sources.messages.source;
+        let message_collection = sources.messages.facts.source();
         pile.commit(
             message_collection,
             &fixture.signer,
