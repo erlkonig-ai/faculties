@@ -19,8 +19,10 @@ use faculties::schemas::{
     decide as decide_schema, files as files_schema, mail as mail_schema,
     relations as relations_schema,
 };
-use faculties::secrets::storage as vaults;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+};
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
@@ -94,15 +96,12 @@ enum AccountCommand {
         #[arg(long)]
         username: Option<String>,
         /// Mailbox secret. Prefer MAIL_PASS rather than a visible argv value.
-        #[arg(long, env = "MAIL_PASS", hide_env_values = true, requires = "vault")]
+        #[arg(long, env = "MAIL_PASS", hide_env_values = true)]
         password: Option<String>,
         /// Exact existing Secrets version. This is the repair path when
         /// a Secrets-first account update was interrupted before Mail commit.
         #[arg(long, value_parser = parse_id, conflicts_with = "password")]
         credential_version: Option<Id>,
-        /// Exact vault epoch receiving a newly sealed mailbox password.
-        #[arg(long, value_parser = parse_id, requires = "password")]
-        vault: Option<Id>,
         #[arg(long)]
         disabled: bool,
     },
@@ -164,7 +163,7 @@ struct Views {
     files: CollectionView,
     decide: CollectionView,
     relations: CollectionView,
-    secrets: vaults::VaultDiscovery,
+    secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 struct Storage<'a> {
@@ -200,6 +199,7 @@ impl Storage<'_> {
                 open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
             let relations_collection =
                 open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
+            let secrets_collection = open_secrets_collection(pile, self.signer.verifying_key())?;
             let mail = FactCollection::new(pile, mail_collection)
                 .context("register maintained Mail fact collection")?;
             let files = FactCollection::new(pile, files_collection)
@@ -256,13 +256,13 @@ impl Storage<'_> {
                     .context("maintain Relations fact collection")?,
             );
 
-            let secrets = vaults::discover_local_vaults(&mut *pile, &self.signer)
-                .context("discover local Secrets vault epochs")?;
+            let secrets = secret_storage::ensure_and_snapshot(&mut *pile, [secrets_collection])
+                .context("maintain configured Secrets collection")?;
             // Secrets discovery owns the final immutable pile snapshot. Attach
             // every exact maintained support through that same world so Mail
             // facts, file payloads, decisions, relations, and credentials can
             // never be assembled from different store prefixes.
-            let store_snapshot = secrets.snapshot().store_snapshot().clone();
+            let store_snapshot = secrets.store_snapshot().clone();
             let mail_facts = store_snapshot
                 .collection_exact(mail.rank9(), &mail_support)
                 .context("attach maintained Mail fact collection")?
@@ -313,27 +313,21 @@ impl Storage<'_> {
         })
     }
 
-    fn add_secret(&self, vault: Id, name: &str, plaintext: &[u8]) -> Result<Id> {
+    fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         let mut pile = self.pile.borrow_mut();
         let pile = pile
             .as_mut()
             .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let discovery = vaults::discover_local_vaults(&mut *pile, &self.signer)
-            .context("discover local Secrets vault epochs")?;
-        let location = discovery
-            .location(vault)
-            .copied()
-            .ok_or_else(|| anyhow!("vault {vault} is not ready for this node"))?;
-        vaults::add_secret(
+        let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
+        secret_storage::add_secret(
             &mut *pile,
             &self.signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             name,
             plaintext,
             point_now()?,
         )
-        .context("publish mailbox credential to exact vault epoch")
+        .context("publish mailbox credential to configured Secrets collection")
     }
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
@@ -465,7 +459,6 @@ fn account_set(
     username: Option<String>,
     password: Option<String>,
     credential_version: Option<Id>,
-    vault: Option<Id>,
     disabled: bool,
 ) -> Result<()> {
     let mut views = storage.views()?;
@@ -487,7 +480,7 @@ fn account_set(
         };
 
     if let Some(id) = credential_version {
-        if !views.secrets.snapshot().contains(id) {
+        if !views.secrets.contains(id) {
             bail!("unknown Secrets credential version {id:x}");
         }
     }
@@ -508,31 +501,27 @@ fn account_set(
     }
     .canonicalized()?;
 
-    let credential_id = match (password, credential_version, old_credential, vault) {
-        (None, None, Some(id), None) => id,
-        (None, None, None, None) if replacing_fork => {
+    let credential_id = match (password, credential_version, old_credential) {
+        (None, None, Some(id)) => id,
+        (None, None, None) if replacing_fork => {
             bail!("--credential-version or MAIL_PASS/--password is required to reconcile a forked account")
         }
-        (None, None, None, None) => {
+        (None, None, None) => {
             bail!("--credential-version or MAIL_PASS/--password is required for a new account")
         }
-        (None, Some(id), _, None) => id,
-        (Some(value), None, _, Some(vault)) => {
-            let id = storage.add_secret(vault, &mailbox_secret_name(anchor), value.as_bytes())?;
+        (None, Some(id), _) => id,
+        (Some(value), None, _) => {
+            let id = storage.add_secret(&mailbox_secret_name(anchor), value.as_bytes())?;
             eprintln!(
-                "Published mailbox credential {id:x} to vault {vault:x}; if Mail publication is interrupted, retry with --credential-version {id:x}"
+                "Published mailbox credential {id:x}; if Mail publication is interrupted, retry with --credential-version {id:x}"
             );
             views = storage.views()?;
-            if !views.secrets.snapshot().contains(id) {
+            if !views.secrets.contains(id) {
                 bail!("published mailbox secret {id:x} did not materialize");
             }
             id
         }
-        (Some(_), None, _, None) => {
-            bail!("--vault is required when sealing a supplied --password")
-        }
-        (None, _, _, Some(_)) => bail!("--vault only applies when sealing a supplied --password"),
-        (Some(_), Some(_), _, _) => {
+        (Some(_), Some(_), _) => {
             bail!("--password cannot be combined with --credential-version")
         }
     };
@@ -849,7 +838,7 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<()> {
     let account = mail::open_account(
         &views.mail.reader,
         &views.mail.facts,
-        views.secrets.snapshot(),
+        &views.secrets,
         record.account,
         &storage.signer,
     )?;
@@ -1117,7 +1106,7 @@ fn cmd_fetch(storage: &Storage<'_>) -> Result<()> {
         let account = mail::open_account(
             &views.mail.reader,
             &views.mail.facts,
-            views.secrets.snapshot(),
+            &views.secrets,
             anchor,
             &storage.signer,
         )
@@ -1166,7 +1155,6 @@ fn main() -> Result<()> {
                 username,
                 password,
                 credential_version,
-                vault,
                 disabled,
             } => account_set(
                 &storage,
@@ -1178,7 +1166,6 @@ fn main() -> Result<()> {
                 username,
                 password,
                 credential_version,
-                vault,
                 disabled,
             ),
             AccountCommand::List => account_list(&storage),

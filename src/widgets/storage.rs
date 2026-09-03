@@ -11,9 +11,9 @@
 //! closure. Loading may maintain deterministic derived views for the exact
 //! resident source support observed before work begins; those unsigned
 //! artifacts are cache exhaust, not authoritative writes. Most sources are
-//! fixed descriptor-handle collections. Secrets is deliberately different: it
-//! is the aggregate of exact vault epochs for which the pile signer has one
-//! verified exact `READ` capability.
+//! fixed descriptor-handle collections. Secrets uses the same explicit
+//! collection configuration and is attached only when the pile signer is
+//! admitted to READ it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -46,8 +46,10 @@ use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
-use crate::secrets::{storage as vaults, SecretsSnapshot};
-use crate::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use crate::secrets::{storage as secret_storage, SecretsSnapshot};
+use crate::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+};
 
 /// Stable logical input requested by a widget.
 ///
@@ -159,18 +161,15 @@ impl DatasetRevision {
         Self(*hasher.finalize().as_bytes())
     }
 
-    fn from_secrets(discovery: &vaults::VaultDiscovery) -> Self {
+    fn from_secrets(snapshot: &SecretsSnapshot<PileSnapshot>) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.secrets-revision.v3");
-        for collection in discovery.locations().keys() {
-            let vault = discovery
-                .snapshot()
-                .vault_exact(*collection)
-                .expect("every ready vault location has one snapshot");
-            let support = vault
-                .support()
-                .expect("every access-discovered vault retains exact support");
-            Self::hash_collection_support(&mut hasher, *collection, support);
+        for collection in snapshot.collections() {
+            Self::hash_collection_support(
+                &mut hasher,
+                collection.collection(),
+                collection.support(),
+            );
         }
         Self(*hasher.finalize().as_bytes())
     }
@@ -212,7 +211,7 @@ impl<'a> WidgetContext<'a> {
         self.datasets?.get(&key).map(LoadedDataset::view)
     }
 
-    /// Return the aggregate of exact readable Secrets vault epochs.
+    /// Return the explicitly configured readable Secrets collection.
     pub fn secrets(&self) -> Option<SecretsView<'a>> {
         self.secrets.map(LoadedSecrets::view)
     }
@@ -228,7 +227,7 @@ impl<'a> WidgetContext<'a> {
     }
 }
 
-/// Borrowed aggregate of ready exact vault epochs plus its viewer cache token.
+/// Borrowed Secrets snapshot plus its viewer cache token.
 #[derive(Clone, Copy)]
 pub struct SecretsView<'a> {
     pub snapshot: &'a SecretsSnapshot<PileSnapshot>,
@@ -274,7 +273,7 @@ impl LoadedDataset {
 }
 
 struct LoadedSecrets {
-    discovery: vaults::VaultDiscovery,
+    snapshot: SecretsSnapshot<PileSnapshot>,
     revision: DatasetRevision,
 }
 
@@ -284,17 +283,14 @@ struct LoadedInputs {
 }
 
 impl LoadedSecrets {
-    fn new(discovery: vaults::VaultDiscovery) -> Self {
-        let revision = DatasetRevision::from_secrets(&discovery);
-        Self {
-            discovery,
-            revision,
-        }
+    fn new(snapshot: SecretsSnapshot<PileSnapshot>) -> Self {
+        let revision = DatasetRevision::from_secrets(&snapshot);
+        Self { snapshot, revision }
     }
 
     fn view(&self) -> SecretsView<'_> {
         SecretsView {
-            snapshot: self.discovery.snapshot(),
+            snapshot: &self.snapshot,
             revision: self.revision,
         }
     }
@@ -719,9 +715,11 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
         let secrets = sources
             .contains(&SourceKey::Secrets)
             .then(|| {
-                vaults::discover_local_vaults(&mut pile, &signer)
+                let collection = open_secrets_collection(&mut pile, signer.verifying_key())
+                    .map_err(|error| format!("open configured Secrets collection: {error:#}"))?;
+                secret_storage::ensure_and_snapshot(&mut pile, [collection])
                     .map(LoadedSecrets::new)
-                    .map_err(|error| format!("discover readable Secrets vaults: {error:#}"))
+                    .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))
             })
             .transpose()?;
 
@@ -730,7 +728,7 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
         // inhabit literally one known-prefix observation. A viewer without
         // Secrets freezes the same boundary itself.
         let store_snapshot = match secrets.as_ref() {
-            Some(secrets) => secrets.discovery.snapshot().store_snapshot().clone(),
+            Some(secrets) => secrets.snapshot.store_snapshot().clone(),
             None => pile
                 .snapshot()
                 .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?,

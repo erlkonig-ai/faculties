@@ -24,8 +24,10 @@ use faculties::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use faculties::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
-use faculties::secrets::storage::{self as vaults, VaultDiscovery};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+};
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -144,7 +146,7 @@ struct TriageSnapshot {
     pile: Option<Pile>,
     store_snapshot: PileSnapshot,
     collections: BTreeMap<Id, FactArchive>,
-    secrets: VaultDiscovery,
+    secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 impl TriageSnapshot {
@@ -195,13 +197,14 @@ impl TriageSnapshot {
                     .with_context(|| format!("maintain {label} fact archive"))?,
             );
         }
-        let secrets = vaults::discover_local_vaults(&mut pile, &signer)
-            .context("discover readable Secrets vaults")?;
+        let secrets_collection = open_secrets_collection(&mut pile, signer.verifying_key())?;
+        let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection])
+            .context("maintain configured Secrets collection")?;
 
         // Secrets discovery already owns the one later immutable snapshot.
         // Reuse it so facts, attachments, and credentials inhabit literally
         // the same known-prefix observation.
-        let store_snapshot = secrets.snapshot().store_snapshot().clone();
+        let store_snapshot = secrets.store_snapshot().clone();
         let mut collections = BTreeMap::new();
         for ((scope, label, facts), support) in registered.iter().zip(&supports) {
             let archive = store_snapshot
@@ -240,11 +243,11 @@ impl TriageSnapshot {
     fn headspace(&self) -> Result<(CollectionView, TriageHeadspace)> {
         let secrets = self.secrets();
         let view = self.view(HEADSPACE_SCOPE_ID, "Headspace")?;
-        let projected = triage_model::project_headspace(view.source(), secrets.snapshot())?;
+        let projected = triage_model::project_headspace(view.source(), secrets)?;
         Ok((view, projected))
     }
 
-    fn secrets(&self) -> &VaultDiscovery {
+    fn secrets(&self) -> &SecretsSnapshot<PileSnapshot> {
         &self.secrets
     }
 
@@ -418,7 +421,7 @@ fn cmd_scan(
         ScanSources {
             cognition: cognition.source(),
             headspace: headspace_view.source(),
-            secrets: secrets.snapshot(),
+            secrets,
             relations: relations.source(),
             messages: messages.source(),
         },
