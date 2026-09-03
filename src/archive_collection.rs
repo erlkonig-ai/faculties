@@ -39,10 +39,8 @@ use crate::collection_names::open_configured;
 #[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
-use triblespace::core::collection::succinctarchive_union::SimpleToSuccinctMapping;
-#[cfg(test)]
 use triblespace::core::collection::{
-    CollectionDerive, CollectionMapping, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionDerivation, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
@@ -553,7 +551,7 @@ async fn ensure_bm25_for_snapshot(
     authority: VerifyingKey,
 ) -> Result<EnsuredBm25> {
     let target = pile
-        .derive(
+        .derive_with(
             archive.collections.source(),
             archive_bm25::ArchiveBlockTextBm25Mapping,
             crate::collection_names::private_policy(authority),
@@ -561,7 +559,7 @@ async fn ensure_bm25_for_snapshot(
         .context("register Archive BM25 derivation")?;
     let source_elements = archive.support().len();
     let maintained = pile
-        .maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, archive.support())
+        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, archive.support())
         .await
         .context("maintain exact Archive BM25 cover")?;
     let attached = maintained
@@ -1650,7 +1648,7 @@ mod tests {
         key: &std::path::Path,
     ) -> Collection<PortableBM25Blob> {
         store
-            .derive(
+            .derive_with(
                 source,
                 archive_bm25::ArchiveBlockTextBm25Mapping,
                 crate::collection_names::private_policy(test_authority(pile, key)),
@@ -2334,9 +2332,9 @@ mod tests {
         let authority = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
         let source = test_source(&mut pile, &pile_path, &key);
         let raw_target = pile
-            .derive(
+            .derive::<SuccinctArchiveBlob>(
                 source,
-                SimpleToSuccinctMapping,
+                (),
                 crate::collection_names::private_policy(authority),
             )
             .unwrap();
@@ -2358,7 +2356,8 @@ mod tests {
         let output: Blob<SuccinctArchiveBlob> = reader
             .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
             .unwrap();
-        let expected = SimpleToSuccinctMapping.map(&input, &reader).unwrap();
+        let expected =
+            <SuccinctArchiveBlob as CollectionDerivation>::map(&(), &input, &reader).unwrap();
         assert_eq!(expected.get_handle(), output.get_handle());
         pile.close().unwrap();
     }
@@ -2702,7 +2701,7 @@ mod tests {
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let first_snapshot = pollster::block_on(
-            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
                 &first_support,
             ),
@@ -2725,7 +2724,10 @@ mod tests {
         assert_eq!(first_derives, 1);
 
         let full_snapshot = pollster::block_on(
-            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support),
+            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                target,
+                &full_support,
+            ),
         )
         .unwrap();
         let full = full_snapshot
@@ -2754,7 +2756,10 @@ mod tests {
             records_before.merges().len(),
         );
         let retry_snapshot = pollster::block_on(
-            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &full_support),
+            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                target,
+                &full_support,
+            ),
         )
         .unwrap();
         let retry = retry_snapshot
@@ -2806,7 +2811,7 @@ mod tests {
             .is_none());
 
         let ready_snapshot = pollster::block_on(
-            pile.maintain_exact::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
                 &source_support,
             ),

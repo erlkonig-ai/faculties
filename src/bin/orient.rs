@@ -47,9 +47,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
-use triblespace::core::collection::lww_register::{
-    LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
-};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{
     next_authorization_change_at, Collection, CollectionSnapshot, CollectionSnapshotExt,
     CollectionStoreExt, Support,
@@ -428,7 +426,7 @@ async fn maintain_sources_at(
         .maintain_at(pile, snapshot, instant)
         .await?;
     drop(
-        pile.maintain_exact::<RegisterCoordinatesMapping>(sources.compass_status, &compass)
+        pile.maintain_exact(sources.compass_status, &compass)
             .await
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
@@ -3043,9 +3041,7 @@ async fn cmd_wake(
         );
         drop(
             storage
-                .maintain_exact::<
-                    triblespace::core::collection::observed_union::ObserveStatesMapping,
-                >(wiki_observed, &wiki_support)
+                .maintain_exact(wiki_observed, &wiki_support)
                 .await
                 .context("maintain Wiki supersession index")?,
         );

@@ -18,7 +18,7 @@ use faculties::wiki::{
 };
 #[cfg(test)]
 use hifitime::Epoch;
-use triblespace::core::collection::observed_union::{ObserveStatesMapping, ObservedIndex};
+use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{
     CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
@@ -292,7 +292,7 @@ impl WikiStorage<'_> {
                         .context("maintain Wiki fact collection")?,
                 );
                 drop(
-                    pile.maintain_exact::<ObserveStatesMapping>(observed, &wiki_support)
+                    pile.maintain_exact(observed, &wiki_support)
                         .await
                         .context("maintain Wiki supersession index")?,
                 );

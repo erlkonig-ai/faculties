@@ -10,9 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::collection::lww_register::{
-    LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
-};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -115,9 +113,9 @@ where
         .policy(&snapshot)
         .context("read Body source collection policy")?;
     drop(snapshot);
-    let target = store.derive(
+    let target = store.derive::<LwwRegisterBlob>(
         source,
-        RegisterCoordinatesMapping::new(metadata::tag.id(), metadata::created_at.id()),
+        (metadata::tag.id(), metadata::created_at.id()),
         policy,
     )?;
     Ok(target)
@@ -562,7 +560,7 @@ pub async fn materialize_indexed_collection(
             .context("maintain Body fact collection")?,
     );
     let store_snapshot = pile
-        .maintain_exact::<RegisterCoordinatesMapping>(target, &support)
+        .maintain_exact(target, &support)
         .await
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     let facts = store_snapshot

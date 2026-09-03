@@ -32,9 +32,6 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
@@ -137,10 +134,10 @@ impl FactCollection {
             .context("read fact collection policy")?;
         drop(snapshot);
         let succinct = store
-            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .context("register Succinct fact collection")?;
         let rank9 = store
-            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .context("register Rank9 fact collection")?;
         Ok(Self {
             source,
@@ -199,12 +196,12 @@ impl FactCollection {
     {
         drop(
             store
-                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .maintain_exact(self.succinct, support)
                 .await
                 .context("maintain Succinct fact collection")?,
         );
         store
-            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .maintain_exact(self.rank9, support)
             .await
             .context("maintain Rank9 fact collection")
     }

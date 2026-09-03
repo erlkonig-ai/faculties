@@ -11,9 +11,6 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{
     collection_read_audience_at, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt,
@@ -52,10 +49,10 @@ impl SecretsCollection {
             .collection(name, policy.clone())
             .map_err(|error| anyhow!("register Secrets source collection: {error}"))?;
         let succinct = store
-            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
         let rank9 = store
-            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
         Ok(Self {
             source,
@@ -81,10 +78,10 @@ impl SecretsCollection {
             .context("read Secrets source collection policy")?;
         drop(snapshot);
         let succinct = store
-            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
         let rank9 = store
-            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
         Ok(Self {
             source,
@@ -123,12 +120,12 @@ impl SecretsCollection {
     {
         drop(
             store
-                .ensure_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .ensure_exact(self.succinct, support)
                 .await
                 .context("ensure Succinct Secrets collection")?,
         );
         store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .ensure_exact(self.rank9, support)
             .await
             .context("ensure Rank9 Secrets collection")
     }
@@ -160,12 +157,12 @@ impl SecretsCollection {
     {
         drop(
             store
-                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .maintain_exact(self.succinct, support)
                 .await
                 .context("maintain Succinct Secrets collection")?,
         );
         store
-            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .maintain_exact(self.rank9, support)
             .await
             .context("maintain Rank9 Secrets collection")
     }

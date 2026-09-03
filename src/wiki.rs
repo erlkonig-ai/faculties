@@ -14,9 +14,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
-use triblespace::core::collection::observed_union::{
-    ObserveStatesMapping, ObservedIndex, ObservedSetBlob,
-};
+use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
@@ -252,9 +250,9 @@ where
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    let target = store.derive(
+    let target = store.derive::<ObservedSetBlob>(
         source,
-        ObserveStatesMapping::new(metadata::supersedes.id()),
+        metadata::supersedes.id(),
         crate::collection_names::private_policy(authority),
     )?;
     Ok(target)
@@ -1641,7 +1639,7 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
             .context("maintain Wiki fact collection")?,
     );
     let store_snapshot = pile
-        .maintain_exact::<ObserveStatesMapping>(target, &support)
+        .maintain_exact(target, &support)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let facts = store_snapshot
@@ -1678,7 +1676,7 @@ pub async fn materialize_indexed_collection(
         .context("read Wiki collection")?;
     let target = observed_collection(pile, signer.verifying_key())?;
     let maintained = pile
-        .maintain_exact::<ObserveStatesMapping>(target, &cover)
+        .maintain_exact(target, &cover)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let observed = maintained
