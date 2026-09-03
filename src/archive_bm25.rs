@@ -28,7 +28,7 @@ use triblespace::core::collection::{CollectionMapping, CollectionOperationError}
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::{Inline, IntoInline};
+use triblespace::core::inline::{Inline, IntoInline, RawInline};
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::Fragment;

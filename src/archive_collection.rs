@@ -17,6 +17,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -24,7 +25,9 @@ use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
-use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+#[cfg(test)]
+use triblespace_search::portable_bm25::PortableBM25Blob;
+use triblespace_search::portable_bm25::PortableBM25Index;
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::archive_bm25;
@@ -411,7 +414,7 @@ fn fact_archive_contains(facts: &FactArchive, fact: &Trible) -> bool {
     exists!(facts.pattern(
         inlineencodings::GenId::inline_from(*fact.e()),
         inlineencodings::GenId::inline_from(*fact.a()),
-        *fact.v::<inlineencodings::UnknownInline>(),
+        *fact.v::<UnknownInline>(),
     ))
 }
 
@@ -696,7 +699,7 @@ impl ArchiveSnapshot {
             .clone();
         let (_, mut commits) = collections
             .source()
-            .admitted_with_commits_at(&before, instant)
+            .admitted_with_commits_at(before, instant)
             .context("discover admitted Archive commits")?;
         commits
             .retain(|commit| support.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
