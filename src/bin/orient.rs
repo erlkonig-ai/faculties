@@ -2557,13 +2557,27 @@ struct WaitFrame {
 struct PendingWaitFrame {
     watermark: PileSnapshot,
     next_authorization_change: Option<Epoch>,
+    reason: PendingWaitReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingWaitReason {
+    /// The persona selector cannot yet be resolved in this observation.
+    PersonaSelection,
+    /// The persona is settled, but another selected payload is unavailable.
+    Payload,
 }
 
 impl PendingWaitFrame {
-    fn awaiting_view(watermark: PileSnapshot, observation: &OrientObservation) -> Self {
+    fn awaiting_view(
+        watermark: PileSnapshot,
+        observation: &OrientObservation,
+        reason: PendingWaitReason,
+    ) -> Self {
         Self {
             watermark,
             next_authorization_change: observation.next_authorization_change,
+            reason,
         }
     }
 }
@@ -2605,6 +2619,7 @@ fn load_wait_frame(
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
                 snapshot,
                 &observation,
+                PendingWaitReason::PersonaSelection,
             )));
         }
         Err(error) => return Err(error),
@@ -2622,6 +2637,7 @@ fn load_wait_frame(
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
                 snapshot,
                 &observation,
+                PendingWaitReason::Payload,
             )));
         }
         Err(error) => return Err(error),
@@ -2631,6 +2647,7 @@ fn load_wait_frame(
         return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
             snapshot,
             &observation,
+            PendingWaitReason::Payload,
         )));
     }
     Ok(WaitFrameLoad::Ready(WaitFrame {
@@ -2640,6 +2657,26 @@ fn load_wait_frame(
         habits,
         news,
     }))
+}
+
+fn retained_habit_support_is_admitted_at(
+    observation: &OrientObservation,
+    sources: &OrientSources,
+    snapshot: &PileSnapshot,
+    instant: Epoch,
+) -> Result<bool> {
+    let (Some(source), Some(facts)) = (sources.habits.as_ref(), observation.facts.habits.as_ref())
+    else {
+        return Ok(true);
+    };
+    let admitted = source
+        .source
+        .admitted_at(snapshot, instant)
+        .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
+    facts
+        .support()
+        .is_subset(&admitted)
+        .map_err(|error| anyhow!("compare retained Habit authorization: {error}"))
 }
 
 fn observe_habits_in_observation(
@@ -2748,7 +2785,7 @@ fn cmd_wait(
         // rearmed one-shot watcher therefore waits for a transition instead
         // of reporting the same unsatisfied intention forever.
         let mut last_habit_sweep = Instant::now();
-        let mut current_authorization_valid = true;
+        let mut current_habit_context_valid = true;
 
         let stdout = io::stdout();
         let mut output = stdout.lock();
@@ -2809,7 +2846,7 @@ fn cmd_wait(
                 match attempt {
                     WaitFrameLoad::Ready(candidate) => {
                         view_pending = false;
-                        current_authorization_valid = true;
+                        current_habit_context_valid = true;
                         let habit_report = render_habit_transitions(&habit_seen, &candidate.habits)
                             .unwrap_or_default();
                         let habit_fired = !habit_report.is_empty();
@@ -2835,19 +2872,32 @@ fn cmd_wait(
                         last_habit_sweep = Instant::now();
                         continue;
                     }
-                    WaitFrameLoad::Pending(_) => {
+                    WaitFrameLoad::Pending(pending) => {
                         view_pending = true;
-                        if authorization_changed {
-                            current_authorization_valid = false;
+                        if pending.reason == PendingWaitReason::PersonaSelection {
+                            // Once a formerly resolved selector is absent or
+                            // undecidable, the old persona context cannot emit
+                            // new time-driven reports.
+                            current_habit_context_valid = false;
+                        } else if authorization_changed {
+                            // A global capability boundary is only a reload
+                            // trigger. It invalidates the retained Habit view
+                            // only when that view's own support lost admission.
+                            current_habit_context_valid &= retained_habit_support_is_admitted_at(
+                                &current,
+                                &sources,
+                                &pending.watermark,
+                                now,
+                            )?;
                         }
                     }
                 }
             }
 
-            // Once this frame's authorization boundary has elapsed, its old
-            // facts cannot drive new time-based Habit reports. Retain it only
-            // as a presentation baseline until a readable replacement arrives.
-            if !current_authorization_valid {
+            // A frame whose persona selection is unresolved or whose Habit
+            // support actually lost admission remains only a presentation
+            // baseline until a readable replacement arrives.
+            if !current_habit_context_valid {
                 last_habit_sweep = Instant::now();
                 continue;
             }
@@ -3286,6 +3336,7 @@ mod tests {
         let WaitFrameLoad::Pending(pending) = attempt else {
             panic!("an absent persona unexpectedly produced a readable wait frame")
         };
+        assert_eq!(pending.reason, PendingWaitReason::PersonaSelection);
         assert!(
             pending.watermark.changes_since(&watermark).is_empty()
                 && watermark.changes_since(&pending.watermark).is_empty(),
