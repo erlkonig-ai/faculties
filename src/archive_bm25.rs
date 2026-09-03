@@ -10,9 +10,10 @@
 //! `UTF8String` payload is tokenized with [`hash_tokens`], and repeated
 //! documents join by pointwise maximum in the portable carrier.
 //!
-//! Importer receipts are deliberately outside the projection. The mapping
-//! validates the intrinsic block/part/fact graph it consumes; Archive's full
-//! domain validator remains the publication boundary for source facts.
+//! Importer receipts are deliberately outside the projection. The mapping is
+//! an open-world typed query: unknown facts and undecodable rows are inert,
+//! while a block-selected part/fact closure which is actually needed for this
+//! BM25 value must be present in the same derivable source element.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,15 +28,14 @@ use triblespace::core::collection::{CollectionMapping, CollectionOperationError}
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::encodings::iu256::U256BE;
-use triblespace::core::inline::encodings::time::NsTAIInterval;
-use triblespace::core::inline::encodings::UnknownInline;
-use triblespace::core::inline::{Inline, InlineEncoding, IntoInline, RawInline, TryFromInline};
+use triblespace::core::inline::{Inline, IntoInline};
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::core::trible::Fragment;
-use triblespace::core::trible::{build_intrinsic_entity, IntrinsicEntityRow, Trible, TribleSet};
+use triblespace::core::trible::TribleSet;
 use triblespace::macros::entity;
+use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::{find, pattern};
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
@@ -226,277 +226,92 @@ where
 fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<ProjectionPlan, String> {
     let facts = TribleSet::try_from_blob(source)
         .map_err(|error| format!("source is not a canonical SimpleArchive: {error}"))?;
-    let mut entities: BTreeMap<Id, Vec<Trible>> = BTreeMap::new();
-    for fact in facts.iter() {
-        entities.entry(*fact.e()).or_default().push(*fact);
-    }
-
-    let block_ids: BTreeSet<Id> = entities
-        .iter()
-        .filter_map(|(&entity, rows)| has_exact_tag(rows, schema::block::KIND).then_some(entity))
-        .collect();
+    let block_ids: BTreeSet<Id> = find!(
+        block: Id,
+        pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+    )
+    .collect();
     let mut documents = BTreeMap::new();
     for block_id in block_ids {
-        let block_rows = entities
-            .get(&block_id)
-            .expect("a discovered entity has rows");
-        if validate_block(block_id, block_rows)? {
+        let part_ids: BTreeSet<Id> = find!(
+            part: Id,
+            pattern!(&facts, [{ block_id @ schema::block::contains: ?part }])
+        )
+        .collect();
+        // The unique content-free bottom is not a BM25 document. Under the
+        // open-world schema, other tag-only rows are simply nonmatching too;
+        // neither case licenses reconstructing or validating an entity id.
+        if part_ids.is_empty() {
             continue;
         }
 
         let mut parts = Vec::new();
-        for raw in values(block_rows, schema::block::contains.id()) {
-            let part_id = parse_id(raw, "block contains")?;
-            let part_rows = entities.get(&part_id).ok_or_else(|| {
-                format!("Archive block {block_id:X} references absent part {part_id:X}")
-            })?;
-            let (ordinal, fact_id) = validate_part(part_id, part_rows)?;
-            let fact_rows = entities.get(&fact_id).ok_or_else(|| {
-                format!("Archive part {part_id:X} references absent fact {fact_id:X}")
-            })?;
-            let payloads = validate_content_fact(fact_id, fact_rows)?;
-            parts.push((ordinal, payloads));
-        }
-        parts.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-        for (expected, (actual, _)) in parts.iter().enumerate() {
-            let expected = u64::try_from(expected)
-                .map_err(|_| format!("Archive block {block_id:X} has more than u64::MAX parts"))?;
-            if *actual != expected {
+        for part_id in part_ids {
+            let occurrences: BTreeSet<(u64, Id)> = find!(
+                (ordinal: u64, fact: Id),
+                pattern!(&facts, [{
+                    part_id @ metadata::tag: &schema::content_part::KIND,
+                    schema::content_part::ordinal: ?ordinal,
+                    schema::content_part::fact: ?fact,
+                }])
+            )
+            .collect();
+            if occurrences.is_empty() {
                 return Err(format!(
-                    "Archive block {block_id:X} part ordinals are not exactly contiguous from zero"
+                    "Archive block {block_id:X} references absent part {part_id:X} or one without typed fields"
                 ));
             }
+            for (ordinal, fact_id) in occurrences {
+                if find!(
+                    (modality: Id, direction: Id),
+                    pattern!(&facts, [{
+                        fact_id @ metadata::tag: &schema::content_fact::KIND,
+                        schema::content_fact::modality: ?modality,
+                        schema::content_fact::direction: ?direction,
+                    }])
+                )
+                .next()
+                .is_none()
+                {
+                    return Err(format!(
+                        "Archive part {part_id:X} references absent or untyped fact {fact_id:X}"
+                    ));
+                }
+                let payloads: Vec<Inline<Handle<UTF8String>>> = find!(
+                    payload: Inline<Handle<UTF8String>>,
+                    pattern!(&facts, [{ fact_id @ schema::content_fact::payload: ?payload }])
+                )
+                .collect();
+                let has_nontext_payload = find!(
+                    _blob: Inline<Handle<RawBytes>>,
+                    pattern!(&facts, [{ fact_id @ schema::content_fact::blob: ?_blob }])
+                )
+                .next()
+                .is_some()
+                    || find!(
+                        _pointer: Inline<Handle<UTF8String>>,
+                        pattern!(&facts, [{
+                            fact_id @ schema::content_fact::asset_pointer: ?_pointer
+                        }])
+                    )
+                    .next()
+                    .is_some();
+                if payloads.is_empty() && !has_nontext_payload {
+                    return Err(format!(
+                        "Archive content fact {fact_id:X} has no typed payload variant"
+                    ));
+                }
+                parts.push((ordinal, part_id, payloads));
+            }
         }
+        parts.sort_unstable_by_key(|(ordinal, part, _)| (*ordinal, *part));
         let payloads = parts
             .into_iter()
-            .flat_map(|(_, payloads)| payloads)
+            .flat_map(|(_, _, payloads)| payloads)
             .collect();
         documents.insert(block_id, payloads);
     }
     Ok(ProjectionPlan { documents })
-}
-
-/// Validate one block and report whether it is Archive's canonical bottom.
-fn validate_block(entity: Id, rows: &[Trible]) -> std::result::Result<bool, String> {
-    let identity = [schema::block::previous.id(), schema::block::contains.id()];
-    let nonidentity = [metadata::tag.id(), schema::block::timestamp.id()];
-    validate_intrinsic_entity(entity, rows, schema::block::KIND, &identity, &nonidentity)?;
-
-    let previous = values(rows, schema::block::previous.id());
-    for raw in &previous {
-        parse_id(*raw, "block previous")?;
-    }
-    let timestamps = values(rows, schema::block::timestamp.id());
-    for raw in &timestamps {
-        NsTAIInterval::validate(Inline::new(*raw))
-            .map_err(|_| format!("Archive block {entity:X} has an invalid timestamp"))?;
-    }
-    let contained = values(rows, schema::block::contains.id());
-    if contained.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
-        return Err(format!(
-            "Archive content-free block {entity:X} is not the predecessor-free, timeless canonical bottom"
-        ));
-    }
-    for raw in &contained {
-        parse_id(*raw, "block contains")?;
-    }
-    Ok(contained.is_empty())
-}
-
-fn validate_part(entity: Id, rows: &[Trible]) -> std::result::Result<(u64, Id), String> {
-    let identity = [
-        schema::content_part::ordinal.id(),
-        schema::content_part::fact.id(),
-        schema::content_part::responds_to.id(),
-        schema::content_part::resolution.id(),
-    ];
-    let nonidentity = [metadata::tag.id()];
-    validate_intrinsic_entity(
-        entity,
-        rows,
-        schema::content_part::KIND,
-        &identity,
-        &nonidentity,
-    )?;
-
-    let ordinal = exactly_one(
-        rows,
-        schema::content_part::ordinal.id(),
-        "part ordinal",
-        entity,
-    )?;
-    let ordinal = u64::try_from_inline(&Inline::<U256BE>::new(ordinal))
-        .map_err(|_| format!("Archive part {entity:X} ordinal does not fit u64"))?;
-    let fact = exactly_one(rows, schema::content_part::fact.id(), "part fact", entity)?;
-    let fact = parse_id(fact, "part fact")?;
-    let responses = values(rows, schema::content_part::responds_to.id());
-    if responses.len() > 1 {
-        return Err(format!(
-            "Archive part {entity:X} has multiple responds_to values"
-        ));
-    }
-    if let Some(raw) = responses.first() {
-        parse_id(*raw, "part responds_to")?;
-    }
-    Ok((ordinal, fact))
-}
-
-fn validate_content_fact(
-    entity: Id,
-    rows: &[Trible],
-) -> std::result::Result<Vec<Inline<Handle<UTF8String>>>, String> {
-    let identity = [
-        schema::content_fact::modality.id(),
-        schema::content_fact::direction.id(),
-        schema::content_fact::payload.id(),
-        schema::content_fact::blob.id(),
-        schema::content_fact::asset_pointer.id(),
-        schema::content_fact::asset_namespace.id(),
-        schema::content_fact::media_type.id(),
-        schema::content_fact::asset_size.id(),
-    ];
-    let nonidentity = [metadata::tag.id(), schema::content_fact::resolved_to.id()];
-    validate_intrinsic_entity(
-        entity,
-        rows,
-        schema::content_fact::KIND,
-        &identity,
-        &nonidentity,
-    )?;
-
-    let modality = exactly_one(
-        rows,
-        schema::content_fact::modality.id(),
-        "content modality",
-        entity,
-    )?;
-    parse_id(modality, "content modality")?;
-    let direction = exactly_one(
-        rows,
-        schema::content_fact::direction.id(),
-        "content direction",
-        entity,
-    )?;
-    parse_id(direction, "content direction")?;
-
-    let payloads = values(rows, schema::content_fact::payload.id());
-    let blobs = values(rows, schema::content_fact::blob.id());
-    let pointers = values(rows, schema::content_fact::asset_pointer.id());
-    if payloads.len() > 1 || blobs.len() > 1 || pointers.len() > 1 {
-        return Err(format!(
-            "Archive content fact {entity:X} has a repeated scalar payload variant"
-        ));
-    }
-    let variant_count = usize::from(!payloads.is_empty())
-        + usize::from(!blobs.is_empty())
-        + usize::from(!pointers.is_empty());
-    if variant_count != 1 {
-        return Err(format!(
-            "Archive content fact {entity:X} must have exactly one payload variant"
-        ));
-    }
-
-    let namespaces = values(rows, schema::content_fact::asset_namespace.id());
-    if pointers.is_empty() != namespaces.is_empty() || namespaces.len() > 1 {
-        return Err(format!(
-            "Archive content fact {entity:X} must pair one external pointer with one namespace"
-        ));
-    }
-    if let Some(raw) = namespaces.first() {
-        parse_id(*raw, "asset namespace")?;
-    }
-    let media_types = values(rows, schema::content_fact::media_type.id());
-    if media_types.len() > 1 {
-        return Err(format!(
-            "Archive content fact {entity:X} has multiple media types"
-        ));
-    }
-    if let Some(raw) = media_types.first() {
-        parse_id(*raw, "content media type")?;
-    }
-    if values(rows, schema::content_fact::asset_size.id()).len() > 1 {
-        return Err(format!(
-            "Archive content fact {entity:X} has multiple asset sizes"
-        ));
-    }
-
-    Ok(payloads
-        .into_iter()
-        .map(Inline::<Handle<UTF8String>>::new)
-        .collect())
-}
-
-fn validate_intrinsic_entity(
-    entity: Id,
-    rows: &[Trible],
-    kind: Id,
-    identity: &[Id],
-    nonidentity: &[Id],
-) -> std::result::Result<(), String> {
-    let tags = values(rows, metadata::tag.id());
-    if tags.len() != 1 || parse_id(tags[0], "kind tag")? != kind {
-        return Err(format!(
-            "Archive entity {entity:X} does not carry exactly its canonical kind tag"
-        ));
-    }
-
-    let identity_set: BTreeSet<_> = identity.iter().copied().collect();
-    let nonidentity_set: BTreeSet<_> = nonidentity.iter().copied().collect();
-    let mut intrinsic_rows = Vec::new();
-    for row in rows {
-        if identity_set.contains(row.a()) {
-            intrinsic_rows.push(IntrinsicEntityRow::new(
-                *row.a(),
-                row.v::<UnknownInline>().raw,
-            ));
-        } else if !nonidentity_set.contains(row.a()) {
-            return Err(format!(
-                "Archive entity {entity:X} carries unknown attribute {:X}",
-                row.a()
-            ));
-        }
-    }
-    let (expected, _) = build_intrinsic_entity(intrinsic_rows);
-    if expected != entity {
-        return Err(format!(
-            "Archive entity {entity:X} is not the intrinsic id of its canonical fields (expected {expected:X})"
-        ));
-    }
-    Ok(())
-}
-
-fn has_exact_tag(rows: &[Trible], kind: Id) -> bool {
-    let expected: Inline<GenId> = kind.to_inline();
-    rows.iter()
-        .any(|row| row.a() == &metadata::tag.id() && row.v::<UnknownInline>().raw == expected.raw)
-}
-
-fn values(rows: &[Trible], attribute: Id) -> Vec<RawInline> {
-    rows.iter()
-        .filter(|row| row.a() == &attribute)
-        .map(|row| row.v::<UnknownInline>().raw)
-        .collect()
-}
-
-fn exactly_one(
-    rows: &[Trible],
-    attribute: Id,
-    field: &str,
-    entity: Id,
-) -> std::result::Result<RawInline, String> {
-    let values = values(rows, attribute);
-    if values.len() != 1 {
-        return Err(format!(
-            "Archive entity {entity:X} has {} values for scalar {field}",
-            values.len()
-        ));
-    }
-    Ok(values[0])
-}
-
-fn parse_id(raw: RawInline, field: &str) -> std::result::Result<Id, String> {
-    Id::try_from_inline(&Inline::<GenId>::new(raw))
-        .map_err(|_| format!("Archive {field} is not a canonical non-nil GenId"))
 }
 
 #[cfg(test)]
@@ -649,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_rejects_noncanonical_content_free_blocks() {
+    fn content_free_nonmatching_rows_are_inert() {
         let predecessor = text_block(&[(schema::content_fact::modality::TEXT, "parent")]);
         let predecessor_id = predecessor.root().unwrap();
         let mut invalid = entity! { _ @
@@ -664,12 +479,14 @@ mod tests {
         corpus += invalid;
         let (source, attachments) = source_and_attachments(corpus);
         let store = StoredBlobs::new(attachments);
-        let error = derive_element(&store.reader, source).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("is not the predecessor-free, timeless canonical bottom"),
-            "unexpected validation error: {error:#}"
+        let index = parse(derive(&store.reader, source));
+        assert_eq!(index.doc_count(), 1);
+        assert_eq!(
+            index
+                .document_keys()
+                .map(|document| document.raw)
+                .collect::<Vec<_>>(),
+            vec![predecessor_id.to_inline().raw],
         );
     }
 
@@ -710,26 +527,48 @@ mod tests {
     }
 
     #[test]
-    fn missing_payload_and_malformed_source_fail_derivation() {
+    fn selected_missing_payload_and_malformed_encoding_fail_derivation() {
         let block = text_block(&[(schema::content_fact::modality::TEXT, "not resident")]);
         let (source, _attachments) = source_and_attachments(block);
         let missing_store = StoredBlobs::new([]);
         let error = derive_element(&missing_store.reader, source).unwrap_err();
         assert!(format!("{error:#}").contains("nonresident text payload"));
 
-        let mut malformed_graph =
-            text_block(&[(schema::content_fact::modality::TEXT, "also absent")]);
-        let block_id = malformed_graph.root().unwrap();
-        malformed_graph += entity! { ExclusiveId::force_ref(&block_id) @
+        let fact = archive::text_fact(
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::direction::IN,
+            "open world",
+        )
+        .unwrap();
+        let part = archive::content_part(0, fact, None).unwrap();
+        let part_id = part.root().unwrap();
+        let block_id = Id::new([0xA5; 16]).unwrap();
+        let mut graph_with_unknown_fact = part;
+        graph_with_unknown_fact += entity! { ExclusiveId::force_ref(&block_id) @
+            metadata::tag: &schema::block::KIND,
             metadata::name: "unexpected block field",
+            schema::block::contains: &part_id,
         };
-        let (malformed_graph, _attachments) = source_and_attachments(malformed_graph);
-        let malformed_store = StoredBlobs::new([]);
-        let error = derive_element(&malformed_store.reader, malformed_graph).unwrap_err();
-        assert!(format!("{error:#}").contains("unknown attribute"));
+        let (graph_with_unknown_fact, attachments) =
+            source_and_attachments(graph_with_unknown_fact);
+        let open_world_store = StoredBlobs::new(attachments);
+        let index = parse(derive(&open_world_store.reader, graph_with_unknown_fact));
+        assert_eq!(
+            index.doc_count(),
+            1,
+            "unknown facts do not close the schema"
+        );
+        assert_eq!(
+            index
+                .document_keys()
+                .map(|document| document.raw)
+                .collect::<Vec<_>>(),
+            vec![block_id.to_inline().raw],
+            "the selected entity id remains opaque",
+        );
 
         let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xFF]));
-        let error = derive_element(&malformed_store.reader, malformed).unwrap_err();
+        let error = derive_element(&open_world_store.reader, malformed).unwrap_err();
         assert!(format!("{error:#}").contains("canonical SimpleArchive"));
     }
 }

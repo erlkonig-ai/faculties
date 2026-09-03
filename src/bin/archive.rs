@@ -19,21 +19,23 @@ use faculties::archive_copilot::{self, ProjectionSummary as CopilotProjectionSum
 use faculties::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
 use faculties::collection_names::open_configured;
 use faculties::comb::{
-    self as comb_model, CombCatalog, CursorDraft, CursorResolution, CursorState,
+    self as comb_model, CursorDraft, CursorResolution, CursorRow, CursorState, CursorTrack,
 };
 use faculties::schemas::blockdag as archive_schema;
-use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::schemas::memory::{comb as comb_schema, DEFAULT_COMB_SCOPE_ID};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use hifitime::Epoch;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryToInline};
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
-use triblespace::core::trible::{Fragment, TribleSet};
+use triblespace::core::trible::Fragment;
+use triblespace::prelude::{exists, find, pattern};
 
 #[derive(Parser)]
 #[command(
@@ -136,8 +138,7 @@ struct ArchiveStorage<'a> {
 
 struct ReplayView {
     archive: ArchiveSnapshot,
-    comb_facts: TribleSet,
-    comb_catalog: CombCatalog,
+    comb_facts: FactArchive,
 }
 
 impl ArchiveStorage<'_> {
@@ -145,34 +146,88 @@ impl ArchiveStorage<'_> {
         ArchiveSnapshot::load_local(self.pile, self.key, archive_schema::DEFAULT_SCOPE_ID)
     }
 
-    fn load_comb(&self) -> Result<(TribleSet, CombCatalog)> {
+    fn load_comb(&self) -> Result<FactArchive> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            let collection =
-                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
-            let facts = faculties::storage::read_fact_collection(collection, &store_snapshot)
-                .map(|(facts, _)| facts)
-                .context("materialize Comb cursor collection")?;
-            let catalog =
-                comb_model::load_catalog(&facts).context("validate Comb cursor collection")?;
-            Ok((facts, catalog))
+            let source = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            let collection = FactCollection::new(&mut pile, source)
+                .context("register maintained Comb cursor collection")?;
+            let instant = faculties::clock::now()?;
+            let before = pile.snapshot().context("freeze Comb source snapshot")?;
+            let support = before
+                .collection_at(collection.source(), instant)
+                .context("observe resident Comb cursor collection")?
+                .support()
+                .clone();
+            let after = collection
+                .maintain_exact(&mut pile, &support)
+                .context("maintain Comb cursor collection")?;
+            after
+                .collection_exact(collection.rank9(), &support)
+                .context("attach exact Comb cursor collection")?
+                .view::<FactArchive>()
+                .context("read exact Comb cursor collection")
         })();
         finish_pile(pile, result)
     }
 
-    /// Materialize the Archive and its separate Comb cursor collection from
-    /// consecutive known-prefix views. Cursor publication rematerializes Comb
-    /// and validates the successor again at the commit boundary.
+    /// Attach Archive and its separate Comb cursor collection at one watermark.
+    ///
+    /// Both foundational supports come from `before`; both maintained views
+    /// are then attached through Archive's final immutable store snapshot.
+    /// The cursor view therefore cannot come from a later source watermark
+    /// than the Archive view read alongside it.
     fn load_replay(&self) -> Result<ReplayView> {
-        let archive = self.load()?;
-        let (comb_facts, comb_catalog) = self.load_comb()?;
-        Ok(ReplayView {
-            archive,
-            comb_facts,
-            comb_catalog,
-        })
+        let signer = load_signer(self.pile, self.key)?;
+        let mut pile = open_pile_strict(self.pile)?;
+        let result = (|| {
+            let archive_source = open_configured(
+                &mut pile,
+                archive_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
+            let archive_collections = FactCollection::new(&mut pile, archive_source)
+                .context("register maintained Archive fact collection")?;
+            let comb_source =
+                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            let comb_collections = FactCollection::new(&mut pile, comb_source)
+                .context("register maintained Comb cursor collection")?;
+
+            let instant = faculties::clock::now()?;
+            let before = pile
+                .snapshot()
+                .context("freeze Archive replay source snapshot")?;
+            let comb_support = before
+                .collection_at(comb_collections.source(), instant)
+                .context("observe resident Comb cursor collection")?
+                .support()
+                .clone();
+
+            drop(
+                comb_collections
+                    .maintain_exact(&mut pile, &comb_support)
+                    .context("maintain Comb cursor collection")?,
+            );
+            let archive = ArchiveSnapshot::maintain_from(
+                &mut pile,
+                archive_collections,
+                archive_schema::DEFAULT_SCOPE_ID,
+                &before,
+                instant,
+            )?;
+            let comb_facts = archive
+                .store_snapshot()
+                .collection_exact(comb_collections.rank9(), &comb_support)
+                .context("attach exact Comb cursor collection")?
+                .view::<FactArchive>()
+                .context("read exact Comb cursor collection")?;
+            Ok(ReplayView {
+                archive,
+                comb_facts,
+            })
+        })();
+        finish_pile(pile, result)
     }
 }
 
@@ -907,17 +962,178 @@ fn cursor_state(position: Option<Epoch>, anchor: Option<Id>) -> CursorState {
     }
 }
 
+/// Resolve one cursor track directly from the maintained fact archive.
+///
+/// The query is deliberately local to the track used by replay. Unknown or
+/// undecodable rows remain inert under the open-world schema; there is no
+/// whole-Comb catalog, closed-world fact accounting, or intrinsic-id check on
+/// the normal read path.
+fn cursor_resolution(
+    facts: &FactArchive,
+    stream: &str,
+    persona: &str,
+) -> Result<Option<CursorResolution>> {
+    let members: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(facts, [{
+            ?id @ metadata::tag: &comb_schema::kind_comb_cursor,
+            comb_schema::cursor_stream: stream,
+            comb_schema::cursor_persona: persona,
+        }])
+    )
+    .collect();
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    let track = CursorTrack {
+        stream: stream.to_owned(),
+        persona: persona.to_owned(),
+    };
+    let mut rows = Vec::new();
+    for id in members {
+        let has_position = exists!(pattern!(facts, [{
+            id @ comb_schema::cursor_position: _?position
+        }]));
+        let positions: BTreeSet<Inline<NsTAIInterval>> = find!(
+            value: Inline<NsTAIInterval>,
+            pattern!(facts, [{ id @ comb_schema::cursor_position: ?value }])
+        )
+        .filter(|value| {
+            value
+                .try_from_inline()
+                .is_ok_and(|(lower, upper): (i128, i128)| lower == upper)
+        })
+        .collect();
+        let has_anchor = exists!(pattern!(facts, [{
+            id @ comb_schema::cursor_anchor: _?anchor
+        }]));
+        let anchors: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ comb_schema::cursor_anchor: ?value }])
+        )
+        .collect();
+        let has_grain = exists!(pattern!(facts, [{
+            id @ comb_schema::cursor_grain: _?grain
+        }]));
+        let grains: BTreeSet<String> = find!(
+            value: String,
+            pattern!(facts, [{ id @ comb_schema::cursor_grain: ?value }])
+        )
+        .collect();
+        let predecessors: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ metadata::supersedes: ?value }])
+        )
+        .collect();
+        let observed_at: BTreeSet<Inline<NsTAIInterval>> = find!(
+            value: Inline<NsTAIInterval>,
+            pattern!(facts, [{ id @ metadata::created_at: ?value }])
+        )
+        .filter(|value| {
+            value
+                .try_from_inline()
+                .is_ok_and(|(lower, upper): (i128, i128)| lower == upper)
+        })
+        .collect();
+
+        if positions.is_empty() {
+            if !has_position && !has_anchor && !has_grain {
+                rows.push(CursorRow {
+                    id,
+                    track: track.clone(),
+                    state: CursorState {
+                        position: None,
+                        anchor: None,
+                        grain: None,
+                    },
+                    predecessors,
+                    observed_at,
+                });
+            }
+            continue;
+        }
+        if (has_anchor && anchors.is_empty()) || (has_grain && grains.is_empty()) {
+            continue;
+        }
+
+        let anchors: Vec<Option<Id>> = if anchors.is_empty() {
+            vec![None]
+        } else {
+            anchors.into_iter().map(Some).collect()
+        };
+        let grains: Vec<Option<String>> = if grains.is_empty() {
+            vec![None]
+        } else {
+            grains.into_iter().map(Some).collect()
+        };
+        for position in positions {
+            for anchor in &anchors {
+                for grain in &grains {
+                    rows.push(CursorRow {
+                        id,
+                        track: track.clone(),
+                        state: CursorState {
+                            position: Some(position),
+                            anchor: *anchor,
+                            grain: grain.clone(),
+                        },
+                        predecessors: predecessors.clone(),
+                        observed_at: observed_at.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let typed_members: BTreeSet<Id> = rows.iter().map(|row| row.id).collect();
+    let replaced: BTreeSet<Id> = rows
+        .iter()
+        .flat_map(|row| row.predecessors.iter().copied())
+        .filter(|predecessor| typed_members.contains(predecessor))
+        .collect();
+    let mut heads: Vec<_> = rows
+        .into_iter()
+        .filter(|row| !replaced.contains(&row.id))
+        .collect();
+
+    heads.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| {
+                left.state
+                    .position
+                    .map(|value| value.raw)
+                    .cmp(&right.state.position.map(|value| value.raw))
+            })
+            .then_with(|| left.state.anchor.cmp(&right.state.anchor))
+            .then_with(|| left.state.grain.cmp(&right.state.grain))
+    });
+    let resolution = match heads.as_slice() {
+        [] => bail!("Comb cursor track ({stream}, {persona}) has no typed live head"),
+        [row] => CursorResolution::Unique(row.clone()),
+        rows if rows.iter().all(|row| row.state == rows[0].state) => {
+            CursorResolution::Agreed(heads)
+        }
+        _ => CursorResolution::Forked(heads),
+    };
+    Ok(Some(resolution))
+}
+
 fn plan_cursor_update(
-    catalog: &CombCatalog,
+    facts: &FactArchive,
     stream: &str,
     persona: &str,
     position: Option<Epoch>,
     anchor: Option<Id>,
 ) -> Result<Option<Fragment>> {
     let state = cursor_state(position, anchor);
-    let predecessors = match catalog.resolution(stream, persona) {
+    let predecessors = match cursor_resolution(facts, stream, persona)? {
         None => BTreeSet::new(),
-        Some(resolution) => {
+        Some(ref resolution) => {
             let settled = resolution.settled_state()?;
             if matches!(resolution, CursorResolution::Unique(_)) && settled == &state {
                 return Ok(None);
@@ -938,11 +1154,11 @@ fn plan_cursor_update(
 }
 
 fn active_archive_cursor(
-    catalog: &CombCatalog,
+    facts: &FactArchive,
     stream: &str,
     persona: &str,
 ) -> Result<ArchiveTimelineCursor> {
-    let resolution = catalog.resolution(stream, persona).ok_or_else(|| {
+    let resolution = cursor_resolution(facts, stream, persona)?.ok_or_else(|| {
         anyhow!("no active replay for persona {persona}: use `archive replay start <from>`")
     })?;
     let state = resolution.settled_state()?;
@@ -961,24 +1177,11 @@ fn active_archive_cursor(
     ))
 }
 
-fn validate_cursor_update(current: &TribleSet, fragment: &Fragment) -> Result<()> {
-    let mut candidate = current.clone();
-    candidate += fragment.clone();
-    comb_model::load_catalog(&candidate)
-        .context("validate archive replay cursor successor")
-        .map(|_| ())
-}
-
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
     let signer = load_signer(storage.pile, storage.key)?;
     let mut pile = open_pile_strict(storage.pile)?;
     let result = (|| {
         let collection = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-        let store_snapshot = pile.snapshot().context("freeze Comb store snapshot")?;
-        let current = faculties::storage::read_fact_collection(collection, &store_snapshot)
-            .map(|(facts, _)| facts)
-            .context("materialize Comb cursor collection before publication")?;
-        validate_cursor_update(&current, &fragment)?;
         pile.commit(collection, &signer, fragment)
             .context("publish archive replay cursor")?;
         Ok(())
@@ -1021,11 +1224,10 @@ fn run_replay(
             }
             let from = parse_tai_timestamp(raw)?;
             let position = from - hifitime::Duration::from_total_nanoseconds(1);
-            let (facts, catalog) = storage.load_comb()?;
+            let facts = storage.load_comb()?;
             if let Some(fragment) =
-                plan_cursor_update(&catalog, REPLAY_STREAM, persona, Some(position), None)?
+                plan_cursor_update(&facts, REPLAY_STREAM, persona, Some(position), None)?
             {
-                validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
             }
             println!("replay started at {raw} (persona {persona})");
@@ -1035,11 +1237,9 @@ fn run_replay(
             if action.len() != 1 {
                 bail!("usage: archive replay stop");
             }
-            let (facts, catalog) = storage.load_comb()?;
-            if let Some(fragment) =
-                plan_cursor_update(&catalog, REPLAY_STREAM, persona, None, None)?
+            let facts = storage.load_comb()?;
+            if let Some(fragment) = plan_cursor_update(&facts, REPLAY_STREAM, persona, None, None)?
             {
-                validate_cursor_update(&facts, &fragment)?;
                 publish_cursor_update(storage, fragment)?;
             }
             println!("replay stopped (persona {persona})");
@@ -1050,7 +1250,7 @@ fn run_replay(
     }
 
     let replay = storage.load_replay()?;
-    let cursor = active_archive_cursor(&replay.comb_catalog, REPLAY_STREAM, persona)?;
+    let cursor = active_archive_cursor(&replay.comb_facts, REPLAY_STREAM, persona)?;
     let (selected, remaining) = split_replay_batch(
         replay.archive.timeline_after(cursor, |block| {
             with_tools || block.has_modality(archive_schema::content_fact::modality::TEXT)
@@ -1073,14 +1273,13 @@ fn run_replay(
     let last_epoch =
         Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last.position));
     let fragment = plan_cursor_update(
-        &replay.comb_catalog,
+        &replay.comb_facts,
         REPLAY_STREAM,
         persona,
         Some(last_epoch),
         Some(last.block.semantic.block),
     )?
     .ok_or_else(|| anyhow!("replay emitted blocks without advancing its cursor"))?;
-    validate_cursor_update(&replay.comb_facts, &fragment)?;
     publish_cursor_update(storage, fragment)?;
     println!(
         "batch: {} block(s); cursor -> {}; {} remaining",
