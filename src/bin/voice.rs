@@ -130,6 +130,13 @@ struct Cli {
     /// Reachy daemon base URL (the `shout` Reachy-speaker target).
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
+    /// Soma body base URL (e.g. http://reachy:8383): the STREAMING speaker
+    /// sink. When set and reachable, `shout` streams 24 kHz PCM into
+    /// `POST /audio/stream` as it is synthesized -- first sound before the
+    /// last word -- instead of the daemon's whole-file upload. Unreachable:
+    /// says so and falls through to the ordinary shout ladder.
+    #[arg(long, env = "SOMA_URL")]
+    soma: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -204,6 +211,15 @@ fn http() -> reqwest::blocking::Client {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("build http client")
+}
+
+/// Is a Soma body answering at `url`? (`GET /state` is its cheapest read.)
+fn soma_reachable(url: &str) -> bool {
+    http()
+        .get(format!("{url}/state"))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 // ── audio device detection + classification ────────────────────────────────
@@ -405,6 +421,10 @@ fn reachy_reachable(daemon: &str) -> bool {
 
 /// The outcome of resolving a channel's routing against the live devices.
 enum Routed {
+    /// Stream into a Soma body's speaker (`POST /audio/stream`, chunk by
+    /// chunk as synthesized; the base URL is carried so the sink needs no
+    /// second lookup).
+    Soma(String),
     /// Play through the Reachy robot speaker (daemon upload + play).
     Reachy,
     /// Play through the native sink on the first OPENABLE device of this
@@ -418,6 +438,7 @@ enum Routed {
 impl Routed {
     fn describe(&self) -> String {
         match self {
+            Routed::Soma(url) => format!("Soma body speaker (stream) at {url}"),
             Routed::Reachy => "Reachy speaker (daemon)".to_string(),
             Routed::Devices(ladder) => {
                 let (first, rest) = ladder.split_first().expect("ladder is never empty");
@@ -460,7 +481,21 @@ fn route_say(prefs: &[String], devices: &[AudioDevice]) -> Routed {
 /// short-circuits when it is the FIRST connected match and the daemon is up
 /// (its sink is the whole-file daemon upload, not the streaming device sink);
 /// when the daemon is down it is skipped and the ladder keeps going.
-fn route_shout(prefs: &[String], devices: &[AudioDevice], daemon_up: bool) -> Routed {
+fn route_shout(
+    prefs: &[String],
+    devices: &[AudioDevice],
+    daemon_up: bool,
+    soma: Option<&str>,
+) -> Routed {
+    // A configured Soma body is the streaming speaker and wins outright; a
+    // configured one that does not answer is said aloud, never silently
+    // skipped, and the ladder below carries on.
+    if let Some(url) = soma {
+        if soma_reachable(url) {
+            return Routed::Soma(url.to_string());
+        }
+        eprintln!("  [route] Soma at {url} is not answering; falling through");
+    }
     let mut ladder: Vec<String> = Vec::new();
     for pat in prefs {
         for dev in connected_matches(pat, devices) {
@@ -792,6 +827,7 @@ fn speak_and_play(
             sr,
             est_secs,
         ),
+        Routed::Soma(url) => stream_to_soma(&mut stream, &mut samples, t_call, url, sr),
         Routed::Text(_) => Ok(()), // handled by the caller; nothing to play
     };
 
@@ -815,6 +851,119 @@ fn speak_and_play(
         }
     }
     Ok(Spoken::Played)
+}
+
+/// Drain `stream` into a Soma body's speaker: one chunked `POST
+/// /audio/stream`, each synthesized chunk converted to 24 kHz mono s16le and
+/// written the moment it exists, so the body starts playing behind its own
+/// ~150 ms prebuffer while the rest is still being synthesized. Soma's
+/// response completes when the LAST sample has left the device -- the HTTP
+/// call finishing IS "done speaking" -- and carries its callback and underrun
+/// counts, which are printed rather than interpreted: an underrun means the
+/// synthesis fell behind the room, and that is a fact to record, not hide.
+/// `preempt=1` cuts anything the body is still saying (the newest utterance
+/// owns the mouth). A body that ends the request early surfaces as the
+/// error of THIS utterance; the caller still logs the words.
+#[cfg(feature = "voice")]
+fn stream_to_soma(
+    stream: &mut mary::speak::SpeakStream,
+    samples: &mut Vec<f32>,
+    t_call: std::time::Instant,
+    url: &str,
+    sr: u32,
+) -> Result<()> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    /// The request body: chunks arrive over a channel as synthesis produces
+    /// them; the sender dropping is the end of the utterance (EOF).
+    struct ChunkReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+        buf: Vec<u8>,
+        pos: usize,
+    }
+    impl Read for ChunkReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.buf.len() {
+                match self.rx.recv() {
+                    Ok(next) => {
+                        self.buf = next;
+                        self.pos = 0;
+                    }
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = (self.buf.len() - self.pos).min(out.len());
+            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let endpoint = format!("{url}/audio/stream?rate={sr}&ch=1&fmt=s16le&preempt=1");
+    let request = std::thread::spawn(move || -> Result<String> {
+        // No read timeout: the response only arrives once the body has
+        // FINISHED PLAYING, which for a long utterance is longer than any
+        // sensible request timeout.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .context("build the Soma stream client")?;
+        let response = client
+            .post(&endpoint)
+            .header("Content-Type", "application/octet-stream")
+            .body(reqwest::blocking::Body::new(ChunkReader {
+                rx,
+                buf: Vec::new(),
+                pos: 0,
+            }))
+            .send()
+            .with_context(|| format!("stream to {endpoint}"))?;
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        if !status.is_success() {
+            bail!("Soma /audio/stream answered {status}: {text}");
+        }
+        Ok(text)
+    });
+
+    let mut appended = 0usize;
+    let mut first = true;
+    for chunk in stream.by_ref() {
+        if first {
+            println!(
+                "  [soma] first chunk {:.2}s after the call ({} samples)",
+                t_call.elapsed().as_secs_f32(),
+                chunk.len()
+            );
+            first = false;
+        }
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for &sample in &chunk {
+            let v = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        appended += chunk.len();
+        samples.extend_from_slice(&chunk);
+        if tx.send(bytes).is_err() {
+            // The request side is gone; its error is the one to report.
+            break;
+        }
+    }
+    drop(tx);
+    let report = request
+        .join()
+        .map_err(|_| anyhow::anyhow!("the Soma stream thread panicked"))??;
+    if appended == 0 {
+        bail!("no audio chunks arrived to stream to Soma at {url}");
+    }
+    println!(
+        "  [soma] streamed {:.1}s to {url} ({appended} samples): {}",
+        appended as f32 / sr as f32,
+        report.trim()
+    );
+    Ok(())
 }
 
 /// Drain `stream` into the first device of `ladder` that OPENS, through the
@@ -1014,6 +1163,7 @@ fn speak_and_play(
 fn cmd_speak(
     session: &mut VoiceSession<'_>,
     daemon: &str,
+    soma: Option<&str>,
     channel: &str,
     text: &str,
     dry_run: bool,
@@ -1025,7 +1175,7 @@ fn cmd_speak(
     let routed = if channel == CHANNEL_SAY {
         route_say(&prefs, &devices)
     } else {
-        route_shout(&prefs, &devices, reachy_reachable(daemon))
+        route_shout(&prefs, &devices, reachy_reachable(daemon), soma)
     };
 
     println!("[{channel}] → {}", routed.describe());
@@ -1133,7 +1283,7 @@ fn unique_voice_tmp() -> Result<PathBuf> {
     );
 }
 
-fn cmd_route(session: &VoiceSession<'_>, daemon: &str) -> Result<()> {
+fn cmd_route(session: &VoiceSession<'_>, daemon: &str, soma: Option<&str>) -> Result<()> {
     let devices = detect_output_devices()?;
     let daemon_up = reachy_reachable(daemon);
 
@@ -1160,7 +1310,7 @@ fn cmd_route(session: &VoiceSession<'_>, daemon: &str) -> Result<()> {
         let routed = if channel == CHANNEL_SAY {
             route_say(&prefs, &devices)
         } else {
-            route_shout(&prefs, &devices, daemon_up)
+            route_shout(&prefs, &devices, daemon_up, soma)
         };
         println!("  would route to: {}", routed.describe());
     }
@@ -1215,6 +1365,7 @@ fn main() -> Result<()> {
         key: key.as_deref(),
     };
     let daemon = cli.daemon.clone();
+    let soma = cli.soma.clone();
 
     match cli.command {
         None => {
@@ -1229,6 +1380,7 @@ fn main() -> Result<()> {
             cmd_speak(
                 session,
                 &daemon,
+                soma.as_deref(),
                 CHANNEL_SAY,
                 &text,
                 dry_run,
@@ -1243,13 +1395,16 @@ fn main() -> Result<()> {
             cmd_speak(
                 session,
                 &daemon,
+                soma.as_deref(),
                 CHANNEL_SHOUT,
                 &text,
                 dry_run,
                 pause_file.as_deref(),
             )
         })?,
-        Some(Command::Route) => storage.with_session(|session| cmd_route(session, &daemon))?,
+        Some(Command::Route) => {
+            storage.with_session(|session| cmd_route(session, &daemon, soma.as_deref()))?
+        }
         Some(Command::RouteSet { channel, devices }) => {
             storage.with_session(|session| cmd_route_set(session, &channel, &devices))?
         }
@@ -1422,7 +1577,7 @@ mod tests {
             dev("Reachy Mini Audio", false),
         ];
         assert!(matches!(
-            route_shout(&prefs(&["Reachy", "MacBook"]), &devices, true),
+            route_shout(&prefs(&["Reachy", "MacBook"]), &devices, true, None),
             Routed::Reachy
         ));
     }
@@ -1438,6 +1593,7 @@ mod tests {
             &prefs(&["Reachy", "Studio", "MacBook"]),
             &devices,
             false,
+            None,
         ));
         assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
     }
@@ -1449,10 +1605,10 @@ mod tests {
             dev("Studio Display Speakers", false),
         ];
         // Policy matches nothing: fall to the default output alone.
-        let l = ladder(route_shout(&prefs(&["Reachy"]), &devices, false));
+        let l = ladder(route_shout(&prefs(&["Reachy"]), &devices, false, None));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
         // Policy matches something: default output still appended as fallback.
-        let l = ladder(route_shout(&prefs(&["Studio"]), &devices, false));
+        let l = ladder(route_shout(&prefs(&["Studio"]), &devices, false, None));
         assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
     }
 
@@ -1463,7 +1619,12 @@ mod tests {
             dev("Reachy Mini Audio", false),
         ];
         // Reachy below a local match is not a streaming-sink candidate.
-        let l = ladder(route_shout(&prefs(&["MacBook", "Reachy"]), &devices, true));
+        let l = ladder(route_shout(
+            &prefs(&["MacBook", "Reachy"]),
+            &devices,
+            true,
+            None,
+        ));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
     }
 
