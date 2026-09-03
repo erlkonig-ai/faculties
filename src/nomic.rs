@@ -219,7 +219,7 @@ mod tests {
 
         let text = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
             .expect("load one text collection snapshot");
-        assert_eq!(text.cover().len(), 2);
+        assert_eq!(text.support().len(), 2);
 
         // Freeze really means freeze: a later same-coordinate model commit
         // cannot change the facts used for either half of this text load.
@@ -268,7 +268,7 @@ mod tests {
         );
         let vision = load_model_snapshot(vision_file.path(), NOMIC_VISION_MODEL)
             .expect("load one vision collection snapshot");
-        assert_eq!(vision.cover().len(), 1);
+        assert_eq!(vision.support().len(), 1);
         let vision_keymap = mary::selection::load_keymap_from_graph(
             vision.facts(),
             vision.store(),
