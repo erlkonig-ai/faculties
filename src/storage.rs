@@ -50,13 +50,34 @@ use triblespace::core::trible::{Fragment, TribleSet};
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
 
-/// Open the explicitly configured Secrets policy boundary for this process.
+/// Open the explicitly configured Secrets policy boundary for publication.
 ///
 /// `TRIBLESPACE_COLLECTION_SECRETS` selects an exact shared source descriptor;
 /// otherwise the usual signer-private `secrets` descriptor is registered.
-/// READ admission is sufficient to attach it. Mutation APIs independently
-/// require the signer to satisfy WRITE admission before publishing.
+/// This validates descriptor identity but deliberately performs no admission
+/// check: local publication is unconditional, and WRITE admission is applied
+/// when collection snapshots admit commits.
 pub fn open_secrets_collection<S>(
+    store: &mut S,
+    subject: VerifyingKey,
+) -> Result<crate::secrets::storage::SecretsCollection>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet,
+{
+    let source =
+        crate::collection_names::open_configured(store, crate::secrets::DEFAULT_SCOPE_ID, subject)
+            .context("open configured Secrets source collection")?;
+    crate::secrets::storage::SecretsCollection::from_source(store, source)
+        .context("register maintained Secrets collection descriptors")
+}
+
+/// Open the explicitly configured Secrets policy boundary for disclosure.
+///
+/// Exact shared descriptors must admit `subject` under their READ policy
+/// before a caller may attach or decrypt the collection. An unset override
+/// still registers the ordinary signer-private `secrets` descriptor.
+pub fn open_secrets_collection_read<S>(
     store: &mut S,
     subject: VerifyingKey,
 ) -> Result<crate::secrets::storage::SecretsCollection>
@@ -69,7 +90,7 @@ where
         crate::secrets::DEFAULT_SCOPE_ID,
         subject,
     )
-    .context("open configured Secrets source collection")?;
+    .context("open configured Secrets source collection for READ")?;
     crate::secrets::storage::SecretsCollection::from_source(store, source)
         .context("register maintained Secrets collection descriptors")
 }
@@ -228,10 +249,9 @@ impl TargetDiscovery {
 ///
 /// `scope` resolves the faculty's canonical name. Without an exact override,
 /// `authority` seeds the descriptor's direct READ and WRITE policies; with an
-/// override, the selected descriptor keeps its own immutable policies and the
-/// signer must already satisfy WRITE admission. The returned handle selects
-/// records. No definition registry, blob scan, or legacy pin lookup
-/// participates in target discovery.
+/// override, the selected descriptor keeps its own immutable policies. The
+/// returned handle selects records. No definition registry, blob scan, or
+/// legacy pin lookup participates in target discovery.
 pub fn discover_target<S>(
     store: &mut S,
     scope: Id,

@@ -14,7 +14,7 @@ use faculties::schemas::headspace::{
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -314,7 +314,8 @@ impl WebStorage<'_> {
                     .context("maintain Headspace fact collection")?,
             );
 
-            let secrets_collection = open_secrets_collection(&mut pile, signer.verifying_key())?;
+            let secrets_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
             let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection])
                 .context("ensure configured Secrets collection")?;
 

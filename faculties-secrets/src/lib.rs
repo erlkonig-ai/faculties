@@ -565,13 +565,21 @@ where
 
     let mut plaintext = None::<Vec<u8>>;
     for body in bodies {
-        let body = read_bytes(reader, body).context("read encrypted secret body")?;
-        validate_encrypted_body(&body)?;
-        let nonce = Nonce::try_from(&body[..24]).context("secret nonce")?;
-        let candidate = DryocSecretBox::from_bytes(&body[24..])
-            .map_err(|error| anyhow!("parse secret body: {error:?}"))?
-            .decrypt_to_vec(&nonce, dek)
-            .map_err(|_| anyhow!("decrypt secret body failed"))?;
+        let Ok(body) = read_bytes(reader, body) else {
+            continue;
+        };
+        if validate_encrypted_body(&body).is_err() {
+            continue;
+        }
+        let Ok(nonce) = Nonce::try_from(&body[..24]) else {
+            continue;
+        };
+        let Ok(boxed) = DryocSecretBox::from_bytes(&body[24..]) else {
+            continue;
+        };
+        let Ok(candidate) = boxed.decrypt_to_vec(&nonce, dek) else {
+            continue;
+        };
         if plaintext
             .as_ref()
             .is_some_and(|previous| previous != &candidate)
@@ -582,7 +590,7 @@ where
             plaintext = Some(candidate);
         }
     }
-    Ok(plaintext.expect("at least one body checked above"))
+    plaintext.ok_or_else(|| anyhow!("secret {secret} has no resident decryptable body"))
 }
 
 /// Open one secret directly from any queryable fact view.
@@ -797,9 +805,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_body_occurrence_does_not_hide_a_decryptable_body() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let mut sealed =
+            seal_version("database", b"value", [alice.verifying_key()], at(4)).unwrap();
+        let secret = sealed.secret;
+        let row = secret_rows_for(sealed.fragment.facts(), secret)[0];
+        let missing = Inline::<inlineencodings::Handle<blobencodings::RawBytes>>::new([0x66; 32]);
+        sealed.fragment += secret_record(secret, row.name, missing, row.created_at);
+
+        let reader = sealed.fragment.blobs_mut().snapshot().unwrap();
+        assert_eq!(
+            open_version_from_facts(&reader, sealed.fragment.facts(), secret, &alice).unwrap(),
+            b"value"
+        );
+    }
+
+    #[test]
     fn recipient_list_cannot_be_empty() {
         assert!(
-            seal_version("token", b"value", std::iter::empty::<VerifyingKey>(), at(4),).is_err()
+            seal_version("token", b"value", std::iter::empty::<VerifyingKey>(), at(5),).is_err()
         );
     }
 }

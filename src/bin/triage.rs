@@ -26,7 +26,7 @@ use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
 use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
 };
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
@@ -197,11 +197,11 @@ impl TriageSnapshot {
                     .with_context(|| format!("maintain {label} fact archive"))?,
             );
         }
-        let secrets_collection = open_secrets_collection(&mut pile, signer.verifying_key())?;
+        let secrets_collection = open_secrets_collection_read(&mut pile, signer.verifying_key())?;
         let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection])
-            .context("maintain configured Secrets collection")?;
+            .context("ensure configured Secrets collection")?;
 
-        // Secrets discovery already owns the one later immutable snapshot.
+        // Secrets attachment already owns the one later immutable snapshot.
         // Reuse it so facts, attachments, and credentials inhabit literally
         // the same known-prefix observation.
         let store_snapshot = secrets.store_snapshot().clone();

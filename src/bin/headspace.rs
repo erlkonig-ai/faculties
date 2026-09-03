@@ -14,7 +14,8 @@ use faculties::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resol
 use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+    FactArchive, FactCollection,
 };
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
@@ -191,7 +192,7 @@ impl Storage<'_> {
         let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
         let collection = FactCollection::new(pile, source)
             .context("register maintained Headspace fact collection")?;
-        let secrets_collection = open_secrets_collection(pile, self.signer.verifying_key())?;
+        let secrets_collection = open_secrets_collection_read(pile, self.signer.verifying_key())?;
 
         // One frozen source watermark decides the exact Headspace support.
         // Maintenance and Secrets discovery may append physical views, but
@@ -213,7 +214,7 @@ impl Storage<'_> {
         );
 
         let secrets = secret_storage::ensure_and_snapshot(pile, [secrets_collection])
-            .context("maintain configured Secrets collection")?;
+            .context("ensure configured Secrets collection")?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
         let reader = secrets.store_snapshot().clone();
@@ -1006,7 +1007,7 @@ mod tests {
     fn headspace_and_secrets_share_one_final_store_snapshot() {
         let (_directory, pile, key) = fixture();
         let (storage, views) = views(&pile, &key);
-        let secrets_reader = views.secrets.snapshot().store_snapshot();
+        let secrets_reader = views.secrets.store_snapshot();
         assert!(views
             .headspace
             .reader
@@ -1084,21 +1085,11 @@ mod tests {
 
         let signer = load_signer(&pile, Some(&key)).unwrap();
         let mut store = open_pile_strict(&pile).unwrap();
-        let vault = Id::new([0x77; 16]).unwrap();
-        let location = vaults::create_vault(
+        let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
+        let version = secret_storage::add_secret(
             &mut store,
             &signer,
-            vault,
-            "headspace-test",
-            point_now().unwrap(),
-        )
-        .unwrap();
-        let discovery = vaults::discover_local_vaults(&mut store, &signer).unwrap();
-        let version = vaults::add_secret(
-            &mut store,
-            &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "hs/model/interrupted",
             b"exact",
             point_now().unwrap(),
@@ -1115,14 +1106,13 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, repaired) = views(&pile, &key);
-        assert_eq!(repaired.secrets.snapshot().vaults().len(), 1);
-        assert!(repaired.secrets.snapshot().contains(version));
+        assert_eq!(repaired.secrets.collections().len(), 1);
+        assert!(repaired.secrets.contains(version));
         let config_resolution =
             headspace::current_config(&repaired.headspace.reader, &repaired.headspace.facts)
                 .unwrap();
@@ -1145,13 +1135,12 @@ mod tests {
                 command: SecretCommand::Set(SecretSetArgs {
                     value: None,
                     version: Some(format!("{version:x}")),
-                    vault: None,
                 }),
             },
         ))
         .unwrap();
         let (storage, replay) = views(&pile, &key);
-        assert_eq!(replay.secrets.snapshot().vaults().len(), 1);
+        assert_eq!(replay.secrets.collections().len(), 1);
         let config_resolution =
             headspace::current_config(&replay.headspace.reader, &replay.headspace.facts).unwrap();
         let config = settled_config(&config_resolution).unwrap().unwrap();

@@ -48,7 +48,7 @@ use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 use crate::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
 };
 
 /// Stable logical input requested by a widget.
@@ -715,7 +715,7 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
         let secrets = sources
             .contains(&SourceKey::Secrets)
             .then(|| {
-                let collection = open_secrets_collection(&mut pile, signer.verifying_key())
+                let collection = open_secrets_collection_read(&mut pile, signer.verifying_key())
                     .map_err(|error| format!("open configured Secrets collection: {error:#}"))?;
                 secret_storage::ensure_and_snapshot(&mut pile, [collection])
                     .map(LoadedSecrets::new)

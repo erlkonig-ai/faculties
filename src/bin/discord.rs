@@ -186,7 +186,7 @@ impl DiscordStorage<'_> {
         let snapshot = pile
             .snapshot()
             .context("freeze store while opening exact Discord collection")?;
-        open_exact_in(&snapshot, DEFAULT_SCOPE_ID, authority, handle)
+        open_exact_in(&snapshot, DEFAULT_SCOPE_ID, handle)
     }
 
     /// Prove that this process can publish to the selected collection before
@@ -194,9 +194,19 @@ impl DiscordStorage<'_> {
     fn preflight_write(&self) -> Result<()> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = self
-            .open_collection(&mut pile, signer.verifying_key())
-            .map(|_| ());
+        let result = (|| {
+            let collection = self.open_collection(&mut pile, signer.verifying_key())?;
+            let snapshot = pile
+                .snapshot()
+                .context("freeze Discord WRITE-admission preflight")?;
+            if !collection
+                .writer_is_admitted(&snapshot, signer.verifying_key())
+                .context("check Discord collection WRITE admission")?
+            {
+                bail!("durable signer is not admitted to WRITE the Discord collection");
+            }
+            Ok(())
+        })();
         finish_pile(pile, result)
     }
 

@@ -57,8 +57,9 @@ pub struct CoverageHead {
 }
 
 /// Complete public state of one immutable Teams authentication profile.
-/// Secret-bearing values live in explicit Secrets vault epochs; these fields
-/// are exact immutable version references, never names resolved by time.
+/// Secret-bearing values live in an explicitly configured Secrets collection;
+/// these fields are exact immutable version references, never names resolved
+/// by time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthProfileRecord {
     pub id: Id,
@@ -327,11 +328,11 @@ where
     }
 }
 
-/// Validate the active auth-profile references against one discovered Secrets
-/// vault snapshot. This deliberately performs no name or timestamp resolution.
+/// Validate the active auth-profile references against the configured Secrets
+/// snapshot. This deliberately performs no name or timestamp resolution.
 ///
 /// Superseded profiles are provenance, not live configuration. Their exact
-/// secret versions may legitimately have been left behind by a vault cutover;
+/// secret versions may legitimately have been left behind by an additive cutover;
 /// requiring those historical versions would make an additive successor
 /// unable to repair the active profile.
 pub fn validate_auth_secret_references<R, P>(
@@ -2807,46 +2808,41 @@ mod tests {
     }
 
     #[test]
-    fn auth_reference_validation_uses_exact_vault_snapshot_ids() {
+    fn auth_reference_validation_uses_exact_secret_ids() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("teams-secrets.pile");
         std::fs::File::create(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0x31; 32]);
-        let vault = Id::new([0x32; 16]).unwrap();
-        let location =
-            crate::secrets::storage::create_vault(&mut pile, &signer, vault, "teams", point(1.0))
-                .unwrap();
+        let collection =
+            crate::storage::open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
 
-        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
         let exact = crate::secrets::storage::add_secret(
             &mut pile,
             &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "same-name",
             b"exact",
             point(2.0),
         )
         .unwrap();
-        drop(discovery);
 
-        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
         let later = crate::secrets::storage::add_secret(
             &mut pile,
             &signer,
-            &location,
-            discovery.snapshot(),
+            collection,
             "same-name",
             b"later",
             point(3.0),
         )
         .unwrap();
         assert_ne!(exact, later);
-        drop(discovery);
 
-        let discovery = crate::secrets::storage::discover_local_vaults(&mut pile, &signer).unwrap();
-        let secrets = discovery.snapshot();
+        let collection =
+            crate::storage::open_secrets_collection_read(&mut pile, signer.verifying_key())
+                .unwrap();
+        let secrets =
+            crate::secrets::storage::ensure_and_snapshot(&mut pile, [collection]).unwrap();
         assert_eq!(secrets.open(exact, &signer).unwrap(), b"exact");
 
         let source_identity = source_fragment("tenant.example");
@@ -2863,7 +2859,7 @@ mod tests {
         .unwrap();
         let mut teams = source_identity;
         teams += profile;
-        validate_auth_secret_references(teams.facts(), secrets).unwrap();
+        validate_auth_secret_references(teams.facts(), &secrets).unwrap();
 
         let unknown = Id::new([0x33; 16]).unwrap();
         let (profile, dangling_profile) = auth_profile_fragment(
@@ -2878,7 +2874,7 @@ mod tests {
         .unwrap();
         let mut dangling = source_fragment("tenant.example");
         dangling += profile;
-        let error = validate_auth_secret_references(dangling.facts(), secrets).unwrap_err();
+        let error = validate_auth_secret_references(dangling.facts(), &secrets).unwrap_err();
         assert!(format!("{error:#}").contains(&format!("{unknown:x}")));
 
         let (successor, _) = auth_profile_fragment(
@@ -2892,9 +2888,8 @@ mod tests {
         )
         .unwrap();
         dangling += successor;
-        validate_auth_secret_references(dangling.facts(), secrets).unwrap();
+        validate_auth_secret_references(dangling.facts(), &secrets).unwrap();
 
-        drop(discovery);
         pile.close().unwrap();
     }
 

@@ -2023,7 +2023,7 @@ pub fn validate_catalog<R>(
     validate_secret_references(facts, secrets)
 }
 
-/// Validate only Mail's exact immutable references into Secrets vaults.
+/// Validate only Mail's exact immutable references into configured Secrets.
 pub fn validate_secret_references<R>(
     facts: &TribleSet,
     secrets: &SecretsSnapshot<R>,
@@ -3431,8 +3431,11 @@ mod tests {
         decide as decide_schema, files as files_schema, mail as mail_schema,
         relations as relations_schema,
     };
-    use crate::secrets::storage as vaults;
-    use crate::storage::{load_signer, open_pile_strict, publish_fragment};
+    use crate::secrets::storage as secret_storage;
+    use crate::storage::{
+        load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+        publish_fragment,
+    };
     use crate::test_support::initialize_open_collection_fixture;
     use triblespace::core::repo::pile::{Pile, PileSnapshot};
 
@@ -3459,7 +3462,6 @@ mod tests {
         _directory: tempfile::TempDir,
         pile: PathBuf,
         key: PathBuf,
-        secret_vault: Id,
     }
 
     struct CollectionView {
@@ -3482,16 +3484,10 @@ mod tests {
             let key = directory.path().join("mail.key");
             File::create(&pile).unwrap();
             initialize_open_collection_fixture(&pile, Some(&key));
-            let secret_vault = id(120);
-            let signer = load_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
-            vaults::create_vault(&mut store, &signer, secret_vault, "mail-test", at(2)).unwrap();
-            store.close().unwrap();
             Self {
                 _directory: directory,
                 pile,
                 key,
-                secret_vault,
             }
         }
 
@@ -3502,10 +3498,10 @@ mod tests {
         fn views(&self) -> Views {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            let secrets = vaults::discover_local_vaults(&mut pile, &signer)
-                .unwrap()
-                .into_parts()
-                .0;
+            let secrets_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+            let secrets =
+                secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection]).unwrap();
             let mail = open_configured(
                 &mut pile,
                 mail_schema::DEFAULT_SCOPE_ID,
@@ -3557,19 +3553,11 @@ mod tests {
         fn add_secret(&self, name: &str, plaintext: &[u8], created_at: IntervalValue) -> Id {
             let signer = self.signer();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            let discovery = vaults::discover_local_vaults(&mut pile, &signer).unwrap();
-            let location = *discovery.location(self.secret_vault).unwrap();
-            let secret = vaults::add_secret(
-                &mut pile,
-                &signer,
-                &location,
-                discovery.snapshot(),
-                name,
-                plaintext,
-                created_at,
+            let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+            let secret = secret_storage::add_secret(
+                &mut pile, &signer, collection, name, plaintext, created_at,
             )
             .unwrap();
-            drop(discovery);
             pile.close().unwrap();
             secret
         }
@@ -3986,7 +3974,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_account_uses_the_durable_signer_without_password_identity() {
+    fn opening_an_account_uses_the_durable_signer_key() {
         let fixture = Fixture::new();
         let account = id(86);
         add_account(&fixture, account);
@@ -4012,7 +4000,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("not the access-envelope subject"),
+            format!("{error:#}").contains("no wrap for this signing key"),
             "{error:#}"
         );
     }

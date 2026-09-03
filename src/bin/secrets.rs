@@ -13,7 +13,9 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
 use faculties::secrets::{self, storage as secret_storage};
-use faculties::storage::{load_signer, open_pile_strict, open_secrets_collection};
+use faculties::storage::{
+    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+};
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
@@ -128,7 +130,7 @@ fn cmd_add(storage: SecretsStorage<'_>, name: String, value: String) -> Result<(
 
 fn cmd_get(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
     let plaintext = Zeroizing::new(storage.with_pile(|pile, signer| {
-        let collection = open_secrets_collection(pile, signer.verifying_key())?;
+        let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
         let snapshot = secret_storage::ensure_and_snapshot(pile, [collection])?;
         snapshot.open(secret, signer)
     })?);
@@ -140,7 +142,7 @@ fn cmd_get(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
 
 fn cmd_list(storage: SecretsStorage<'_>) -> Result<()> {
     storage.with_pile(|pile, signer| {
-        let collection = open_secrets_collection(pile, signer.verifying_key())?;
+        let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
         let snapshot = secret_storage::ensure_and_snapshot(pile, [collection])?;
         let Some(facts) = snapshot.facts() else {
             println!("(no secrets)");
@@ -160,7 +162,7 @@ fn cmd_list(storage: SecretsStorage<'_>) -> Result<()> {
 
 fn cmd_maintain(storage: SecretsStorage<'_>) -> Result<()> {
     storage.with_pile(|pile, signer| {
-        let collection = open_secrets_collection(pile, signer.verifying_key())?;
+        let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
         let snapshot = secret_storage::maintain_and_snapshot(pile, [collection])?;
         let added = secret_storage::maintain_recipient_envelopes(
             pile, signer, &snapshot, collection, signer,

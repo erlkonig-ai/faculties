@@ -144,7 +144,26 @@ impl SecretsCollection {
         self.ensure_exact(store, &support)
     }
 
-    /// Maintain both derived lattices for one frozen admitted support.
+    /// Maintain both derived lattices for one exact foundational support.
+    pub fn maintain_exact<S>(
+        self,
+        store: &mut S,
+        support: &triblespace::core::collection::Support,
+    ) -> Result<S::Snapshot>
+    where
+        S: Store + CollectionStoreExt,
+    {
+        drop(
+            store
+                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .context("maintain Succinct Secrets collection")?,
+        );
+        store
+            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .context("maintain Rank9 Secrets collection")
+    }
+
+    /// Maintain both derived lattices for the current admitted source support.
     pub fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt,
@@ -157,14 +176,7 @@ impl SecretsCollection {
             .admitted(&before)
             .context("admit Secrets source support")?;
         drop(before);
-        drop(
-            store
-                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, &support)
-                .context("maintain Succinct Secrets collection")?,
-        );
-        store
-            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, &support)
-            .context("maintain Rank9 Secrets collection")
+        self.maintain_exact(store, &support)
     }
 }
 
@@ -210,8 +222,21 @@ where
     I: IntoIterator<Item = SecretsCollection>,
 {
     let collections = collections.into_iter().collect::<Vec<_>>();
-    for collection in &collections {
-        drop(collection.maintain(store)?);
+    let before = store
+        .snapshot()
+        .context("freeze Secrets supports before maintenance")?;
+    let supports = collections
+        .iter()
+        .map(|collection| {
+            collection
+                .source
+                .admitted(&before)
+                .context("admit Secrets source support")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(before);
+    for (collection, support) in collections.iter().zip(&supports) {
+        drop(collection.maintain_exact(store, support)?);
     }
     let store_snapshot = store
         .snapshot()
@@ -278,7 +303,7 @@ where
 
 /// Publish one immutable version to the source collection.
 ///
-/// Local `commit` remains unconditional. The audience snapshot only selects
+/// Local `commit` is unconditional. The audience snapshot only selects
 /// cryptographic recipients; generic collection admission later decides
 /// whether this signed commit contributes to a view.
 pub fn add_secret<S>(
@@ -295,13 +320,6 @@ where
     let snapshot = store
         .snapshot()
         .context("freeze Secrets audience before publication")?;
-    if !collection
-        .source
-        .writer_is_admitted(&snapshot, signing_key.verifying_key())
-        .map_err(|error| anyhow!("check Secrets writer admission: {error}"))?
-    {
-        bail!("signer is not admitted to WRITE the configured Secrets collection");
-    }
     let recipients = admitted_readers(&snapshot, collection)?;
     drop(snapshot);
     let sealed = seal_version(name, plaintext, recipients, created_at)?;
@@ -339,13 +357,6 @@ where
         return Ok(0);
     };
     let recipients = admitted_readers(secrets.store_snapshot(), collection)?;
-    if !collection
-        .source
-        .writer_is_admitted(secrets.store_snapshot(), signing_key.verifying_key())
-        .map_err(|error| anyhow!("check Secrets envelope writer admission: {error}"))?
-    {
-        bail!("signer is not admitted to WRITE the configured Secrets collection");
-    }
     let secret_ids = find!(
         id: triblespace::core::id::Id,
         pattern!(view.facts(), [{
@@ -380,7 +391,9 @@ where
 mod tests {
     use hifitime::Epoch;
     use rand_core::OsRng;
-    use triblespace::core::collection::{grant_collection_read, AdmissionPolicy, CollectionPolicy};
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionPolicy,
+    };
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::prelude::TryToInline;
 
@@ -445,6 +458,42 @@ mod tests {
     }
 
     #[test]
+    fn an_offline_commit_can_be_admitted_by_later_write_evidence() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let offline_writer = SigningKey::generate(&mut OsRng);
+        let mut store = MemoryRepo::default();
+        let collection = SecretsCollection::register(
+            &mut store,
+            "offline-secrets",
+            direct_policy(owner.verifying_key()),
+        )
+        .unwrap();
+
+        let secret = add_secret(
+            &mut store,
+            &offline_writer,
+            collection,
+            "token",
+            b"authored offline",
+            at(3),
+        )
+        .unwrap();
+        let before = ensure_and_snapshot(&mut store, [collection]).unwrap();
+        assert!(!before.contains(secret));
+        drop(before);
+
+        grant_collection_write(
+            &mut store,
+            collection.handle(),
+            &owner,
+            offline_writer.verifying_key(),
+        )
+        .unwrap();
+        let after = ensure_and_snapshot(&mut store, [collection]).unwrap();
+        assert_eq!(after.open(secret, &owner).unwrap(), b"authored offline");
+    }
+
+    #[test]
     fn newly_admitted_reader_gets_an_additive_wrap() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
@@ -455,9 +504,9 @@ mod tests {
             direct_policy(alice.verifying_key()),
         )
         .unwrap();
-        let first = add_secret(&mut store, &alice, collection, "token", b"value", at(3)).unwrap();
+        let first = add_secret(&mut store, &alice, collection, "token", b"value", at(4)).unwrap();
         let second =
-            add_secret(&mut store, &alice, collection, "password", b"other", at(4)).unwrap();
+            add_secret(&mut store, &alice, collection, "password", b"other", at(5)).unwrap();
         let before = maintain_and_snapshot(&mut store, [collection]).unwrap();
         assert!(before.open(first, &bob).is_err());
         assert!(before.open(second, &bob).is_err());
@@ -483,7 +532,7 @@ mod tests {
         let left = SecretsCollection::register(&mut store, "split-secret", policy.clone()).unwrap();
         let right = SecretsCollection::register(&mut store, "split-wrap", policy).unwrap();
         let sealed =
-            seal_version("split", b"still one entity", [alice.verifying_key()], at(5)).unwrap();
+            seal_version("split", b"still one entity", [alice.verifying_key()], at(6)).unwrap();
         let secret = sealed.secret;
         let (_, facts, metafacts, blobs) = sealed.fragment.into_parts();
         let mut secret_facts = triblespace::core::trible::TribleSet::new();

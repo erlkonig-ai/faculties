@@ -7,7 +7,7 @@
 //! roster of other profiles.
 //!
 //! It consumes the exact native Headspace snapshot and the aggregate of locally
-//! readable Secrets vault snapshots. The shared projector preserves missing,
+//! readable configured Secrets collections. The shared projector preserves missing,
 //! agreed, and forked DAG heads; this widget never chooses a timestamp winner
 //! and never decrypts a credential.
 //!
