@@ -1128,8 +1128,7 @@ fn main() -> Result<()> {
             .context("freeze Relations pre-maintenance snapshot")?;
         let instant = clock::now()?;
         drop(
-            facts
-                .maintain_at(&mut pile, &before, instant)
+            pollster::block_on(facts.maintain_at(&mut pile, &before, instant))
                 .context("maintain Relations fact collection")?,
         );
         let reader = pile
@@ -1296,7 +1295,7 @@ mod tests {
 
         let before = store.snapshot().unwrap();
         let instant = clock::now().unwrap();
-        drop(facts.maintain_at(&mut store, &before, instant).unwrap());
+        drop(pollster::block_on(facts.maintain_at(&mut store, &before, instant)).unwrap());
         let reader = store.snapshot().unwrap();
         let observed = reader.collection_at(facts.rank9(), instant).unwrap();
         let view = observed.view::<FactArchive>().unwrap();

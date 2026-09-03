@@ -537,7 +537,7 @@ pub fn latest_intent<P: TriblePattern>(
 
 /// Capture Body facts and attach the maintained intent LWW index for that
 /// exact source cover, constructing missing derived artifacts if necessary.
-pub fn materialize_indexed_collection(
+pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
@@ -558,10 +558,12 @@ pub fn materialize_indexed_collection(
     drop(
         collection
             .maintain_exact(pile, &support)
+            .await
             .context("maintain Body fact collection")?,
     );
     let store_snapshot = pile
         .maintain_exact::<RegisterCoordinatesMapping>(target, &support)
+        .await
         .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
     let facts = store_snapshot
         .collection_exact(collection.rank9(), &support)

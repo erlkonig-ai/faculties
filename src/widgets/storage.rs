@@ -506,7 +506,7 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match load_consistent_inputs(&self.pile_path, &self.sources) {
+        match pollster::block_on(load_consistent_inputs(&self.pile_path, &self.sources)) {
             Ok((inputs, stamp)) => {
                 self.datasets = Some(inputs.datasets);
                 self.secrets = inputs.secrets;
@@ -614,13 +614,13 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     })
 }
 
-fn load_consistent_inputs(
+async fn load_consistent_inputs(
     path: &Path,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<(LoadedInputs, FileStamp), String> {
     for _ in 0..2 {
         let before = file_stamp(path)?;
-        let inputs = load_inputs(path, sources)?;
+        let inputs = load_inputs(path, sources).await?;
         let after = file_stamp(path)?;
         if before == after {
             return Ok((inputs, after));
@@ -632,12 +632,12 @@ fn load_consistent_inputs(
     ))
 }
 
-fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
+async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
     let signer = load_signer(path, None)
         .map_err(|error| format!("load durable collection signer: {error:#}"))?;
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
-    let loaded = (|| {
+    let loaded = async {
         let mut by_scope = BTreeMap::<Id, (FactCollection, Support)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
@@ -690,6 +690,7 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
             drop(
                 collection
                     .maintain_exact(&mut pile, support)
+                    .await
                     .map_err(|error| format!("maintain {label} fact archive: {error:#}"))?,
             );
         }
@@ -699,6 +700,7 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
         {
             drop(
                 pile.maintain_exact::<RegisterCoordinatesMapping>(target, support)
+                    .await
                     .map_err(|error| format!("maintain Compass status register: {error}"))?,
             );
         }
@@ -708,20 +710,24 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
         {
             drop(
                 pile.maintain_exact::<ObserveStatesMapping>(target, support)
+                    .await
                     .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
             );
         }
 
-        let secrets = sources
-            .contains(&SourceKey::Secrets)
-            .then(|| {
-                let collection = open_secrets_collection_read(&mut pile, signer.verifying_key())
+        let secrets = if sources.contains(&SourceKey::Secrets) {
+            let collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)
                     .map_err(|error| format!("open configured Secrets collection: {error:#}"))?;
-                secret_storage::ensure_and_snapshot(&mut pile, [collection])
+            Some(
+                secret_storage::ensure_and_snapshot(&mut pile, [collection], instant)
+                    .await
                     .map(LoadedSecrets::new)
-                    .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))
-            })
-            .transpose()?;
+                    .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?,
+            )
+        } else {
+            None
+        };
 
         // Secrets discovery already owns the final immutable snapshot when it
         // participates. Reuse it so all facts, attachments, and credentials
@@ -809,7 +815,8 @@ fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInput
             })
             .collect();
         Ok(LoadedInputs { datasets, secrets })
-    })();
+    }
+    .await;
 
     let closed = pile.close().map_err(|error| format!("close pile: {error}"));
     match (loaded, closed) {
@@ -1067,7 +1074,8 @@ mod tests {
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_before = collection.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
         pile.close().unwrap();
 
         let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
@@ -1087,7 +1095,8 @@ mod tests {
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_after = collection.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let cover_after = collection.admitted_at(&store_snapshot, instant).unwrap();
         pile.close().unwrap();
         assert_eq!(cover_after, cover_before);
     }

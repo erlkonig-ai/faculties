@@ -290,7 +290,7 @@ impl WebStorage<'_> {
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let source = open_configured(&mut pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
             let headspace = FactCollection::new(&mut pile, source)
                 .context("register maintained Headspace fact collection")?;
@@ -311,13 +311,16 @@ impl WebStorage<'_> {
             drop(
                 headspace
                     .maintain_exact(&mut pile, &support)
+                    .await
                     .context("maintain Headspace fact collection")?,
             );
 
             let secrets_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-            let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection])
-                .context("ensure configured Secrets collection")?;
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
+            let secrets =
+                secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
+                    .await
+                    .context("ensure configured Secrets collection")?;
 
             // Secrets discovery owns a later immutable pile snapshot. Attach
             // the exact maintained Headspace support through that same world,
@@ -334,7 +337,7 @@ impl WebStorage<'_> {
                 tavily: open_web_secret(&secrets, &signer, &versions.tavily, "Tavily")?,
                 exa: open_web_secret(&secrets, &signer, &versions.exa, "Exa")?,
             })
-        })();
+        });
         finish_pile(pile, result, "credential read")
     }
 
@@ -947,7 +950,8 @@ mod tests {
         let collection = FactCollection::new(&mut pile, source).unwrap();
         let before = pile.snapshot().unwrap();
         let instant = clock::now().unwrap();
-        let store_snapshot = collection.maintain_at(&mut pile, &before, instant).unwrap();
+        let store_snapshot =
+            pollster::block_on(collection.maintain_at(&mut pile, &before, instant)).unwrap();
         let facts = store_snapshot
             .collection_at(collection.rank9(), instant)
             .unwrap()

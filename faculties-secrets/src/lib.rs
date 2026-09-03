@@ -18,6 +18,7 @@ use dryoc::dryocbox::{DryocBox, KeyPair as BoxKeyPair, PublicKey as BoxPublicKey
 use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::types::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
@@ -99,18 +100,20 @@ impl SecretsView {
 /// collection registry is introduced merely to find ciphertext.
 pub struct SecretsSnapshot<R> {
     store_snapshot: R,
+    instant: Epoch,
     collections: Vec<SecretsView>,
     facts: Option<SecretsFacts>,
 }
 
 impl<R> SecretsSnapshot<R> {
-    pub(crate) fn new(store_snapshot: R, collections: Vec<SecretsView>) -> Self {
+    pub(crate) fn new(store_snapshot: R, instant: Epoch, collections: Vec<SecretsView>) -> Self {
         let facts = collections
             .iter()
             .map(|view| view.facts.clone())
             .reduce(|left, right| left.union(&right));
         Self {
             store_snapshot,
+            instant,
             collections,
             facts,
         }
@@ -118,6 +121,11 @@ impl<R> SecretsSnapshot<R> {
 
     pub fn store_snapshot(&self) -> &R {
         &self.store_snapshot
+    }
+
+    /// Authorization instant shared by every collection view in this snapshot.
+    pub const fn instant(&self) -> Epoch {
+        self.instant
     }
 
     pub fn collections(&self) -> &[SecretsView] {

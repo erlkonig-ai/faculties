@@ -23,5 +23,6 @@ triblespace = { version = "0.47", path = "../../triblespace-rs" }
 zeroize = "1.9"
 
 [dev-dependencies]
+pollster = "0.4"
 rand_core = "0.6.4"
 tempfile = "3"

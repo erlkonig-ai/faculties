@@ -160,9 +160,7 @@ impl DiscordSession<'_> {
             .snapshot()
             .context("freeze Discord post-commit source snapshot")?;
         let instant = faculties::clock::now()?;
-        self.reader = self
-            .maintained
-            .maintain_at(self.pile, &before, instant)
+        self.reader = pollster::block_on(self.maintained.maintain_at(self.pile, &before, instant))
             .context("maintain Discord fact collection after commit")?;
         self.facts = self
             .reader
@@ -199,8 +197,9 @@ impl DiscordStorage<'_> {
             let snapshot = pile
                 .snapshot()
                 .context("freeze Discord WRITE-admission preflight")?;
+            let instant = faculties::clock::now()?;
             if !collection
-                .writer_is_admitted(&snapshot, signer.verifying_key())
+                .writer_is_admitted_at(&snapshot, signer.verifying_key(), instant)
                 .context("check Discord collection WRITE admission")?
             {
                 bail!("durable signer is not admitted to WRITE the Discord collection");
@@ -224,9 +223,9 @@ impl DiscordStorage<'_> {
                 .snapshot()
                 .context("freeze Discord pre-maintenance snapshot")?;
             let instant = faculties::clock::now()?;
-            let store_snapshot = maintained
-                .maintain_at(&mut pile, &before, instant)
-                .context("maintain Discord fact collection")?;
+            let store_snapshot =
+                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
+                    .context("maintain Discord fact collection")?;
             let facts = store_snapshot
                 .collection_at(maintained.rank9(), instant)
                 .context("observe maintained Discord fact collection")?

@@ -192,8 +192,6 @@ impl Storage<'_> {
         let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
         let collection = FactCollection::new(pile, source)
             .context("register maintained Headspace fact collection")?;
-        let secrets_collection = open_secrets_collection_read(pile, self.signer.verifying_key())?;
-
         // One frozen source watermark decides the exact Headspace support.
         // Maintenance and Secrets discovery may append physical views, but
         // cannot move that semantic boundary.
@@ -201,20 +199,25 @@ impl Storage<'_> {
             .snapshot()
             .context("freeze Headspace source snapshot")?;
         let instant = clock::now()?;
+        let secrets_collection =
+            open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
         let support = before
             .collection_at(collection.source(), instant)
             .context("observe resident Headspace collection")?
             .support()
             .clone();
         drop(before);
-        drop(
-            collection
-                .maintain_exact(pile, &support)
-                .context("maintain Headspace fact collection")?,
-        );
-
-        let secrets = secret_storage::ensure_and_snapshot(pile, [secrets_collection])
-            .context("ensure configured Secrets collection")?;
+        let secrets = pollster::block_on(async {
+            drop(
+                collection
+                    .maintain_exact(pile, &support)
+                    .await
+                    .context("maintain Headspace fact collection")?,
+            );
+            secret_storage::ensure_and_snapshot(pile, [secrets_collection], instant)
+                .await
+                .context("ensure configured Secrets collection")
+        })?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
         let reader = secrets.store_snapshot().clone();

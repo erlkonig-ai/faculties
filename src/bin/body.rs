@@ -445,8 +445,7 @@ impl BodyStorage<'_> {
                 .context("register maintained Body fact collection")?;
             let before = pile.snapshot().context("freeze Body source snapshot")?;
             let instant = triblespace::core::clock::epoch_now();
-            let store_snapshot = collection
-                .maintain_at(pile, &before, instant)
+            let store_snapshot = pollster::block_on(collection.maintain_at(pile, &before, instant))
                 .context("maintain Body fact collection")?;
             let facts = store_snapshot
                 .collection_at(collection.rank9(), instant)
@@ -462,7 +461,8 @@ impl BodyStorage<'_> {
         f: impl FnOnce(&body_model::BodySnapshot) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let snapshot = body_model::materialize_indexed_collection(pile, signer)?;
+            let snapshot =
+                pollster::block_on(body_model::materialize_indexed_collection(pile, signer))?;
             f(&snapshot)
         })
     }
@@ -1292,7 +1292,10 @@ mod tests {
         let collection =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, first).unwrap();
-        let before = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
+        let before = pollster::block_on(body_model::materialize_indexed_collection(
+            &mut pile, &signer,
+        ))
+        .unwrap();
         assert_eq!(
             body_model::latest_intent(before.facts(), before.intent_register())
                 .unwrap()
@@ -1304,7 +1307,10 @@ mod tests {
         let second = intent_fragment("second", at_unix(1_760_000_000.0));
         let second_id = second.root().unwrap();
         pile.commit(collection, &signer, second).unwrap();
-        let after = body_model::materialize_indexed_collection(&mut pile, &signer).unwrap();
+        let after = pollster::block_on(body_model::materialize_indexed_collection(
+            &mut pile, &signer,
+        ))
+        .unwrap();
 
         assert_eq!(
             body_model::latest_intent(before.facts(), before.intent_register())

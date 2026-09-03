@@ -18,8 +18,11 @@ use triblespace::core::collection::{
     collection_read_audience_at, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt,
 };
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::SnapshotSource;
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreSnapshot};
+use triblespace::core::repo::{
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, Store, StoreRead, StoreSnapshot,
+};
 use triblespace::macros::{find, pattern};
 
 use super::{
@@ -110,73 +113,77 @@ impl SecretsCollection {
     ///
     /// This constructs only what the requested support needs. It does not run
     /// LSM compaction policy and is therefore the normal foreground read path.
-    pub fn ensure_exact<S>(
+    pub async fn ensure_exact<S>(
         self,
         store: &mut S,
         support: &triblespace::core::collection::Support,
     ) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         drop(
             store
                 .ensure_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .await
                 .context("ensure Succinct Secrets collection")?,
         );
         store
             .ensure_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .await
             .context("ensure Rank9 Secrets collection")
     }
 
-    /// Ensure the current admitted source support without compacting it.
-    pub fn ensure<S>(self, store: &mut S) -> Result<S::Snapshot>
+    /// Ensure the source support admitted at the caller's authorization instant.
+    pub async fn ensure<S>(self, store: &mut S, instant: hifitime::Epoch) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         let before = store
             .snapshot()
             .context("freeze Secrets support before ensure")?;
         let support = self
             .source
-            .admitted(&before)
+            .admitted_at(&before, instant)
             .context("admit Secrets source support")?;
         drop(before);
-        self.ensure_exact(store, &support)
+        self.ensure_exact(store, &support).await
     }
 
     /// Maintain both derived lattices for one exact foundational support.
-    pub fn maintain_exact<S>(
+    pub async fn maintain_exact<S>(
         self,
         store: &mut S,
         support: &triblespace::core::collection::Support,
     ) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         drop(
             store
                 .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .await
                 .context("maintain Succinct Secrets collection")?,
         );
         store
             .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .await
             .context("maintain Rank9 Secrets collection")
     }
 
-    /// Maintain both derived lattices for the current admitted source support.
-    pub fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
+    /// Maintain the source support admitted at the caller's authorization instant.
+    pub async fn maintain<S>(self, store: &mut S, instant: hifitime::Epoch) -> Result<S::Snapshot>
     where
-        S: Store + CollectionStoreExt,
+        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         let before = store
             .snapshot()
             .context("freeze Secrets support before maintenance")?;
         let support = self
             .source
-            .admitted(&before)
+            .admitted_at(&before, instant)
             .context("admit Secrets source support")?;
         drop(before);
-        self.maintain_exact(store, &support)
+        self.maintain_exact(store, &support).await
     }
 }
 
@@ -184,20 +191,19 @@ impl SecretsCollection {
 ///
 /// This never performs maintenance. It reports exactly the support physically
 /// realized in `snapshot`, preserving the snapshot/derivation boundary.
-pub fn snapshot<R, I>(store_snapshot: R, collections: I) -> Result<SecretsSnapshot<R>>
+pub fn snapshot<R, I>(
+    store_snapshot: R,
+    collections: I,
+    instant: hifitime::Epoch,
+) -> Result<SecretsSnapshot<R>>
 where
-    R: StoreSnapshot
-        + BlobStoreGet
-        + triblespace::core::repo::BlobStoreList
-        + triblespace::core::repo::BlobStoreMeta
-        + triblespace::core::collection::CollectionRead
-        + triblespace::core::repo::CapabilityProofRead,
+    R: StoreRead,
     I: IntoIterator<Item = SecretsCollection>,
 {
     let mut views = Vec::new();
     for collection in collections {
         let observed = store_snapshot
-            .collection(collection.rank9)
+            .collection_at(collection.rank9, instant)
             .context("observe maintained Secrets collection")?;
         if observed.cover().is_empty() {
             continue;
@@ -208,17 +214,18 @@ where
             .context("read maintained Secrets collection")?;
         views.push(SecretsView::new(collection.handle(), support, facts));
     }
-    Ok(SecretsSnapshot::new(store_snapshot, views))
+    Ok(SecretsSnapshot::new(store_snapshot, instant, views))
 }
 
-/// Maintain each explicit policy boundary, then freeze and attach one shared
-/// store snapshot.
-pub fn maintain_and_snapshot<S, I>(
+/// Maintain each explicit policy boundary at one caller-selected authorization
+/// instant, then freeze and attach one shared store snapshot.
+pub async fn maintain_and_snapshot<S, I>(
     store: &mut S,
     collections: I,
+    instant: hifitime::Epoch,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
-    S: Store + CollectionStoreExt,
+    S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     I: IntoIterator<Item = SecretsCollection>,
 {
     let collections = collections.into_iter().collect::<Vec<_>>();
@@ -230,31 +237,33 @@ where
         .map(|collection| {
             collection
                 .source
-                .admitted(&before)
+                .admitted_at(&before, instant)
                 .context("admit Secrets source support")
         })
         .collect::<Result<Vec<_>>>()?;
     drop(before);
     for (collection, support) in collections.iter().zip(&supports) {
-        drop(collection.maintain_exact(store, support)?);
+        drop(collection.maintain_exact(store, support).await?);
     }
     let store_snapshot = store
         .snapshot()
         .context("freeze maintained Secrets snapshot")?;
-    snapshot(store_snapshot, collections)
+    snapshot(store_snapshot, collections, instant)
 }
 
-/// Ensure each explicit policy boundary, then attach one shared snapshot.
+/// Ensure each explicit policy boundary at one caller-selected authorization
+/// instant, then attach one shared snapshot.
 ///
 /// All source supports are selected from one frozen prefix. This is the
 /// ordinary consumer path; unlike [`maintain_and_snapshot`] it performs no
 /// opportunistic LSM compaction.
-pub fn ensure_and_snapshot<S, I>(
+pub async fn ensure_and_snapshot<S, I>(
     store: &mut S,
     collections: I,
+    instant: hifitime::Epoch,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
-    S: Store + CollectionStoreExt,
+    S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     I: IntoIterator<Item = SecretsCollection>,
 {
     let collections = collections.into_iter().collect::<Vec<_>>();
@@ -266,30 +275,30 @@ where
         .map(|collection| {
             collection
                 .source
-                .admitted(&before)
+                .admitted_at(&before, instant)
                 .context("admit Secrets source support")
         })
         .collect::<Result<Vec<_>>>()?;
     drop(before);
     for (collection, support) in collections.iter().zip(&supports) {
-        drop(collection.ensure_exact(store, support)?);
+        drop(collection.ensure_exact(store, support).await?);
     }
     let store_snapshot = store
         .snapshot()
         .context("freeze ensured Secrets snapshot")?;
-    snapshot(store_snapshot, collections)
+    snapshot(store_snapshot, collections, instant)
 }
 
-fn admitted_readers<R>(snapshot: &R, collection: SecretsCollection) -> Result<Vec<VerifyingKey>>
+fn admitted_readers<R>(
+    snapshot: &R,
+    collection: SecretsCollection,
+    instant: hifitime::Epoch,
+) -> Result<Vec<VerifyingKey>>
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
-    match collection_read_audience_at(
-        snapshot,
-        collection.handle(),
-        triblespace::core::clock::epoch_now(),
-    )
-    .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?
+    match collection_read_audience_at(snapshot, collection.handle(), instant)
+        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?
     {
         CollectionReadAudience::Open => {
             bail!("cannot seal a finite DEK envelope set for an open-read collection")
@@ -317,10 +326,11 @@ pub fn add_secret<S>(
 where
     S: Store + CollectionStoreExt,
 {
+    let instant = triblespace::core::clock::epoch_now();
     let snapshot = store
         .snapshot()
         .context("freeze Secrets audience before publication")?;
-    let recipients = admitted_readers(&snapshot, collection)?;
+    let recipients = admitted_readers(&snapshot, collection, instant)?;
     drop(snapshot);
     let sealed = seal_version(name, plaintext, recipients, created_at)?;
     let secret = sealed.secret;
@@ -344,7 +354,7 @@ pub fn maintain_recipient_envelopes<S, R>(
 ) -> Result<usize>
 where
     S: Store + CollectionStoreExt,
-    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    R: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     let Some(view) = secrets
         .collections()
@@ -356,7 +366,7 @@ where
     let Some(facts) = secrets.facts() else {
         return Ok(0);
     };
-    let recipients = admitted_readers(secrets.store_snapshot(), collection)?;
+    let recipients = admitted_readers(secrets.store_snapshot(), collection, secrets.instant())?;
     let secret_ids = find!(
         id: triblespace::core::id::Id,
         pattern!(view.facts(), [{
@@ -410,33 +420,39 @@ mod tests {
 
     #[test]
     fn collection_write_maintain_and_read_round_trip() {
-        let alice = SigningKey::generate(&mut OsRng);
-        let bob = SigningKey::generate(&mut OsRng);
-        let mut store = MemoryRepo::default();
-        let collection = SecretsCollection::register(
-            &mut store,
-            "production-secrets",
-            direct_policy(alice.verifying_key()),
-        )
-        .unwrap();
-        grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
+        pollster::block_on(async {
+            let alice = SigningKey::generate(&mut OsRng);
+            let bob = SigningKey::generate(&mut OsRng);
+            let mut store = MemoryRepo::default();
+            let collection = SecretsCollection::register(
+                &mut store,
+                "production-secrets",
+                direct_policy(alice.verifying_key()),
+            )
             .unwrap();
+            grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
+                .unwrap();
 
-        let secret = add_secret(
-            &mut store,
-            &alice,
-            collection,
-            "database",
-            b"hunter2",
-            at(1),
-        )
-        .unwrap();
-        let secrets = maintain_and_snapshot(&mut store, [collection]).unwrap();
+            let secret = add_secret(
+                &mut store,
+                &alice,
+                collection,
+                "database",
+                b"hunter2",
+                at(1),
+            )
+            .unwrap();
+            let instant = Epoch::from_unix_seconds(100.0);
+            let secrets = maintain_and_snapshot(&mut store, [collection], instant)
+                .await
+                .unwrap();
 
-        assert_eq!(secrets.collections().len(), 1);
-        assert!(secrets.contains(secret));
-        assert_eq!(secrets.open(secret, &alice).unwrap(), b"hunter2");
-        assert_eq!(secrets.open(secret, &bob).unwrap(), b"hunter2");
+            assert_eq!(secrets.instant(), instant);
+            assert_eq!(secrets.collections().len(), 1);
+            assert!(secrets.contains(secret));
+            assert_eq!(secrets.open(secret, &alice).unwrap(), b"hunter2");
+            assert_eq!(secrets.open(secret, &bob).unwrap(), b"hunter2");
+        });
     }
 
     #[test]
@@ -459,129 +475,159 @@ mod tests {
 
     #[test]
     fn an_offline_commit_can_be_admitted_by_later_write_evidence() {
-        let owner = SigningKey::generate(&mut OsRng);
-        let offline_writer = SigningKey::generate(&mut OsRng);
-        let mut store = MemoryRepo::default();
-        let collection = SecretsCollection::register(
-            &mut store,
-            "offline-secrets",
-            direct_policy(owner.verifying_key()),
-        )
-        .unwrap();
+        pollster::block_on(async {
+            let owner = SigningKey::generate(&mut OsRng);
+            let offline_writer = SigningKey::generate(&mut OsRng);
+            let mut store = MemoryRepo::default();
+            let collection = SecretsCollection::register(
+                &mut store,
+                "offline-secrets",
+                direct_policy(owner.verifying_key()),
+            )
+            .unwrap();
 
-        let secret = add_secret(
-            &mut store,
-            &offline_writer,
-            collection,
-            "token",
-            b"authored offline",
-            at(3),
-        )
-        .unwrap();
-        let before = ensure_and_snapshot(&mut store, [collection]).unwrap();
-        assert!(!before.contains(secret));
-        drop(before);
+            let secret = add_secret(
+                &mut store,
+                &offline_writer,
+                collection,
+                "token",
+                b"authored offline",
+                at(3),
+            )
+            .unwrap();
+            let before =
+                ensure_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert!(!before.contains(secret));
+            drop(before);
 
-        grant_collection_write(
-            &mut store,
-            collection.handle(),
-            &owner,
-            offline_writer.verifying_key(),
-        )
-        .unwrap();
-        let after = ensure_and_snapshot(&mut store, [collection]).unwrap();
-        assert_eq!(after.open(secret, &owner).unwrap(), b"authored offline");
+            grant_collection_write(
+                &mut store,
+                collection.handle(),
+                &owner,
+                offline_writer.verifying_key(),
+            )
+            .unwrap();
+            let after =
+                ensure_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert_eq!(after.open(secret, &owner).unwrap(), b"authored offline");
+        });
     }
 
     #[test]
     fn newly_admitted_reader_gets_an_additive_wrap() {
-        let alice = SigningKey::generate(&mut OsRng);
-        let bob = SigningKey::generate(&mut OsRng);
-        let mut store = MemoryRepo::default();
-        let collection = SecretsCollection::register(
-            &mut store,
-            "shared-secrets",
-            direct_policy(alice.verifying_key()),
-        )
-        .unwrap();
-        let first = add_secret(&mut store, &alice, collection, "token", b"value", at(4)).unwrap();
-        let second =
-            add_secret(&mut store, &alice, collection, "password", b"other", at(5)).unwrap();
-        let before = maintain_and_snapshot(&mut store, [collection]).unwrap();
-        assert!(before.open(first, &bob).is_err());
-        assert!(before.open(second, &bob).is_err());
-
-        grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
+        pollster::block_on(async {
+            let alice = SigningKey::generate(&mut OsRng);
+            let bob = SigningKey::generate(&mut OsRng);
+            let mut store = MemoryRepo::default();
+            let collection = SecretsCollection::register(
+                &mut store,
+                "shared-secrets",
+                direct_policy(alice.verifying_key()),
+            )
             .unwrap();
-        let current = maintain_and_snapshot(&mut store, [collection]).unwrap();
-        let added =
-            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap();
-        assert_eq!(added, 2);
+            let first =
+                add_secret(&mut store, &alice, collection, "token", b"value", at(4)).unwrap();
+            let second =
+                add_secret(&mut store, &alice, collection, "password", b"other", at(5)).unwrap();
+            let before =
+                maintain_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert!(before.open(first, &bob).is_err());
+            assert!(before.open(second, &bob).is_err());
 
-        let after = maintain_and_snapshot(&mut store, [collection]).unwrap();
-        assert_eq!(after.open(first, &bob).unwrap(), b"value");
-        assert_eq!(after.open(second, &bob).unwrap(), b"other");
+            grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
+                .unwrap();
+            let current =
+                maintain_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            let added =
+                maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
+                    .unwrap();
+            assert_eq!(added, 2);
+
+            let after =
+                maintain_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert_eq!(after.open(first, &bob).unwrap(), b"value");
+            assert_eq!(after.open(second, &bob).unwrap(), b"other");
+        });
     }
 
     #[test]
     fn configured_collection_views_conjoin_before_querying() {
-        let alice = SigningKey::generate(&mut OsRng);
-        let bob = SigningKey::generate(&mut OsRng);
-        let policy = direct_policy(alice.verifying_key());
-        let mut store = MemoryRepo::default();
-        let left = SecretsCollection::register(&mut store, "split-secret", policy.clone()).unwrap();
-        let right = SecretsCollection::register(&mut store, "split-wrap", policy).unwrap();
-        let sealed =
-            seal_version("split", b"still one entity", [alice.verifying_key()], at(6)).unwrap();
-        let secret = sealed.secret;
-        let (_, facts, metafacts, blobs) = sealed.fragment.into_parts();
-        let mut secret_facts = triblespace::core::trible::TribleSet::new();
-        let mut wrap_facts = triblespace::core::trible::TribleSet::new();
-        for fact in facts.iter() {
-            if fact.e() == &secret {
-                secret_facts.insert(fact);
-            } else {
-                wrap_facts.insert(fact);
+        pollster::block_on(async {
+            let alice = SigningKey::generate(&mut OsRng);
+            let bob = SigningKey::generate(&mut OsRng);
+            let policy = direct_policy(alice.verifying_key());
+            let mut store = MemoryRepo::default();
+            let left =
+                SecretsCollection::register(&mut store, "split-secret", policy.clone()).unwrap();
+            let right = SecretsCollection::register(&mut store, "split-wrap", policy).unwrap();
+            let sealed =
+                seal_version("split", b"still one entity", [alice.verifying_key()], at(6)).unwrap();
+            let secret = sealed.secret;
+            let (_, facts, metafacts, blobs) = sealed.fragment.into_parts();
+            let mut secret_facts = triblespace::core::trible::TribleSet::new();
+            let mut wrap_facts = triblespace::core::trible::TribleSet::new();
+            for fact in facts.iter() {
+                if fact.e() == &secret {
+                    secret_facts.insert(fact);
+                } else {
+                    wrap_facts.insert(fact);
+                }
             }
-        }
-        let wrap = *wrap_facts
-            .iter()
-            .next()
-            .expect("sealed version has a wrap")
-            .e();
-        store
-            .commit(
-                left.source(),
-                &alice,
-                triblespace::core::trible::Fragment::rooted_from_parts(
-                    secret,
-                    secret_facts,
-                    metafacts.clone(),
-                    blobs.clone(),
-                ),
-            )
-            .unwrap();
-        store
-            .commit(
-                right.source(),
-                &alice,
-                triblespace::core::trible::Fragment::rooted_from_parts(
-                    wrap, wrap_facts, metafacts, blobs,
-                ),
-            )
-            .unwrap();
+            let wrap = *wrap_facts
+                .iter()
+                .next()
+                .expect("sealed version has a wrap")
+                .e();
+            store
+                .commit(
+                    left.source(),
+                    &alice,
+                    triblespace::core::trible::Fragment::rooted_from_parts(
+                        secret,
+                        secret_facts,
+                        metafacts.clone(),
+                        blobs.clone(),
+                    ),
+                )
+                .unwrap();
+            store
+                .commit(
+                    right.source(),
+                    &alice,
+                    triblespace::core::trible::Fragment::rooted_from_parts(
+                        wrap, wrap_facts, metafacts, blobs,
+                    ),
+                )
+                .unwrap();
 
-        grant_collection_read(&mut store, left.handle(), &alice, bob.verifying_key()).unwrap();
-        let secrets = maintain_and_snapshot(&mut store, [left, right]).unwrap();
-        assert!(secrets.contains(secret));
-        assert_eq!(secrets.open(secret, &alice).unwrap(), b"still one entity");
+            grant_collection_read(&mut store, left.handle(), &alice, bob.verifying_key()).unwrap();
+            let secrets =
+                maintain_and_snapshot(&mut store, [left, right], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert!(secrets.contains(secret));
+            assert_eq!(secrets.open(secret, &alice).unwrap(), b"still one entity");
 
-        let added =
-            maintain_recipient_envelopes(&mut store, &alice, &secrets, left, &alice).unwrap();
-        assert_eq!(added, 2);
-        drop(secrets);
+            let added =
+                maintain_recipient_envelopes(&mut store, &alice, &secrets, left, &alice).unwrap();
+            assert_eq!(added, 2);
+            drop(secrets);
 
-        let left_only = ensure_and_snapshot(&mut store, [left]).unwrap();
-        assert_eq!(left_only.open(secret, &bob).unwrap(), b"still one entity");
+            let left_only =
+                ensure_and_snapshot(&mut store, [left], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert_eq!(left_only.open(secret, &bob).unwrap(), b"still one entity");
+        });
     }
 }

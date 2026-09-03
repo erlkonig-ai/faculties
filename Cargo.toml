@@ -176,6 +176,7 @@ dirs = "5"                  # wiki
 hex = "0.4"                 # gauge
 zeroize = "1.9"             # secrets CLI plaintext lifetime
 humantime = "2.3.0"         # orient, patience
+pollster = "0.4"            # explicit blocking boundary for local CLI/UI collection maintenance
 ical = "0.11"               # planner
 itertools = "0.14"          # wiki
 kamadak-exif = "0.6"        # posture (EXIF/TIFF tags on images)

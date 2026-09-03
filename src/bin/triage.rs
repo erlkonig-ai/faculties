@@ -190,16 +190,21 @@ impl TriageSnapshot {
             .collect::<Result<Vec<Support>>>()?;
         drop(before);
 
-        for ((_, label, facts), support) in registered.iter().zip(&supports) {
-            drop(
-                facts
-                    .maintain_exact(&mut pile, support)
-                    .with_context(|| format!("maintain {label} fact archive"))?,
-            );
-        }
-        let secrets_collection = open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-        let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection])
-            .context("ensure configured Secrets collection")?;
+        let secrets_collection =
+            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
+        let secrets = pollster::block_on(async {
+            for ((_, label, facts), support) in registered.iter().zip(&supports) {
+                drop(
+                    facts
+                        .maintain_exact(&mut pile, support)
+                        .await
+                        .with_context(|| format!("maintain {label} fact archive"))?,
+                );
+            }
+            secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
+                .await
+                .context("ensure configured Secrets collection")
+        })?;
 
         // Secrets attachment already owns the one later immutable snapshot.
         // Reuse it so facts, attachments, and credentials inhabit literally

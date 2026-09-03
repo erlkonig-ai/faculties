@@ -239,7 +239,7 @@ impl CompassStorage<'_> {
         f: impl FnOnce(&FactArchive, &PileSnapshot, &LwwIndex) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer| {
-            let view = compass::materialize_indexed_collection(pile, signer)?;
+            let view = pollster::block_on(compass::materialize_indexed_collection(pile, signer))?;
             f(view.facts(), view.store_snapshot(), view.status_register())
         })
     }
@@ -271,18 +271,23 @@ impl CompassStorage<'_> {
             let before = pile
                 .snapshot()
                 .context("freeze shared Compass/Relations source snapshot")?;
-            drop(
-                compass_facts
-                    .maintain_at(pile, &before, instant)
-                    .context("maintain Compass fact collection")?,
-            );
-            if let Some(relation_facts) = relation_facts {
+            pollster::block_on(async {
                 drop(
-                    relation_facts
+                    compass_facts
                         .maintain_at(pile, &before, instant)
-                        .context("maintain Relations fact collection for Compass persona")?,
+                        .await
+                        .context("maintain Compass fact collection")?,
                 );
-            }
+                if let Some(relation_facts) = relation_facts {
+                    drop(
+                        relation_facts
+                            .maintain_at(pile, &before, instant)
+                            .await
+                            .context("maintain Relations fact collection for Compass persona")?,
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
             drop(before);
 
             // Attach every view through one immutable post-maintenance store

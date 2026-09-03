@@ -1602,7 +1602,8 @@ pub fn read_catalog_strict(pile_path: &Path, key_path: Option<&Path>) -> Result<
         let store_snapshot = pile
             .snapshot()
             .context("freeze native Habit store snapshot")?;
-        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+        let instant = triblespace::core::clock::epoch_now();
+        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
             .context("read native Habit collection")?;
         load_catalog(&store_snapshot, &facts).context("strictly validate native Habit catalog")
     })();

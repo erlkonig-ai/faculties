@@ -3498,10 +3498,15 @@ mod tests {
         fn views(&self) -> Views {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
+            let instant = triblespace::core::clock::epoch_now();
             let secrets_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
-            let secrets =
-                secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection]).unwrap();
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
+            let secrets = pollster::block_on(secret_storage::ensure_and_snapshot(
+                &mut pile,
+                [secrets_collection],
+                instant,
+            ))
+            .unwrap();
             let mail = open_configured(
                 &mut pile,
                 mail_schema::DEFAULT_SCOPE_ID,
@@ -3527,9 +3532,11 @@ mod tests {
             )
             .unwrap();
             let store_snapshot = pile.snapshot().unwrap();
+            let instant = triblespace::core::clock::epoch_now();
             let materialize = |collection| {
                 let (facts, _) =
-                    crate::storage::read_fact_collection(collection, &store_snapshot).unwrap();
+                    crate::storage::read_fact_collection(collection, &store_snapshot, instant)
+                        .unwrap();
                 CollectionView {
                     facts,
                     reader: store_snapshot.clone(),

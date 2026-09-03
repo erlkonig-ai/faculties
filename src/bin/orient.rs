@@ -259,7 +259,7 @@ impl OrientSource {
         Ok(Self { facts, label })
     }
 
-    fn maintain_at(
+    async fn maintain_at(
         &self,
         pile: &mut Pile,
         snapshot: &PileSnapshot,
@@ -273,6 +273,7 @@ impl OrientSource {
         drop(
             self.facts
                 .maintain_exact(pile, &support)
+                .await
                 .with_context(|| format!("maintain {} fact collection", self.label))?,
         );
         Ok(support)
@@ -400,26 +401,35 @@ impl OrientObservation {
 ///
 /// Missing source blobs are simply outside that snapshot's collection value;
 /// a later append creates a later snapshot and another maintenance chance.
-fn maintain_sources_at(
+async fn maintain_sources_at(
     pile: &mut Pile,
     snapshot: &PileSnapshot,
     sources: &OrientSources,
     instant: Epoch,
 ) -> Result<OrientSupports> {
-    let messages = sources.messages.maintain_at(pile, snapshot, instant)?;
-    let mail = sources.mail.maintain_at(pile, snapshot, instant)?;
-    let teams = sources.teams.maintain_at(pile, snapshot, instant)?;
-    let compass = sources.compass.maintain_at(pile, snapshot, instant)?;
-    let relations = sources.relations.maintain_at(pile, snapshot, instant)?;
-    let status = sources.status.maintain_at(pile, snapshot, instant)?;
-    let habits = sources
-        .habits
-        .as_ref()
-        .map(|source| source.maintain_at(pile, snapshot, instant))
-        .transpose()?;
-    let presentations = sources.presentations.maintain_at(pile, snapshot, instant)?;
+    let messages = sources
+        .messages
+        .maintain_at(pile, snapshot, instant)
+        .await?;
+    let mail = sources.mail.maintain_at(pile, snapshot, instant).await?;
+    let teams = sources.teams.maintain_at(pile, snapshot, instant).await?;
+    let compass = sources.compass.maintain_at(pile, snapshot, instant).await?;
+    let relations = sources
+        .relations
+        .maintain_at(pile, snapshot, instant)
+        .await?;
+    let status = sources.status.maintain_at(pile, snapshot, instant).await?;
+    let habits = match sources.habits.as_ref() {
+        Some(source) => Some(source.maintain_at(pile, snapshot, instant).await?),
+        None => None,
+    };
+    let presentations = sources
+        .presentations
+        .maintain_at(pile, snapshot, instant)
+        .await?;
     drop(
         pile.maintain_exact::<RegisterCoordinatesMapping>(sources.compass_status, &compass)
+            .await
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
     Ok(OrientSupports {
@@ -491,27 +501,28 @@ fn observe_sources_at(
 /// Maintain from one frozen source boundary, then observe only the target
 /// state resident in the later boundary. `source_snapshot` remains the
 /// caller's polling watermark; it is not part of the semantic observation.
-fn maintain_and_observe_sources_at(
+async fn maintain_and_observe_sources_at(
     pile: &mut Pile,
     source_snapshot: &PileSnapshot,
     sources: &OrientSources,
     instant: Epoch,
 ) -> Result<OrientObservation> {
-    let supports = maintain_sources_at(pile, source_snapshot, sources, instant)?;
+    let supports = maintain_sources_at(pile, source_snapshot, sources, instant).await?;
     let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
     observe_sources_at(snapshot, sources, &supports, instant)
 }
 
-fn maintain_and_observe_sources(
+async fn maintain_and_observe_sources(
     pile: &mut Pile,
     sources: &OrientSources,
+    instant: Epoch,
 ) -> Result<OrientObservation> {
     let source_snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_sources_at(pile, &source_snapshot, sources, clock::now()?)
+    maintain_and_observe_sources_at(pile, &source_snapshot, sources, instant).await
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2124,28 +2135,30 @@ fn save_presentations(
     Ok(())
 }
 
-fn cmd_baseline(pile_path: &Path, key: Option<&Path>, persona: Option<&str>) -> Result<()> {
+async fn cmd_baseline(pile_path: &Path, key: Option<&Path>, persona: Option<&str>) -> Result<()> {
     let Some(input) = persona else {
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
+        let instant = clock::now()?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
         let query = observation.query();
         let persona = resolve_native_persona(&query, input)?;
         let view = load_attention_view(&query, persona)?;
         let events = view.ids().collect::<Vec<_>>();
         save_presentations(&mut pile, &signer, persona, events.iter().copied())?;
         Ok(events.len())
-    })();
+    }
+    .await;
     let count = close_pile(pile, result)?;
     println!("Baselined {count} current attention event(s) for {input}.");
     Ok(())
 }
 
-fn cmd_show(
+async fn cmd_show(
     pile_path: &Path,
     key: Option<&Path>,
     persona: Option<&str>,
@@ -2157,9 +2170,10 @@ fn cmd_show(
 
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         let sources = OrientSources::open(&mut pile, &signer, true)?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
+        let instant = clock::now()?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
@@ -2172,7 +2186,7 @@ fn cmd_show(
                 .habits
                 .expect("Show opens the Habit source collection"),
             pile_path,
-            epoch_seconds(clock::now()?),
+            epoch_seconds(instant),
         )?);
         let (goals, goal_events) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
         let (window_status, status_events) = render_window_status(&query)?;
@@ -2201,7 +2215,8 @@ fn cmd_show(
             save_presentations(&mut pile, &signer, persona_id, shown)?;
         }
         Ok(())
-    })();
+    }
+    .await;
     close_pile(pile, result)
 }
 
@@ -2514,15 +2529,21 @@ fn close_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
-fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: bool) -> Result<()> {
+async fn cmd_poll(
+    pile_path: &Path,
+    key: Option<&Path>,
+    persona: Option<&str>,
+    peek: bool,
+) -> Result<()> {
     let Some(input) = persona else {
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources)?;
+        let instant = clock::now()?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
         let query = observation.query();
         let persona_id = match resolve_native_persona(&query, input) {
             Ok(persona) => persona,
@@ -2533,7 +2554,8 @@ fn cmd_poll(pile_path: &Path, key: Option<&Path>, persona: Option<&str>, peek: b
         };
         check_news_once(&mut pile, &signer, &query, persona_id, peek)?;
         Ok(())
-    })();
+    }
+    .await;
     close_pile(pile, result)
 }
 
@@ -2600,7 +2622,7 @@ impl WaitFrameLoad {
     }
 }
 
-fn load_wait_frame(
+async fn load_wait_frame(
     pile: &mut Pile,
     sources: &OrientSources,
     snapshot: PileSnapshot,
@@ -2608,7 +2630,7 @@ fn load_wait_frame(
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    let observation = maintain_and_observe_sources_at(pile, &snapshot, sources, instant)?;
+    let observation = maintain_and_observe_sources_at(pile, &snapshot, sources, instant).await?;
     let query = observation.query();
     let persona = match resolve_native_persona(&query, persona_input) {
         Ok(persona) => persona,
@@ -2694,7 +2716,7 @@ fn authorization_change_elapsed(boundary: Option<Epoch>, now: Epoch) -> bool {
     boundary.is_some_and(|boundary| now >= boundary)
 }
 
-fn cmd_wait(
+async fn cmd_wait(
     pile_path: &Path,
     key: Option<&Path>,
     persona: Option<&str>,
@@ -2707,7 +2729,7 @@ fn cmd_wait(
     let timeout = parse_wait_target(target.as_ref())?;
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         let sources = OrientSources::open(&mut pile, &signer, true)?;
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
@@ -2727,7 +2749,8 @@ fn cmd_wait(
             first_instant,
             pile_path,
             persona_input,
-        )?;
+        )
+        .await?;
         let mut observed_snapshot = attempt.watermark_snapshot().clone();
         let mut next_authorization_change = attempt.next_authorization_change();
 
@@ -2767,7 +2790,8 @@ fn cmd_wait(
                 instant,
                 pile_path,
                 persona_input,
-            )?;
+            )
+            .await?;
             observed_snapshot = attempt.watermark_snapshot().clone();
             next_authorization_change = attempt.next_authorization_change();
         };
@@ -2838,7 +2862,8 @@ fn cmd_wait(
 
             if storage_changed || authorization_changed {
                 let attempt =
-                    load_wait_frame(&mut pile, &sources, sampled, now, pile_path, persona_input)?;
+                    load_wait_frame(&mut pile, &sources, sampled, now, pile_path, persona_input)
+                        .await?;
                 observed_snapshot = attempt.watermark_snapshot().clone();
                 next_authorization_change = attempt.next_authorization_change();
                 match attempt {
@@ -2920,7 +2945,8 @@ fn cmd_wait(
                 });
             }
         }
-    })();
+    }
+    .await;
     let outcome = close_pile(pile, result)?;
     if outcome.news_printed {
         // Terse path: the News: reasons and the novel detail were already
@@ -2969,7 +2995,7 @@ fn render_tags(tags: &[String]) -> String {
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
 /// goals. Semantically read-only: it publishes no authoritative collection
 /// commits, though exact derived indexes may be maintained as cache exhaust.
-fn cmd_wake(
+async fn cmd_wake(
     pile_path: &Path,
     key: Option<&Path>,
     persona: Option<&str>,
@@ -2981,7 +3007,7 @@ fn cmd_wake(
 
     let signer = load_signer(pile_path, key)?;
     let mut storage = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         // Register every descriptor before freezing the one source watermark.
         // Maintenance may append derived lattice nodes; all reads attach only
         // after that work, from one later immutable pile snapshot.
@@ -3006,11 +3032,13 @@ fn cmd_wake(
         drop(
             memory_collection
                 .maintain_at(&mut storage, &source_snapshot, instant)
+                .await
                 .context("maintain Memory collection")?,
         );
         drop(
             wiki_collection
                 .maintain_exact(&mut storage, &wiki_support)
+                .await
                 .context("maintain Wiki collection")?,
         );
         drop(
@@ -3018,10 +3046,12 @@ fn cmd_wake(
                 .maintain_exact::<
                     triblespace::core::collection::observed_union::ObserveStatesMapping,
                 >(wiki_observed, &wiki_support)
+                .await
                 .context("maintain Wiki supersession index")?,
         );
         let observation =
-            maintain_and_observe_sources_at(&mut storage, &source_snapshot, &sources, instant)?;
+            maintain_and_observe_sources_at(&mut storage, &source_snapshot, &sources, instant)
+                .await?;
         drop(source_snapshot);
         let memory_facts = observation
             .snapshot
@@ -3090,11 +3120,16 @@ fn cmd_wake(
             )?;
         }
         Ok(())
-    })();
+    }
+    .await;
     close_pile(storage, result)
 }
 
 fn main() -> Result<()> {
+    pollster::block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
@@ -3107,37 +3142,48 @@ fn main() -> Result<()> {
             message_limit,
             doing_limit,
             todo_limit,
-        } => cmd_show(
-            &cli.pile,
-            cli.key.as_deref(),
-            cli.persona.as_deref(),
-            message_limit,
-            doing_limit,
-            todo_limit,
-        ),
-        Command::Wait { target, poll_ms } => cmd_wait(
-            &cli.pile,
-            cli.key.as_deref(),
-            cli.persona.as_deref(),
-            target,
-            poll_ms,
-        ),
+        } => {
+            cmd_show(
+                &cli.pile,
+                cli.key.as_deref(),
+                cli.persona.as_deref(),
+                message_limit,
+                doing_limit,
+                todo_limit,
+            )
+            .await
+        }
+        Command::Wait { target, poll_ms } => {
+            cmd_wait(
+                &cli.pile,
+                cli.key.as_deref(),
+                cli.persona.as_deref(),
+                target,
+                poll_ms,
+            )
+            .await
+        }
         Command::Wake {
             chars,
             doing_limit,
             todo_limit,
-        } => cmd_wake(
-            &cli.pile,
-            cli.key.as_deref(),
-            cli.persona.as_deref(),
-            chars,
-            doing_limit,
-            todo_limit,
-        ),
-        Command::Poll { peek } => {
-            cmd_poll(&cli.pile, cli.key.as_deref(), cli.persona.as_deref(), peek)
+        } => {
+            cmd_wake(
+                &cli.pile,
+                cli.key.as_deref(),
+                cli.persona.as_deref(),
+                chars,
+                doing_limit,
+                todo_limit,
+            )
+            .await
         }
-        Command::Baseline => cmd_baseline(&cli.pile, cli.key.as_deref(), cli.persona.as_deref()),
+        Command::Poll { peek } => {
+            cmd_poll(&cli.pile, cli.key.as_deref(), cli.persona.as_deref(), peek).await
+        }
+        Command::Baseline => {
+            cmd_baseline(&cli.pile, cli.key.as_deref(), cli.persona.as_deref()).await
+        }
     }
 }
 
@@ -3215,7 +3261,9 @@ mod tests {
         )
         .unwrap();
         let snapshot = pile.snapshot().unwrap();
-        let (facts, _) = faculties::storage::read_fact_collection(collection, &snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let (facts, _) =
+            faculties::storage::read_fact_collection(collection, &snapshot, instant).unwrap();
         presented_events(&facts, persona)
     }
 
@@ -3232,6 +3280,10 @@ mod tests {
 
     #[test]
     fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark() {
+        pollster::block_on(wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async())
+    }
+
+    async fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async() {
         let fixture = TestPile::new();
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
@@ -3268,6 +3320,7 @@ mod tests {
                 .messages
                 .facts
                 .maintain_at(&mut pile, &future, instant)
+                .await
                 .unwrap(),
         );
         let attempt = load_wait_frame(
@@ -3278,6 +3331,7 @@ mod tests {
             &fixture.path,
             "test-persona",
         )
+        .await
         .unwrap();
         let WaitFrameLoad::Ready(frame) = attempt else {
             panic!("resident persona payload unexpectedly pending")
@@ -3365,6 +3419,10 @@ mod tests {
 
     #[test]
     fn a_missing_persona_preserves_the_wait_watermark() {
+        pollster::block_on(a_missing_persona_preserves_the_wait_watermark_async())
+    }
+
+    async fn a_missing_persona_preserves_the_wait_watermark_async() {
         let fixture = TestPile::new();
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
@@ -3379,6 +3437,7 @@ mod tests {
             &fixture.path,
             "not-yet-resident",
         )
+        .await
         .unwrap();
         let WaitFrameLoad::Pending(pending) = attempt else {
             panic!("an absent persona unexpectedly produced a readable wait frame")

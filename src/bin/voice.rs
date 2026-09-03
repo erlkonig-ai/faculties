@@ -534,9 +534,9 @@ impl VoiceStorage<'_> {
                 .context("register maintained Voice fact collection")?;
             let before = pile.snapshot().context("freeze Voice source snapshot")?;
             let instant = clock::now()?;
-            let store_snapshot = maintained
-                .maintain_at(&mut pile, &before, instant)
-                .context("maintain Voice fact collection")?;
+            let store_snapshot =
+                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
+                    .context("maintain Voice fact collection")?;
             drop(before);
             let facts = store_snapshot
                 .collection_at(maintained.rank9(), instant)

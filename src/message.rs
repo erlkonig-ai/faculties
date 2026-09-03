@@ -1555,7 +1555,7 @@ mod tests {
         );
         let before = pile.snapshot().unwrap();
         let instant = crate::clock::now().unwrap();
-        drop(messages.maintain_at(&mut pile, &before, instant).unwrap());
+        drop(pollster::block_on(messages.maintain_at(&mut pile, &before, instant)).unwrap());
         let store_snapshot = pile.snapshot().unwrap();
         let observed = store_snapshot
             .collection_at(messages.rank9(), instant)

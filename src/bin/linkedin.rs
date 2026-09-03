@@ -218,7 +218,7 @@ impl RelationsStorage<'_> {
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
+        let result = pollster::block_on(async {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Relations fact collection")?;
@@ -229,6 +229,7 @@ impl RelationsStorage<'_> {
             drop(
                 maintained
                     .maintain_at(&mut pile, &before, instant)
+                    .await
                     .context("maintain Relations fact collection")?,
             );
             let store_snapshot = pile
@@ -249,7 +250,7 @@ impl RelationsStorage<'_> {
                     reader: store_snapshot,
                 },
             )
-        })();
+        });
         finish_pile(pile, result)
     }
 
@@ -292,7 +293,8 @@ impl RelationsStorage<'_> {
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
-            let cover = collection.admitted(&store_snapshot)?;
+            let instant = clock::now()?;
+            let cover = collection.admitted_at(&store_snapshot, instant)?;
             Ok(cover
                 .commits(&store_snapshot)?
                 .iter()

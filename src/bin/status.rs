@@ -121,16 +121,21 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
     let before = pile
         .snapshot()
         .context("freeze shared Status/Relations source snapshot")?;
-    drop(
-        status
-            .maintain_at(pile, &before, instant)
-            .context("maintain Status fact collection")?,
-    );
-    drop(
-        relations
-            .maintain_at(pile, &before, instant)
-            .context("maintain Relations fact collection")?,
-    );
+    pollster::block_on(async {
+        drop(
+            status
+                .maintain_at(pile, &before, instant)
+                .await
+                .context("maintain Status fact collection")?,
+        );
+        drop(
+            relations
+                .maintain_at(pile, &before, instant)
+                .await
+                .context("maintain Relations fact collection")?,
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
     drop(before);
 
     let snapshot = pile
@@ -164,11 +169,12 @@ fn maintain_and_observe_relations(
     let before = pile
         .snapshot()
         .context("freeze Relations source snapshot")?;
-    drop(
+    pollster::block_on(async {
         collection
             .maintain_at(pile, &before, instant)
-            .context("maintain Relations fact collection")?,
-    );
+            .await
+            .context("maintain Relations fact collection")
+    })?;
     drop(before);
 
     let snapshot = pile
@@ -516,7 +522,8 @@ mod tests {
 
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let store_snapshot = pile.snapshot()?;
-                assert!(collection.admitted(&store_snapshot)?.is_empty());
+                let instant = triblespace::core::clock::epoch_now();
+                assert!(collection.admitted_at(&store_snapshot, instant)?.is_empty());
                 let discovered =
                     triblespace::core::collection::discover_collection_records(&store_snapshot)?;
                 let resident = discovered

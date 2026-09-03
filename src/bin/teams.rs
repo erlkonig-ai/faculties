@@ -392,6 +392,7 @@ struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
     maintained: FactCollection,
+    instant: hifitime::Epoch,
     support: Support,
     facts: FactArchive,
     reader: PileSnapshot,
@@ -487,22 +488,28 @@ impl TeamsSession<'_> {
             .context("observe Teams support after commit")?
             .support()
             .clone();
-        drop(
-            self.maintained
-                .maintain_exact(self.pile, &support)
-                .context("maintain Teams fact collection after commit")?,
-        );
-        self.refresh_secrets_for(support)?;
+        pollster::block_on(async {
+            drop(
+                self.maintained
+                    .maintain_exact(self.pile, &support)
+                    .await
+                    .context("maintain Teams fact collection after commit")?,
+            );
+            self.refresh_secrets_for_async(support).await
+        })?;
         Ok(Some(commit))
     }
 
     fn refresh_secrets(&mut self) -> Result<()> {
-        self.refresh_secrets_for(self.support.clone())
+        let support = self.support.clone();
+        pollster::block_on(self.refresh_secrets_for_async(support))
     }
 
-    fn refresh_secrets_for(&mut self, support: Support) -> Result<()> {
-        let secrets = secret_storage::ensure_and_snapshot(self.pile, [self.secret_collection])
-            .context("refresh configured Secrets collection for Teams")?;
+    async fn refresh_secrets_for_async(&mut self, support: Support) -> Result<()> {
+        let secrets =
+            secret_storage::ensure_and_snapshot(self.pile, [self.secret_collection], self.instant)
+                .await
+                .context("refresh configured Secrets collection for Teams")?;
         let reader = secrets.store_snapshot().clone();
         let facts = reader
             .collection_exact(self.maintained.rank9(), &support)
@@ -550,24 +557,28 @@ impl TeamsStorage<'_> {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Teams fact collection")?;
-            let secret_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
             let before = pile
                 .snapshot()
                 .context("freeze Teams pre-maintenance snapshot")?;
             let instant = clock::now()?;
+            let secret_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
             let support = before
                 .collection_at(maintained.source(), instant)
                 .context("observe Teams support before maintenance")?
                 .support()
                 .clone();
-            drop(
-                maintained
-                    .maintain_exact(&mut pile, &support)
-                    .context("maintain Teams fact collection")?,
-            );
-            let secrets = secret_storage::ensure_and_snapshot(&mut pile, [secret_collection])
-                .context("ensure configured Secrets collection for Teams")?;
+            let secrets = pollster::block_on(async {
+                drop(
+                    maintained
+                        .maintain_exact(&mut pile, &support)
+                        .await
+                        .context("maintain Teams fact collection")?,
+                );
+                secret_storage::ensure_and_snapshot(&mut pile, [secret_collection], instant)
+                    .await
+                    .context("ensure configured Secrets collection for Teams")
+            })?;
             let reader = secrets.store_snapshot().clone();
             let facts = reader
                 .collection_exact(maintained.rank9(), &support)
@@ -578,6 +589,7 @@ impl TeamsStorage<'_> {
                 pile: &mut pile,
                 collection,
                 maintained,
+                instant,
                 support,
                 facts,
                 reader,

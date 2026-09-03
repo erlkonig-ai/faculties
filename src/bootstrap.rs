@@ -484,11 +484,12 @@ pub fn generation() -> [u8; 32] {
 /// The pile and durable key must already exist. Both fragments are constructed
 /// completely before publication. Replaying with the same key yields the same
 /// two exact signed COMMIT records.
-pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
+pub async fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
+    let result = async {
         let wiki_before = wiki_model::materialize_indexed_collection(&mut pile, &signer)
+            .await
             .context("materialize Wiki before bootstrap import")?;
         let (wiki, wiki_roots) = wiki_fragment(
             &signer.verifying_key(),
@@ -505,7 +506,7 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
         let wiki_commit = wiki_model::commit_collection(&mut pile, &signer, seed.wiki)?;
         let compass_commit = compass::commit_collection(&mut pile, &signer, seed.compass)?;
 
-        let wiki_after = wiki_model::materialize_indexed_collection(&mut pile, &signer)?;
+        let wiki_after = wiki_model::materialize_indexed_collection(&mut pile, &signer).await?;
         if !expected_wiki.difference(wiki_after.facts()).is_empty() {
             bail!("Wiki collection omitted portable bootstrap facts after publication");
         }
@@ -520,7 +521,8 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
             wiki_commit,
             compass_commit,
         })
-    })();
+    }
+    .await;
     let close = pile.close();
     match (result, close) {
         (Ok(value), Ok(())) => Ok(value),
@@ -555,7 +557,7 @@ mod tests {
         let key = directory.path().join(format!("{name}.key"));
         File::create(&pile).unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
-        let report = import(&pile, Some(&key)).unwrap();
+        let report = pollster::block_on(import(&pile, Some(&key))).unwrap();
         Imported {
             _directory: directory,
             pile,
@@ -639,10 +641,11 @@ mod tests {
         )
         .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_before = collection.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
         pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
-        let second = import(&imported.pile, Some(&imported.key)).unwrap();
+        let second = pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
         let bytes_after = std::fs::metadata(&imported.pile).unwrap().len();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
@@ -653,7 +656,8 @@ mod tests {
         )
         .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let cover_after = collection.admitted(&store_snapshot).unwrap();
+        let instant = triblespace::core::clock::epoch_now();
+        let cover_after = collection.admitted_at(&store_snapshot, instant).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit, second.wiki_commit);
@@ -731,9 +735,9 @@ mod tests {
         })
         .unwrap();
 
-        let upgraded = import(&pile_path, Some(&key_path)).unwrap();
+        let upgraded = pollster::block_on(import(&pile_path, Some(&key_path))).unwrap();
         let bytes_after_upgrade = std::fs::metadata(&pile_path).unwrap().len();
-        let replay = import(&pile_path, Some(&key_path)).unwrap();
+        let replay = pollster::block_on(import(&pile_path, Some(&key_path))).unwrap();
         assert_eq!(upgraded.wiki_commit, replay.wiki_commit);
         assert_eq!(upgraded.compass_commit, replay.compass_commit);
         assert_eq!(
@@ -780,7 +784,7 @@ mod tests {
         wiki_model::commit_collection(&mut pile, &signer, source_b).unwrap();
         pile.close().unwrap();
 
-        import(&imported.pile, Some(&imported.key)).unwrap();
+        pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
@@ -825,7 +829,7 @@ mod tests {
         wiki_model::commit_collection(&mut pile, &signer, forks).unwrap();
         pile.close().unwrap();
 
-        import(&imported.pile, Some(&imported.key)).unwrap();
+        pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
@@ -868,7 +872,7 @@ mod tests {
 
         let built = build(&signer.verifying_key()).unwrap();
         assert_eq!(built.wiki_roots[0], root);
-        import(&pile_path, Some(&key_path)).unwrap();
+        pollster::block_on(import(&pile_path, Some(&key_path))).unwrap();
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -919,9 +923,9 @@ mod tests {
         wiki_model::commit_collection(&mut pile, &signer, same_payload).unwrap();
         pile.close().unwrap();
 
-        let first = import(&imported.pile, Some(&imported.key)).unwrap();
+        let first = pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
         let bytes = std::fs::metadata(&imported.pile).unwrap().len();
-        let second = import(&imported.pile, Some(&imported.key)).unwrap();
+        let second = pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
         assert_eq!(first.wiki_commit, second.wiki_commit);
         assert_eq!(bytes, std::fs::metadata(&imported.pile).unwrap().len());
 

@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let report = faculties::bootstrap::import(&cli.pile, cli.key.as_deref())?;
+    let report = pollster::block_on(faculties::bootstrap::import(&cli.pile, cli.key.as_deref()))?;
     println!("bootstrap generation {}", hex::encode(report.generation));
     println!(
         "wiki COMMIT record fingerprint {}",
