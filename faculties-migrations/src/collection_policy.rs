@@ -17,11 +17,11 @@
 //! DERIVE records are cache exhaust tied to the old descriptor and are rebuilt
 //! lazily.
 //!
-//! Secrets is intentionally not transformed. Its access envelopes, sealed
-//! frames, and capability proofs bind an exact vault descriptor handle. Merely
-//! re-signing its collection leaves would create an inaccessible vault. The
-//! old records remain additive history; operators initialize a fresh
-//! policy-era vault and supply the credentials again.
+//! Secrets is intentionally not transformed here. Its access envelopes,
+//! sealed frames, and capability proofs bind an exact vault descriptor handle.
+//! The separate `secrets_reader_envelopes` migration opens that cryptographic
+//! boundary explicitly and moves the retained fact union into the configured
+//! direct-reader Secrets collection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -238,7 +238,7 @@ fn secrets_exclusion(
                 return None;
             }
             let name = exact_retired_name(snapshot, *collection, authority)?;
-            faculties::secrets::parse_vault_name(&name).ok()?;
+            parse_retired_vault_name(&name)?;
             Some(ExcludedVault {
                 name,
                 collection: *collection,
@@ -252,6 +252,25 @@ fn secrets_exclusion(
         access_records,
         vaults,
     }
+}
+
+fn parse_retired_vault_name(name: &str) -> Option<Id> {
+    const PREFIX: &str = "vault-";
+    const DIGITS: usize = 25;
+    let suffix = name.strip_prefix(PREFIX)?;
+    if suffix.len() != DIGITS {
+        return None;
+    }
+    let mut value = 0u128;
+    for byte in suffix.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u128,
+            b'a'..=b'z' => (byte - b'a' + 10) as u128,
+            _ => return None,
+        };
+        value = value.checked_mul(36)?.checked_add(digit)?;
+    }
+    Id::new(value.to_be_bytes())
 }
 
 fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigration> {
@@ -657,7 +676,7 @@ mod tests {
             missing_metadata(7),
         )))
         .unwrap();
-        let vault_name = faculties::secrets::vault_name(Id::new([0x33; 16]).unwrap());
+        let vault_name = "vault-0000000000000000000000001".to_owned();
         let vault = store_fragment(
             &mut pile,
             retired_root_descriptor(&vault_name, signer.verifying_key()),
@@ -700,7 +719,7 @@ mod tests {
         let policy_access = scratch
             .collection(
                 "secrets-access",
-                faculties::secrets::vault_policy(signer.verifying_key()),
+                faculties::collection_names::private_policy(signer.verifying_key()),
             )
             .unwrap();
         assert!(collection_records(&snapshot, policy_access.handle()).is_empty());
