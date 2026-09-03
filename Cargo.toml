@@ -134,7 +134,7 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # stock installs keep `voice devices`/routing; excluded on audio-less servers
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
-voice = ["dep:mary", "mary/speak", "audio"]
+voice = ["dep:mary", "mary/speak", "audio", "dep:framed-stream"]
 # The `hear` faculty: Soma's framed microphone -> energy VAD -> Gemma-4 audio
 # tower + multimodal embedder, handing over EMBEDDINGS (not text). `mary/gemma`
 # brings the parity-gated audio path; `tokenizers` is the decoder's BPE, needed
@@ -217,6 +217,9 @@ cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "st
 #                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
 #   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
 mary = { path = "../mary", default-features = false, optional = true }
+# The framed-stream convention (drive's streaming-faculty pipe): `voice stream`
+# reads text records on stdin and writes PCM records on stdout as it synthesizes.
+framed-stream = { path = "../drive/framed-stream", optional = true }
 # imagine-only: the `image` crate, matching mary's flux feature, so the
 # RgbImage the pipeline returns can be `.save()`d to a PNG here.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }

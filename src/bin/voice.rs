@@ -177,6 +177,22 @@ enum Command {
         #[arg(long, env = "VOICE_PAUSE_FILE")]
         pause_file: Option<PathBuf>,
     },
+    /// Speak a framed TEXT stream from stdin as it arrives -- drive's
+    /// streaming-faculty convention: text records in, 24 kHz mono PCM records
+    /// out on stdout (one per synthesized chunk, counted in samples), and the
+    /// same PCM into the Soma body when one is configured. Every COMPLETE
+    /// sentence is synthesized the moment its end punctuation arrives, while
+    /// the rest is still being written; the model is loaded once for the
+    /// whole stream. Each sentence is recorded on the Voice collection as an
+    /// utterance of the given channel.
+    Stream {
+        /// Channel the utterances are recorded under (`shout` or `say`).
+        #[arg(long, default_value = CHANNEL_SHOUT)]
+        channel: String,
+        /// Half-duplex pause file, held for the life of the stream.
+        #[arg(long, env = "VOICE_PAUSE_FILE")]
+        pause_file: Option<PathBuf>,
+    },
     /// Show the routing policy for both channels, the connected audio devices,
     /// and what each channel WOULD select right now (a pure dry-run). Read-only.
     Route,
@@ -756,20 +772,19 @@ enum Spoken {
     PlaybackFailed(anyhow::Error),
 }
 
-/// Synthesize `text` (streaming) and play it through the resolved route,
-/// writing the COMPLETE utterance to `out` for the log. Never called for the
-/// `Routed::Text` fallback (the caller short-circuits it — no GPU work for a
-/// silent utterance). Returns after playback settles; see [`Spoken`] for the
-/// synthesis-failure / playback-failure split.
+/// The voice, ready to clone: the reference kit paths and transcript, and the
+/// frozen model snapshot's selected cohort. Weights are a snapshot handle,
+/// not tensors -- the model reaches the GPU when a synthesis starts.
 #[cfg(feature = "voice")]
-fn speak_and_play(
-    routed: &Routed,
-    daemon: &str,
-    channel: &str,
-    text: &str,
-    out: &Path,
-) -> Result<Spoken> {
-    let sr = mary::speak::SpeakStream::SAMPLE_RATE;
+struct VoiceKit {
+    ref_wav: PathBuf,
+    ref_text: String,
+    ref_code: PathBuf,
+    weights: mary::speak::Qwen3TtsWeights,
+}
+
+#[cfg(feature = "voice")]
+fn load_voice_kit() -> Result<VoiceKit> {
     let model_dir = faculties::model_dir();
     let pile = match std::env::var_os("QWEN3TTS_PILE") {
         Some(p) => PathBuf::from(p),
@@ -780,16 +795,6 @@ fn speak_and_play(
     let ref_code = model_dir.join(REF_CODE_FILE);
     let ref_text = std::fs::read_to_string(&ref_txt_path)
         .with_context(|| format!("read reference transcript {}", ref_txt_path.display()))?;
-    // Duration estimate for the adaptive prebuffer: the reference clip's
-    // chars-per-second applied to the generated text (see
-    // `estimate_audio_secs`). Read before t_call so TTFA stays a pure
-    // synthesis measurement.
-    let (ref_samples, ref_sr) = mary::models::f5::wav::read_pcm16_mono(&ref_wav);
-    let est_secs = estimate_audio_secs(
-        text.chars().count(),
-        ref_samples.len() as f32 / ref_sr.max(1) as f32,
-        ref_text.trim().chars().count(),
-    );
     let variant = mary::speak::Qwen3TtsVariant::from_env();
     let snapshot =
         mary::model_collection::load_model_collection_local_latest(&pile).with_context(|| {
@@ -805,6 +810,223 @@ fn speak_and_play(
                 pile.display()
             )
         })?;
+    Ok(VoiceKit {
+        ref_wav,
+        ref_text,
+        ref_code,
+        weights,
+    })
+}
+
+/// Where a sentence ends inside `pending`: the byte index just past the
+/// first `.`, `!` or `?` that is followed by whitespace or the end of what has
+/// arrived so far. A period inside a word (`3.14`, `e.g.`) is not an end,
+/// because nothing arrives after it yet is not the same as a space arriving
+/// after it: the cut waits for the space. The same rule `chunk_text` packs
+/// passes by, applied as text arrives instead of once over a finished string.
+fn sentence_end(pending: &str) -> Option<usize> {
+    let mut chars = pending.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if matches!(c, '.' | '!' | '?') {
+            match chars.peek() {
+                Some((_, next)) if next.is_whitespace() => return Some(i + c.len_utf8()),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+    None
+}
+
+/// `voice stream`: the framed-stream convention on both pipes, with the
+/// vocoder in the middle. Sentences are synthesized as they complete; each
+/// one's PCM goes out as framed records (counted in samples) and into the
+/// Soma body when one is configured, and is recorded on the Voice collection
+/// from a helper thread so the pile never sits between two sentences.
+#[cfg(feature = "voice")]
+fn cmd_stream(storage: &VoiceStorage<'_>, soma: Option<&str>, channel: &str) -> Result<()> {
+    use framed_stream::{EndStatus, Frame, FramedReader, FramedWriter, TEXT_PLAIN, UNIT_SAMPLES};
+
+    const PCM: &str = "audio/L16;rate=24000;channels=1";
+    /// A declared hole in the output for a hole in the input: a tenth of a
+    /// second, the stand-in the stub speech faculty uses too.
+    const GAP_SAMPLES: u64 = 2_400;
+
+    let sr = mary::speak::SpeakStream::SAMPLE_RATE;
+    let kit = load_voice_kit()?;
+    let session = mary::speak::Synthesizer::spawn(
+        kit.weights,
+        &kit.ref_wav,
+        kit.ref_text.trim(),
+        &kit.ref_code,
+    )?;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = FramedReader::open(stdin.lock())?;
+    // A voice handed video must refuse it rather than synthesize the bytes
+    // as if they were words.
+    reader.require_content_type(TEXT_PLAIN)?;
+    let mut writer = FramedWriter::open(stdout.lock(), PCM, UNIT_SAMPLES)?;
+
+    let mut soma_sink = match soma {
+        Some(url) if soma_reachable(url) => {
+            eprintln!("[stream] Soma body at {url}");
+            Some(SomaSink::open(url, sr))
+        }
+        Some(url) => {
+            eprintln!("[stream] Soma at {url} is not answering; PCM goes to stdout only");
+            None
+        }
+        None => None,
+    };
+
+    // The ledger, off the synthesis path: sentences are logged in order on
+    // one helper thread that owns its own pile handle.
+    let log_pile = storage.pile.to_path_buf();
+    let log_key = storage.key.map(Path::to_path_buf);
+    let log_channel = channel.to_string();
+    let (tx_log, rx_log) = std::sync::mpsc::channel::<(String, PathBuf)>();
+    let logger = std::thread::spawn(move || -> Result<usize> {
+        let storage = VoiceStorage {
+            pile: &log_pile,
+            key: log_key.as_deref(),
+        };
+        let mut logged = 0usize;
+        while let Ok((text, wav)) = rx_log.recv() {
+            storage.with_session(|session| {
+                log_utterance(session, &log_channel, &text, Some(&wav), "voice spoke")
+            })?;
+            let _ = std::fs::remove_file(&wav);
+            logged += 1;
+        }
+        Ok(logged)
+    });
+
+    let mut pending = String::new();
+    let mut spoken = 0usize;
+    // Synthesize one sentence: PCM to the framed writer and the body as it
+    // comes, the whole sentence to a WAV for the ledger.
+    let mut speak = |sentence: &str,
+                     writer: &mut FramedWriter<std::io::StdoutLock<'_>>,
+                     soma_sink: &mut Option<SomaSink>|
+     -> Result<()> {
+        let sentence = sentence.trim();
+        if sentence.is_empty() {
+            return Ok(());
+        }
+        let t_call = std::time::Instant::now();
+        let mut stream = session.speak(sentence)?;
+        let mut samples: Vec<f32> = Vec::new();
+        for chunk in stream.by_ref() {
+            if samples.is_empty() {
+                eprintln!(
+                    "[stream] sentence {}: first chunk {:.2}s after the cut ({} chars)",
+                    spoken + 1,
+                    t_call.elapsed().as_secs_f32(),
+                    sentence.chars().count()
+                );
+            }
+            writer.record(&pcm_s16le(&chunk), chunk.len() as u64)?;
+            if let Some(sink) = soma_sink.as_mut() {
+                sink.push(&chunk);
+            }
+            samples.extend_from_slice(&chunk);
+        }
+        stream.finish()?;
+        spoken += 1;
+        let out = unique_voice_tmp()?;
+        mary::models::f5::wav::write_pcm16_mono(&out, &samples, sr);
+        let _ = tx_log.send((sentence.to_string(), out));
+        Ok(())
+    };
+
+    let status = loop {
+        match reader.next_frame()? {
+            Frame::Record(record) => {
+                pending.push_str(record.text()?);
+                while let Some(cut) = sentence_end(&pending) {
+                    let sentence: String = pending.drain(..cut).collect();
+                    speak(&sentence, &mut writer, &mut soma_sink)?;
+                }
+            }
+            Frame::Gap(gap) => {
+                // Loss travels. Whatever was pending is spoken as far as it
+                // got, and the hole is declared, never synthesized over.
+                let tail = std::mem::take(&mut pending);
+                speak(&tail, &mut writer, &mut soma_sink)?;
+                writer.gap(
+                    GAP_SAMPLES,
+                    &format!("input gap of {} byte(s): {}", gap.extent, gap.reason),
+                )?;
+            }
+            Frame::End(status) => {
+                let tail = std::mem::take(&mut pending);
+                speak(&tail, &mut writer, &mut soma_sink)?;
+                break status;
+            }
+        }
+    };
+    drop(speak);
+    if let Some(sink) = soma_sink.take() {
+        if let Err(error) = sink.finish() {
+            eprintln!("[stream] Soma: {error:#}");
+        }
+    }
+    // An upstream abort is relayed as an abort: drive must not be told the
+    // utterance was complete when its own source said it was not.
+    let out = match status {
+        EndStatus::Complete => EndStatus::Complete,
+        EndStatus::Aborted(reason) => EndStatus::Aborted(format!("upstream aborted: {reason}")),
+    };
+    let mut sink = writer.finish(out)?;
+    std::io::Write::flush(&mut sink)?;
+    drop(tx_log);
+    let logged = logger
+        .join()
+        .map_err(|_| anyhow::anyhow!("the Voice ledger thread panicked"))??;
+    eprintln!("[stream] {spoken} sentence(s) spoken, {logged} logged");
+    Ok(())
+}
+
+#[cfg(not(feature = "voice"))]
+fn cmd_stream(_storage: &VoiceStorage<'_>, _soma: Option<&str>, _channel: &str) -> Result<()> {
+    bail!(
+        "voice stream needs the `voice` feature -- rebuild with \
+         `cargo build --release --features voice --bin voice`"
+    );
+}
+
+/// Synthesize `text` (streaming) and play it through the resolved route,
+/// writing the COMPLETE utterance to `out` for the log. Never called for the
+/// `Routed::Text` fallback (the caller short-circuits it — no GPU work for a
+/// silent utterance). Returns after playback settles; see [`Spoken`] for the
+/// synthesis-failure / playback-failure split.
+#[cfg(feature = "voice")]
+fn speak_and_play(
+    routed: &Routed,
+    daemon: &str,
+    channel: &str,
+    text: &str,
+    out: &Path,
+) -> Result<Spoken> {
+    let sr = mary::speak::SpeakStream::SAMPLE_RATE;
+    let VoiceKit {
+        ref_wav,
+        ref_text,
+        ref_code,
+        weights,
+    } = load_voice_kit()?;
+    // Duration estimate for the adaptive prebuffer: the reference clip's
+    // chars-per-second applied to the generated text (see
+    // `estimate_audio_secs`). Read before t_call so TTFA stays a pure
+    // synthesis measurement.
+    let (ref_samples, ref_sr) = mary::models::f5::wav::read_pcm16_mono(&ref_wav);
+    let est_secs = estimate_audio_secs(
+        text.chars().count(),
+        ref_samples.len() as f32 / ref_sr.max(1) as f32,
+        ref_text.trim().chars().count(),
+    );
     let t_call = std::time::Instant::now();
     let mut stream =
         mary::speak::synthesize_stream(weights, &ref_wav, ref_text.trim(), &ref_code, text)?;
@@ -853,17 +1075,143 @@ fn speak_and_play(
     Ok(Spoken::Played)
 }
 
-/// Drain `stream` into a Soma body's speaker: one chunked `POST
-/// /audio/stream`, each synthesized chunk converted to 24 kHz mono s16le and
-/// written the moment it exists, so the body starts playing behind its own
-/// ~150 ms prebuffer while the rest is still being synthesized. Soma's
-/// response completes when the LAST sample has left the device -- the HTTP
-/// call finishing IS "done speaking" -- and carries its callback and underrun
-/// counts, which are printed rather than interpreted: an underrun means the
-/// synthesis fell behind the room, and that is a fact to record, not hide.
-/// `preempt=1` cuts anything the body is still saying (the newest utterance
-/// owns the mouth). A body that ends the request early surfaces as the
-/// error of THIS utterance; the caller still logs the words.
+/// 24 kHz mono f32 in `[-1, 1]` to the s16le bytes every sink past the
+/// synthesizer speaks: Soma's stream endpoint and the framed PCM records.
+#[cfg(feature = "voice")]
+fn pcm_s16le(chunk: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(chunk.len() * 2);
+    for &sample in chunk {
+        let v = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// One open mouth on a Soma body: a single chunked `POST /audio/stream` whose
+/// body is fed chunk by chunk as synthesis produces it, so the body starts
+/// playing behind its own ~150 ms prebuffer while the rest is still being
+/// made. Soma's response completes when the LAST sample has left the device
+/// -- the HTTP call finishing IS "done speaking" -- and carries its callback
+/// and underrun counts, which [`finish`](Self::finish) prints rather than
+/// interprets: an underrun means the synthesis fell behind the room, and
+/// that is a fact to record, not hide. `preempt=1` cuts anything the body is
+/// still saying: the newest mouth owns it. Across the sentences of one
+/// framed stream the SAME request stays open, so nothing preempts anything
+/// and silence between sentences is just silence.
+#[cfg(feature = "voice")]
+struct SomaSink {
+    url: String,
+    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    request: Option<std::thread::JoinHandle<Result<String>>>,
+    samples: usize,
+    rate: u32,
+}
+
+#[cfg(feature = "voice")]
+impl SomaSink {
+    fn open(url: &str, rate: u32) -> Self {
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        /// The request body: chunks arrive over a channel as synthesis
+        /// produces them; the sender dropping is the end of the stream (EOF).
+        struct ChunkReader {
+            rx: mpsc::Receiver<Vec<u8>>,
+            buf: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for ChunkReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.buf.len() {
+                    match self.rx.recv() {
+                        Ok(next) => {
+                            self.buf = next;
+                            self.pos = 0;
+                        }
+                        Err(_) => return Ok(0),
+                    }
+                }
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let endpoint = format!("{url}/audio/stream?rate={rate}&ch=1&fmt=s16le&preempt=1");
+        let request = std::thread::spawn(move || -> Result<String> {
+            // No read timeout: the response only arrives once the body has
+            // FINISHED PLAYING, which for a long stream is longer than any
+            // sensible request timeout.
+            let client = reqwest::blocking::Client::builder()
+                .timeout(None)
+                .build()
+                .context("build the Soma stream client")?;
+            let response = client
+                .post(&endpoint)
+                .header("Content-Type", "application/octet-stream")
+                .body(reqwest::blocking::Body::new(ChunkReader {
+                    rx,
+                    buf: Vec::new(),
+                    pos: 0,
+                }))
+                .send()
+                .with_context(|| format!("stream to {endpoint}"))?;
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            if !status.is_success() {
+                bail!("Soma /audio/stream answered {status}: {text}");
+            }
+            Ok(text)
+        });
+        Self {
+            url: url.to_string(),
+            tx: Some(tx),
+            request: Some(request),
+            samples: 0,
+            rate,
+        }
+    }
+
+    /// Hand the body one synthesized chunk. A body that has ended the request
+    /// is reported by `finish`, not here: the push just stops landing.
+    fn push(&mut self, chunk: &[f32]) {
+        self.samples += chunk.len();
+        if let Some(tx) = &self.tx {
+            if tx.send(pcm_s16le(chunk)).is_err() {
+                self.tx = None;
+            }
+        }
+    }
+
+    /// Close the mouth and wait until the body has finished playing; print
+    /// its report. Nothing pushed is an error: silence was never asked for.
+    fn finish(mut self) -> Result<()> {
+        self.tx = None;
+        let report = match self.request.take() {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("the Soma stream thread panicked"))??,
+            None => String::new(),
+        };
+        if self.samples == 0 {
+            bail!("no audio chunks arrived to stream to Soma at {}", self.url);
+        }
+        println!(
+            "  [soma] streamed {:.1}s to {} ({} samples): {}",
+            self.samples as f32 / self.rate as f32,
+            self.url,
+            self.samples,
+            report.trim()
+        );
+        Ok(())
+    }
+}
+
+/// Drain `stream` into a Soma body's speaker through one [`SomaSink`]. A body
+/// that ends the request early surfaces as the error of THIS utterance; the
+/// caller still logs the words.
 #[cfg(feature = "voice")]
 fn stream_to_soma(
     stream: &mut mary::speak::SpeakStream,
@@ -872,63 +1220,7 @@ fn stream_to_soma(
     url: &str,
     sr: u32,
 ) -> Result<()> {
-    use std::io::Read;
-    use std::sync::mpsc;
-
-    /// The request body: chunks arrive over a channel as synthesis produces
-    /// them; the sender dropping is the end of the utterance (EOF).
-    struct ChunkReader {
-        rx: mpsc::Receiver<Vec<u8>>,
-        buf: Vec<u8>,
-        pos: usize,
-    }
-    impl Read for ChunkReader {
-        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-            if self.pos >= self.buf.len() {
-                match self.rx.recv() {
-                    Ok(next) => {
-                        self.buf = next;
-                        self.pos = 0;
-                    }
-                    Err(_) => return Ok(0),
-                }
-            }
-            let n = (self.buf.len() - self.pos).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-            self.pos += n;
-            Ok(n)
-        }
-    }
-
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let endpoint = format!("{url}/audio/stream?rate={sr}&ch=1&fmt=s16le&preempt=1");
-    let request = std::thread::spawn(move || -> Result<String> {
-        // No read timeout: the response only arrives once the body has
-        // FINISHED PLAYING, which for a long utterance is longer than any
-        // sensible request timeout.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(None)
-            .build()
-            .context("build the Soma stream client")?;
-        let response = client
-            .post(&endpoint)
-            .header("Content-Type", "application/octet-stream")
-            .body(reqwest::blocking::Body::new(ChunkReader {
-                rx,
-                buf: Vec::new(),
-                pos: 0,
-            }))
-            .send()
-            .with_context(|| format!("stream to {endpoint}"))?;
-        let status = response.status();
-        let text = response.text().unwrap_or_default();
-        if !status.is_success() {
-            bail!("Soma /audio/stream answered {status}: {text}");
-        }
-        Ok(text)
-    });
-
-    let mut appended = 0usize;
+    let mut sink = SomaSink::open(url, sr);
     let mut first = true;
     for chunk in stream.by_ref() {
         if first {
@@ -939,31 +1231,10 @@ fn stream_to_soma(
             );
             first = false;
         }
-        let mut bytes = Vec::with_capacity(chunk.len() * 2);
-        for &sample in &chunk {
-            let v = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        appended += chunk.len();
         samples.extend_from_slice(&chunk);
-        if tx.send(bytes).is_err() {
-            // The request side is gone; its error is the one to report.
-            break;
-        }
+        sink.push(&chunk);
     }
-    drop(tx);
-    let report = request
-        .join()
-        .map_err(|_| anyhow::anyhow!("the Soma stream thread panicked"))??;
-    if appended == 0 {
-        bail!("no audio chunks arrived to stream to Soma at {url}");
-    }
-    println!(
-        "  [soma] streamed {:.1}s to {url} ({appended} samples): {}",
-        appended as f32 / sr as f32,
-        report.trim()
-    );
-    Ok(())
+    sink.finish()
 }
 
 /// Drain `stream` into the first device of `ladder` that OPENS, through the
@@ -1402,6 +1673,16 @@ fn main() -> Result<()> {
                 pause_file.as_deref(),
             )
         })?,
+        Some(Command::Stream {
+            channel,
+            pause_file,
+        }) => {
+            let _pause = pause_file.as_deref().map(|path| {
+                eprintln!("  [half-duplex] holding {}", path.display());
+                faculties::turntaking::PauseGuard::hold(path)
+            });
+            cmd_stream(&storage, soma.as_deref(), &channel)?
+        }
         Some(Command::Route) => {
             storage.with_session(|session| cmd_route(session, &daemon, soma.as_deref()))?
         }
@@ -1626,6 +1907,19 @@ mod tests {
             None,
         ));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
+    }
+
+    // ── sentence cutting as text arrives ──
+
+    #[test]
+    fn sentence_ends_only_at_punctuation_followed_by_whitespace() {
+        assert_eq!(sentence_end("Hello there. And"), Some("Hello there.".len()));
+        assert_eq!(sentence_end("Pi is 3.14 today"), None);
+        assert_eq!(sentence_end("Really?! Yes"), Some("Really?!".len()));
+        // Nothing has arrived after the period yet: the cut waits.
+        assert_eq!(sentence_end("Wait."), None);
+        assert_eq!(sentence_end("Wait. "), Some("Wait.".len()));
+        assert_eq!(sentence_end("no end here"), None);
     }
 
     // ── adaptive prebuffer math ──
