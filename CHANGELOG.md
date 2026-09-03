@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Secrets uses collection authority directly instead of maintaining a
+  parallel vault-authority system.** One ordinary source collection is one
+  actual policy boundary. Each immutable secret version has a fresh random DEK
+  sealed additively to the finite subjects admitted for `READ(collection)` in
+  one frozen store snapshot. Later grants add only missing wraps across the
+  collection; ciphertext and opaque secret ids do not change. Vault custody
+  keys and epochs, the `secrets-access` inbox, Secrets-specific READ claims,
+  proof-id envelopes, per-writer access bundles, and decrypt-time expiry checks
+  are removed. Existing secret and wrap facts retain their published schema;
+  old headers and access facts are inert, enabling an additive cutover.
+
 - **Orient reads maintained Succinct collection snapshots directly.** Messages,
   Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations
   remain separately queryable instead of being copied into one temporary
