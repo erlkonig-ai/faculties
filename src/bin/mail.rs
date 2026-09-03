@@ -1216,6 +1216,7 @@ mod tests {
     use std::fs::File;
     use std::rc::Rc;
 
+    use faculties::secrets::secret_rows;
     use faculties::storage::{initialize_signer, publish_fragment};
     use triblespace::core::repo::StoreSnapshot;
 
@@ -1351,7 +1352,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let secrets_before = vaults::secret_rows(
+        let secrets_before = secret_rows(
             before
                 .secrets
                 .snapshot()
@@ -1377,7 +1378,7 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            vaults::secret_rows(
+            secret_rows(
                 after
                     .secrets
                     .snapshot()
@@ -1405,7 +1406,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let before = storage.views().unwrap();
-        let versions_before = vaults::secret_rows(
+        let versions_before = secret_rows(
             before
                 .secrets
                 .snapshot()
@@ -1432,7 +1433,7 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            vaults::secret_rows(
+            secret_rows(
                 after
                     .secrets
                     .snapshot()
@@ -1469,7 +1470,7 @@ mod tests {
             )
             .unwrap();
         let views = storage.views().unwrap();
-        let versions = vaults::secret_rows(
+        let versions = secret_rows(
             views
                 .secrets
                 .snapshot()
@@ -1497,7 +1498,7 @@ mod tests {
 
         let after = storage.views().unwrap();
         assert_eq!(
-            vaults::secret_rows(
+            secret_rows(
                 after
                     .secrets
                     .snapshot()
@@ -1551,7 +1552,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let views = storage.views().unwrap();
-        let secrets_before = vaults::secret_rows(
+        let secrets_before = secret_rows(
             views
                 .secrets
                 .snapshot()
@@ -1578,7 +1579,7 @@ mod tests {
         assert!(format!("{error:#}").contains("account address"));
         let after = storage.views().unwrap();
         assert_eq!(
-            vaults::secret_rows(
+            secret_rows(
                 after
                     .secrets
                     .snapshot()
