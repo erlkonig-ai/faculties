@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_surface_has_no_branch_sidecar_or_legacy_importer_controls() {
+    fn cli_surface_has_no_branch_or_sidecar_controls() {
         let commands: BTreeSet<_> = Cli::command()
             .get_subcommands()
             .map(|command| command.get_name().to_owned())
@@ -1197,16 +1197,6 @@ mod tests {
             "4"
         ])
         .is_err());
-        assert!(Cli::try_parse_from([
-            "archive",
-            "--pile",
-            "archive.pile",
-            "import",
-            "chatgpt",
-            "backup"
-        ])
-        .is_err());
-
         let default_source = Cli::try_parse_from([
             "archive",
             "--pile",
