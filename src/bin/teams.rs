@@ -19,7 +19,7 @@ use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -392,6 +392,7 @@ struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
     maintained: FactCollection,
+    support: Support,
     facts: FactArchive,
     reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
@@ -480,22 +481,37 @@ impl TeamsSession<'_> {
             .snapshot()
             .context("freeze Teams post-commit source snapshot")?;
         let instant = clock::now()?;
-        self.reader = self
-            .maintained
-            .maintain_at(self.pile, &before, instant)
-            .context("maintain Teams fact collection after commit")?;
-        self.facts = self
-            .reader
-            .collection_at(self.maintained.rank9(), instant)
-            .context("observe maintained Teams fact collection after commit")?
-            .view::<FactArchive>()
-            .context("read maintained Teams fact collection after commit")?;
+        let support = before
+            .collection_at(self.maintained.source(), instant)
+            .context("observe Teams support after commit")?
+            .support()
+            .clone();
+        drop(
+            self.maintained
+                .maintain_exact(self.pile, &support)
+                .context("maintain Teams fact collection after commit")?,
+        );
+        self.refresh_secrets_for(support)?;
         Ok(Some(commit))
     }
 
     fn refresh_secrets(&mut self) -> Result<()> {
-        self.secrets = secrets_vaults::discover_local_vaults(self.pile, &self.signer)
+        self.refresh_secrets_for(self.support.clone())
+    }
+
+    fn refresh_secrets_for(&mut self, support: Support) -> Result<()> {
+        let secrets = secrets_vaults::discover_local_vaults(self.pile, &self.signer)
             .context("rediscover Secrets vaults for Teams")?;
+        let reader = secrets.snapshot().store_snapshot().clone();
+        let facts = reader
+            .collection_exact(self.maintained.rank9(), &support)
+            .context("attach exact Teams support through Secrets snapshot")?
+            .view::<FactArchive>()
+            .context("read exact Teams support through Secrets snapshot")?;
+        self.support = support;
+        self.facts = facts;
+        self.reader = reader;
+        self.secrets = secrets;
         Ok(())
     }
 
@@ -544,22 +560,31 @@ impl TeamsStorage<'_> {
                 .snapshot()
                 .context("freeze Teams pre-maintenance snapshot")?;
             let instant = clock::now()?;
-            let store_snapshot = maintained
-                .maintain_at(&mut pile, &before, instant)
-                .context("maintain Teams fact collection")?;
-            let facts = store_snapshot
-                .collection_at(maintained.rank9(), instant)
-                .context("observe maintained Teams fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Teams fact collection")?;
+            let support = before
+                .collection_at(maintained.source(), instant)
+                .context("observe Teams support before maintenance")?
+                .support()
+                .clone();
+            drop(
+                maintained
+                    .maintain_exact(&mut pile, &support)
+                    .context("maintain Teams fact collection")?,
+            );
             let secrets = secrets_vaults::discover_local_vaults(&mut pile, &signer)
                 .context("discover Secrets vaults for Teams")?;
+            let reader = secrets.snapshot().store_snapshot().clone();
+            let facts = reader
+                .collection_exact(maintained.rank9(), &support)
+                .context("attach exact Teams support through Secrets snapshot")?
+                .view::<FactArchive>()
+                .context("read exact Teams support through Secrets snapshot")?;
             operation(&mut TeamsSession {
                 pile: &mut pile,
                 collection,
                 maintained,
+                support,
                 facts,
-                reader: store_snapshot,
+                reader,
                 signer,
                 secrets,
             })
@@ -3767,6 +3792,7 @@ fn load_client_secret(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use triblespace::core::repo::StoreSnapshot;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
     const TEST_PILE: &str = "/tmp/never-opened-teams-cli-test.pile";
@@ -3951,6 +3977,12 @@ mod tests {
         fixture.storage().view().unwrap()
     }
 
+    fn assert_session_has_one_store_watermark(session: &TeamsSession<'_>) {
+        let secrets_reader = session.secrets.snapshot().store_snapshot();
+        assert!(session.reader.changes_since(secrets_reader).is_empty());
+        assert!(secrets_reader.changes_since(&session.reader).is_empty());
+    }
+
     fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id, Id) {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
@@ -4020,6 +4052,7 @@ mod tests {
                 )?;
                 fragment += profile;
                 session.commit(fragment, "test Teams auth profile")?;
+                assert_session_has_one_store_watermark(session);
                 assert_eq!(
                     teams_core::auth_profile_head(&session.facts, source),
                     teams_core::AuthProfileHead::Unique(profile_id)
@@ -4056,9 +4089,11 @@ mod tests {
         fixture
             .storage()
             .with_session(|session| {
+                assert_session_has_one_store_watermark(session);
                 let observed_at = clock::point_now()?;
                 let secret =
                     session.add_secret(vault, "teams/session-test", b"exact-vault", observed_at)?;
+                assert_session_has_one_store_watermark(session);
                 assert_eq!(session.secrets.snapshot().lookup(secret).unwrap().0, vault);
                 assert_eq!(
                     session.secrets.snapshot().open(secret, &session.signer)?,
