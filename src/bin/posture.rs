@@ -5250,7 +5250,11 @@ fn cmd_exemplar(
         let predecessors = head.into_iter().collect();
         append_policy_revision(&mut fragment, channel_id, &members, &predecessors);
     }
-    if fragment.facts().difference(&view.facts).is_empty() {
+    if fragment
+        .facts()
+        .iter()
+        .all(|expected| view.facts.iter().any(|actual| &actual == expected))
+    {
         println!(
             "already stored {} exemplar for channel {channel_name:?}",
             if benign { "BENIGN" } else { "protected" }
