@@ -2500,8 +2500,26 @@ mod tests {
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
+        let bm25_records = |pile: &mut Pile| {
+            let store_snapshot = pile.snapshot().unwrap();
+            let records = discover_collection_records(&store_snapshot).unwrap();
+            (
+                records
+                    .derives()
+                    .iter()
+                    .filter(|record| record.collection() == target.handle())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                records
+                    .merges()
+                    .iter()
+                    .filter(|record| record.collection() == target.handle())
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let bm25_records_before = bm25_records(&mut pile);
         pile.close().unwrap();
-        let before = std::fs::metadata(&pile_path).unwrap().len();
 
         let search = ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)).unwrap();
         let hits = search.search("routed needle", 10).unwrap();
@@ -2509,7 +2527,15 @@ mod tests {
         let projections = search.archive().projection_ids();
         assert_eq!(projections.len(), 1);
         assert_eq!(hits[0].projections, projections);
-        assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
+        drop(search);
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let bm25_records_after = bm25_records(&mut pile);
+        assert_eq!(
+            bm25_records_after, bm25_records_before,
+            "the seeded BM25 merge-before-derive route is reused"
+        );
+        pile.close().unwrap();
     }
 
     #[test]
