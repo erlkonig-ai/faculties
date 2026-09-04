@@ -12,9 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::collection::lww_register::{
-    LwwIndex, LwwRegisterBlob, RegisterCoordinatesMapping,
-};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -93,9 +91,9 @@ where
     let policy = source
         .policy(&snapshot)
         .map_err(|error| anyhow!("read Compass source collection policy: {error}"))?;
-    let target = store.derive(
+    let target = store.derive::<LwwRegisterBlob>(
         source,
-        RegisterCoordinatesMapping::new(board::status_of.id(), metadata::created_at.id()),
+        (board::status_of.id(), metadata::created_at.id()),
         policy,
     )?;
     Ok(target)
@@ -1085,7 +1083,7 @@ pub async fn materialize_indexed_collection(
             .context("maintain Compass fact collection")?,
     );
     let store_snapshot = pile
-        .maintain_exact::<RegisterCoordinatesMapping>(status_target, &support)
+        .maintain_exact(status_target, &support)
         .await
         .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
     let fact_archive = store_snapshot

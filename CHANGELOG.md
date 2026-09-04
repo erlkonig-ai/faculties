@@ -12,8 +12,11 @@ All notable changes to this project will be documented in this file.
   collection; ciphertext and opaque secret ids do not change. Vault custody
   keys and epochs, the `secrets-access` inbox, Secrets-specific READ claims,
   proof-id envelopes, per-writer access bundles, and decrypt-time expiry checks
-  are removed. Existing secret and wrap facts retain their published schema;
-  old headers and access facts are inert, enabling an additive cutover.
+  are removed. Envelope maintenance actively acquires the claim closure of one
+  frozen `READ(collection)` proof frontier by exact blob handle, without
+  emitting durable `WANT`s; a concurrent grant is handled by the next additive
+  pass. Existing secret and wrap facts retain their published schema; old
+  headers and access facts are inert, enabling an additive cutover.
 
 - **Orient reads maintained Succinct collection snapshots directly.** Messages,
   Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations

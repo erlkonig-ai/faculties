@@ -11,9 +11,6 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::succinctarchive_union::{
-    RawToRank9AcceleratedMapping, SimpleToSuccinctMapping,
-};
 use triblespace::core::collection::{
     collection_read_audience_at, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt,
@@ -52,10 +49,10 @@ impl SecretsCollection {
             .collection(name, policy.clone())
             .map_err(|error| anyhow!("register Secrets source collection: {error}"))?;
         let succinct = store
-            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
         let rank9 = store
-            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
         Ok(Self {
             source,
@@ -81,10 +78,10 @@ impl SecretsCollection {
             .context("read Secrets source collection policy")?;
         drop(snapshot);
         let succinct = store
-            .derive(source, SimpleToSuccinctMapping, policy.clone())
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
         let rank9 = store
-            .derive(succinct, RawToRank9AcceleratedMapping, policy)
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
         Ok(Self {
             source,
@@ -123,12 +120,12 @@ impl SecretsCollection {
     {
         drop(
             store
-                .ensure_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .ensure_exact(self.succinct, support)
                 .await
                 .context("ensure Succinct Secrets collection")?,
         );
         store
-            .ensure_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .ensure_exact(self.rank9, support)
             .await
             .context("ensure Rank9 Secrets collection")
     }
@@ -160,12 +157,12 @@ impl SecretsCollection {
     {
         drop(
             store
-                .maintain_exact::<SimpleToSuccinctMapping>(self.succinct, support)
+                .maintain_exact(self.succinct, support)
                 .await
                 .context("maintain Succinct Secrets collection")?,
         );
         store
-            .maintain_exact::<RawToRank9AcceleratedMapping>(self.rank9, support)
+            .maintain_exact(self.rank9, support)
             .await
             .context("maintain Rank9 Secrets collection")
     }
@@ -297,9 +294,13 @@ fn admitted_readers<R>(
 where
     R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
-    match collection_read_audience_at(snapshot, collection.handle(), instant)
-        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?
-    {
+    let audience = collection_read_audience_at(snapshot, collection.handle(), instant)
+        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
+    finite_readers(audience)
+}
+
+fn finite_readers(audience: CollectionReadAudience) -> Result<Vec<VerifyingKey>> {
+    match audience {
         CollectionReadAudience::Open => {
             bail!("cannot seal a finite DEK envelope set for an open-read collection")
         }
@@ -342,10 +343,11 @@ where
 
 /// Add missing envelopes across every secret in one policy boundary.
 ///
-/// One frozen post-maintenance store snapshot supplies both the immutable fact
-/// view and admitted audience. New evidence arriving later cannot split the
-/// decision across temporal boundaries; another maintenance call observes it.
-pub fn maintain_recipient_envelopes<S, R>(
+/// The supplied snapshot fixes the secrets to inspect. The live store then
+/// freezes the READ-proof frontier, acquires that frontier's missing claim
+/// blobs by exact handle, and publishes envelopes for its finite audience.
+/// Concurrent grants and secrets wait for the next additive maintenance call.
+pub async fn maintain_recipient_envelopes<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
     secrets: &SecretsSnapshot<R>,
@@ -353,8 +355,8 @@ pub fn maintain_recipient_envelopes<S, R>(
     holder: &SigningKey,
 ) -> Result<usize>
 where
-    S: Store + CollectionStoreExt,
-    R: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
+    R: StoreSnapshot + BlobStoreGet,
 {
     let Some(view) = secrets
         .collections()
@@ -366,7 +368,11 @@ where
     let Some(facts) = secrets.facts() else {
         return Ok(0);
     };
-    let recipients = admitted_readers(secrets.store_snapshot(), collection, secrets.instant())?;
+    let audience = store
+        .acquire_read_audience_at(collection.handle(), secrets.instant())
+        .await
+        .map_err(|error| anyhow!("acquire admitted Secrets readers: {error}"))?;
+    let recipients = finite_readers(audience)?;
     let secret_ids = find!(
         id: triblespace::core::id::Id,
         pattern!(view.facts(), [{
@@ -399,12 +405,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::convert::Infallible;
+
+    use anybytes::Bytes;
     use hifitime::Epoch;
     use rand_core::OsRng;
-    use triblespace::core::collection::{
-        grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionPolicy,
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob};
+    use triblespace::core::capability::{
+        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
+        CapabilityProofBundle, CapabilityResource,
     };
-    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionData,
+        CollectionPolicy, CollectionRecord, CollectionStore, ACTION_READ,
+    };
+    use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::core::inline::{Inline, InlineEncoding};
+    use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+    use triblespace::core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource, WantRead};
     use triblespace::prelude::TryToInline;
 
     use super::*;
@@ -416,6 +436,86 @@ mod tests {
 
     fn direct_policy(key: VerifyingKey) -> CollectionPolicy {
         CollectionPolicy::new(AdmissionPolicy::direct(key), AdmissionPolicy::direct(key))
+    }
+
+    #[derive(Default)]
+    struct AcquiringStore {
+        inner: MemoryRepo,
+        offered: BTreeMap<CollectionData, Bytes>,
+        acquired: Vec<CollectionData>,
+    }
+
+    impl AcquiringStore {
+        fn offer<E>(&mut self, blob: &Blob<E>)
+        where
+            E: BlobEncoding,
+            Handle<E>: InlineEncoding,
+        {
+            self.offered
+                .insert(Handle::<E>::to_hash(blob.get_handle()), blob.bytes.clone());
+        }
+    }
+
+    impl SnapshotSource for AcquiringStore {
+        type Snapshot = MemoryRepoSnapshot;
+        type SnapshotError = Infallible;
+
+        fn snapshot(&mut self) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot()
+        }
+    }
+
+    impl BlobStorePut for AcquiringStore {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<S, T>(&mut self, item: T) -> std::result::Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.put(item)
+        }
+    }
+
+    impl CollectionStore for AcquiringStore {
+        type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+
+        fn insert(
+            &mut self,
+            record: CollectionRecord,
+        ) -> std::result::Result<(), Self::InsertError> {
+            self.inner.insert(record)
+        }
+    }
+
+    impl CapabilityProofStore for AcquiringStore {
+        type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+
+        fn insert_proof(
+            &mut self,
+            proof: CapabilityProof,
+        ) -> std::result::Result<(), Self::InsertError> {
+            self.inner.insert_proof(proof)
+        }
+    }
+
+    impl AsyncBlobStoreAcquire for AcquiringStore {
+        type AcquireError = Infallible;
+
+        fn acquire(
+            &mut self,
+            handle: Inline<Handle<UnknownBlob>>,
+        ) -> impl std::future::Future<Output = std::result::Result<Option<Bytes>, Self::AcquireError>>
+               + Send {
+            let data = Handle::<UnknownBlob>::to_hash(handle);
+            self.acquired.push(data);
+            let bytes = self.offered.get(&data).cloned();
+            if let Some(bytes) = &bytes {
+                self.inner.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+            }
+            std::future::ready(Ok(bytes))
+        }
     }
 
     #[test]
@@ -548,6 +648,7 @@ mod tests {
                     .unwrap();
             let added =
                 maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
+                    .await
                     .unwrap();
             assert_eq!(added, 2);
 
@@ -557,6 +658,64 @@ mod tests {
                     .unwrap();
             assert_eq!(after.open(first, &bob).unwrap(), b"value");
             assert_eq!(after.open(second, &bob).unwrap(), b"other");
+        });
+    }
+
+    #[test]
+    fn recipient_maintenance_acquires_nonresident_read_claims_without_want() {
+        pollster::block_on(async {
+            let alice = SigningKey::generate(&mut OsRng);
+            let bob = SigningKey::generate(&mut OsRng);
+            let mut store = AcquiringStore::default();
+            let collection = SecretsCollection::register(
+                &mut store,
+                "remotely-granted-secrets",
+                direct_policy(alice.verifying_key()),
+            )
+            .unwrap();
+            let secret =
+                add_secret(&mut store, &alice, collection, "token", b"value", at(5)).unwrap();
+
+            let atom = CapabilityAtom::new(
+                CapabilityAction::new(ACTION_READ),
+                CapabilityResource::from(collection.handle()),
+            );
+            let bundle = CapabilityProofBundle::issue_root(
+                &alice,
+                CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+                bob.verifying_key(),
+            )
+            .unwrap();
+            let (proof, claims) = bundle.into_parts();
+            store.insert_proof(proof).unwrap();
+            let expected = claims
+                .iter()
+                .map(|claim| Handle::<SimpleArchive>::to_hash(claim.get_handle()))
+                .collect::<Vec<_>>();
+            for claim in &claims {
+                store.offer(claim);
+            }
+
+            let current =
+                maintain_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert!(current.open(secret, &bob).is_err());
+
+            let added =
+                maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
+                    .await
+                    .unwrap();
+            assert_eq!(added, 1);
+            assert_eq!(store.acquired, expected);
+            assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+            drop(current);
+
+            let after =
+                maintain_and_snapshot(&mut store, [collection], Epoch::from_unix_seconds(100.0))
+                    .await
+                    .unwrap();
+            assert_eq!(after.open(secret, &bob).unwrap(), b"value");
         });
     }
 
@@ -618,8 +777,9 @@ mod tests {
             assert!(secrets.contains(secret));
             assert_eq!(secrets.open(secret, &alice).unwrap(), b"still one entity");
 
-            let added =
-                maintain_recipient_envelopes(&mut store, &alice, &secrets, left, &alice).unwrap();
+            let added = maintain_recipient_envelopes(&mut store, &alice, &secrets, left, &alice)
+                .await
+                .unwrap();
             assert_eq!(added, 2);
             drop(secrets);
 

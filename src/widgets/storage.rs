@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::collection::lww_register::{LwwIndex, RegisterCoordinatesMapping};
-use triblespace::core::collection::observed_union::{ObserveStatesMapping, ObservedIndex};
+use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{
     CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
@@ -699,7 +699,7 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
         {
             drop(
-                pile.maintain_exact::<RegisterCoordinatesMapping>(target, support)
+                pile.maintain_exact(target, support)
                     .await
                     .map_err(|error| format!("maintain Compass status register: {error}"))?,
             );
@@ -709,7 +709,7 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             (wiki_observations, by_scope.get(&WIKI_SCOPE_ID))
         {
             drop(
-                pile.maintain_exact::<ObserveStatesMapping>(target, support)
+                pile.maintain_exact(target, support)
                     .await
                     .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
             );

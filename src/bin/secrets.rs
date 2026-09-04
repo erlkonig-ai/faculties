@@ -179,9 +179,9 @@ fn cmd_maintain(storage: SecretsStorage<'_>) -> Result<()> {
             [collection],
             instant,
         ))?;
-        let added = secret_storage::maintain_recipient_envelopes(
+        let added = pollster::block_on(secret_storage::maintain_recipient_envelopes(
             pile, signer, &snapshot, collection, signer,
-        )?;
+        ))?;
         println!("added {added} recipient envelope(s)");
         Ok(())
     })
