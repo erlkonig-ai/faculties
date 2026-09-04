@@ -63,6 +63,8 @@ pub mod memory_cover;
 pub mod message;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
+#[cfg(feature = "senses")]
+pub mod organ_client;
 pub mod orient;
 pub mod out;
 pub mod planner;

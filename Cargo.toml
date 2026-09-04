@@ -145,6 +145,12 @@ voice = ["dep:mary", "mary/speak", "audio", "dep:framed-stream"]
 # `mary/dmel` and `framed-stream` are the Inkling ear (`hear stream`): the
 # mind's own tokenizer for sound, written as records for drive's `--hear`.
 hear = ["dep:mary", "mary/gemma", "mary/dmel", "dep:tokenizers", "dep:framed-stream"]
+# The senses (`listen`, `look`): commands she runs that turn a device toward
+# one of HER organs -- drive's iroh endpoint -- and push a framed stream into
+# it for as long as they run. Raw media, never derived: the mind owns the front
+# ends. Off by default because iroh is a heavy build; the resident cohorts
+# (the Sparks, the Pi) turn it on.
+senses = ["dep:framed-stream", "dep:iroh", "dep:iroh-base", "dep:tokio", "dep:image"]
 # The `duplex` faculty: a continuously running spoken channel on mary's
 # streaming full-duplex speech model. `mary/personaplex` brings the LM layers
 # (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
@@ -223,9 +229,14 @@ mary = { path = "../mary", default-features = false, optional = true }
 # The framed-stream convention (drive's streaming-faculty pipe): `voice stream`
 # reads text records on stdin and writes PCM records on stdout as it synthesizes.
 framed-stream = { path = "../drive/framed-stream", optional = true }
+# senses-only: the mesh transport her organs are served on, with the same
+# identity the pile travels under (`trible pile net identity`).
+iroh = { version = "1.0", features = ["platform-verifier"], optional = true }
+iroh-base = { version = "1.0", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
 # imagine-only: the `image` crate, matching mary's flux feature, so the
 # RgbImage the pipeline returns can be `.save()`d to a PNG here.
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
