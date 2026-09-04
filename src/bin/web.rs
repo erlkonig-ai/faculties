@@ -302,11 +302,10 @@ impl WebStorage<'_> {
                 .snapshot()
                 .context("freeze Headspace source snapshot")?;
             let instant = clock::now()?;
-            let support = before
-                .collection_at(headspace.source(), instant)
-                .context("observe resident Headspace collection")?
-                .support()
-                .clone();
+            let support = pile
+                .acquire_admitted_support_at(headspace.source(), &before, instant)
+                .await
+                .context("acquire admitted Headspace collection support")?;
             drop(before);
             drop(
                 headspace
@@ -318,7 +317,7 @@ impl WebStorage<'_> {
             let secrets_collection =
                 open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
             let secrets =
-                secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
+                secret_storage::ensure_and_snapshot(&mut pile, secrets_collection, instant)
                     .await
                     .context("ensure configured Secrets collection")?;
 

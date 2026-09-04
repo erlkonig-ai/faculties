@@ -1070,11 +1070,10 @@ pub async fn materialize_indexed_collection(
     let status_target = status_register_for_source(pile, source)?;
     let instant = crate::clock::now()?;
     let before = pile.snapshot().context("freeze Compass source snapshot")?;
-    let support = before
-        .collection_at(source, instant)
-        .context("observe resident Compass source collection")?
-        .support()
-        .clone();
+    let support = pile
+        .acquire_admitted_support_at(source, &before, instant)
+        .await
+        .context("acquire admitted Compass source support")?;
     drop(before);
     drop(
         facts

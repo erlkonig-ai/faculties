@@ -161,13 +161,17 @@ impl FactCollection {
         self.rank9
     }
 
-    /// Maintain both derivation hops for source support resident in `before`.
+    /// Maintain both derivation hops for support admitted at `before`.
     ///
-    /// The one pre-work snapshot is the semantic watermark. Admitted commits
-    /// whose payloads are not resident there are deliberately absent, while a
-    /// later returned snapshot truthfully includes all compatible concurrent
-    /// work visible after maintenance. The same foundational support crosses
-    /// both mapping edges; a downstream edge never constructs its source.
+    /// `before` freezes the collection-record and capability-proof control
+    /// frontier. Missing immutable descriptor, data, and metadata bytes
+    /// may become resident while support is acquired, but records and proofs
+    /// arriving concurrently remain deferred. The returned snapshot is later
+    /// and may therefore observe additional compatible work; callers pinning
+    /// several views to one denotation should retain the acquired [`Support`]
+    /// and attach each target with `collection_exact`. The same foundational
+    /// support crosses both mapping edges; a downstream edge never constructs
+    /// its source.
     pub async fn maintain_at<S>(
         self,
         store: &mut S,
@@ -177,11 +181,10 @@ impl FactCollection {
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let support = before
-            .collection_at(self.source, instant)
-            .context("observe resident fact collection")?
-            .support()
-            .clone();
+        let support = store
+            .acquire_admitted_support_at(self.source, before, instant)
+            .await
+            .context("acquire admitted fact collection support")?;
         self.maintain_exact(store, &support).await
     }
 

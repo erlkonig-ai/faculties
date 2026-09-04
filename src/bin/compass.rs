@@ -271,22 +271,36 @@ impl CompassStorage<'_> {
             let before = pile
                 .snapshot()
                 .context("freeze shared Compass/Relations source snapshot")?;
-            pollster::block_on(async {
+            let (compass_support, relation_support) = pollster::block_on(async {
+                let compass_support = pile
+                    .acquire_admitted_support_at(compass_facts.source(), &before, instant)
+                    .await
+                    .context("acquire admitted Compass support")?;
+                let relation_support = match relation_facts {
+                    Some(relation_facts) => Some(
+                        pile.acquire_admitted_support_at(relation_facts.source(), &before, instant)
+                            .await
+                            .context("acquire admitted Relations support for Compass persona")?,
+                    ),
+                    None => None,
+                };
                 drop(
                     compass_facts
-                        .maintain_at(pile, &before, instant)
+                        .maintain_exact(pile, &compass_support)
                         .await
                         .context("maintain Compass fact collection")?,
                 );
-                if let Some(relation_facts) = relation_facts {
+                if let (Some(relation_facts), Some(relation_support)) =
+                    (relation_facts, relation_support.as_ref())
+                {
                     drop(
                         relation_facts
-                            .maintain_at(pile, &before, instant)
+                            .maintain_exact(pile, relation_support)
                             .await
                             .context("maintain Relations fact collection for Compass persona")?,
                     );
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<_, anyhow::Error>((compass_support, relation_support))
             })?;
             drop(before);
 
@@ -297,13 +311,15 @@ impl CompassStorage<'_> {
                 .snapshot()
                 .context("freeze maintained Compass/Relations snapshot")?;
             let facts = reader
-                .collection_at(compass_facts.rank9(), instant)
+                .collection_exact(compass_facts.rank9(), &compass_support)
                 .context("observe Compass fact collection")?
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
-            let by = if let (Some(persona), Some(relation_facts)) = (persona, relation_facts) {
+            let by = if let (Some(persona), Some(relation_facts), Some(relation_support)) =
+                (persona, relation_facts, relation_support.as_ref())
+            {
                 let relations = reader
-                    .collection_at(relation_facts.rank9(), instant)
+                    .collection_exact(relation_facts.rank9(), relation_support)
                     .context("observe Relations fact collection for Compass persona")?
                     .view::<FactArchive>()
                     .context("read Relations fact collection for Compass persona")?;

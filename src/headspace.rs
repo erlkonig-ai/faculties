@@ -1738,9 +1738,7 @@ mod tests {
         let collection =
             open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
         let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
-            &mut pile,
-            [collection],
-            instant,
+            &mut pile, collection, instant,
         ))
         .unwrap();
 
@@ -1782,9 +1780,7 @@ mod tests {
         let collection =
             open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
         let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
-            &mut pile,
-            [collection],
-            instant,
+            &mut pile, collection, instant,
         ))
         .unwrap();
         let error = validate_secret_references(&catalog, &secrets).unwrap_err();

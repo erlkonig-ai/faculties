@@ -8,9 +8,10 @@
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
 //! not participate in this boundary. The interactive viewer loads all sources;
 //! focused capture binaries request only their source dependency
-//! closure. Loading may maintain deterministic derived views for the exact
-//! resident source support observed before work begins; those unsigned
-//! artifacts are cache exhaust, not authoritative writes. Most sources are
+//! closure. Loading may acquire immutable bytes and maintain deterministic
+//! derived views for the exact admitted support selected through one common
+//! pre-work control frontier; those unsigned artifacts are cache exhaust, not
+//! authoritative writes. Most sources are
 //! fixed descriptor-handle collections. Secrets uses the same explicit
 //! collection configuration and is attached only when the pile signer is
 //! admitted to READ it.
@@ -164,13 +165,7 @@ impl DatasetRevision {
     fn from_secrets(snapshot: &SecretsSnapshot<PileSnapshot>) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.secrets-revision.v3");
-        for collection in snapshot.collections() {
-            Self::hash_collection_support(
-                &mut hasher,
-                collection.collection(),
-                collection.support(),
-            );
-        }
+        Self::hash_collection_support(&mut hasher, snapshot.collection(), snapshot.support());
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -666,17 +661,20 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             })
             .transpose()?;
 
-        // All source supports come from one immutable pre-work watermark.
+        // All source supports share one immutable records-and-proofs
+        // watermark. Acquisition may add immutable blob residency, never
+        // concurrent authority or collection records.
         let before = pile
             .snapshot()
             .map_err(|error| format!("freeze pre-maintenance viewer snapshot: {error}"))?;
         let instant = triblespace::core::clock::epoch_now();
         for (scope, label, collection) in collections {
-            let support = before
-                .collection_at(collection.source(), instant)
-                .map_err(|error| format!("observe resident {label} collection: {error:#}"))?
-                .support()
-                .clone();
+            let support = pile
+                .acquire_admitted_support_at(collection.source(), &before, instant)
+                .await
+                .map_err(|error| {
+                    format!("acquire admitted {label} collection support: {error:#}")
+                })?;
             by_scope.insert(scope, (collection, support));
         }
         drop(before);
@@ -720,7 +718,7 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
                 open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)
                     .map_err(|error| format!("open configured Secrets collection: {error:#}"))?;
             Some(
-                secret_storage::ensure_and_snapshot(&mut pile, [collection], instant)
+                secret_storage::ensure_and_snapshot(&mut pile, collection, instant)
                     .await
                     .map(LoadedSecrets::new)
                     .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?,

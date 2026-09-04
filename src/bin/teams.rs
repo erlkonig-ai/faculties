@@ -478,16 +478,18 @@ impl TeamsSession<'_> {
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("commit Teams fragment")?;
-        let before = self
+        let shared_control = self
             .pile
             .snapshot()
             .context("freeze Teams post-commit source snapshot")?;
         let instant = clock::now()?;
-        let support = before
-            .collection_at(self.maintained.source(), instant)
-            .context("observe Teams support after commit")?
-            .support()
-            .clone();
+        let support = pollster::block_on(self.pile.acquire_admitted_support_at(
+            self.maintained.source(),
+            &shared_control,
+            instant,
+        ))
+        .context("acquire admitted Teams support after commit")?;
+        drop(shared_control);
         pollster::block_on(async {
             drop(
                 self.maintained
@@ -507,7 +509,7 @@ impl TeamsSession<'_> {
 
     async fn refresh_secrets_for_async(&mut self, support: Support) -> Result<()> {
         let secrets =
-            secret_storage::ensure_and_snapshot(self.pile, [self.secret_collection], self.instant)
+            secret_storage::ensure_and_snapshot(self.pile, self.secret_collection, self.instant)
                 .await
                 .context("refresh configured Secrets collection for Teams")?;
         let reader = secrets.store_snapshot().clone();
@@ -557,17 +559,19 @@ impl TeamsStorage<'_> {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Teams fact collection")?;
-            let before = pile
+            let shared_control = pile
                 .snapshot()
                 .context("freeze Teams pre-maintenance snapshot")?;
             let instant = clock::now()?;
             let secret_collection =
                 open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
-            let support = before
-                .collection_at(maintained.source(), instant)
-                .context("observe Teams support before maintenance")?
-                .support()
-                .clone();
+            let support = pollster::block_on(pile.acquire_admitted_support_at(
+                maintained.source(),
+                &shared_control,
+                instant,
+            ))
+            .context("acquire admitted Teams support before maintenance")?;
+            drop(shared_control);
             let secrets = pollster::block_on(async {
                 drop(
                     maintained
@@ -575,7 +579,7 @@ impl TeamsStorage<'_> {
                         .await
                         .context("maintain Teams fact collection")?,
                 );
-                secret_storage::ensure_and_snapshot(&mut pile, [secret_collection], instant)
+                secret_storage::ensure_and_snapshot(&mut pile, secret_collection, instant)
                     .await
                     .context("ensure configured Secrets collection for Teams")
             })?;

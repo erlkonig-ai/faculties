@@ -546,11 +546,10 @@ pub async fn materialize_indexed_collection(
 
     let before = pile.snapshot().context("freeze Body source snapshot")?;
     let instant = triblespace::core::clock::epoch_now();
-    let support = before
-        .collection_at(source, instant)
-        .context("observe resident Body collection")?
-        .support()
-        .clone();
+    let support = pile
+        .acquire_admitted_support_at(source, &before, instant)
+        .await
+        .context("acquire admitted Body support")?;
     drop(before);
 
     drop(

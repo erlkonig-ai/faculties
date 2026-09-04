@@ -155,11 +155,11 @@ impl ArchiveStorage<'_> {
                 .context("register maintained Comb cursor collection")?;
             let instant = faculties::clock::now()?;
             let before = pile.snapshot().context("freeze Comb source snapshot")?;
-            let support = before
-                .collection_at(collection.source(), instant)
-                .context("observe resident Comb cursor collection")?
-                .support()
-                .clone();
+            let support = pile
+                .acquire_admitted_support_at(collection.source(), &before, instant)
+                .await
+                .context("acquire admitted Comb cursor support")?;
+            drop(before);
             let after = collection
                 .maintain_exact(&mut pile, &support)
                 .await
@@ -199,11 +199,15 @@ impl ArchiveStorage<'_> {
             let before = pile
                 .snapshot()
                 .context("freeze Archive replay source snapshot")?;
-            let comb_support = before
-                .collection_at(comb_collections.source(), instant)
-                .context("observe resident Comb cursor collection")?
-                .support()
-                .clone();
+            let comb_support = pile
+                .acquire_admitted_support_at(comb_collections.source(), &before, instant)
+                .await
+                .context("acquire admitted Comb cursor support")?;
+            let (archive_support, archive_commits) = pile
+                .acquire_admitted_with_commits_at(archive_collections.source(), &before, instant)
+                .await
+                .context("acquire admitted Archive support and commits")?;
+            drop(before);
 
             drop(
                 comb_collections
@@ -211,12 +215,12 @@ impl ArchiveStorage<'_> {
                     .await
                     .context("maintain Comb cursor collection")?,
             );
-            let archive = ArchiveSnapshot::maintain_from(
+            let archive = ArchiveSnapshot::maintain_exact(
                 &mut pile,
                 archive_collections,
                 archive_schema::DEFAULT_SCOPE_ID,
-                &before,
-                instant,
+                archive_support,
+                archive_commits,
             )
             .await?;
             let comb_facts = archive

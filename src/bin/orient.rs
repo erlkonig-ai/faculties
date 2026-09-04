@@ -263,11 +263,10 @@ impl OrientSource {
         snapshot: &PileSnapshot,
         instant: Epoch,
     ) -> Result<Support> {
-        let support = snapshot
-            .collection_at(self.facts.source(), instant)
-            .map_err(|error| anyhow!("observe resident {} collection: {error}", self.label))?
-            .support()
-            .clone();
+        let support = pile
+            .acquire_admitted_support_at(self.facts.source(), snapshot, instant)
+            .await
+            .map_err(|error| anyhow!("acquire admitted {} support: {error}", self.label))?;
         drop(
             self.facts
                 .maintain_exact(pile, &support)
@@ -395,10 +394,10 @@ impl OrientObservation {
     }
 }
 
-/// Maintain the resident support visible in one immutable source snapshot.
+/// Acquire and maintain the support admitted by one immutable control snapshot.
 ///
-/// Missing source blobs are simply outside that snapshot's collection value;
-/// a later append creates a later snapshot and another maintenance chance.
+/// Acquisition may refresh blob residency, but records and capability proofs
+/// appended after `snapshot` cannot enter any support selected by this batch.
 async fn maintain_sources_at(
     pile: &mut Pile,
     snapshot: &PileSnapshot,
@@ -3022,14 +3021,17 @@ async fn cmd_wake(
         let source_snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake source snapshot: {error}"))?;
-        let wiki_support = source_snapshot
-            .collection_at(wiki_source, instant)
-            .context("observe resident Wiki source collection")?
-            .support()
-            .clone();
+        let memory_support = storage
+            .acquire_admitted_support_at(memory_collection.source(), &source_snapshot, instant)
+            .await
+            .context("acquire admitted Memory support")?;
+        let wiki_support = storage
+            .acquire_admitted_support_at(wiki_source, &source_snapshot, instant)
+            .await
+            .context("acquire admitted Wiki support")?;
         drop(
             memory_collection
-                .maintain_at(&mut storage, &source_snapshot, instant)
+                .maintain_exact(&mut storage, &memory_support)
                 .await
                 .context("maintain Memory collection")?,
         );
@@ -3051,7 +3053,7 @@ async fn cmd_wake(
         drop(source_snapshot);
         let memory_facts = observation
             .snapshot
-            .collection_at(memory_collection.rank9(), instant)
+            .collection_exact(memory_collection.rank9(), &memory_support)
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;

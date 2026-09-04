@@ -397,22 +397,31 @@ fn main() -> Result<()> {
             .context("register maintained Relations fact collection")?;
         let messages = FactCollection::new(&mut pile, message_source)
             .context("register maintained Message fact collection")?;
-        let before = pile
+        let control = pile
             .snapshot()
             .context("freeze shared Message pre-maintenance snapshot")?;
         let instant = clock::now()?;
+        let relations_support = pile
+            .acquire_admitted_support_at(relations.source(), &control, instant)
+            .await
+            .context("acquire admitted Relations support")?;
+        let messages_support = pile
+            .acquire_admitted_support_at(messages.source(), &control, instant)
+            .await
+            .context("acquire admitted Message support")?;
         drop(
             relations
-                .maintain_at(&mut pile, &before, instant)
+                .maintain_exact(&mut pile, &relations_support)
                 .await
                 .context("maintain Relations fact collection")?,
         );
         drop(
             messages
-                .maintain_at(&mut pile, &before, instant)
+                .maintain_exact(&mut pile, &messages_support)
                 .await
                 .context("maintain Message fact collection")?,
         );
+        drop(control);
 
         // Both query views and every attachment read share this one later
         // immutable boundary.
@@ -420,13 +429,13 @@ fn main() -> Result<()> {
             .snapshot()
             .context("freeze maintained Message snapshot")?;
         let relation_collection = reader
-            .collection_at(relations.rank9(), instant)
+            .collection_exact(relations.rank9(), &relations_support)
             .context("observe Relations Rank9 projection")?;
         let relation_facts = relation_collection
             .view::<FactArchive>()
             .context("read Relations Rank9 projection")?;
         let message_collection = reader
-            .collection_at(messages.rank9(), instant)
+            .collection_exact(messages.rank9(), &messages_support)
             .context("observe Message Rank9 projection")?;
         let message_facts = message_collection
             .view::<FactArchive>()

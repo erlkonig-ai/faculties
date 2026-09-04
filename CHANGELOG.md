@@ -12,11 +12,11 @@ All notable changes to this project will be documented in this file.
   collection; ciphertext and opaque secret ids do not change. Vault custody
   keys and epochs, the `secrets-access` inbox, Secrets-specific READ claims,
   proof-id envelopes, per-writer access bundles, and decrypt-time expiry checks
-  are removed. Envelope maintenance actively acquires the claim closure of one
-  frozen `READ(collection)` proof frontier by exact blob handle, without
-  emitting durable `WANT`s; a concurrent grant is handled by the next additive
-  pass. Existing secret and wrap facts retain their published schema; old
-  headers and access facts are inert, enabling an additive cutover.
+  are removed. Envelope maintenance reads self-contained capability paths from
+  the same frozen snapshot as the ciphertext; a concurrent grant is handled by
+  the next additive pass and no authority-specific blob acquisition or durable
+  `WANT` is involved. Existing secret and wrap facts retain their published
+  schema; old headers and access facts are inert.
 
 - **Orient reads maintained Succinct collection snapshots directly.** Messages,
   Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations
@@ -53,7 +53,8 @@ All notable changes to this project will be documented in this file.
   reuses the retired commits' exact data and metadata handles, and
   deterministically re-signs their distinct leaves. Planning and verification
   classify untouched residue; MERGE/DERIVE cache exhaust is rebuilt lazily,
-  and Secrets is explicitly deferred to its handle-aware migration.
+  and historical vault ciphertext remains inert rather than extending runtime
+  compatibility.
 
 - **New Compass goals and notes use intrinsic occurrence ids.** Their immutable
   fields, including creation time, now determine the id returned by the typed

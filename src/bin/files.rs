@@ -383,12 +383,27 @@ fn with_files_view<T>(
     with_files_store(pile, |store, collection, signer| {
         let facts = FactCollection::new(store, collection)
             .context("register maintained Files fact collection")?;
-        let before = store.snapshot().context("freeze Files source snapshot")?;
+        let control = store.snapshot().context("freeze Files source snapshot")?;
         let instant = clock::now()?;
-        let reader = pollster::block_on(facts.maintain_at(store, &before, instant))
-            .context("maintain Files fact collection")?;
+        let support = pollster::block_on(async {
+            let support = store
+                .acquire_admitted_support_at(facts.source(), &control, instant)
+                .await
+                .context("acquire admitted Files support")?;
+            drop(
+                facts
+                    .maintain_exact(store, &support)
+                    .await
+                    .context("maintain Files fact collection")?,
+            );
+            Ok::<_, anyhow::Error>(support)
+        })?;
+        drop(control);
+        let reader = store
+            .snapshot()
+            .context("freeze maintained Files snapshot")?;
         let space = reader
-            .collection_at(facts.rank9(), instant)
+            .collection_exact(facts.rank9(), &support)
             .context("observe Files fact collection")?
             .view::<FactArchive>()
             .context("read Files fact collection")?;

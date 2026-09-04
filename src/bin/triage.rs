@@ -36,7 +36,7 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::collection::{CollectionSnapshotExt, Support};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -174,25 +174,24 @@ impl TriageSnapshot {
             registered.push((scope, label, facts));
         }
 
-        // One immutable watermark chooses every source's resident support.
+        // One immutable watermark chooses every source's admitted support.
         let before = pile
             .snapshot()
             .context("freeze pre-maintenance Triage snapshot")?;
         let instant = clock::now()?;
-        let supports = registered
-            .iter()
-            .map(|(_, label, facts)| {
-                before
-                    .collection_at(facts.source(), instant)
-                    .with_context(|| format!("observe resident {label} collection"))
-                    .map(|snapshot| snapshot.support().clone())
-            })
-            .collect::<Result<Vec<Support>>>()?;
-        drop(before);
-
         let secrets_collection =
             open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
-        let secrets = pollster::block_on(async {
+        let (supports, secrets) = pollster::block_on(async {
+            let mut supports = Vec::<Support>::with_capacity(registered.len());
+            for (_, label, facts) in &registered {
+                supports.push(
+                    pile.acquire_admitted_support_at(facts.source(), &before, instant)
+                        .await
+                        .with_context(|| format!("acquire admitted {label} collection support"))?,
+                );
+            }
+            drop(before);
+
             for ((_, label, facts), support) in registered.iter().zip(&supports) {
                 drop(
                     facts
@@ -201,9 +200,11 @@ impl TriageSnapshot {
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
             }
-            secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
-                .await
-                .context("ensure configured Secrets collection")
+            let secrets =
+                secret_storage::ensure_and_snapshot(&mut pile, secrets_collection, instant)
+                    .await
+                    .context("ensure configured Secrets collection")?;
+            Ok::<_, anyhow::Error>((supports, secrets))
         })?;
 
         // Secrets attachment already owns the one later immutable snapshot.

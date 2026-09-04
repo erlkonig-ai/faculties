@@ -1625,13 +1625,13 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     let facts = FactCollection::new(pile, collection)
         .context("register maintained Wiki fact collection")?;
     let target = observed_collection(pile, signer.verifying_key())?;
-    let before = pile.snapshot().context("freeze Wiki source snapshot")?;
+    let shared_control = pile.snapshot().context("freeze Wiki source snapshot")?;
     let instant = crate::clock::now()?;
-    let support = before
-        .collection_at(collection, instant)
-        .context("observe resident Wiki source collection")?
-        .support()
-        .clone();
+    let support = pile
+        .acquire_admitted_support_at(collection, &shared_control, instant)
+        .await
+        .context("acquire admitted Wiki source support")?;
+    drop(shared_control);
     drop(
         facts
             .maintain_exact(pile, &support)

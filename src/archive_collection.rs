@@ -680,23 +680,26 @@ impl ArchiveSnapshot {
 
     async fn from_store(pile: &mut Pile, collections: FactCollection, scope: Id) -> Result<Self> {
         let instant = crate::clock::now()?;
-        let before = pile.snapshot().context("freeze Archive source snapshot")?;
-        Self::maintain_from(pile, collections, scope, &before, instant).await
+        let control = pile.snapshot().context("freeze Archive source snapshot")?;
+        let (support, commits) = pile
+            .acquire_admitted_with_commits_at(collections.source(), &control, instant)
+            .await
+            .context("acquire admitted Archive support and commits")?;
+        drop(control);
+        Self::maintain_exact(pile, collections, scope, support, commits).await
     }
 
-    /// Maintain and attach Archive from one caller-selected source watermark.
+    /// Maintain and attach Archive for one exact support and provenance set.
     ///
-    /// Callers which read several collections together can freeze one
-    /// pre-work snapshot, capture every collection's exact support there, and
-    /// then attach all maintained views through the one immutable snapshot
-    /// returned by the final maintenance step. This removes cross-watermark
-    /// skew without pretending that maintenance writes change the observation.
-    pub async fn maintain_from(
+    /// Callers reading several collections acquire all supports against one
+    /// control snapshot before invoking this constructor. The final view is
+    /// attached for exactly `support`; no later admission decision is made.
+    pub async fn maintain_exact(
         pile: &mut Pile,
         collections: FactCollection,
         scope: Id,
-        before: &PileSnapshot,
-        instant: hifitime::Epoch,
+        support: Support,
+        mut commits: Vec<CollectionCommit>,
     ) -> Result<Self> {
         if scope != schema::DEFAULT_SCOPE_ID {
             bail!(
@@ -704,15 +707,6 @@ impl ArchiveSnapshot {
                 schema::DEFAULT_SCOPE_ID
             );
         }
-        let support = before
-            .collection_at(collections.source(), instant)
-            .context("observe resident Archive source collection")?
-            .support()
-            .clone();
-        let (_, mut commits) = collections
-            .source()
-            .admitted_with_commits_at(before, instant)
-            .context("discover admitted Archive commits")?;
         commits
             .retain(|commit| support.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
         let store_snapshot = collections

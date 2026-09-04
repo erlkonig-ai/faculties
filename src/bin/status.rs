@@ -121,20 +121,28 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
     let before = pile
         .snapshot()
         .context("freeze shared Status/Relations source snapshot")?;
-    pollster::block_on(async {
+    let (status_support, relations_support) = pollster::block_on(async {
+        let status_support = pile
+            .acquire_admitted_support_at(status.source(), &before, instant)
+            .await
+            .context("acquire admitted Status support")?;
+        let relations_support = pile
+            .acquire_admitted_support_at(relations.source(), &before, instant)
+            .await
+            .context("acquire admitted Relations support")?;
         drop(
             status
-                .maintain_at(pile, &before, instant)
+                .maintain_exact(pile, &status_support)
                 .await
                 .context("maintain Status fact collection")?,
         );
         drop(
             relations
-                .maintain_at(pile, &before, instant)
+                .maintain_exact(pile, &relations_support)
                 .await
                 .context("maintain Relations fact collection")?,
         );
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>((status_support, relations_support))
     })?;
     drop(before);
 
@@ -142,12 +150,12 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
         .snapshot()
         .context("freeze maintained Status/Relations snapshot")?;
     let status = snapshot
-        .collection_at(status.rank9(), instant)
+        .collection_exact(status.rank9(), &status_support)
         .context("observe Status Rank9 collection")?
         .view::<FactArchive>()
         .context("read Status Rank9 collection")?;
     let relations = snapshot
-        .collection_at(relations.rank9(), instant)
+        .collection_exact(relations.rank9(), &relations_support)
         .context("observe Relations Rank9 collection")?
         .view::<FactArchive>()
         .context("read Relations Rank9 collection")?;

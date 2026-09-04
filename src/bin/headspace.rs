@@ -201,22 +201,22 @@ impl Storage<'_> {
         let instant = clock::now()?;
         let secrets_collection =
             open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
-        let support = before
-            .collection_at(collection.source(), instant)
-            .context("observe resident Headspace collection")?
-            .support()
-            .clone();
-        drop(before);
-        let secrets = pollster::block_on(async {
+        let (support, secrets) = pollster::block_on(async {
+            let support = pile
+                .acquire_admitted_support_at(collection.source(), &before, instant)
+                .await
+                .context("acquire admitted Headspace collection support")?;
+            drop(before);
             drop(
                 collection
                     .maintain_exact(pile, &support)
                     .await
                     .context("maintain Headspace fact collection")?,
             );
-            secret_storage::ensure_and_snapshot(pile, [secrets_collection], instant)
+            let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, instant)
                 .await
-                .context("ensure configured Secrets collection")
+                .context("ensure configured Secrets collection")?;
+            Ok::<_, anyhow::Error>((support, secrets))
         })?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
@@ -1114,7 +1114,7 @@ mod tests {
         ))
         .unwrap();
         let (storage, repaired) = views(&pile, &key);
-        assert_eq!(repaired.secrets.collections().len(), 1);
+        assert_eq!(repaired.secrets.collection(), collection.handle());
         assert!(repaired.secrets.contains(version));
         let config_resolution =
             headspace::current_config(&repaired.headspace.reader, &repaired.headspace.facts)
@@ -1143,7 +1143,7 @@ mod tests {
         ))
         .unwrap();
         let (storage, replay) = views(&pile, &key);
-        assert_eq!(replay.secrets.collections().len(), 1);
+        assert_eq!(replay.secrets.collection(), collection.handle());
         let config_resolution =
             headspace::current_config(&replay.headspace.reader, &replay.headspace.facts).unwrap();
         let config = settled_config(&config_resolution).unwrap().unwrap();

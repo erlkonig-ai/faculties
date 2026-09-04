@@ -2846,9 +2846,7 @@ mod tests {
         )
         .unwrap();
         let secrets = pollster::block_on(crate::secrets::storage::ensure_and_snapshot(
-            &mut pile,
-            [collection],
-            instant,
+            &mut pile, collection, instant,
         ))
         .unwrap();
         assert_eq!(secrets.open(exact, &signer).unwrap(), b"exact");

@@ -133,9 +133,7 @@ fn cmd_get(storage: SecretsStorage<'_>, secret: Id) -> Result<()> {
         let instant = clock::now()?;
         let collection = open_secrets_collection_read(pile, signer.verifying_key(), instant)?;
         let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
-            pile,
-            [collection],
-            instant,
+            pile, collection, instant,
         ))?;
         snapshot.open(secret, signer)
     })?);
@@ -150,9 +148,7 @@ fn cmd_list(storage: SecretsStorage<'_>) -> Result<()> {
         let instant = clock::now()?;
         let collection = open_secrets_collection_read(pile, signer.verifying_key(), instant)?;
         let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
-            pile,
-            [collection],
-            instant,
+            pile, collection, instant,
         ))?;
         let Some(facts) = snapshot.facts() else {
             println!("(no secrets)");
@@ -175,13 +171,11 @@ fn cmd_maintain(storage: SecretsStorage<'_>) -> Result<()> {
         let instant = clock::now()?;
         let collection = open_secrets_collection_read(pile, signer.verifying_key(), instant)?;
         let snapshot = pollster::block_on(secret_storage::maintain_and_snapshot(
-            pile,
-            [collection],
-            instant,
+            pile, collection, instant,
         ))?;
-        let added = pollster::block_on(secret_storage::maintain_recipient_envelopes(
+        let added = secret_storage::maintain_recipient_envelopes(
             pile, signer, &snapshot, collection, signer,
-        ))?;
+        )?;
         println!("added {added} recipient envelope(s)");
         Ok(())
     })

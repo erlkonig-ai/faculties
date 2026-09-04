@@ -3503,7 +3503,7 @@ mod tests {
                 open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
             let secrets = pollster::block_on(secret_storage::ensure_and_snapshot(
                 &mut pile,
-                [secrets_collection],
+                secrets_collection,
                 instant,
             ))
             .unwrap();
