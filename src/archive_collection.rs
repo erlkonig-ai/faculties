@@ -9,30 +9,30 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anybytes::{Bytes, View};
+use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
+    Collection, CollectionCommit, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
+    Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
-use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::RawBytes;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 #[cfg(test)]
 use triblespace_search::portable_bm25::PortableBM25Blob;
-use triblespace_search::portable_bm25::PortableBM25Index;
-use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::archive_bm25;
 use crate::blockdag::{self, CatalogValidation};
-use crate::schemas::{blockdag as schema, files as files_schema};
+use crate::schemas::blockdag as schema;
 use crate::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 
 use crate::collection_names::open_configured;
@@ -45,172 +45,7 @@ use triblespace::core::collection::{
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
 
-type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
-type ArchiveBm25 = PortableBM25Index<inlineencodings::GenId, WordHash>;
-/// Canonical payload of one ordinal-bearing Archive content part.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ArchivePayload {
-    Text(String),
-    Resident {
-        blob: RawHandle,
-        media_type: Id,
-    },
-    External {
-        pointer: String,
-        namespace: Id,
-        media_type: Option<Id>,
-        size: Option<u128>,
-        resolutions: Vec<RawHandle>,
-    },
-}
-
-/// One ordered semantic part of a canonical Archive block.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivePart {
-    pub id: Id,
-    pub ordinal: u64,
-    pub fact: Id,
-    pub responds_to: Option<Id>,
-    /// Exact recovered body selected by this occurrence of an external fact.
-    /// The fact may accumulate other resolution evidence later without making
-    /// this part ambiguous.
-    pub resolution: Option<RawHandle>,
-    pub modality: Id,
-    pub direction: Id,
-    pub payload: ArchivePayload,
-}
-
-/// One exact source occurrence projected onto a canonical Archive block.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveProjection {
-    pub id: Id,
-    pub source_namespace: Id,
-    pub source_locator: String,
-    pub raw_record: RawHandle,
-    pub block: Id,
-    pub block_previous: Vec<Id>,
-    pub block_timestamp: Option<Inline<NsTAIInterval>>,
-    /// Source receipts supporting the block's semantic predecessor classes;
-    /// exact vendor adjacency remains in `raw_record`.
-    pub semantic_predecessor_support: Vec<Id>,
-    pub source_timestamp: Option<Inline<NsTAIInterval>>,
-    pub author: Option<Id>,
-    pub experiencer: Option<Id>,
-    pub raw_author: Option<String>,
-    pub raw_role: Option<String>,
-    pub raw_model: Option<String>,
-    pub source_paths: Vec<String>,
-    pub parts: Vec<ArchivePart>,
-}
-
-/// One canonical semantic block together with every exact source receipt that
-/// projects to it.
-///
-/// `semantic` is the receipt with the lowest intrinsic id. All receipts for a
-/// block carry the same semantic block value; choosing one canonically avoids
-/// manufacturing an import-order-dependent representative while `receipts`
-/// preserves the complete occurrence evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveBlock {
-    pub semantic: ArchiveProjection,
-    pub receipts: Vec<ArchiveProjection>,
-}
-
-impl ArchiveBlock {
-    /// Whether this block contains at least one part of `modality`.
-    pub fn has_modality(&self, modality: Id) -> bool {
-        self.semantic
-            .parts
-            .iter()
-            .any(|part| part.modality == modality)
-    }
-
-    /// Timestamp used to place this block in the interleaved Archive view.
-    ///
-    /// A canonical semantic timestamp wins. Otherwise the earliest genuine
-    /// source-receipt timestamp supplies the position; an untimed block remains
-    /// absent from the temporal view.
-    pub fn timeline_timestamp(&self) -> Result<Option<Inline<NsTAIInterval>>> {
-        if let Some(timestamp) = self.semantic.block_timestamp {
-            return Ok(Some(timestamp));
-        }
-        let mut earliest = None;
-        for receipt in &self.receipts {
-            let Some(timestamp) = receipt.source_timestamp else {
-                continue;
-            };
-            let key = interval_lower_key(timestamp)?;
-            if earliest.is_none_or(|(earliest_key, _)| key < earliest_key) {
-                earliest = Some((key, timestamp));
-            }
-        }
-        Ok(earliest.map(|(_, timestamp)| timestamp))
-    }
-}
-
-/// Exact position from which to continue Archive's interleaved temporal view.
-///
-/// A time boundary is useful only to begin a replay. Once a block has been
-/// emitted, its content identity is the cursor: unlike a bare timestamp it
-/// distinguishes every member of an equal-time run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArchiveTimelineCursor {
-    AfterTime(i128),
-    AfterBlock(Id),
-}
-
-/// One canonical block positioned in Archive's interleaved temporal view.
-///
-/// `position` is the lower TAI-nanosecond bound of the block's canonical or
-/// earliest source timestamp, lifted to at least the position of every causal
-/// predecessor. It therefore remains monotone even when a source clock moves
-/// backwards. Independent ready roots are still interleaved by their temporal
-/// positions, with canonical block id as the deterministic tie-breaker.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveTimelineBlock {
-    pub position: i128,
-    pub block: ArchiveBlock,
-}
-
-impl ArchiveTimelineBlock {
-    pub const fn cursor(&self) -> ArchiveTimelineCursor {
-        ArchiveTimelineCursor::AfterBlock(self.block.semantic.block)
-    }
-}
-
-/// One ordered content-addressed range in an exact source snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveSourceChunk {
-    pub id: Id,
-    pub offset: u128,
-    pub bytes: RawHandle,
-}
-
-/// One exact source-file version retained independently of semantic messages.
-///
-/// Chunks stay lightweight until explicitly read, so listing a 100+ GiB
-/// archive never hashes or maps all source bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveSourceSnapshot {
-    pub id: Id,
-    pub source_namespace: Id,
-    pub source_locator: String,
-    pub byte_length: u128,
-    pub source_paths: Vec<String>,
-    pub chunks: Vec<ArchiveSourceChunk>,
-}
-
-/// One BM25 result over a canonical Archive block.
-///
-/// Search indexes semantic blocks rather than source receipts. `projections`
-/// names every source occurrence which projects to the winning block.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ArchiveSearchHit {
-    pub block: Id,
-    pub score: f32,
-    pub projections: Vec<Id>,
-}
 
 /// One atomic canonical Archive import.
 pub struct ArchiveImportWriter {
@@ -233,9 +68,11 @@ impl ArchiveImportWriter {
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let facts = FactCollection::new(&mut pile, source)
                 .context("register maintained Archive fact collection")?;
-            let archive =
-                ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
-            Ok((facts.source(), archive.facts))
+            let observed = ensure_facts(&mut pile, facts).await?;
+            let current = observed
+                .view::<FactArchive>()
+                .context("read Archive facts")?;
+            Ok((facts.source(), current))
         }
         .await;
         match result {
@@ -467,53 +304,82 @@ fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result
     }
 }
 
-/// Exact V4 accelerated-Succinct derivation summary.
+/// Ensure the Archive's maintained fact representation and return the ordinary
+/// collection observation. This boundary performs storage work, not domain
+/// decoding: consumers choose their own typed queries over `view::<FactArchive>()`.
+pub async fn ensure_local(
+    pile_path: &std::path::Path,
+    key_path: Option<&std::path::Path>,
+) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+    let (mut pile, collections, _signer) = open_local(pile_path, key_path)?;
+    let result = ensure_facts(&mut pile, collections).await;
+    close_pile(pile, result, "closing Archive pile")
+}
+
+fn open_local(
+    pile_path: &std::path::Path,
+    key_path: Option<&std::path::Path>,
+) -> Result<(Pile, FactCollection, SigningKey)> {
+    let signer = load_signer(pile_path, key_path)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let result = (|| {
+        let source = open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        FactCollection::new(&mut pile, source)
+            .context("register maintained Archive fact collection")
+    })();
+    match result {
+        Ok(collections) => Ok((pile, collections, signer)),
+        Err(error) => close_pile(pile, Err(error), "closing Archive pile after failed open"),
+    }
+}
+
+async fn ensure_facts(
+    pile: &mut Pile,
+    collections: FactCollection,
+) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+    let prepared = pile
+        .ensure(collections.source())
+        .await
+        .context("ensure Archive source dependencies")?;
+    let support = prepared
+        .collection(collections.source())
+        .context("observe Archive source support")?
+        .support()
+        .clone();
+    drop(prepared);
+    let after = collections
+        .maintain_exact(pile, &support)
+        .await
+        .context("maintain Archive fact collection")?;
+    after
+        .collection_exact(collections.rank9(), &support)
+        .context("attach exact Archive fact collection")
+}
+
+/// Exact accelerated-Succinct derivation summary. Source membership is measured
+/// in distinct data elements, never in the number of attestations over them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SuccinctIndexReport {
-    pub source_commits: usize,
-    /// Distinct source data elements named by the frozen foundational support.
     pub source_elements: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
     pub target_collection: Inline<Handle<SimpleArchive>>,
 }
 
-/// Ensure an exact resident accelerated-Succinct view for frozen Archive support.
-///
-/// This is a reproducible physical cover, not new authority. Canonical raw
-/// Succinct members are derived and merged first; the public target is their
-/// exact Rank9-accelerated image. [`ensure_bm25_index`] provides the analogous
-/// exact projection for Archive full-text search.
 pub async fn ensure_succinct_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<SuccinctIndexReport> {
-    let (mut pile, facts, _signer) =
-        ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-    let result = async {
-        let archive =
-            ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
-        let source_elements = archive.support().len();
-
-        Ok(SuccinctIndexReport {
-            source_commits: archive.commits().len(),
-            source_elements,
-            source_collection: archive.collections.source().handle(),
-            target_collection: archive.collections.rank9().handle(),
-        })
-    }
-    .await;
-    close_pile(
-        pile,
-        result,
-        "closing Archive pile after accelerated-Succinct derivation",
-    )
+    let observed = ensure_local(pile_path, key_path).await?;
+    Ok(SuccinctIndexReport {
+        source_elements: observed.support().len(),
+        source_collection: observed.support().collection().handle(),
+        target_collection: observed.cover().collection().handle(),
+    })
 }
 
-/// Exact V4 Archive BM25 derivation summary.
+/// Exact Archive BM25 derivation summary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bm25IndexReport {
-    pub source_commits: usize,
-    /// Distinct source data elements named by the frozen foundational support.
     pub source_elements: usize,
     pub cover_segments: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
@@ -522,1094 +388,305 @@ pub struct Bm25IndexReport {
 
 struct EnsuredBm25 {
     report: Bm25IndexReport,
-    index: ArchiveBm25,
+    index: archive_bm25::ArchiveBM25Index,
 }
 
-/// Ensure and deterministically maintain a portable exact-TF cover of the
-/// frozen Archive support through exact `DERIVE` and `MERGE` equations.
-pub async fn ensure_bm25_index(
-    pile_path: &std::path::Path,
-    key_path: Option<&std::path::Path>,
-) -> Result<Bm25IndexReport> {
-    let (mut pile, facts, signer) =
-        ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-    let result = async {
-        let authority = signer.verifying_key();
-        let archive =
-            ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
-        Ok(ensure_bm25_for_snapshot(&mut pile, &archive, authority)
-            .await?
-            .report)
-    }
-    .await;
-    close_pile(pile, result, "closing Archive pile after BM25 derivation")
-}
-
-async fn ensure_bm25_for_snapshot(
+/// Maintain the BM25 representation for one explicit foundational support.
+/// Provenance records are neither part of this value nor required to replay it.
+async fn ensure_bm25_exact(
     pile: &mut Pile,
-    archive: &ArchiveSnapshot,
+    support: &Support,
     authority: VerifyingKey,
 ) -> Result<EnsuredBm25> {
     let target = pile
         .derive_with(
-            archive.collections.source(),
+            support.collection(),
             archive_bm25::ArchiveBlockTextBm25Mapping,
             crate::collection_names::private_policy(authority),
         )
         .context("register Archive BM25 derivation")?;
-    let source_elements = archive.support().len();
     let maintained = pile
-        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, archive.support())
+        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, support)
         .await
         .context("maintain exact Archive BM25 cover")?;
     let attached = maintained
-        .collection_exact(target, archive.support())
+        .collection_exact(target, support)
         .context("attach exact Archive BM25 cover")?;
-    let cover_segments = attached.cover().len();
     let index = attached
-        .view::<ArchiveBm25>()
+        .view::<archive_bm25::ArchiveBM25Index>()
         .context("read exact Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
-            source_commits: archive.commits().len(),
-            source_elements,
-            cover_segments,
-            source_collection: archive.collections.source().handle(),
+            source_elements: support.len(),
+            cover_segments: attached.cover().len(),
+            source_collection: support.collection().handle(),
             target_collection: target.handle(),
         },
         index,
     })
 }
 
-fn interval_lower_key(interval: Inline<NsTAIInterval>) -> Result<i128> {
-    let (lower, _upper): (i128, i128) = interval
-        .try_from_inline()
-        .map_err(|error| anyhow!("decode Archive timestamp: {error:?}"))?;
-    Ok(lower)
-}
-
-/// One frozen Archive view and one resident portable BM25 index attached from
-/// the exact foundational support of the same admitted source commits.
-pub struct ArchiveSearchSnapshot {
-    archive: ArchiveSnapshot,
-    index: ArchiveBm25,
-}
-
-impl ArchiveSearchSnapshot {
-    pub async fn ensure_local(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-    ) -> Result<Self> {
-        let (mut pile, facts, signer) =
-            ArchiveSnapshot::open_local(pile_path, key_path, schema::DEFAULT_SCOPE_ID)?;
-        let result = async {
-            let authority = signer.verifying_key();
-            let archive =
-                ArchiveSnapshot::from_store(&mut pile, facts, schema::DEFAULT_SCOPE_ID).await?;
-            let EnsuredBm25 { index, .. } =
-                ensure_bm25_for_snapshot(&mut pile, &archive, authority).await?;
-            Ok(Self { archive, index })
-        }
-        .await;
-        close_pile(
-            pile,
-            result,
-            "closing Archive pile after BM25 search preparation",
+pub async fn ensure_bm25_index(
+    pile_path: &std::path::Path,
+    key_path: Option<&std::path::Path>,
+) -> Result<Bm25IndexReport> {
+    let (mut pile, collections, signer) = open_local(pile_path, key_path)?;
+    let result = async {
+        let observed = ensure_facts(&mut pile, collections).await?;
+        Ok(
+            ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key())
+                .await?
+                .report,
         )
     }
+    .await;
+    close_pile(pile, result, "closing Archive pile after BM25 derivation")
+}
 
-    pub fn archive(&self) -> &ArchiveSnapshot {
-        &self.archive
+/// Prepare fact and search values for the same exact support. The returned
+/// collection snapshot exposes the usual fact view and blob reader; callers
+/// query BM25 and join document ids to whatever facts their operation needs.
+pub async fn ensure_search_local(
+    pile_path: &std::path::Path,
+    key_path: Option<&std::path::Path>,
+) -> Result<(
+    CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    archive_bm25::ArchiveBM25Index,
+)> {
+    let (mut pile, collections, signer) = open_local(pile_path, key_path)?;
+    let result = async {
+        let observed = ensure_facts(&mut pile, collections).await?;
+        let ensured =
+            ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key()).await?;
+        // Search maintenance may have acquired referenced text payloads. Attach
+        // the fact view through the final reader while retaining exact support.
+        let after = pile
+            .snapshot()
+            .context("freeze prepared Archive search snapshot")?;
+        let observed = after
+            .collection_exact(collections.rank9(), observed.support())
+            .context("reattach exact Archive search facts")?;
+        Ok((observed, ensured.index))
     }
+    .await;
+    close_pile(
+        pile,
+        result,
+        "closing Archive pile after BM25 search preparation",
+    )
+}
 
-    pub fn search(&self, text: &str, limit: usize) -> Result<Vec<ArchiveSearchHit>> {
-        if limit == 0 {
-            return Ok(Vec::new());
+/// Stream the byte geometry selected by one source snapshot. Only lightweight
+/// chunk coordinates are sorted; each payload is fetched and hash-checked on
+/// demand. Geometry errors affect this export, never ordinary archive reads.
+///
+/// The queried entity ids are opaque. Equal offset/handle rows deduplicate even
+/// when different chunk ids witness them, and unrelated annotations are inert.
+pub fn write_source_snapshot<P, R, W>(
+    facts: &P,
+    reader: &R,
+    id: Id,
+    destination: &mut W,
+) -> Result<u128>
+where
+    P: TriblePattern,
+    R: BlobStoreGet,
+    W: std::io::Write,
+{
+    let lengths: BTreeSet<u128> = find!(
+        length: u128,
+        pattern!(facts, [{
+            id @ metadata::tag: &schema::source_snapshot::KIND,
+            schema::source_snapshot::byte_length: ?length
+        }])
+    )
+    .collect();
+    if lengths.is_empty() {
+        bail!("Archive source snapshot {id:X} has no readable byte length");
+    }
+    let chunks: BTreeSet<(u128, RawHandle)> = find!(
+        (offset: u128, bytes: RawHandle),
+        pattern!(facts, [
+            { id @ schema::source_snapshot::contains: _?chunk },
+            { _?chunk @ schema::source_chunk::offset: ?offset,
+                schema::source_chunk::bytes: ?bytes },
+        ])
+    )
+    .collect();
+    let mut written = 0u128;
+    for (offset, handle) in chunks {
+        if offset != written {
+            bail!("Archive source snapshot {id:X} has a chunk at {offset}, expected {written}");
         }
-        let ranked = self.index.query_multi(&hash_tokens(text));
-        ranked
-            .into_iter()
-            .take(limit)
-            .map(|(document, score)| {
-                let block = Id::try_from_inline(&document).map_err(|error| {
-                    anyhow!("Archive BM25 document is not a block id: {error:?}")
-                })?;
-                let projections = self.archive.projections_for_block(block);
-                if projections.is_empty() {
-                    bail!("Archive BM25 block {block:X} has no source projection");
+        let bytes: Bytes = reader.get(handle).context("read Archive source chunk")?;
+        destination
+            .write_all(bytes.as_ref())
+            .with_context(|| format!("write Archive source snapshot {id:X}"))?;
+        written = written
+            .checked_add(bytes.len() as u128)
+            .ok_or_else(|| anyhow!("Archive source snapshot {id:X} length overflows u128"))?;
+    }
+    if !lengths.contains(&written) {
+        bail!("Archive source snapshot {id:X} yielded {written} bytes, outside its stated lengths");
+    }
+    Ok(written)
+}
+
+/// Exact continuation point for the causal-temporal view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveTimelineCursor {
+    AfterTime(i128),
+    AfterBlock(Id),
+}
+
+/// One positioned identity, not a decoded domain object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveTimelineBlock {
+    pub position: i128,
+    pub block: Id,
+}
+
+impl ArchiveTimelineBlock {
+    pub const fn cursor(&self) -> ArchiveTimelineCursor {
+        ArchiveTimelineCursor::AfterBlock(self.block)
+    }
+}
+
+/// Position canonical blocks in deterministic causal order. Timestamp
+/// annotations may have several values: the earliest canonical timestamp wins,
+/// falling back to the earliest source timestamp. Untimed nodes carry causal
+/// position but emit nothing. Inclusion policy belongs to the caller after
+/// positioning, so filtering cannot change cursor or predecessor semantics.
+pub fn timeline_after<P>(
+    facts: &P,
+    cursor: ArchiveTimelineCursor,
+) -> Result<Vec<ArchiveTimelineBlock>>
+where
+    P: TriblePattern,
+{
+    let blocks: BTreeSet<Id> = find!(
+        block: Id,
+        pattern!(facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+    )
+    .collect();
+    let mut canonical_timestamps = BTreeMap::<Id, i128>::new();
+    for (block, (lower, _)) in find!(
+        (block: Id, timestamp: (i128, i128)),
+        pattern!(facts, [{ ?block @ schema::block::timestamp: ?timestamp }])
+    ) {
+        canonical_timestamps
+            .entry(block)
+            .and_modify(|current| *current = (*current).min(lower))
+            .or_insert(lower);
+    }
+    let mut receipt_timestamps = BTreeMap::<Id, i128>::new();
+    for (block, (lower, _)) in find!(
+        (block: Id, timestamp: (i128, i128)),
+        pattern!(facts, [{
+            _?projection @ schema::source_projection::projects_to: ?block,
+            schema::source_projection::source_timestamp: ?timestamp
+        }])
+    ) {
+        receipt_timestamps
+            .entry(block)
+            .and_modify(|current| *current = (*current).min(lower))
+            .or_insert(lower);
+    }
+    let mut timestamps = BTreeMap::new();
+    let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
+    for block in &blocks {
+        timestamps.insert(
+            *block,
+            canonical_timestamps
+                .get(block)
+                .or_else(|| receipt_timestamps.get(block))
+                .copied(),
+        );
+        let previous: BTreeSet<_> = find!(
+            predecessor: Id,
+            pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
+        )
+        .collect();
+        for predecessor in &previous {
+            successors.entry(*predecessor).or_default().insert(*block);
+        }
+        predecessors.insert(*block, previous);
+    }
+    let mut remaining: BTreeMap<Id, usize> = predecessors
+        .iter()
+        .map(|(block, previous)| (*block, previous.len()))
+        .collect();
+    let mut inherited = BTreeMap::<Id, Option<i128>>::new();
+    let mut ready_untimed = BTreeSet::new();
+    let mut ready_timed = BTreeSet::new();
+    for block in &blocks {
+        inherited.insert(*block, None);
+        if remaining[block] == 0 {
+            match timestamps[block] {
+                Some(position) => {
+                    ready_timed.insert((position, *block));
                 }
-                Ok(ArchiveSearchHit {
-                    block,
-                    score,
-                    projections,
-                })
-            })
-            .collect()
-    }
-}
-
-/// One immutable shard-preserving Archive view from the local durable collection.
-pub struct ArchiveSnapshot {
-    scope: Id,
-    collections: FactCollection,
-    facts: FactArchive,
-    store_snapshot: PileSnapshot,
-    support: Support,
-    commits: Vec<CollectionCommit>,
-}
-
-impl ArchiveSnapshot {
-    fn open_local(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-        scope: Id,
-    ) -> Result<(Pile, FactCollection, SigningKey)> {
-        if scope != schema::DEFAULT_SCOPE_ID {
-            bail!(
-                "Archive runtime only supports fixed scope {:X}",
-                schema::DEFAULT_SCOPE_ID
-            );
-        }
-        let signer = load_signer(pile_path, key_path)?;
-        let mut pile = open_pile_strict(pile_path)?;
-        let source = open_configured(&mut pile, scope, signer.verifying_key())?;
-        let collections = FactCollection::new(&mut pile, source)
-            .context("register maintained Archive fact collection")?;
-        Ok((pile, collections, signer))
-    }
-
-    async fn from_store(pile: &mut Pile, collections: FactCollection, scope: Id) -> Result<Self> {
-        let instant = crate::clock::now()?;
-        let control = pile.snapshot().context("freeze Archive source snapshot")?;
-        let (support, commits) = pile
-            .acquire_admitted_with_commits_at(collections.source(), &control, instant)
-            .await
-            .context("acquire admitted Archive support and commits")?;
-        drop(control);
-        Self::maintain_exact(pile, collections, scope, support, commits).await
-    }
-
-    /// Maintain and attach Archive for one exact support and provenance set.
-    ///
-    /// Callers reading several collections acquire all supports against one
-    /// control snapshot before invoking this constructor. The final view is
-    /// attached for exactly `support`; no later admission decision is made.
-    pub async fn maintain_exact(
-        pile: &mut Pile,
-        collections: FactCollection,
-        scope: Id,
-        support: Support,
-        mut commits: Vec<CollectionCommit>,
-    ) -> Result<Self> {
-        if scope != schema::DEFAULT_SCOPE_ID {
-            bail!(
-                "Archive runtime only supports fixed scope {:X}",
-                schema::DEFAULT_SCOPE_ID
-            );
-        }
-        commits
-            .retain(|commit| support.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
-        let store_snapshot = collections
-            .maintain_exact(pile, &support)
-            .await
-            .context("maintain Archive fact collection")?;
-        let facts = store_snapshot
-            .collection_exact(collections.rank9(), &support)
-            .context("attach exact Archive fact collection")?
-            .view::<FactArchive>()
-            .context("read exact Archive fact collection")?;
-        Ok(Self {
-            scope,
-            collections,
-            facts,
-            store_snapshot,
-            support,
-            commits,
-        })
-    }
-
-    pub async fn load_local(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-        scope: Id,
-    ) -> Result<Self> {
-        let (mut pile, collections, _signer) = Self::open_local(pile_path, key_path, scope)?;
-        let result = Self::from_store(&mut pile, collections, scope).await;
-        close_pile(pile, result, "closing Archive pile")
-    }
-
-    pub const fn scope(&self) -> Id {
-        self.scope
-    }
-
-    pub fn facts(&self) -> &FactArchive {
-        &self.facts
-    }
-
-    pub fn store_snapshot(&self) -> &PileSnapshot {
-        &self.store_snapshot
-    }
-
-    /// Exact admitted foundational support represented by this snapshot.
-    pub fn support(&self) -> &Support {
-        &self.support
-    }
-
-    pub fn commits(&self) -> &[CollectionCommit] {
-        &self.commits
-    }
-
-    /// Every queryable display-name variant attached to an entity.
-    ///
-    /// Archive metadata is additive, so this deliberately preserves several
-    /// names instead of manufacturing a last-writer-wins label.
-    pub fn names(&self, id: Id) -> Result<Vec<String>> {
-        let handles: BTreeSet<_> = find!(
-            value: TextHandle,
-            pattern!(&self.facts, [{ id @ metadata::name: ?value }])
-        )
-        .collect();
-        handles
-            .into_iter()
-            .map(|handle| self.read_text(handle))
-            .collect::<Result<BTreeSet<_>>>()
-            .map(|names| names.into_iter().collect())
-    }
-
-    /// Canonical source-projection ids in byte order.
-    pub fn projection_ids(&self) -> Vec<Id> {
-        let catalog = &self.facts;
-        let mut ids: Vec<_> = find!(
-            projection: Id,
-            pattern!(catalog, [{
-                ?projection @ metadata::tag: &schema::source_projection::KIND
-            }])
-        )
-        .collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// Canonical exact-source snapshot ids in byte order.
-    pub fn source_snapshot_ids(&self) -> Vec<Id> {
-        let mut ids: Vec<_> = find!(
-            snapshot: Id,
-            pattern!(&self.facts, [{
-                ?snapshot @ metadata::tag: &schema::source_snapshot::KIND
-            }])
-        )
-        .collect();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// Resolve an exact-source snapshot from a hexadecimal id prefix.
-    pub fn resolve_source_snapshot_prefix(&self, prefix: &str) -> Result<Id> {
-        let prefix = prefix.trim();
-        if prefix.is_empty()
-            || prefix.len() > 32
-            || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("Archive source-snapshot prefix must contain 1..=32 hexadecimal digits");
-        }
-        let prefix = prefix.to_ascii_uppercase();
-        let mut matches = self
-            .source_snapshot_ids()
-            .into_iter()
-            .filter(|id| format!("{id:X}").starts_with(&prefix));
-        let first = matches
-            .next()
-            .ok_or_else(|| anyhow!("no Archive source snapshot matches {prefix}"))?;
-        if matches.next().is_some() {
-            bail!("Archive source-snapshot prefix {prefix} is ambiguous");
-        }
-        Ok(first)
-    }
-
-    /// Load exact-source metadata and ordered lightweight chunk handles.
-    pub fn source_snapshot(&self, id: Id) -> Result<ArchiveSourceSnapshot> {
-        if !exists!(pattern!(&self.facts, [{
-            id @ metadata::tag: &schema::source_snapshot::KIND
-        }])) {
-            bail!("Archive entity {id:X} is not a source snapshot");
-        }
-        let source_namespace = required_one(
-            find!(
-                value: Id,
-                pattern!(&self.facts, [{
-                    id @ schema::source_projection::source_namespace: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source namespace",
-        )?;
-        let source_locator = self.read_required_text(
-            find!(
-                value: TextHandle,
-                pattern!(&self.facts, [{
-                    id @ schema::source_projection::source_locator: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source locator",
-        )?;
-        let byte_length = required_one(
-            find!(
-                value: Inline<U256BE>,
-                pattern!(&self.facts, [{
-                    id @ schema::source_snapshot::byte_length: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source snapshot byte length",
-        )?;
-        let byte_length = u128::try_from_inline(&byte_length).map_err(|error| {
-            anyhow!("Archive source snapshot {id:X} length does not fit u128: {error:?}")
-        })?;
-
-        let mut chunks = Vec::new();
-        let chunk_ids: BTreeSet<_> = find!(
-            chunk: Id,
-            pattern!(&self.facts, [{
-                id @ schema::source_snapshot::contains: ?chunk
-            }])
-        )
-        .collect();
-        for chunk in chunk_ids {
-            let offset = required_one(
-                find!(
-                    value: Inline<U256BE>,
-                    pattern!(&self.facts, [{
-                        chunk @ schema::source_chunk::offset: ?value
-                    }])
-                )
-                .collect(),
-                chunk,
-                "source chunk offset",
-            )?;
-            let offset = u128::try_from_inline(&offset).map_err(|error| {
-                anyhow!("Archive source chunk {chunk:X} offset does not fit u128: {error:?}")
-            })?;
-            let bytes = required_one(
-                find!(
-                    value: RawHandle,
-                    pattern!(&self.facts, [{
-                        chunk @ schema::source_chunk::bytes: ?value
-                    }])
-                )
-                .collect(),
-                chunk,
-                "source chunk bytes",
-            )?;
-            chunks.push(ArchiveSourceChunk {
-                id: chunk,
-                offset,
-                bytes,
-            });
-        }
-        chunks.sort_by_key(|chunk| (chunk.offset, chunk.id));
-
-        let path_handles: BTreeSet<_> = find!(
-            value: TextHandle,
-            pattern!(&self.facts, [{ id @ files_schema::file::source_path: ?value }])
-        )
-        .collect();
-        let source_paths = path_handles
-            .into_iter()
-            .map(|handle| self.read_text(handle))
-            .collect::<Result<BTreeSet<_>>>()?
-            .into_iter()
-            .collect();
-
-        Ok(ArchiveSourceSnapshot {
-            id,
-            source_namespace,
-            source_locator,
-            byte_length,
-            source_paths,
-            chunks,
-        })
-    }
-
-    /// Retrieve and hash-validate one source chunk on demand.
-    pub fn source_chunk_bytes(&self, chunk: &ArchiveSourceChunk) -> Result<Bytes> {
-        self.store_snapshot
-            .get(chunk.bytes)
-            .with_context(|| format!("read Archive source chunk {:X}", chunk.id))
-    }
-
-    /// Stream one exact source snapshot without assembling it in memory.
-    pub fn write_source_snapshot<W: std::io::Write>(
-        &self,
-        id: Id,
-        destination: &mut W,
-    ) -> Result<u128> {
-        let snapshot = self.source_snapshot(id)?;
-        let mut written = 0u128;
-        for chunk in &snapshot.chunks {
-            if chunk.offset != written {
-                bail!(
-                    "Archive source snapshot {id:X} chunk {:X} begins at {}, expected {written}",
-                    chunk.id,
-                    chunk.offset
-                );
-            }
-            let bytes = self.source_chunk_bytes(chunk)?;
-            destination
-                .write_all(bytes.as_ref())
-                .with_context(|| format!("write Archive source snapshot {id:X}"))?;
-            written = written
-                .checked_add(bytes.len() as u128)
-                .ok_or_else(|| anyhow!("Archive source snapshot {id:X} length overflows u128"))?;
-        }
-        if written != snapshot.byte_length {
-            bail!(
-                "Archive source snapshot {id:X} yielded {written} bytes, expected {}",
-                snapshot.byte_length
-            );
-        }
-        Ok(written)
-    }
-
-    /// Resolve one source-projection id from a case-insensitive hexadecimal
-    /// prefix. Ambiguous prefixes fail instead of depending on physical shard
-    /// or query iteration order.
-    pub fn resolve_projection_prefix(&self, prefix: &str) -> Result<Id> {
-        let prefix = prefix.trim();
-        if prefix.is_empty()
-            || prefix.len() > 32
-            || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("Archive projection prefix must contain 1..=32 hexadecimal digits");
-        }
-        let prefix = prefix.to_ascii_uppercase();
-        let mut matches = self
-            .projection_ids()
-            .into_iter()
-            .filter(|id| format!("{id:X}").starts_with(&prefix));
-        let first = matches
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no Archive source projection matches {prefix}"))?;
-        if matches.next().is_some() {
-            bail!("Archive source projection prefix {prefix} is ambiguous");
-        }
-        Ok(first)
-    }
-
-    /// Source receipts projecting to one canonical block, in canonical id
-    /// order. Several receipts may intentionally witness the same block.
-    pub fn projections_for_block(&self, block: Id) -> Vec<Id> {
-        let catalog = &self.facts;
-        let mut projections: Vec<_> = find!(
-            projection: Id,
-            pattern!(catalog, [{
-                ?projection @ schema::source_projection::projects_to: block
-            }])
-        )
-        .collect();
-        projections.sort_unstable();
-        projections
-    }
-
-    /// Load one canonical semantic block and every exact source receipt that
-    /// witnesses it.
-    pub fn block(&self, block: Id) -> Result<ArchiveBlock> {
-        let receipt_ids = self.projections_for_block(block);
-        if receipt_ids.is_empty() {
-            bail!("canonical Archive block {block:X} has no source projection");
-        }
-        let mut receipts = receipt_ids
-            .into_iter()
-            .map(|id| self.projection(id))
-            .collect::<Result<Vec<_>>>()?;
-        receipts.sort_unstable_by_key(|projection| projection.id);
-        if receipts.iter().any(|projection| projection.block != block) {
-            bail!("Archive source projection lookup crossed block identities");
-        }
-        Ok(ArchiveBlock {
-            semantic: receipts[0].clone(),
-            receipts,
-        })
-    }
-
-    /// Replay canonical blocks after one exact cursor as a pure, deterministic
-    /// causal-temporal view.
-    ///
-    /// The caller supplies the inclusion policy. This deliberately does not
-    /// encode the Archive CLI's dialogue-only default: a human reader may want
-    /// to hide tool-only blocks, while a mind reconstructing its own causal
-    /// history must include them. Cursor ownership and mutation likewise live
-    /// above this pure view.
-    pub fn timeline_after<F>(
-        &self,
-        cursor: ArchiveTimelineCursor,
-        mut include: F,
-    ) -> Result<Vec<ArchiveTimelineBlock>>
-    where
-        F: FnMut(&ArchiveBlock) -> bool,
-    {
-        let catalog = &self.facts;
-        let blocks: BTreeSet<Id> = find!(
-            block: Id,
-            pattern!(catalog, [{
-                _?projection @ schema::source_projection::projects_to: ?block
-            }])
-        )
-        .collect();
-        let canonical_timestamps: BTreeMap<Id, Inline<NsTAIInterval>> = find!(
-            (block: Id, timestamp: Inline<NsTAIInterval>),
-            pattern!(catalog, [{ ?block @ schema::block::timestamp: ?timestamp }])
-        )
-        .collect();
-        let mut earliest_receipt_timestamps = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
-        for (block, timestamp) in find!(
-            (block: Id, timestamp: Inline<NsTAIInterval>),
-            pattern!(catalog, [
-                { _?projection @ schema::source_projection::projects_to: ?block },
-                { _?projection @ schema::source_projection::source_timestamp: ?timestamp },
-            ])
-        ) {
-            let key = interval_lower_key(timestamp)?;
-            let entry = earliest_receipt_timestamps
-                .entry(block)
-                .or_insert((key, timestamp));
-            if key < entry.0 {
-                *entry = (key, timestamp);
+                None => {
+                    ready_untimed.insert(*block);
+                }
             }
         }
-
-        let mut timestamps = BTreeMap::<Id, Option<i128>>::new();
-        let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
-        let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
-        for block_id in &blocks {
-            let timestamp = canonical_timestamps.get(block_id).copied().or_else(|| {
-                earliest_receipt_timestamps
-                    .get(block_id)
-                    .map(|(_, timestamp)| *timestamp)
-            });
-            timestamps.insert(*block_id, timestamp.map(interval_lower_key).transpose()?);
-
-            let previous: BTreeSet<_> = find!(
-                predecessor: Id,
-                pattern!(catalog, [{ block_id @ schema::block::previous: ?predecessor }])
-            )
-            .collect();
-            for predecessor in &previous {
-                successors
-                    .entry(*predecessor)
-                    .or_default()
-                    .insert(*block_id);
-            }
-            predecessors.insert(*block_id, previous);
+    }
+    let mut positioned = Vec::new();
+    let mut visited = 0usize;
+    while visited < blocks.len() {
+        let (block, position, emits) = if let Some(block) = ready_untimed.pop_first() {
+            (block, inherited[&block], false)
+        } else if let Some((position, block)) = ready_timed.pop_first() {
+            (block, Some(position), true)
+        } else {
+            bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+        };
+        visited += 1;
+        if let Some(position) = position.filter(|_| emits) {
+            positioned.push(ArchiveTimelineBlock { position, block });
         }
-
-        // Kahn's algorithm makes causality authoritative and time merely the
-        // priority among blocks which are already ready. Untimed blocks are
-        // contracted eagerly: they emit nothing, but carry their ancestors'
-        // lifted position into timed descendants.
-        let mut remaining: BTreeMap<Id, usize> = predecessors
-            .iter()
-            .map(|(block, previous)| (*block, previous.len()))
-            .collect();
-        let mut inherited = BTreeMap::<Id, Option<i128>>::new();
-        let mut ready_untimed = BTreeSet::<Id>::new();
-        let mut ready_timed = BTreeSet::<(i128, Id)>::new();
-        for block in &blocks {
-            inherited.insert(*block, None);
-            if remaining[block] == 0 {
-                match timestamps[block] {
-                    Some(position) => {
-                        ready_timed.insert((position, *block));
+        for successor in successors.get(&block).into_iter().flatten() {
+            if let Some(position) = position {
+                let inherited = inherited
+                    .get_mut(successor)
+                    .expect("every successor belongs to the canonical block set");
+                *inherited = Some(inherited.map_or(position, |current| current.max(position)));
+            }
+            let count = remaining
+                .get_mut(successor)
+                .expect("every successor has a dependency count");
+            *count -= 1;
+            if *count == 0 {
+                let inherited = inherited[successor];
+                match timestamps[successor] {
+                    Some(timestamp) => {
+                        ready_timed.insert((
+                            inherited.map_or(timestamp, |value| value.max(timestamp)),
+                            *successor,
+                        ));
                     }
                     None => {
-                        ready_untimed.insert(*block);
+                        ready_untimed.insert(*successor);
                     }
                 }
             }
         }
-
-        let mut positioned = Vec::<(i128, Id)>::new();
-        let mut visited = 0usize;
-        while visited < blocks.len() {
-            let (block, position, emits) = if let Some(block) = ready_untimed.pop_first() {
-                (block, inherited[&block], false)
-            } else if let Some((position, block)) = ready_timed.pop_first() {
-                (block, Some(position), true)
-            } else {
-                bail!("canonical Archive block graph became cyclic while building its timeline");
-            };
-            visited += 1;
-            if let Some(position) = position.filter(|_| emits) {
-                positioned.push((position, block));
-            }
-
-            for successor in successors.get(&block).into_iter().flatten() {
-                if let Some(position) = position {
-                    let inherited = inherited
-                        .get_mut(successor)
-                        .expect("every successor belongs to the canonical block set");
-                    *inherited = Some(inherited.map_or(position, |current| current.max(position)));
-                }
-                let count = remaining
-                    .get_mut(successor)
-                    .expect("every successor has a dependency count");
-                *count -= 1;
-                if *count == 0 {
-                    let inherited = inherited[successor];
-                    match timestamps[successor] {
-                        Some(timestamp) => {
-                            ready_timed.insert((
-                                inherited.map_or(timestamp, |value| value.max(timestamp)),
-                                *successor,
-                            ));
-                        }
-                        None => {
-                            ready_untimed.insert(*successor);
-                        }
-                    }
-                }
-            }
+    }
+    let start = match cursor {
+        ArchiveTimelineCursor::AfterTime(position) => {
+            positioned.partition_point(|candidate| candidate.position <= position)
         }
-
-        let start = match cursor {
-            ArchiveTimelineCursor::AfterTime(position) => {
-                positioned.partition_point(|(candidate, _)| *candidate <= position)
-            }
-            ArchiveTimelineCursor::AfterBlock(anchor) => positioned
-                .iter()
-                .position(|(_, block)| *block == anchor)
-                .map(|index| index + 1)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Archive timeline cursor block {anchor:X} is absent or has no timestamp"
-                    )
-                })?,
-        };
-
-        let mut timeline = Vec::new();
-        for (position, block_id) in positioned.into_iter().skip(start) {
-            let block = self.block(block_id)?;
-            if include(&block) {
-                timeline.push(ArchiveTimelineBlock { position, block });
-            }
-        }
-        Ok(timeline)
-    }
-
-    /// Most recent source receipts by exact source time, falling back to the
-    /// canonical block time for sources which carry time semantically.
-    ///
-    /// Untimed blocks sort after genuinely timed blocks. Ties use the source
-    /// projection id, making the result independent of collection commit order.
-    pub fn recent_projection_ids(&self, limit: usize) -> Vec<Id> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let mut rows: Vec<(Id, Option<i128>)> =
-            self.projection_ids()
-                .into_iter()
-                .map(|projection| {
-                    let source_timestamp = find!(
-                        value: Inline<NsTAIInterval>,
-                        pattern!(&self.facts, [{
-                            projection @ schema::source_projection::source_timestamp: ?value
-                        }])
-                    )
-                    .next();
-                    let timestamp = source_timestamp
-                        .or_else(|| {
-                            find!(
-                    value: Inline<NsTAIInterval>,
-                    pattern!(&self.facts, [
-                        { projection @ schema::source_projection::projects_to: _?block },
-                        { _?block @ schema::block::timestamp: ?value },
-                    ])
-                ).next()
-                        })
-                        .map(|value| {
-                            let (lower, _upper): (i128, i128) = value
-                                .try_from_inline()
-                                .expect("validated Archive timestamp is inline");
-                            lower
-                        });
-                    (projection, timestamp)
-                })
-                .collect();
-        rows.sort_unstable_by(|left, right| {
-            right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0))
-        });
-        rows.into_iter().take(limit).map(|(id, _)| id).collect()
-    }
-
-    /// Resolve and attach one complete source projection.
-    ///
-    /// Scalar ambiguity is an error. Repeated predecessor, path, resolution,
-    /// and part fields retain set semantics and are returned in canonical
-    /// order.
-    pub fn projection(&self, id: Id) -> Result<ArchiveProjection> {
-        let catalog = &self.facts;
-        let tagged = find!(
-            tag: Id,
-            pattern!(catalog, [{ id @ metadata::tag: ?tag }])
-        )
-        .any(|tag| tag == schema::source_projection::KIND);
-        if !tagged {
-            bail!("Archive source projection {id:X} does not exist");
-        }
-
-        let source_namespace = required_one(
-            find!(
-                value: Id,
-                pattern!(catalog, [{
-                    id @ schema::source_projection::source_namespace: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source namespace",
-        )?;
-        let source_locator = self.read_required_text(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{
-                    id @ schema::source_projection::source_locator: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source locator",
-        )?;
-        let raw_record = required_one(
-            find!(
-                value: RawHandle,
-                pattern!(catalog, [{ id @ schema::source_projection::raw_record: ?value }])
-            )
-            .collect(),
-            id,
-            "raw record",
-        )?;
-        let block = required_one(
-            find!(
-                value: Id,
-                pattern!(catalog, [{ id @ schema::source_projection::projects_to: ?value }])
-            )
-            .collect(),
-            id,
-            "projected block",
-        )?;
-
-        let mut semantic_predecessor_support: Vec<_> = find!(
-            value: Id,
-            pattern!(catalog, [{
-                id @ schema::source_projection::semantic_predecessor_support: ?value
-            }])
-        )
-        .collect();
-        semantic_predecessor_support.sort_unstable();
-        let source_timestamp = optional_one(
-            find!(
-                value: Inline<NsTAIInterval>,
-                pattern!(catalog, [{
-                    id @ schema::source_projection::source_timestamp: ?value
-                }])
-            )
-            .collect(),
-            id,
-            "source timestamp",
-        )?;
-        let author = optional_one(
-            find!(
-                value: Id,
-                pattern!(catalog, [{ id @ schema::source_projection::author: ?value }])
-            )
-            .collect(),
-            id,
-            "author",
-        )?;
-        let experiencer = optional_one(
-            find!(
-                value: Id,
-                pattern!(catalog, [{ id @ schema::source_projection::experiencer: ?value }])
-            )
-            .collect(),
-            id,
-            "experiencer",
-        )?;
-        let raw_author = self.read_optional_text(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{ id @ schema::source_projection::raw_author: ?value }])
-            )
-            .collect(),
-            id,
-            "raw author",
-        )?;
-        let raw_role = self.read_optional_text(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{ id @ schema::source_projection::raw_role: ?value }])
-            )
-            .collect(),
-            id,
-            "raw role",
-        )?;
-        let raw_model = self.read_optional_text(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{ id @ schema::source_projection::raw_model: ?value }])
-            )
-            .collect(),
-            id,
-            "raw model",
-        )?;
-        let mut source_paths = find!(
-            value: TextHandle,
-            pattern!(catalog, [{ id @ files_schema::file::source_path: ?value }])
-        )
-        .map(|handle| self.read_text(handle))
-        .collect::<Result<Vec<_>>>()?;
-        source_paths.sort_unstable();
-
-        let mut block_previous: Vec<_> = find!(
-            value: Id,
-            pattern!(catalog, [{ block @ schema::block::previous: ?value }])
-        )
-        .collect();
-        block_previous.sort_unstable();
-        let block_timestamp = optional_one(
-            find!(
-                value: Inline<NsTAIInterval>,
-                pattern!(catalog, [{ block @ schema::block::timestamp: ?value }])
-            )
-            .collect(),
-            block,
-            "block timestamp",
-        )?;
-
-        let mut parts = find!(
-            (
-                part: Id,
-                ordinal: Inline<U256BE>,
-                fact: Id,
-                modality: Id,
-                direction: Id
-            ),
-            pattern!(catalog, [
-                { block @ schema::block::contains: ?part },
-                { ?part @ schema::content_part::ordinal: ?ordinal },
-                { ?part @ schema::content_part::fact: ?fact },
-                { ?fact @ schema::content_fact::modality: ?modality },
-                { ?fact @ schema::content_fact::direction: ?direction },
-            ])
-        )
-        .map(|(part, ordinal, fact, modality, direction)| {
-            let ordinal = u64::try_from_inline(&ordinal)
-                .map_err(|error| anyhow::anyhow!("Archive part {part:X} ordinal: {error:?}"))?;
-            let responds_to = optional_one(
-                find!(
-                    value: Id,
-                    pattern!(catalog, [{
-                        part @ schema::content_part::responds_to: ?value
-                    }])
-                )
-                .collect(),
-                part,
-                "responds-to",
-            )?;
-            let resolution = optional_one(
-                find!(
-                    value: RawHandle,
-                    pattern!(catalog, [{
-                        part @ schema::content_part::resolution: ?value
-                    }])
-                )
-                .collect(),
-                part,
-                "resolution",
-            )?;
-            let payload = self.payload(catalog, fact)?;
-            Ok(ArchivePart {
-                id: part,
-                ordinal,
-                fact,
-                responds_to,
-                resolution,
-                modality,
-                direction,
-                payload,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-        parts.sort_unstable_by_key(|part| (part.ordinal, part.id));
-
-        Ok(ArchiveProjection {
-            id,
-            source_namespace,
-            source_locator,
-            raw_record,
-            block,
-            block_previous,
-            block_timestamp,
-            semantic_predecessor_support,
-            source_timestamp,
-            author,
-            experiencer,
-            raw_author,
-            raw_role,
-            raw_model,
-            source_paths,
-            parts,
-        })
-    }
-
-    fn payload(&self, catalog: &FactArchive, fact: Id) -> Result<ArchivePayload> {
-        let text = optional_one(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{ fact @ schema::content_fact::payload: ?value }])
-            )
-            .collect(),
-            fact,
-            "text payload",
-        )?;
-        let blob = optional_one(
-            find!(
-                value: RawHandle,
-                pattern!(catalog, [{ fact @ schema::content_fact::blob: ?value }])
-            )
-            .collect(),
-            fact,
-            "resident payload",
-        )?;
-        let pointer = optional_one(
-            find!(
-                value: TextHandle,
-                pattern!(catalog, [{ fact @ schema::content_fact::asset_pointer: ?value }])
-            )
-            .collect(),
-            fact,
-            "asset pointer",
-        )?;
-        match (text, blob, pointer) {
-            (Some(text), None, None) => Ok(ArchivePayload::Text(self.read_text(text)?)),
-            (None, Some(blob), None) => {
-                let media_type = required_one(
-                    find!(
-                        value: Id,
-                        pattern!(catalog, [{ fact @ schema::content_fact::media_type: ?value }])
-                    )
-                    .collect(),
-                    fact,
-                    "resident media type",
-                )?;
-                Ok(ArchivePayload::Resident { blob, media_type })
-            }
-            (None, None, Some(pointer)) => {
-                let namespace = required_one(
-                    find!(
-                        value: Id,
-                        pattern!(catalog, [{
-                            fact @ schema::content_fact::asset_namespace: ?value
-                        }])
-                    )
-                    .collect(),
-                    fact,
-                    "asset namespace",
-                )?;
-                let media_type = optional_one(
-                    find!(
-                        value: Id,
-                        pattern!(catalog, [{ fact @ schema::content_fact::media_type: ?value }])
-                    )
-                    .collect(),
-                    fact,
-                    "asset media type",
-                )?;
-                let size = optional_one(
-                    find!(
-                        value: Inline<U256BE>,
-                        pattern!(catalog, [{ fact @ schema::content_fact::asset_size: ?value }])
-                    )
-                    .collect(),
-                    fact,
-                    "asset size",
-                )?
-                .map(|size| {
-                    u128::try_from_inline(&size).map_err(|error| {
-                        anyhow::anyhow!("Archive content fact {fact:X} asset size: {error:?}")
-                    })
-                })
-                .transpose()?;
-                let mut resolutions: Vec<_> = find!(
-                    value: RawHandle,
-                    pattern!(catalog, [{ fact @ schema::content_fact::resolved_to: ?value }])
-                )
-                .collect();
-                resolutions.sort_unstable();
-                Ok(ArchivePayload::External {
-                    pointer: self.read_text(pointer)?,
-                    namespace,
-                    media_type,
-                    size,
-                    resolutions,
-                })
-            }
-            _ => bail!(
-                "Archive content fact {fact:X} must have exactly one canonical payload variant"
-            ),
-        }
-    }
-
-    fn read_required_text(
-        &self,
-        values: Vec<TextHandle>,
-        entity: Id,
-        field: &str,
-    ) -> Result<String> {
-        self.read_text(required_one(values, entity, field)?)
-    }
-
-    fn read_optional_text(
-        &self,
-        values: Vec<TextHandle>,
-        entity: Id,
-        field: &str,
-    ) -> Result<Option<String>> {
-        optional_one(values, entity, field)?
-            .map(|handle| self.read_text(handle))
-            .transpose()
-    }
-
-    fn read_text(&self, handle: TextHandle) -> Result<String> {
-        let value: View<str> = self
-            .store_snapshot
-            .get(handle)
-            .context("read Archive text")?;
-        Ok(value.to_string())
-    }
-}
-
-fn required_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "Archive entity {entity:X} has {} values for required scalar {field}",
-            values.len()
-        );
-    }
-    Ok(values.into_iter().next().expect("one checked value"))
-}
-
-fn optional_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "Archive entity {entity:X} has {} values for optional scalar {field}",
-            values.len()
-        );
-    }
-    Ok(values.into_iter().next())
+        ArchiveTimelineCursor::AfterBlock(anchor) => positioned
+            .iter()
+            .position(|candidate| candidate.block == anchor)
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                anyhow!("Archive timeline cursor block {anchor:X} is absent or has no timestamp")
+            })?,
+    };
+    Ok(positioned.into_iter().skip(start).collect())
 }
 
 #[cfg(test)]
@@ -1656,6 +733,19 @@ mod tests {
     }
 
     use super::*;
+    use crate::schemas::files as files_schema;
+    use anybytes::View;
+    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::inlineencodings::NsTAIInterval;
+    use triblespace_search::tokens::hash_tokens;
+
+    fn projection_ids(facts: &FactArchive) -> Vec<Id> {
+        find!(
+            projection: Id,
+            pattern!(facts, [{ ?projection @ metadata::tag: &schema::source_projection::KIND }])
+        )
+        .collect()
+    }
     use crate::storage::initialize_signer;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
@@ -1822,25 +912,26 @@ mod tests {
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
         physical.close().unwrap();
-        let before = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert!(before.commits().is_empty());
-        assert!(before.facts().iter().next().is_none());
+        let before = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert!(before.support().is_empty());
+        assert!(before
+            .view::<FactArchive>()
+            .unwrap()
+            .iter()
+            .next()
+            .is_none());
         drop(before);
 
         let commit = writer.finish(Ok(())).unwrap().1.unwrap();
-        let after = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(after.commits(), &[commit]);
-        assert_eq!(after.projection_ids().len(), 1);
+        let after = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert_eq!(after.support().len(), 1);
+        assert!(after
+            .support()
+            .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
+        assert_eq!(
+            projection_ids(&after.view::<FactArchive>().unwrap()).len(),
+            1
+        );
     }
 
     #[test]
@@ -1868,14 +959,14 @@ mod tests {
         // `finish` closed the writer even on validation failure. Reopening is
         // sound, no semantic edge escaped, and the dependency is merely an
         // unreachable content-addressed record available for later GC.
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert!(snapshot.commits().is_empty());
-        assert!(snapshot.facts().iter().next().is_none());
+        let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert!(snapshot.support().is_empty());
+        assert!(snapshot
+            .view::<FactArchive>()
+            .unwrap()
+            .iter()
+            .next()
+            .is_none());
         drop(snapshot);
         let mut physical = open_pile_strict(&pile).unwrap();
         let reader = physical.snapshot().unwrap();
@@ -1946,14 +1037,15 @@ mod tests {
         assert_eq!(repeated, None);
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(snapshot.commits(), &[first]);
-        assert_eq!(snapshot.projection_ids().len(), 1);
+        let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert_eq!(snapshot.support().len(), 1);
+        assert!(snapshot
+            .support()
+            .contains(Handle::<SimpleArchive>::from_hash(first.data())));
+        assert_eq!(
+            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
+            1
+        );
     }
 
     #[test]
@@ -1974,14 +1066,15 @@ mod tests {
         assert_eq!(duplicate.data(), admitted.data());
         pile.close().unwrap();
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key_path),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(snapshot.commits(), &[admitted]);
-        assert_eq!(snapshot.projection_ids().len(), 1);
+        let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key_path))).unwrap();
+        assert_eq!(snapshot.support().len(), 1);
+        assert!(snapshot
+            .support()
+            .contains(Handle::<SimpleArchive>::from_hash(admitted.data())));
+        assert_eq!(
+            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
+            1
+        );
         let support = snapshot.support().clone();
         drop(snapshot);
 
@@ -2017,34 +1110,46 @@ mod tests {
         writer.stage_fragment(fragment).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let archive = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
+        let archive = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        let facts = archive.view::<FactArchive>().unwrap();
+        let snapshots: BTreeSet<_> = find!(
+            snapshot: Id,
+            pattern!(&facts, [{ ?snapshot @ metadata::tag: &schema::source_snapshot::KIND }])
+        )
+        .collect();
+        assert_eq!(snapshots, BTreeSet::from([expected]));
+        let (namespace, locator, length, path) = find!(
+            (namespace: Id, locator: Inline<Handle<UTF8String>>, length: u128,
+                path: Inline<Handle<UTF8String>>),
+            pattern!(&facts, [{
+                expected @ schema::source_projection::source_namespace: ?namespace,
+                schema::source_projection::source_locator: ?locator,
+                schema::source_snapshot::byte_length: ?length,
+                files_schema::file::source_path: ?path
+            }])
+        )
+        .next()
         .unwrap();
-        assert_eq!(archive.source_snapshot_ids(), vec![expected]);
-        assert_eq!(
-            archive
-                .resolve_source_snapshot_prefix(&format!("{expected:X}")[..8])
-                .unwrap(),
-            expected
-        );
-        let snapshot = archive.source_snapshot(expected).unwrap();
-        assert_eq!(
-            snapshot.source_namespace,
-            schema::source_projection::SOURCE_CODEX
-        );
-        assert_eq!(snapshot.source_locator, "snapshot/v1/session:exact");
-        assert_eq!(snapshot.byte_length, source.len() as u128);
-        assert_eq!(snapshot.source_paths, vec!["/moved/rollout.jsonl"]);
-        assert_eq!(snapshot.chunks.len(), 1);
-        assert_eq!(snapshot.chunks[0].offset, 0);
-
+        assert_eq!(namespace, schema::source_projection::SOURCE_CODEX);
+        assert_eq!(length, source.len() as u128);
+        let locator: View<str> = archive.snapshot().get(locator).unwrap();
+        let path: View<str> = archive.snapshot().get(path).unwrap();
+        assert_eq!(locator.as_ref(), "snapshot/v1/session:exact");
+        assert_eq!(path.as_ref(), "/moved/rollout.jsonl");
+        let chunks: Vec<_> = find!(
+            (offset: u128, bytes: RawHandle),
+            pattern!(&facts, [
+                { expected @ schema::source_snapshot::contains: _?chunk },
+                { _?chunk @ schema::source_chunk::offset: ?offset,
+                    schema::source_chunk::bytes: ?bytes },
+            ])
+        )
+        .collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, 0);
         let mut reconstructed = Vec::new();
         assert_eq!(
-            archive
-                .write_source_snapshot(expected, &mut reconstructed)
+            write_source_snapshot(&facts, archive.snapshot(), expected, &mut reconstructed)
                 .unwrap(),
             source.len() as u128
         );
@@ -2082,15 +1187,13 @@ mod tests {
         let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
         assert_ne!(first.data(), second.data());
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(snapshot.commits().len(), 2);
-        assert_eq!(snapshot.projection_ids().len(), 2);
-        assert!(snapshot.facts().iter().count() > first_len);
+        let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(
+            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
+            2
+        );
+        assert!(snapshot.view::<FactArchive>().unwrap().iter().count() > first_len);
     }
 
     #[test]
@@ -2102,20 +1205,11 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
-        assert_eq!(
-            (
-                report.source_commits,
-                report.source_elements,
-                report.cover_segments
-            ),
-            (0, 0, 0)
-        );
+        assert_eq!((report.source_elements, report.cover_segments), (0, 0));
 
-        let search =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        assert!(search.archive().commits().is_empty());
-        assert!(search.search("anything", 10).unwrap().is_empty());
+        let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert!(search.0.support().is_empty());
+        assert!(search.1.query_multi(&hash_tokens("anything")).is_empty());
     }
 
     #[test]
@@ -2135,15 +1229,8 @@ mod tests {
 
         let succinct = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
         let bm25 = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
-        assert_eq!((succinct.source_commits, succinct.source_elements), (1, 1));
-        assert_eq!(
-            (
-                bm25.source_commits,
-                bm25.source_elements,
-                bm25.cover_segments
-            ),
-            (1, 1, 1)
-        );
+        assert_eq!(succinct.source_elements, 1);
+        assert_eq!((bm25.source_elements, bm25.cover_segments), (1, 1));
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let records = {
@@ -2158,19 +1245,15 @@ mod tests {
         assert_eq!(derives.len(), 2, "one empty derive per target mapping");
         pile.close().unwrap();
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(snapshot.commits(), &[commit]);
-        assert!(snapshot.recent_projection_ids(10).is_empty());
+        let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(snapshot.support().len(), 1);
+        assert!(snapshot
+            .support()
+            .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
+        assert!(projection_ids(&snapshot.view::<FactArchive>().unwrap()).is_empty());
         drop(snapshot);
-        let search =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        assert!(search.search("anything", 10).unwrap().is_empty());
+        let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert!(search.1.query_multi(&hash_tokens("anything")).is_empty());
     }
 
     #[test]
@@ -2201,43 +1284,27 @@ mod tests {
             .unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        let complete = snapshot
-            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
-            .unwrap();
+        let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
+        let facts = snapshot.view::<FactArchive>().unwrap();
+        let complete = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
         assert_eq!(complete.len(), 2);
         assert!(complete[0].position < complete[1].position);
-        assert!(complete[0]
-            .block
-            .has_modality(schema::content_fact::modality::TEXT));
-        assert!(complete[1]
-            .block
-            .has_modality(schema::content_fact::modality::TOOL_CALL));
-
-        let dialogue = snapshot
-            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |block| {
-                block.has_modality(schema::content_fact::modality::TEXT)
+        let dialogue: Vec<_> = complete
+            .iter()
+            .filter(|item| {
+                exists!(pattern!(&facts, [
+                    { item.block @ schema::block::contains: _?part },
+                    { _?part @ schema::content_part::fact: _?fact },
+                    { _?fact @ schema::content_fact::modality:
+                        &schema::content_fact::modality::TEXT },
+                ]))
             })
-            .unwrap();
+            .collect();
         assert_eq!(dialogue.len(), 1);
-        assert_eq!(
-            dialogue[0].block.semantic.block,
-            complete[0].block.semantic.block
-        );
-
-        let after_first = snapshot
-            .timeline_after(complete[0].cursor(), |_| true)
-            .unwrap();
+        assert_eq!(dialogue[0].block, complete[0].block);
+        let after_first = timeline_after(&facts, complete[0].cursor()).unwrap();
         assert_eq!(after_first.len(), 1);
-        assert_eq!(
-            after_first[0].block.semantic.block,
-            complete[1].block.semantic.block
-        );
+        assert_eq!(after_first[0].block, complete[1].block);
     }
 
     #[test]
@@ -2266,35 +1333,28 @@ mod tests {
         writer.stage_fragment(parent).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let snapshot = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        let timeline = snapshot
-            .timeline_after(ArchiveTimelineCursor::AfterTime(i128::MIN), |_| true)
-            .unwrap();
+        let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
+        let facts = snapshot.view::<FactArchive>().unwrap();
+        let timeline = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
         assert_eq!(timeline.len(), 3, "the untimed conduit stays invisible");
-        assert_eq!(timeline[0].block.semantic.block, independent_id);
-        assert_eq!(timeline[1].block.semantic.block, parent_id);
-        assert_eq!(timeline[2].block.semantic.block, child_id);
+        assert_eq!(timeline[0].block, independent_id);
+        assert_eq!(timeline[1].block, parent_id);
+        assert_eq!(timeline[2].block, child_id);
         assert!(timeline[0].position < timeline[1].position);
         assert_eq!(
             timeline[1].position, timeline[2].position,
             "the regressed child is lifted to its predecessor's position"
         );
 
-        let after_parent = snapshot
-            .timeline_after(timeline[1].cursor(), |_| true)
-            .unwrap();
+        let after_parent = timeline_after(&facts, timeline[1].cursor()).unwrap();
         assert_eq!(after_parent.len(), 1);
-        assert_eq!(after_parent[0].block.semantic.block, child_id);
-        assert!(snapshot
-            .timeline_after(ArchiveTimelineCursor::AfterBlock(untimed_id), |_| true)
-            .unwrap_err()
-            .to_string()
-            .contains("absent or has no timestamp"));
+        assert_eq!(after_parent[0].block, child_id);
+        assert!(
+            timeline_after(&facts, ArchiveTimelineCursor::AfterBlock(untimed_id))
+                .unwrap_err()
+                .to_string()
+                .contains("absent or has no timestamp")
+        );
     }
 
     #[test]
@@ -2313,7 +1373,7 @@ mod tests {
         writer.finish(Ok(())).unwrap();
 
         let report = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
-        assert_eq!(report.source_commits, 1);
+
         assert_eq!(report.source_elements, 1);
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
@@ -2372,7 +1432,7 @@ mod tests {
         }
 
         let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
-        assert_eq!(report.source_commits, 2);
+
         assert_eq!(report.source_elements, 2);
         assert_eq!(report.cover_segments, 1);
         let length = std::fs::metadata(&pile_path).unwrap().len();
@@ -2404,19 +1464,16 @@ mod tests {
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let source_support = source.admitted_at(&store_snapshot, instant).unwrap();
+        let source_support = store_snapshot.collection(source).unwrap().support().clone();
         let attached = store_snapshot
             .collection_exact(target, &source_support)
             .unwrap();
         assert_eq!(attached.cover().len(), 1);
         pile.close().unwrap();
 
-        let search =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        assert_eq!(search.search("alpha", 10).unwrap().len(), 1);
-        assert_eq!(search.search("beta", 10).unwrap().len(), 1);
+        let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(search.1.query_multi(&hash_tokens("alpha")).len(), 1);
+        assert_eq!(search.1.query_multi(&hash_tokens("beta")).len(), 1);
     }
 
     #[test]
@@ -2437,11 +1494,9 @@ mod tests {
         }
 
         let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
-        assert_eq!((report.source_commits, report.source_elements), (2, 2));
-        let search =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        let hits = search.search("shared closure needle", 10).unwrap();
+        assert_eq!(report.source_elements, 2);
+        let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        let hits = search.1.query_multi(&hash_tokens("shared closure needle"));
         assert_eq!(hits.len(), 1);
     }
 
@@ -2458,9 +1513,8 @@ mod tests {
             pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         writer.stage_fragment(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
-        let first = pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-            .unwrap();
-        assert_eq!(first.search("alpha", 10).unwrap().len(), 1);
+        let first = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(first.1.query_multi(&hash_tokens("alpha")).len(), 1);
         drop(first);
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
@@ -2469,12 +1523,10 @@ mod tests {
         writer.stage_fragment(second_fragment.clone()).unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let extended =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        assert_eq!(extended.search("alpha", 10).unwrap().len(), 1);
-        assert_eq!(extended.search("beta", 10).unwrap().len(), 1);
-        assert_eq!(extended.search("🛰️", 1).unwrap().len(), 1);
+        let extended = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(extended.1.query_multi(&hash_tokens("alpha")).len(), 1);
+        assert_eq!(extended.1.query_multi(&hash_tokens("beta")).len(), 1);
+        assert_eq!(extended.1.query_multi(&hash_tokens("🛰️")).len(), 1);
         drop(extended);
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
@@ -2482,10 +1534,8 @@ mod tests {
             pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
         retry.stage_fragment(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
-        let after_retry =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        assert_eq!(after_retry.search("beta", 10).unwrap().len(), 1);
+        let after_retry = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(after_retry.1.query_multi(&hash_tokens("beta")).len(), 1);
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
     }
 
@@ -2513,14 +1563,12 @@ mod tests {
         let _target = test_target(&mut pile, collection, &pile_path, &key);
         pile.close().unwrap();
 
-        let archive = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
-        assert_eq!(archive.commits().len(), 2);
-        assert_eq!(archive.projection_ids().len(), 1);
+        let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(archive.support().len(), 2);
+        assert_eq!(
+            projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
+            1
+        );
         drop(archive);
         let before = std::fs::metadata(&pile_path).unwrap().len();
 
@@ -2599,14 +1647,21 @@ mod tests {
         let bm25_records_before = bm25_records(&mut pile);
         pile.close().unwrap();
 
-        let search =
-            pollster::block_on(ArchiveSearchSnapshot::ensure_local(&pile_path, Some(&key)))
-                .unwrap();
-        let hits = search.search("routed needle", 10).unwrap();
+        let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        let hits = search.1.query_multi(&hash_tokens("routed needle"));
         assert_eq!(hits.len(), 1);
-        let projections = search.archive().projection_ids();
+        let projections = projection_ids(&search.0.view::<FactArchive>().unwrap());
         assert_eq!(projections.len(), 1);
-        assert_eq!(hits[0].projections, projections);
+        let facts = search.0.view::<FactArchive>().unwrap();
+        let block = Id::try_from_inline(&hits[0].0).unwrap();
+        let found: Vec<_> = find!(
+            projection: Id,
+            pattern!(&facts, [{
+                ?projection @ schema::source_projection::projects_to: block
+            }])
+        )
+        .collect();
+        assert_eq!(found, projections);
         drop(search);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -2627,22 +1682,18 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let first = commit_projection(&pile_path, &key, "session:frozen", "frozen needle");
-        let frozen = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
+        let frozen = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let later = commit_projection(&pile_path, &key, "session:later", "later needle");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let ensured = pollster::block_on(ensure_bm25_for_snapshot(
+        let ensured = pollster::block_on(ensure_bm25_exact(
             &mut pile,
-            &frozen,
+            frozen.support(),
             test_authority(&pile_path, &key),
         ))
         .unwrap();
-        assert_eq!(ensured.report.source_commits, 1);
+
+        assert_eq!(ensured.report.source_elements, 1);
         drop(ensured);
         pile.close().unwrap();
         drop(frozen);
@@ -2673,21 +1724,11 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
-        let first_archive = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
+        let first_archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let first_support = first_archive.support().clone();
         drop(first_archive);
         commit_projection(&pile_path, &key, "session:second", "second residual");
-        let archive = pollster::block_on(ArchiveSnapshot::load_local(
-            &pile_path,
-            Some(&key),
-            schema::DEFAULT_SCOPE_ID,
-        ))
-        .unwrap();
+        let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let full_support = archive.support().clone();
         drop(archive);
 
@@ -2786,8 +1827,7 @@ mod tests {
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let source_support = source.admitted_at(&store_snapshot, instant).unwrap();
+        let source_support = store_snapshot.collection(source).unwrap().support().clone();
         let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
@@ -2837,5 +1877,120 @@ mod tests {
             "the recovered deterministic equation remains one record"
         );
         pile.close().unwrap();
+    }
+    #[test]
+    fn exact_fact_cover_and_raw_export_need_no_outer_commits() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile_path, &key);
+
+        // Chunk and snapshot ids are deliberately extrinsic. Two different
+        // witnesses of identical byte geometry must not duplicate the output.
+        let chunk_a = fucid();
+        let chunk_b = fucid();
+        let snapshot_id = fucid();
+        let block = fucid();
+        let timestamp: Inline<NsTAIInterval> = (1i128, 1i128).try_to_inline().unwrap();
+        let mut fragment = entity! { &chunk_a @
+            schema::source_chunk::offset: 0u128,
+            schema::source_chunk::bytes: b"raw".to_vec(),
+        };
+        fragment += entity! { &chunk_b @
+            schema::source_chunk::offset: 0u128,
+            schema::source_chunk::bytes: b"raw".to_vec(),
+        };
+        fragment += entity! { &snapshot_id @
+            metadata::tag: &schema::source_snapshot::KIND,
+            metadata::name*: ["first annotation", "another annotation"],
+            schema::source_snapshot::byte_length*: [3u128, 9u128],
+            schema::source_snapshot::contains*: [&chunk_a, &chunk_b],
+        };
+        fragment += entity! { &block @
+            metadata::tag: &schema::block::KIND,
+            schema::block::timestamp: timestamp,
+        };
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source = test_source(&mut pile, &pile_path, &key);
+        let collections = FactCollection::new(&mut pile, source).unwrap();
+        let (_, facts, _metadata, blobs) = fragment.into_parts();
+        stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
+        let data = pile.put::<SimpleArchive, _>(facts).unwrap();
+        let support = Support::from_data(source, [data]);
+        let after = pollster::block_on(collections.maintain_exact(&mut pile, &support)).unwrap();
+        let observed = after
+            .collection_exact(collections.rank9(), &support)
+            .unwrap();
+        assert!(observed
+            .support()
+            .commits(observed.snapshot())
+            .unwrap()
+            .is_empty());
+        let facts = observed.view::<FactArchive>().unwrap();
+        let mut output = Vec::new();
+        assert_eq!(
+            write_source_snapshot(&facts, observed.snapshot(), snapshot_id.id, &mut output)
+                .unwrap(),
+            3,
+        );
+        assert_eq!(output, b"raw");
+        let timeline = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
+        assert_eq!(
+            timeline,
+            [ArchiveTimelineBlock {
+                position: 1,
+                block: block.id
+            }]
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn export_geometry_failure_does_not_reject_other_fact_queries() {
+        let source = fucid();
+        let chunk = fucid();
+        let mut fragment = entity! { &chunk @
+            schema::source_chunk::offset: 1u128,
+            schema::source_chunk::bytes: b"gap".to_vec(),
+        };
+        fragment += entity! { &source @
+            metadata::tag: &schema::source_snapshot::KIND,
+            schema::source_snapshot::contains: &chunk,
+            schema::source_snapshot::byte_length: 3u128,
+            metadata::name: "still queryable",
+        };
+        let reader = fragment.blobs().clone().snapshot().unwrap();
+        let names: Vec<_> = find!(
+            name: Inline<Handle<UTF8String>>,
+            pattern!(&fragment, [{ source.id @ metadata::name: ?name }])
+        )
+        .collect();
+        assert_eq!(names.len(), 1);
+        let error =
+            write_source_snapshot(&fragment, &reader, source.id, &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("expected 0"));
+    }
+
+    #[test]
+    fn timeline_uses_all_timestamp_annotations_without_scalar_validation() {
+        let block = fucid();
+        let later: Inline<NsTAIInterval> = (9i128, 9i128).try_to_inline().unwrap();
+        let earlier: Inline<NsTAIInterval> = (4i128, 4i128).try_to_inline().unwrap();
+        let fragment = entity! { &block @
+            metadata::tag: &schema::block::KIND,
+            schema::block::timestamp*: [later, earlier],
+            metadata::name*: ["one", "two"],
+        };
+        let timeline =
+            timeline_after(&fragment, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
+        assert_eq!(
+            timeline,
+            [ArchiveTimelineBlock {
+                position: 4,
+                block: block.id
+            }]
+        );
     }
 }
