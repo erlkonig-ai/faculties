@@ -142,7 +142,9 @@ voice = ["dep:mary", "mary/speak", "audio", "dep:framed-stream"]
 # replaces `converse` as the shipping ear surface, and `local-embed` (also
 # default) already pays for `mary/gemma`, so the marginal cost is the
 # tokenizer. Capture itself is `soma-client`, which is unconditional and tiny.
-hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
+# `mary/dmel` and `framed-stream` are the Inkling ear (`hear stream`): the
+# mind's own tokenizer for sound, written as records for drive's `--hear`.
+hear = ["dep:mary", "mary/gemma", "mary/dmel", "dep:tokenizers", "dep:framed-stream"]
 # The `duplex` faculty: a continuously running spoken channel on mary's
 # streaming full-duplex speech model. `mary/personaplex` brings the LM layers
 # (it rides the same layer stack as `speak`), `mary/q4` the 4-bit temporal
