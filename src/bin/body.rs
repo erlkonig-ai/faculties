@@ -25,9 +25,7 @@ use faculties::body as body_model;
 use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
-use faculties::storage::{
-    load_signer, open_pile_strict, publish_fragment, FactArchive, FactCollection,
-};
+use faculties::storage::{load_signer, open_pile_strict, publish_fragment, FactArchive};
 use hifitime::efmt::consts::ISO8601;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -37,10 +35,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -441,12 +443,24 @@ impl BodyStorage<'_> {
     fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let collection = FactCollection::new(pile, source)
-                .context("register maintained Body fact collection")?;
-            let store_snapshot = pollster::block_on(collection.maintain(pile))
-                .context("maintain Body fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = source.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let collection_succinct =
+                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+            let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                collection_succinct,
+                (),
+                policy,
+            )?;
+            let store_snapshot = pollster::block_on(async {
+                drop(pile.ensure(source).await?);
+                drop(pile.maintain(collection_succinct).await?);
+                pile.maintain(collection_rank9).await
+            })
+            .context("maintain Body fact collection")?;
             let facts = store_snapshot
-                .collection(collection.rank9())
+                .collection(collection_rank9)
                 .context("observe maintained Body fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Body fact collection")?;

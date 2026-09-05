@@ -13,7 +13,7 @@ use faculties::storage::initialize_signer;
 #[cfg(test)]
 use faculties::storage::open_secrets_collection;
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive,
 };
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
@@ -21,6 +21,9 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
@@ -29,6 +32,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
@@ -391,7 +395,8 @@ struct CollectionView {
 struct TeamsSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
-    maintained: FactCollection,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     support: Support,
     facts: FactArchive,
     reader: PileSnapshot,
@@ -479,7 +484,7 @@ impl TeamsSession<'_> {
             .context("commit Teams fragment")?;
         pollster::block_on(async {
             for (label, source) in [
-                ("Teams", self.maintained.source()),
+                ("Teams", self.collection),
                 ("Secrets", self.secret_collection.source()),
             ] {
                 drop(
@@ -493,11 +498,6 @@ impl TeamsSession<'_> {
                 .pile
                 .snapshot()
                 .context("freeze shared Teams post-commit support snapshot")?;
-            let support = self
-                .maintained
-                .source()
-                .admitted(&shared_control)
-                .context("admit Teams support after commit")?;
             let secrets_support = self
                 .secret_collection
                 .source()
@@ -505,13 +505,18 @@ impl TeamsSession<'_> {
                 .context("admit Secrets support after Teams commit")?;
             drop(shared_control);
             drop(
-                self.maintained
-                    .maintain_exact(self.pile, &support)
+                self.pile
+                    .maintain(self.succinct)
+                    .await
+                    .context("maintain Teams succinct fact collection after commit")?,
+            );
+            drop(
+                self.pile
+                    .maintain(self.rank9)
                     .await
                     .context("maintain Teams fact collection after commit")?,
             );
-            self.refresh_secrets_for_async(support, secrets_support)
-                .await
+            self.refresh_secrets_for_async(None, secrets_support).await
         })?;
         Ok(Some(commit))
     }
@@ -532,14 +537,14 @@ impl TeamsSession<'_> {
                 .admitted(&ready)
                 .context("admit Secrets support after credential publication")?;
             drop(ready);
-            self.refresh_secrets_for_async(support, secrets_support)
+            self.refresh_secrets_for_async(Some(support), secrets_support)
                 .await
         })
     }
 
     async fn refresh_secrets_for_async(
         &mut self,
-        support: Support,
+        support: Option<Support>,
         secrets_support: Support,
     ) -> Result<()> {
         let store_snapshot = self
@@ -551,11 +556,18 @@ impl TeamsSession<'_> {
             secret_storage::snapshot_exact(store_snapshot, self.secret_collection, secrets_support)
                 .context("attach exact Secrets collection for Teams")?;
         let reader = secrets.store_snapshot().clone();
-        let facts = reader
-            .collection_exact(self.maintained.rank9(), &support)
-            .context("attach exact Teams support through Secrets snapshot")?
+        // Credential-only refreshes retain the session's Teams support;
+        // Teams commits observe the ordinary view at this final snapshot.
+        let observed = match support.as_ref() {
+            Some(support) => reader.collection_exact(self.rank9, support),
+            None => reader.collection(self.rank9),
+        }
+        .context("attach Teams through Secrets snapshot")?;
+        let support = observed.support().clone();
+        let facts = observed
             .view::<FactArchive>()
-            .context("read exact Teams support through Secrets snapshot")?;
+            .context("read Teams through Secrets snapshot")?;
+        drop(observed);
         self.support = support;
         self.facts = facts;
         self.reader = reader;
@@ -595,13 +607,21 @@ impl TeamsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let maintained = FactCollection::new(&mut pile, collection)
-                .context("register maintained Teams fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let maintained_succinct =
+                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                maintained_succinct,
+                (),
+                policy,
+            )?;
             let secret_collection =
                 open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-            let (support, secrets) = pollster::block_on(async {
+            let secrets = pollster::block_on(async {
                 for (label, source) in [
-                    ("Teams", maintained.source()),
+                    ("Teams", collection),
                     ("Secrets", secret_collection.source()),
                 ] {
                     drop(
@@ -613,18 +633,18 @@ impl TeamsStorage<'_> {
                 let shared_control = pile
                     .snapshot()
                     .context("freeze shared Teams support snapshot")?;
-                let support = maintained
-                    .source()
-                    .admitted(&shared_control)
-                    .context("admit Teams support before maintenance")?;
                 let secrets_support = secret_collection
                     .source()
                     .admitted(&shared_control)
                     .context("admit Secrets support before Teams maintenance")?;
                 drop(shared_control);
                 drop(
-                    maintained
-                        .maintain_exact(&mut pile, &support)
+                    pile.maintain(maintained_succinct)
+                        .await
+                        .context("maintain Teams fact collection")?,
+                );
+                drop(
+                    pile.maintain(maintained_rank9)
                         .await
                         .context("maintain Teams fact collection")?,
                 );
@@ -638,18 +658,22 @@ impl TeamsStorage<'_> {
                     secrets_support,
                 )
                 .context("attach exact Secrets collection for Teams")?;
-                Ok::<_, anyhow::Error>((support, secrets))
+                Ok::<_, anyhow::Error>(secrets)
             })?;
             let reader = secrets.store_snapshot().clone();
-            let facts = reader
-                .collection_exact(maintained.rank9(), &support)
-                .context("attach exact Teams support through Secrets snapshot")?
+            let observed = reader
+                .collection(maintained_rank9)
+                .context("observe Teams through Secrets snapshot")?;
+            let support = observed.support().clone();
+            let facts = observed
                 .view::<FactArchive>()
-                .context("read exact Teams support through Secrets snapshot")?;
+                .context("read Teams through Secrets snapshot")?;
+            drop(observed);
             operation(&mut TeamsSession {
                 pile: &mut pile,
                 collection,
-                maintained,
+                succinct: maintained_succinct,
+                rank9: maintained_rank9,
                 support,
                 facts,
                 reader,
@@ -4113,10 +4137,24 @@ mod tests {
             .storage()
             .with_session(|session| {
                 assert_session_has_one_store_watermark(session);
+                let support = session.support.clone();
+                session.pile.commit(
+                    session.collection,
+                    &session.signer,
+                    source_fragment("newer-session-input.example"),
+                )?;
+                let later = pollster::block_on(async {
+                    drop(session.pile.ensure(session.collection).await?);
+                    drop(session.pile.maintain(session.succinct).await?);
+                    session.pile.maintain(session.rank9).await
+                })?;
+                assert_ne!(later.collection(session.rank9)?.support(), &support);
+                drop(later);
                 let observed_at = clock::point_now()?;
                 let secret =
                     session.add_secret("teams/session-test", b"configured", observed_at)?;
                 assert_session_has_one_store_watermark(session);
+                assert_eq!(session.support, support);
                 assert_eq!(
                     session.secrets.open(secret, &session.signer)?,
                     b"configured"

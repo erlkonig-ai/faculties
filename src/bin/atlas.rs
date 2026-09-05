@@ -8,11 +8,16 @@ use faculties::collection_names::open_configured;
 use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::{CliRequest, Faculty, Invocation, Param, Spec, Verb};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::{find, pattern, Id};
 
 const SHARED: &[Param] = &[
@@ -72,12 +77,25 @@ impl AtlasContext {
             DEFAULT_SCOPE_ID,
             self.signer.verifying_key(),
         )?;
-        let collection = FactCollection::new(&mut self.pile, source)
-            .context("register maintained Atlas fact collection")?;
-        let store_snapshot = pollster::block_on(collection.maintain(&mut self.pile))
-            .context("maintain Atlas fact collection")?;
+        let descriptor_snapshot = self.pile.snapshot()?;
+        let policy = source.policy(&descriptor_snapshot)?;
+        drop(descriptor_snapshot);
+        let collection_succinct =
+            self.pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+        let collection_rank9 = self.pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+            collection_succinct,
+            (),
+            policy,
+        )?;
+        let store_snapshot = pollster::block_on(async {
+            drop(self.pile.ensure(source).await?);
+            drop(self.pile.maintain(collection_succinct).await?);
+            self.pile.maintain(collection_rank9).await
+        })
+        .context("maintain Atlas fact collection")?;
         let facts = store_snapshot
-            .collection(collection.rank9())
+            .collection(collection_rank9)
             .context("observe maintained Atlas fact collection")?
             .view::<FactArchive>()
             .context("read maintained Atlas fact collection")?;

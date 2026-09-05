@@ -16,7 +16,7 @@
 //! one. `gate_compass_stated_order` shows compass's `(created_at, event id)`
 //! rule is not a special case but the maximal state of a register — once the
 //! register is given the identity it lacked — and
-//! `gate_derived_observed_index` shows the maintained observed-set collection
+//! `gate_derived_latest_index` shows the maintained positive latest collection
 //! answers exactly what the live reverse-index probes do.
 //!
 //! Reads only; never writes.
@@ -46,8 +46,7 @@ fn scope(pile: &mut Pile, id: Id, signer: &ed25519_dalek::SigningKey) -> Result<
     let store_snapshot = pile
         .snapshot()
         .with_context(|| format!("freeze collection {id:x} store snapshot"))?;
-    let instant = triblespace::core::clock::epoch_now();
-    faculties::storage::read_fact_collection(collection, &store_snapshot, instant)
+    faculties::storage::read_fact_collection(collection, &store_snapshot)
         .map(|(facts, _)| facts)
         .with_context(|| format!("snapshot collection {id:x}"))
 }
@@ -422,11 +421,11 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     }
 }
 
-/// The derived collection maintains the *dominated* set — the monotone half
-/// — and the reader subtracts. This checks the derived index answers exactly
+/// The derived collection maintains current known states and historical
+/// supersession evidence. This checks its positive membership answers exactly
 /// what the live order does over the wiki's revisions.
-fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
-    use triblespace::core::collection::observed_union::{derive_element, join, ObservedIndex};
+fn gate_derived_latest_index(space: &TribleSet) -> Result<()> {
+    use triblespace::core::collection::latest::{derive_element, join, LatestIndex};
 
     let catalog = wiki_model::load_catalog(space)?;
     let entries = catalog.revisions.all_entries();
@@ -435,7 +434,7 @@ fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
         .flat_map(|entry| entry.members.iter().copied())
         .collect();
 
-    // Derive from the archived facts, then read the frontier by subtraction.
+    // Derive from archived facts, then join positive latest membership.
     let archive = space.clone().to_blob();
     let derived = derive_element(&archive, metadata::supersedes.id())
         .map_err(|error| anyhow::anyhow!("derive failed: {error}"))?;
@@ -445,17 +444,21 @@ fn gate_derived_observed_index(space: &TribleSet) -> Result<()> {
     assert_eq!(
         derived.bytes.as_ref(),
         rejoined.bytes.as_ref(),
-        "the observed-set join is not idempotent on live data"
+        "the latest-state join is not idempotent on live data"
     );
 
-    let index = ObservedIndex::decode(&derived)
-        .map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
-    let from_index = resolve(&index, members.iter().copied());
+    let index =
+        LatestIndex::decode(&derived).map_err(|error| anyhow::anyhow!("decode failed: {error}"))?;
+    let candidates: Vec<Id> = members.iter().copied().collect();
+    let from_index: BTreeSet<Id> = find!(state: Id, and!(
+        index.has(state), SortedSlice::new_unchecked(&candidates).has(state)
+    ))
+    .collect();
     let from_live = latest(space, metadata::supersedes.id(), members.iter().copied());
 
-    println!("DERIVED OBSERVED SET (the maintained half)");
+    println!("DERIVED LATEST RELATION (positive membership)");
     println!(
-        "  revisions examined: {} · observed states in the derived set: {}",
+        "  revisions examined: {} · latest states in the derived set: {}",
         members.len(),
         index.len()
     );
@@ -602,7 +605,7 @@ fn main() -> Result<()> {
     println!();
     gate_compass_stated_order(&compass)?;
     println!();
-    gate_derived_observed_index(&wiki)?;
+    gate_derived_latest_index(&wiki)?;
     println!();
     gate_relations_track_heads(&relations)?;
     println!();

@@ -16,6 +16,7 @@ use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
@@ -26,15 +27,18 @@ use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
-use crate::storage::{FactArchive, FactCollection};
+use crate::storage::FactArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// One coherent Compass source snapshot plus its maintained status register.
 ///
-/// Facts, cover, and blob reader are captured at one collection observation;
-/// the index is then attached for exactly that source cover. Maintained
+/// Facts, positive status membership, and blob reader are captured at one
+/// immutable store observation without requiring equal support. Maintained
 /// artifacts are cache exhaust, never additional semantic authority.
 pub struct CompassSnapshot {
     facts: FactArchive,
@@ -53,7 +57,7 @@ impl CompassSnapshot {
         &self.store_snapshot
     }
 
-    /// Maintained LWW order attached for this snapshot's source cover.
+    /// Known complete LWW winners attached from the same store observation.
     pub fn status_register(&self) -> &LwwIndex {
         &self.status
     }
@@ -90,7 +94,7 @@ where
         .context("freeze Compass source policy snapshot")?;
     let policy = source
         .policy(&snapshot)
-        .map_err(|error| anyhow!("read Compass source collection policy: {error}"))?;
+        .context("read Compass source collection policy")?;
     let target = store.derive::<LwwRegisterBlob>(
         source,
         (board::status_of.id(), metadata::created_at.id()),
@@ -977,9 +981,7 @@ pub fn priority_ranks(
 }
 
 pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
-    let value: View<str> = reader
-        .get(handle)
-        .map_err(|error| anyhow!("load Compass text: {error:?}"))?;
+    let value: View<str> = reader.get(handle).context("load Compass text")?;
     Ok(value.to_string())
 }
 
@@ -1057,44 +1059,49 @@ pub fn materialize_collection(
     Ok((facts, store_snapshot))
 }
 
-/// Capture Compass facts and attach the maintained status LWW index for that
-/// exact source cover, constructing missing derived artifacts if necessary.
-pub async fn materialize_indexed_collection(
-    pile: &mut Pile,
+/// Capture Compass facts and the positive status LWW index through one store
+/// observation, constructing missing derived artifacts if necessary.
+pub async fn materialize_indexed_collection<S>(
+    pile: &mut S,
     signer: &SigningKey,
-) -> Result<CompassSnapshot> {
+) -> Result<CompassSnapshot>
+where
+    S: Store<Snapshot = PileSnapshot> + AsyncBlobStoreAcquire + Send,
+{
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let facts =
-        FactCollection::new(pile, source).context("register maintained Compass fact collection")?;
+    let policy = source.policy(&pile.snapshot()?)?;
+    let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let status_target = status_register_for_source(pile, source)?;
-    let source_snapshot = pile
-        .ensure(source)
-        .await
-        .context("ensure Compass source collection")?;
-    let support = source
-        .admitted(&source_snapshot)
-        .context("admit ensured Compass source support")?;
-    drop(source_snapshot);
     drop(
-        facts
-            .maintain_exact(pile, &support)
+        pile.ensure(source)
+            .await
+            .context("ensure Compass source collection")?,
+    );
+    drop(
+        pile.maintain(succinct)
+            .await
+            .context("maintain Compass Succinct collection")?,
+    );
+    drop(
+        pile.maintain(rank9)
             .await
             .context("maintain Compass fact collection")?,
     );
     let store_snapshot = pile
-        .maintain_exact(status_target, &support)
+        .maintain(status_target)
         .await
-        .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
+        .context("maintain Compass status register")?;
     let fact_archive = store_snapshot
-        .collection_exact(facts.rank9(), &support)
-        .map_err(|error| anyhow!("observe Compass fact collection: {error}"))?
+        .collection(rank9)
+        .context("observe Compass fact collection")?
         .view::<FactArchive>()
-        .map_err(|error| anyhow!("read Compass fact collection: {error}"))?;
+        .context("read Compass fact collection")?;
     let status = store_snapshot
-        .collection_exact(status_target, &support)
-        .map_err(|error| anyhow!("observe Compass status register: {error}"))?
+        .collection(status_target)
+        .context("observe Compass status register")?
         .view::<LwwIndex>()
-        .map_err(|error| anyhow!("read Compass status register: {error}"))?;
+        .context("read Compass status register")?;
     Ok(CompassSnapshot {
         facts: fact_archive,
         store_snapshot,
@@ -1108,14 +1115,18 @@ pub async fn materialize_indexed_collection(
 /// Once this returns, the authoritative commit is durable; cache maintenance
 /// must never turn that success into an error which tempts a caller to retry
 /// the semantic action.
-pub fn commit_collection(
-    pile: &mut Pile,
+pub fn commit_collection<S>(
+    pile: &mut S,
     signer: &SigningKey,
     fragment: Fragment,
-) -> Result<CollectionCommit> {
+) -> Result<CollectionCommit>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet,
+{
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
-        .map_err(|error| anyhow!("commit Compass collection fragment: {error}"))
+        .context("commit Compass collection fragment")
 }
 
 #[cfg(test)]
@@ -1142,6 +1153,72 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
 
         assert_eq!(register.policy(&snapshot).unwrap(), policy,);
+    }
+
+    #[test]
+    fn facts_ahead_of_status_register_do_not_admit_unknown_winners() {
+        pollster::block_on(async {
+            let signer = SigningKey::from_bytes(&[14; 32]);
+            let goal = genid().id;
+            let unseen_goal = genid().id;
+            let initial = status_fragment(goal, "todo", None, at(1)).unwrap();
+            let initial_id = initial.root().unwrap();
+            let next = status_fragment(goal, "done", None, at(2)).unwrap();
+            let next_id = next.root().unwrap();
+            let unseen = status_fragment(unseen_goal, "doing", None, at(3)).unwrap();
+            let unseen_id = unseen.root().unwrap();
+            let mut store = MemoryRepo::default();
+            let source = store
+                .collection(
+                    "status-lag",
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            let target = status_register_for_source(&mut store, source).unwrap();
+            store.commit(source, &signer, initial).unwrap();
+            let ready = store.maintain(target).await.unwrap();
+            let lagging = ready
+                .collection(target)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            store.commit(source, &signer, next + unseen).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let facts = snapshot
+                .collection(source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &lagging, goal)
+                    .unwrap()
+                    .0,
+                initial_id
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &lagging, unseen_goal),
+                None
+            );
+
+            let ready = store.maintain(target).await.unwrap();
+            let advanced = ready
+                .collection(target)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &advanced, goal)
+                    .unwrap()
+                    .0,
+                next_id
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &advanced, unseen_goal)
+                    .unwrap()
+                    .0,
+                unseen_id
+            );
+        });
     }
 
     #[test]

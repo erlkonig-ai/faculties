@@ -10,12 +10,16 @@ use faculties::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -132,12 +136,24 @@ impl DecideStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let maintained = FactCollection::new(&mut pile, collection)
-                .context("register maintained Decide fact collection")?;
-            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
-                .context("maintain Decide fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let maintained_succinct =
+                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                maintained_succinct,
+                (),
+                policy,
+            )?;
+            let store_snapshot = pollster::block_on(async {
+                drop(pile.ensure(collection).await?);
+                drop(pile.maintain(maintained_succinct).await?);
+                pile.maintain(maintained_rank9).await
+            })
+            .context("maintain Decide fact collection")?;
             let facts = store_snapshot
-                .collection(maintained.rank9())
+                .collection(maintained_rank9)
                 .context("observe maintained Decide fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Decide fact collection")?;

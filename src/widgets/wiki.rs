@@ -96,7 +96,7 @@ impl WikiLive {
     /// Confirm that the maintained supersession order needed for frontiers is
     /// attached to this exact immutable dataset view.
     fn refresh(wiki: DatasetView<'_>, files: Option<DatasetView<'_>>) -> Result<Self, String> {
-        wiki.observed_order(metadata::supersedes.id())
+        wiki.latest_index(metadata::supersedes.id())
             .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
         Ok(WikiLive {
             cached_revision: wiki.revision,
@@ -141,13 +141,12 @@ impl WikiLive {
     /// An archived/live fork keeps both heads visible: hiding the archived
     /// side would falsely present a resolved state. Entries whose complete
     /// frontier is archived are absent from the default graph.
-    fn projected_heads<P, O>(facts: &P, order: &O) -> Vec<VisibleHead>
-    where
-        P: TriblePattern,
-        O: triblespace::core::query::register::RegisterOrder + ?Sized,
-    {
+    fn projected_heads<P: TriblePattern>(
+        facts: &P,
+        latest: &triblespace::core::collection::latest::LatestIndex,
+    ) -> Vec<VisibleHead> {
         let mut heads = Vec::new();
-        for entry in crate::wiki::entries(facts, order) {
+        for entry in crate::wiki::entries(facts, latest) {
             if entry
                 .frontier
                 .iter()
@@ -172,7 +171,7 @@ impl WikiLive {
     }
 
     fn visible_heads(wiki: DatasetView<'_>) -> Vec<VisibleHead> {
-        let Some(order) = wiki.observed_order(metadata::supersedes.id()) else {
+        let Some(order) = wiki.latest_index(metadata::supersedes.id()) else {
             return Vec::new();
         };
         let mut heads = Self::projected_heads(wiki.facts, order);
@@ -202,14 +201,14 @@ impl WikiLive {
     /// Resolve a selector as a live entry reference. Unlike an immutable
     /// revision link, this deliberately follows the selected revision's
     /// connected component to its complete current frontier.
-    fn resolve_entry_selector_with_order<P, O>(facts: &P, order: &O, selector: Id) -> Vec<Id>
-    where
-        P: TriblePattern,
-        O: triblespace::core::query::register::RegisterOrder + ?Sized,
-    {
+    fn resolve_entry_selector_with_order<P: TriblePattern>(
+        facts: &P,
+        latest: &triblespace::core::collection::latest::LatestIndex,
+        selector: Id,
+    ) -> Vec<Id> {
         let mut heads = BTreeSet::new();
         for revision in Self::resolve_selector(facts, selector) {
-            if let Some(entry) = crate::wiki::entry(facts, order, revision) {
+            if let Some(entry) = crate::wiki::entry(facts, latest, revision) {
                 heads.extend(entry.frontier.iter().map(|head| head.id));
             }
         }
@@ -217,7 +216,7 @@ impl WikiLive {
     }
 
     fn resolve_entry_selector(wiki: DatasetView<'_>, selector: Id) -> Vec<Id> {
-        wiki.observed_order(metadata::supersedes.id())
+        wiki.latest_index(metadata::supersedes.id())
             .map(|order| Self::resolve_entry_selector_with_order(wiki.facts, order, selector))
             .unwrap_or_default()
     }
@@ -258,7 +257,7 @@ impl WikiLive {
     /// frontiers used by the graph. This changes only graph topology; opening
     /// the link still shows every exact set-valued target.
     fn graph_link_targets(wiki: DatasetView<'_>, revision: Id) -> Vec<Id> {
-        let Some(order) = wiki.observed_order(metadata::supersedes.id()) else {
+        let Some(order) = wiki.latest_index(metadata::supersedes.id()) else {
             return Vec::new();
         };
         let mut heads = BTreeSet::new();
@@ -1645,7 +1644,7 @@ impl WikiViewer {
             let revision = WikiLive::revision(wiki_view.facts, revision_id);
             let entry = revision.as_ref().and_then(|_| {
                 wiki_view
-                    .observed_order(metadata::supersedes.id())
+                    .latest_index(metadata::supersedes.id())
                     .and_then(|order| crate::wiki::entry(wiki_view.facts, order, revision_id))
             });
             let title = WikiLive::title(wiki_view.facts, wiki_reader, revision_id);
@@ -1860,10 +1859,12 @@ mod tests {
             7.0,
         );
 
-        let order = triblespace::core::query::register::ObservationOrder::new(
-            fragment.facts(),
+        let derived = triblespace::core::collection::latest::derive_element(
+            &fragment.facts().clone().to_blob(),
             metadata::supersedes.id(),
-        );
+        )
+        .unwrap();
+        let order = triblespace::core::collection::latest::LatestIndex::decode(&derived).unwrap();
         let projected = WikiLive::projected_heads(fragment.facts(), &order);
         let by_revision: BTreeMap<_, _> = projected
             .iter()

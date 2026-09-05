@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
@@ -20,7 +23,7 @@ use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
-use crate::storage::{FactArchive, FactCollection};
+use crate::storage::FactArchive;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -540,31 +543,36 @@ pub async fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let collection =
-        FactCollection::new(pile, source).context("register maintained Body fact collection")?;
+    let policy = source.policy(&pile.snapshot()?)?;
+    let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let target = intent_register_collection(pile, signer.verifying_key())?;
 
-    let source_snapshot = pile
-        .ensure(source)
-        .await
-        .context("ensure Body source collection")?;
-    let support = source
-        .admitted(&source_snapshot)
-        .context("admit ensured Body source support")?;
-    drop(source_snapshot);
-
     drop(
-        collection
-            .maintain_exact(pile, &support)
+        pile.ensure(source)
             .await
-            .context("maintain Body fact collection")?,
+            .context("ensure Body source collection")?,
     );
-    let store_snapshot = pile
-        .maintain_exact(target, &support)
+    drop(
+        pile.maintain(succinct)
+            .await
+            .context("maintain Body Succinct collection")?,
+    );
+    let ready = pile
+        .maintain(rank9)
         .await
-        .map_err(|error| anyhow!("maintain Body intent register: {error}"))?;
+        .context("maintain Body fact collection")?;
+    let support = ready.collection(rank9)?.support().clone();
+    let instant = ready.instant();
+    drop(ready);
+    drop(
+        pile.maintain_exact(target, &support)
+            .await
+            .map_err(|error| anyhow!("maintain Body intent register: {error}"))?,
+    );
+    let store_snapshot = pile.snapshot_at(instant)?;
     let facts = store_snapshot
-        .collection_exact(collection.rank9(), &support)
+        .collection_exact(rank9, &support)
         .context("observe maintained Body fact collection")?
         .view::<FactArchive>()
         .context("read maintained Body fact collection")?;

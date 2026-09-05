@@ -532,6 +532,7 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    use crate::memory_cover::all_chunk_ids;
     use triblespace::prelude::{Fragment, TryToInline};
 
     fn point(seconds: f64) -> memory::IntervalValue {

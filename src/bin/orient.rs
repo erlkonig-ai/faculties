@@ -5,7 +5,7 @@ use chrono::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::collection_names::open_configured;
+use faculties::collection_names::{configured_handle, open_configured, open_exact_in};
 use faculties::memory_cover::{render_cover, CoverOpts};
 use faculties::schemas::archive::archive;
 use faculties::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
@@ -36,7 +36,7 @@ use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
 use faculties::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
     teams as teams_model, wiki as wiki_model,
@@ -46,7 +46,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{
     next_authorization_change, Collection, CollectionSnapshot, CollectionSnapshotExt,
@@ -55,7 +58,9 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreList, StoreSnapshot};
+use triblespace::core::repo::{
+    BlobStoreGet, BlobStoreList, MissingBlob, StorageClose, StoreSnapshot,
+};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -242,39 +247,74 @@ fn visible_notes<P: TriblePattern>(
     notes
 }
 
-/// One authored fact collection and its maintained Succinct projection.
+/// One Orient input's authored collection and explicit query projections.
 struct OrientSource {
-    facts: FactCollection,
+    source: Collection<SimpleArchive>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &'static str,
 }
 
 impl OrientSource {
-    fn open(pile: &mut Pile, signer: &SigningKey, scope: Id, label: &'static str) -> Result<Self> {
+    async fn open(
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        scope: Id,
+        label: &'static str,
+    ) -> Result<Self> {
         let authority = signer.verifying_key();
-        let collection = open_configured(pile, scope, authority)?;
-        let facts = FactCollection::new(pile, collection)
-            .with_context(|| format!("register {label} maintained fact collection"))?;
-        Ok(Self { facts, label })
+        let source = if let Some(handle) = configured_handle(scope)? {
+            let snapshot = pile.snapshot()?;
+            read(pile, &snapshot, |reader| {
+                open_exact_in(reader, scope, handle)
+            })
+            .await?
+        } else {
+            open_configured(pile, scope, authority)?
+        };
+        let descriptors = pile
+            .snapshot()
+            .with_context(|| format!("freeze {label} source policy snapshot"))?;
+        let policy = source
+            .policy(&descriptors)
+            .with_context(|| format!("read {label} source policy"))?;
+        drop(descriptors);
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .with_context(|| format!("register {label} Succinct collection"))?;
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .with_context(|| format!("register {label} Rank9 collection"))?;
+        Ok(Self {
+            source,
+            succinct,
+            rank9,
+            label,
+        })
     }
 
-    async fn maintain(&self, pile: &mut Pile, snapshot: &PileSnapshot) -> Result<Support> {
+    async fn maintain(&self, pile: &mut FacultyStore, snapshot: &PileSnapshot) -> Result<Support> {
         let support = snapshot
-            .collection(self.facts.source())
+            .collection(self.source)
             .map_err(|error| anyhow!("observe admitted {} support: {error}", self.label))?
             .support()
             .clone();
         drop(
-            self.facts
-                .maintain_exact(pile, &support)
+            pile.maintain_exact(self.succinct, &support)
                 .await
-                .with_context(|| format!("maintain {} fact collection", self.label))?,
+                .with_context(|| format!("maintain {} Succinct collection", self.label))?,
+        );
+        drop(
+            pile.maintain_exact(self.rank9, &support)
+                .await
+                .with_context(|| format!("maintain {} Rank9 collection", self.label))?,
         );
         Ok(support)
     }
 
     fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_exact(self.facts.rank9(), support)
+            .collection_exact(self.rank9, support)
             .with_context(|| format!("observe exact {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
@@ -297,7 +337,7 @@ struct OrientSources {
 
 impl OrientSources {
     /// Fetch direct source dependencies before choosing a common observation.
-    async fn ensure(&self, pile: &mut Pile) -> Result<()> {
+    async fn ensure(&self, pile: &mut FacultyStore) -> Result<()> {
         for source in [
             Some(&self.messages),
             Some(&self.mail),
@@ -312,7 +352,7 @@ impl OrientSources {
         .flatten()
         {
             drop(
-                pile.ensure(source.facts.source())
+                pile.ensure(source.source)
                     .await
                     .with_context(|| format!("ensure {} source collection", source.label))?,
             );
@@ -320,24 +360,31 @@ impl OrientSources {
         Ok(())
     }
 
-    fn open(pile: &mut Pile, signer: &SigningKey, include_habits: bool) -> Result<Self> {
+    async fn open(
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        include_habits: bool,
+    ) -> Result<Self> {
         let authority = signer.verifying_key();
         Ok(Self {
-            messages: OrientSource::open(pile, signer, MESSAGE_SCOPE_ID, "Message")?,
-            mail: OrientSource::open(pile, signer, MAIL_SCOPE_ID, "Mail")?,
-            teams: OrientSource::open(pile, signer, TEAMS_SCOPE_ID, "Teams")?,
-            compass: OrientSource::open(pile, signer, COMPASS_SCOPE_ID, "Compass")?,
-            relations: OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations")?,
-            status: OrientSource::open(pile, signer, STATUS_SCOPE_ID, "Status")?,
-            habits: include_habits
-                .then(|| OrientSource::open(pile, signer, HABIT_SCOPE_ID, "Habit"))
-                .transpose()?,
+            messages: OrientSource::open(pile, signer, MESSAGE_SCOPE_ID, "Message").await?,
+            mail: OrientSource::open(pile, signer, MAIL_SCOPE_ID, "Mail").await?,
+            teams: OrientSource::open(pile, signer, TEAMS_SCOPE_ID, "Teams").await?,
+            compass: OrientSource::open(pile, signer, COMPASS_SCOPE_ID, "Compass").await?,
+            relations: OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?,
+            status: OrientSource::open(pile, signer, STATUS_SCOPE_ID, "Status").await?,
+            habits: if include_habits {
+                Some(OrientSource::open(pile, signer, HABIT_SCOPE_ID, "Habit").await?)
+            } else {
+                None
+            },
             presentations: OrientSource::open(
                 pile,
                 signer,
                 faculties::schemas::orient::DEFAULT_SCOPE_ID,
                 "Orient",
-            )?,
+            )
+            .await?,
             compass_status: compass::status_register_collection(pile, authority)?,
         })
     }
@@ -389,8 +436,9 @@ struct OrientSupports {
 /// target collection and Rank9 query view; shared vocabulary never turns those
 /// authority boundaries into an accidental global fact union.
 struct OrientObservation {
-    /// Exact immutable store boundary from which every collection view and
-    /// selected payload is read.
+    /// Resident payload reader at the observation's frozen authorization
+    /// instant. Exact acquisition may advance its blob residency without
+    /// changing any selected fact view, support, or authorization boundary.
     snapshot: PileSnapshot,
     facts: OrientFacts,
     compass_status: LwwIndex,
@@ -398,7 +446,7 @@ struct OrientObservation {
 }
 
 impl OrientObservation {
-    fn query(&self) -> OrientQuery<'_> {
+    fn query<'a>(&'a self, snapshot: &'a PileSnapshot) -> OrientQuery<'a> {
         OrientQuery {
             messages: self.facts.messages.view(),
             mail: self.facts.mail.view(),
@@ -409,7 +457,7 @@ impl OrientObservation {
             habits: self.facts.habits.as_ref().map(OrientFact::view),
             presentations: self.facts.presentations.view(),
             compass_status: &self.compass_status,
-            snapshot: &self.snapshot,
+            snapshot,
         }
     }
 }
@@ -419,7 +467,7 @@ impl OrientObservation {
 /// Source acquisition precedes this observation. Later records, proofs, and
 /// blobs cannot enter any support selected by this batch.
 async fn maintain_sources(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     snapshot: &PileSnapshot,
     sources: &OrientSources,
 ) -> Result<OrientSupports> {
@@ -465,9 +513,9 @@ fn observe_sources(
         .attach_exact(&snapshot, &supports.messages)?;
     let mail = sources.mail.attach_exact(&snapshot, &supports.mail)?;
     let teams = sources.teams.attach_exact(&snapshot, &supports.teams)?;
-    // Compass facts and their maintained LWW index are one logical query
-    // substrate. Pin both to the same resident foundational support so a
-    // concurrent maintainer cannot expose one half of a newer support here.
+    // Orient explicitly preserves its whole source watermark across later
+    // maintenance. The positive status relation shares that chosen boundary;
+    // ordinary joins do not themselves require equal support.
     let compass = sources.compass.attach_exact(&snapshot, &supports.compass)?;
     let relations = sources
         .relations
@@ -510,7 +558,7 @@ fn observe_sources(
 /// Preserve its authorization instant too: if maintenance crosses a validity
 /// boundary, the next poll must still see that boundary and refresh admission.
 async fn maintain_and_observe_snapshot(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     source_snapshot: &PileSnapshot,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
@@ -522,7 +570,7 @@ async fn maintain_and_observe_snapshot(
 }
 
 async fn maintain_and_observe_sources(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
     sources.ensure(pile).await?;
@@ -549,21 +597,10 @@ struct OrientQuery<'a> {
     snapshot: &'a PileSnapshot,
 }
 
-#[derive(Debug)]
-struct PayloadPending(&'static str);
-
-impl std::fmt::Display for PayloadPending {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "selected {} payload is not resident", self.0)
-    }
-}
-
-impl std::error::Error for PayloadPending {}
-
 fn is_payload_pending(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .any(|source| source.downcast_ref::<PayloadPending>().is_some())
+        .any(|source| source.downcast_ref::<MissingBlob>().is_some())
 }
 
 fn read_utf8(
@@ -576,7 +613,7 @@ fn read_utf8(
         .contains_blob(unknown)
         .map_err(|error| anyhow!("inspect {label} residency: {error}"))?
     {
-        return Err(PayloadPending("UTF-8").into());
+        return Err(MissingBlob { handle: unknown }.into());
     }
     let value: View<str> = snapshot
         .get(handle)
@@ -594,7 +631,7 @@ fn read_bytes(
         .contains_blob(unknown)
         .map_err(|error| anyhow!("inspect {label} residency: {error}"))?
     {
-        return Err(PayloadPending("raw bytes").into());
+        return Err(MissingBlob { handle: unknown }.into());
     }
     let value: Bytes = snapshot
         .get(handle)
@@ -1330,7 +1367,7 @@ fn latest_goal_status(query: &OrientQuery<'_>, goal: Id) -> Option<(Id, String, 
                 board::status: ?status,
                 metadata::created_at: ?at,
             }]),
-            maximal(event, query.compass_status),
+            query.compass_status.has(event),
         )
     )
     .next()
@@ -1526,16 +1563,13 @@ struct HabitObservation {
     next_cooldown_at: Option<i64>,
 }
 
-/// Evaluate the shared Habit read model once. The wall clock and evaluation
-/// directory are explicit so the wait loop can re-run this without requiring
-/// any collection append, and tests can exercise the temporal edge directly.
-fn observe_habits(
+/// Prepare only the selected Habit evaluation inputs. No scripts run here:
+/// a missing payload can safely retry this read against the same frozen facts.
+fn prepare_habits(
     snapshot: &PileSnapshot,
     facts: &FactArchive,
-    pile: &Path,
-    now_secs: i64,
-) -> Result<HabitObservation> {
-    let at = habits::evaluation_dir(pile);
+) -> Result<(Vec<habits::HabitRow>, HabitObservation)> {
+    let mut rows = Vec::new();
     let mut observation = HabitObservation::default();
     let definitions: Vec<(Id, String, habits::TextHandle, habits::TextHandle)> = find!(
         (habit: Id, label: String, condition: habits::TextHandle, nudge: habits::TextHandle),
@@ -1649,7 +1683,7 @@ fn observe_habits(
         } else {
             habits::Activation::Forked(heads)
         };
-        let row = habits::HabitRow {
+        rows.push(habits::HabitRow {
             id: habit,
             label,
             condition,
@@ -1657,7 +1691,21 @@ fn observe_habits(
             script,
             activation,
             completed_at,
-        };
+        });
+    }
+    Ok((rows, observation))
+}
+
+/// Evaluate once after payload preparation succeeds. The wall clock and
+/// directory stay explicit so a wait can observe temporal edges without an
+/// append, and an acquisition retry cannot repeat a condition script.
+fn observe_habits(
+    (rows, mut observation): (Vec<habits::HabitRow>, HabitObservation),
+    pile: &Path,
+    now_secs: i64,
+) -> Result<HabitObservation> {
+    let at = habits::evaluation_dir(pile);
+    for row in rows {
         let state = habits::evaluate(&row, now_secs, &at);
         match &state {
             habits::State::Due => {
@@ -2123,7 +2171,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
 }
 
 fn save_presentations(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     signer: &SigningKey,
     persona: Id,
     events: impl IntoIterator<Item = Id>,
@@ -2147,14 +2195,17 @@ async fn cmd_baseline(pile_path: &Path, key: Option<&Path>, persona: Option<&str
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let signer = load_signer(pile_path, key)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_store(pile_path)?;
     let result = async {
-        let sources = OrientSources::open(&mut pile, &signer, false)?;
+        let sources = OrientSources::open(&mut pile, &signer, false).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
-        let query = observation.query();
-        let persona = resolve_native_persona(&query, input)?;
-        let view = load_attention_view(&query, persona)?;
-        let events = view.ids().collect::<Vec<_>>();
+        let (persona, events) = read(&mut pile, &observation.snapshot, |reader| {
+            let query = observation.query(reader);
+            let persona = resolve_native_persona(&query, input)?;
+            let view = load_attention_view(&query, persona)?;
+            Ok((persona, view.ids().collect::<Vec<_>>()))
+        })
+        .await?;
         save_presentations(&mut pile, &signer, persona, events.iter().copied())?;
         Ok(events.len())
     }
@@ -2175,27 +2226,56 @@ async fn cmd_show(
     use std::fmt::Write as _;
 
     let signer = load_signer(pile_path, key)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_store(pile_path)?;
     let result = async {
-        let sources = OrientSources::open(&mut pile, &signer, true)?;
+        let sources = OrientSources::open(&mut pile, &signer, true).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let instant = observation.snapshot.instant();
-        let query = observation.query();
-        let persona_id = persona
-            .map(|input| resolve_native_persona(&query, input))
-            .transpose()?;
-        let (messages, message_events) = render_native_messages(&query, persona_id, message_limit)?;
-        let (mail, mail_events) = render_native_mail(&query, persona_id, message_limit)?;
-        let habits = render_native_habits(&observe_habits(
-            query.snapshot,
-            query
-                .habits
-                .expect("Show opens the Habit source collection"),
-            pile_path,
-            epoch_seconds(instant),
-        )?);
-        let (goals, goal_events) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
-        let (window_status, status_events) = render_window_status(&query)?;
+        let (persona_id, messages, mail, habits, goals, window_status, shown) =
+            read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                let persona_id = persona
+                    .map(|input| resolve_native_persona(&query, input))
+                    .transpose()?;
+                let (messages, message_events) =
+                    render_native_messages(&query, persona_id, message_limit)?;
+                let (mail, mail_events) = render_native_mail(&query, persona_id, message_limit)?;
+                let habits = prepare_habits(
+                    reader,
+                    query
+                        .habits
+                        .expect("Show opens the Habit source collection"),
+                )?;
+                let (goals, goal_events) =
+                    render_native_compass_goals(&query, doing_limit, todo_limit)?;
+                let (window_status, status_events) = render_window_status(&query)?;
+                let shown = match persona_id {
+                    Some(persona) => {
+                        let candidates: BTreeSet<_> =
+                            load_attention_view(&query, persona)?.ids().collect();
+                        message_events
+                            .into_iter()
+                            .chain(mail_events)
+                            .chain(goal_events)
+                            .chain(status_events)
+                            .filter(|event| candidates.contains(event))
+                            .collect::<Vec<_>>()
+                    }
+                    None => Vec::new(),
+                };
+                Ok((
+                    persona_id,
+                    messages,
+                    mail,
+                    habits,
+                    goals,
+                    window_status,
+                    shown,
+                ))
+            })
+            .await?;
+        let habits =
+            render_native_habits(&observe_habits(habits, pile_path, epoch_seconds(instant))?);
 
         let mut report = String::new();
         writeln!(report, "Orient").unwrap();
@@ -2211,13 +2291,6 @@ async fn cmd_show(
         write_complete_report(&mut output, &report, "Orient overview")?;
 
         if let Some(persona_id) = persona_id {
-            let candidates: BTreeSet<_> = load_attention_view(&query, persona_id)?.ids().collect();
-            let shown = message_events
-                .into_iter()
-                .chain(mail_events)
-                .chain(goal_events)
-                .chain(status_events)
-                .filter(|event| candidates.contains(event));
             save_presentations(&mut pile, &signer, persona_id, shown)?;
         }
         Ok(())
@@ -2419,7 +2492,6 @@ fn render_news_detail(
 }
 
 enum News {
-    Pending,
     Quiet,
     Report { text: String, events: Vec<Id> },
 }
@@ -2434,33 +2506,27 @@ fn write_complete_report(output: &mut impl Write, report: &str, description: &st
 }
 
 fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
-    let prepared = (|| {
-        let candidates = load_attention_view(query, persona_id)?;
-        let presented = presented_events(query.presentations, persona_id);
-        let pending = candidates.pending(&presented);
-        if pending.is_empty() {
-            return Ok(News::Quiet);
-        }
-        use std::fmt::Write as _;
-
-        let mut text = String::new();
-        for event in pending.events.values() {
-            writeln!(text, "News: {}", event.reason()).unwrap();
-        }
-        text.push_str(&render_news_detail(query, &pending, persona_id)?);
-        Ok(News::Report {
-            text,
-            events: pending.ids().collect(),
-        })
-    })();
-    match prepared {
-        Err(error) if is_payload_pending(&error) => Ok(News::Pending),
-        other => other,
+    let candidates = load_attention_view(query, persona_id)?;
+    let presented = presented_events(query.presentations, persona_id);
+    let pending = candidates.pending(&presented);
+    if pending.is_empty() {
+        return Ok(News::Quiet);
     }
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for event in pending.events.values() {
+        writeln!(text, "News: {}", event.reason()).unwrap();
+    }
+    text.push_str(&render_news_detail(query, &pending, persona_id)?);
+    Ok(News::Report {
+        text,
+        events: pending.ids().collect(),
+    })
 }
 
 fn apply_prepared_news(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     signer: &SigningKey,
     persona_id: Id,
     peek: bool,
@@ -2483,48 +2549,11 @@ fn apply_prepared_news(
                 write_complete_report(output, prefix, "Orient habit report")?;
             }
         }
-        News::Pending => {}
     }
     Ok(())
 }
 
-/// One shot of the wait fire-path for a persona: load the current
-/// attention-event set, subtract the persona's presentation ledger, and if
-/// anything remains print the terse report (`News:` reasons + the novel
-/// message bodies / status windows) before recording those events. Shared by
-/// `wait` (pre-loop check) and `poll` (the whole command) — one code
-/// path, blocking vs non-blocking only in the caller.
-fn check_news_once(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    query: &OrientQuery<'_>,
-    persona_id: Id,
-    peek: bool,
-) -> Result<News> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    check_news_once_to(pile, signer, query, persona_id, peek, &mut output)
-}
-
-fn check_news_once_to(
-    pile: &mut Pile,
-    signer: &SigningKey,
-    query: &OrientQuery<'_>,
-    persona_id: Id,
-    peek: bool,
-    output: &mut impl Write,
-) -> Result<News> {
-    let news = prepare_news_once(query, persona_id)?;
-    apply_prepared_news(pile, signer, persona_id, peek, &news, "", output)?;
-    Ok(news)
-}
-
-/// One-shot, non-blocking `wait`: report pending attention tersely, or print
-/// nothing and exit 0. Meant for per-turn
-/// harness hooks (UserPromptSubmit and friends) so busy sessions
-/// passively ingest team news at every turn boundary, while `wait`
-/// keeps its job of waking idle ones.
-fn close_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
+fn close_pile<T>(pile: FacultyStore, result: Result<T>) -> Result<T> {
     match (result, pile.close()) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
@@ -2535,6 +2564,9 @@ fn close_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
     }
 }
 
+/// One-shot `wait`: acquire selected payloads, report pending attention
+/// tersely, and only then record presentation. No provider means quiet pending,
+/// not acknowledgment of a body the recipient never saw.
 async fn cmd_poll(
     pile_path: &Path,
     key: Option<&Path>,
@@ -2545,19 +2577,26 @@ async fn cmd_poll(
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let signer = load_signer(pile_path, key)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_store(pile_path)?;
     let result = async {
-        let sources = OrientSources::open(&mut pile, &signer, false)?;
+        let sources = OrientSources::open(&mut pile, &signer, false).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
-        let query = observation.query();
-        let persona_id = match resolve_native_persona(&query, input) {
-            Ok(persona) => persona,
+        let prepared = read(&mut pile, &observation.snapshot, |reader| {
+            let query = observation.query(reader);
+            let persona = resolve_native_persona(&query, input)?;
+            Ok((persona, prepare_news_once(&query, persona)?))
+        })
+        .await;
+        let (persona, news) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
                 return Ok(())
             }
             Err(error) => return Err(error),
         };
-        check_news_once(&mut pile, &signer, &query, persona_id, peek)?;
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        apply_prepared_news(&mut pile, &signer, persona, peek, &news, "", &mut output)?;
         Ok(())
     }
     .await;
@@ -2628,20 +2667,23 @@ impl WaitFrameLoad {
 }
 
 async fn load_wait_frame(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     sources: &OrientSources,
     snapshot: PileSnapshot,
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    // Fetching may change residency, but this attempt keeps its caller's
-    // watermark. The next poll observes those additions (and any concurrent
-    // records); maintenance never consumes an unobserved source frontier.
-    sources.ensure(pile).await?;
+    // The caller ensures sources before choosing this watermark. Later
+    // maintenance and selected-payload acquisition may change residency, but
+    // neither can advance the source frontier consumed by this attempt.
     let instant = snapshot.instant();
-    let observation = maintain_and_observe_snapshot(pile, &snapshot, sources).await?;
-    let query = observation.query();
-    let persona = match resolve_native_persona(&query, persona_input) {
+    let mut observation = maintain_and_observe_snapshot(pile, &snapshot, sources).await?;
+    let (persona, reader) = match read(pile, &observation.snapshot, |reader| {
+        let persona = resolve_native_persona(&observation.query(reader), persona_input)?;
+        Ok((persona, reader.clone()))
+    })
+    .await
+    {
         Ok(persona) => persona,
         Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
@@ -2652,15 +2694,21 @@ async fn load_wait_frame(
         }
         Err(error) => return Err(error),
     };
-    let habits = match observe_habits(
-        query.snapshot,
-        query
-            .habits
-            .expect("Wait opens the Habit source collection"),
-        pile_path,
-        epoch_seconds(instant),
-    ) {
-        Ok(habits) => habits,
+    observation.snapshot = reader;
+    let prepared = read(pile, &observation.snapshot, |reader| {
+        let query = observation.query(reader);
+        let habits = prepare_habits(
+            reader,
+            query
+                .habits
+                .expect("Wait opens the Habit source collection"),
+        )?;
+        let news = prepare_news_once(&query, persona)?;
+        Ok((reader.clone(), habits, news))
+    })
+    .await;
+    let (reader, habits, news) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) if is_payload_pending(&error) => {
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
                 snapshot,
@@ -2670,14 +2718,10 @@ async fn load_wait_frame(
         }
         Err(error) => return Err(error),
     };
-    let news = prepare_news_once(&query, persona)?;
-    if matches!(news, News::Pending) {
-        return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
-            snapshot,
-            &observation,
-            PendingWaitReason::Payload,
-        )));
-    }
+    // Retain acquired bytes for later timer-driven Habit evaluation. The
+    // original fact/support vector and polling watermark remain untouched.
+    observation.snapshot = reader;
+    let habits = observe_habits(habits, pile_path, epoch_seconds(instant))?;
     Ok(WaitFrameLoad::Ready(WaitFrame {
         watermark: snapshot,
         observation,
@@ -2697,8 +2741,7 @@ fn retained_habit_support_is_admitted(
         return Ok(true);
     };
     let admitted = source
-        .facts
-        .source()
+        .source
         .admitted(snapshot)
         .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
     facts
@@ -2717,7 +2760,11 @@ fn observe_habits_in_observation(
         .habits
         .as_ref()
         .expect("a wait observation includes Habit");
-    observe_habits(&observation.snapshot, facts.view(), pile_path, now_secs)
+    observe_habits(
+        prepare_habits(&observation.snapshot, facts.view())?,
+        pile_path,
+        now_secs,
+    )
 }
 
 fn authorization_change_elapsed(boundary: Option<Epoch>, now: Epoch) -> bool {
@@ -2736,9 +2783,9 @@ async fn cmd_wait(
     };
     let timeout = parse_wait_target(target.as_ref())?;
     let signer = load_signer(pile_path, key)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_store(pile_path)?;
     let result = async {
-        let sources = OrientSources::open(&mut pile, &signer, true)?;
+        let sources = OrientSources::open(&mut pile, &signer, true).await?;
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
         let mut view_pending;
@@ -2746,6 +2793,7 @@ async fn cmd_wait(
         // `observed_snapshot` is the pre-maintenance prefix we attempted. It
         // deliberately remains the polling watermark after derived writes so
         // a concurrent source append cannot be swallowed by those writes.
+        sources.ensure(&mut pile).await?;
         let first_snapshot = pile
             .snapshot()
             .map_err(|error| anyhow!("freeze initial Orient wait snapshot: {error}"))?;
@@ -2780,18 +2828,13 @@ async fn cmd_wait(
                     had_ready_frame: false,
                 });
             }
-            std::thread::sleep(poll);
+            tokio::time::sleep(poll).await;
+            sources.ensure(&mut pile).await?;
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
-            let changed = !sampled.changes_since(&observed_snapshot).is_empty();
-            let instant = sampled.instant();
-            if !changed
-                && instant >= observed_snapshot.instant()
-                && !authorization_change_elapsed(next_authorization_change, instant)
-            {
-                continue;
-            }
+            // Provider availability can change without an appended record.
+            // Retry this pending view, still selecting only the sampled facts.
             attempt =
                 load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
             observed_snapshot = attempt.watermark_snapshot().clone();
@@ -2841,7 +2884,8 @@ async fn cmd_wait(
                     });
                 }
             }
-            std::thread::sleep(poll);
+            tokio::time::sleep(poll).await;
+            sources.ensure(&mut pile).await?;
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
@@ -2856,13 +2900,14 @@ async fn cmd_wait(
             let periodic_condition_check = last_habit_sweep.elapsed() >= Duration::from_secs(60);
             if !storage_changed
                 && !authorization_changed
+                && !view_pending
                 && !cooldown_elapsed
                 && !periodic_condition_check
             {
                 continue;
             }
 
-            if storage_changed || authorization_changed {
+            if storage_changed || authorization_changed || view_pending {
                 let attempt =
                     load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
                 observed_snapshot = attempt.watermark_snapshot().clone();
@@ -3006,19 +3051,19 @@ async fn cmd_wake(
     use std::fmt::Write as _;
 
     let signer = load_signer(pile_path, key)?;
-    let mut storage = open_pile_strict(pile_path)?;
+    let mut storage = open_store(pile_path)?;
     let result = async {
         // Register every descriptor before freezing the one source watermark.
         // Maintenance may append derived lattice nodes; all reads attach only
         // after that work, from one later immutable pile snapshot.
-        let sources = OrientSources::open(&mut storage, &signer, false)?;
-        let memory_source = open_configured(&mut storage, MEMORY_SCOPE_ID, signer.verifying_key())?;
-        let memory_collection = FactCollection::new(&mut storage, memory_source)
-            .context("register maintained Memory collection")?;
-        let wiki_source = open_configured(&mut storage, WIKI_SCOPE_ID, signer.verifying_key())?;
-        let wiki_collection = FactCollection::new(&mut storage, wiki_source)
-            .context("register maintained Wiki collection")?;
-        let wiki_observed = wiki_model::observed_collection(&mut storage, signer.verifying_key())
+        let sources = OrientSources::open(&mut storage, &signer, false).await?;
+        let memory_collection =
+            OrientSource::open(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory").await?;
+        let memory_source = memory_collection.source;
+        let wiki_collection =
+            OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki").await?;
+        let wiki_source = wiki_collection.source;
+        let wiki_latest = wiki_model::latest_collection(&mut storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
         sources.ensure(&mut storage).await?;
         drop(storage.ensure(memory_source).await?);
@@ -3029,20 +3074,32 @@ async fn cmd_wake(
         let memory_support = source_snapshot.collection(memory_source)?.support().clone();
         let wiki_support = source_snapshot.collection(wiki_source)?.support().clone();
         drop(
-            memory_collection
-                .maintain_exact(&mut storage, &memory_support)
+            storage
+                .maintain_exact(memory_collection.succinct, &memory_support)
                 .await
-                .context("maintain Memory collection")?,
-        );
-        drop(
-            wiki_collection
-                .maintain_exact(&mut storage, &wiki_support)
-                .await
-                .context("maintain Wiki collection")?,
+                .context("maintain Memory Succinct collection")?,
         );
         drop(
             storage
-                .maintain_exact(wiki_observed, &wiki_support)
+                .maintain_exact(memory_collection.rank9, &memory_support)
+                .await
+                .context("maintain Memory Rank9 collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact(wiki_collection.succinct, &wiki_support)
+                .await
+                .context("maintain Wiki Succinct collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact(wiki_collection.rank9, &wiki_support)
+                .await
+                .context("maintain Wiki Rank9 collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact(wiki_latest, &wiki_support)
                 .await
                 .context("maintain Wiki supersession index")?,
         );
@@ -3051,42 +3108,65 @@ async fn cmd_wake(
         drop(source_snapshot);
         let memory_facts = observation
             .snapshot
-            .collection_exact(memory_collection.rank9(), &memory_support)
+            .collection_exact(memory_collection.rank9, &memory_support)
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;
         let wiki_facts = observation
             .snapshot
-            .collection_exact(wiki_collection.rank9(), &wiki_support)
+            .collection_exact(wiki_collection.rank9, &wiki_support)
             .context("observe maintained Wiki collection")?
             .view::<FactArchive>()
             .context("attach maintained Wiki collection")?;
         let wiki_order = observation
             .snapshot
-            .collection_exact(wiki_observed, &wiki_support)
+            .collection_exact(wiki_latest, &wiki_support)
             .context("observe maintained Wiki supersession index")?
-            .view::<triblespace::core::collection::observed_union::ObservedIndex>()
+            .view::<triblespace::core::collection::latest::LatestIndex>()
             .context("attach maintained Wiki supersession index")?;
-        let query = observation.query();
-        let persona_id = persona
-            .map(|input| resolve_native_persona(&query, input))
-            .transpose()?;
+        let persona_id = read(&mut storage, &observation.snapshot, |reader| {
+            let query = observation.query(reader);
+            persona
+                .map(|input| resolve_native_persona(&query, input))
+                .transpose()
+        })
+        .await?;
+        // Prepare each independent section separately. A missing Wiki or
+        // Compass attachment must not repeat memory-cover planning/diagnostics.
+        // Plain wake never consults Embeddings; these facts stay shard-backed.
+        let cover = read(&mut storage, &observation.snapshot, |reader| {
+            render_cover(
+                &memory_facts,
+                &TribleSet::new(),
+                reader,
+                &CoverOpts::plain(chars),
+            )
+        })
+        .await?;
+        let beliefs = read(&mut storage, &observation.snapshot, |reader| {
+            wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order)
+        })
+        .await?;
+        let (goals, shown) = read(&mut storage, &observation.snapshot, |reader| {
+            let query = observation.query(reader);
+            let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
+            let shown = match persona_id {
+                Some(persona) => {
+                    let candidates: BTreeSet<_> =
+                        load_attention_view(&query, persona)?.ids().collect();
+                    shown
+                        .into_iter()
+                        .filter(|event| candidates.contains(event))
+                        .collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
 
-        // Plain wake never consults Embeddings. The maintained Memory archive
-        // remains shard-backed and is queried directly; opaque historical ids
-        // are ordinary additive journal members.
-        let cover = render_cover(
-            &memory_facts,
-            &TribleSet::new(),
-            &observation.snapshot,
-            &CoverOpts::plain(chars),
-        )?;
+            Ok((goals, shown))
+        })
+        .await?;
 
-        let beliefs = wiki_model::cover_fragments(&observation.snapshot, &wiki_facts, &wiki_order)?;
-        let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
-
-        let mut report = String::new();
-        report.push_str(&cover);
+        let mut report = cover;
         report.push('\n');
         writeln!(report, "Beliefs (cover):").unwrap();
         if beliefs.is_empty() {
@@ -3107,13 +3187,7 @@ async fn cmd_wake(
         write_complete_report(&mut output, &report, "Orient wake report")?;
 
         if let Some(persona_id) = persona_id {
-            let candidates: BTreeSet<_> = load_attention_view(&query, persona_id)?.ids().collect();
-            save_presentations(
-                &mut storage,
-                &signer,
-                persona_id,
-                shown.into_iter().filter(|event| candidates.contains(event)),
-            )?;
+            save_presentations(&mut storage, &signer, persona_id, shown)?;
         }
         Ok(())
     }
@@ -3122,7 +3196,7 @@ async fn cmd_wake(
 }
 
 fn main() -> Result<()> {
-    pollster::block_on(async_main())
+    runtime()?.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
@@ -3249,7 +3323,11 @@ mod tests {
         UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(facts)])
     }
 
-    fn stored_presentations(pile: &mut Pile, signer: &SigningKey, persona: Id) -> BTreeSet<Id> {
+    fn stored_presentations(
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        persona: Id,
+    ) -> BTreeSet<Id> {
         let collection = open_configured(
             pile,
             faculties::schemas::orient::DEFAULT_SCOPE_ID,
@@ -3273,25 +3351,105 @@ mod tests {
     }
 
     #[test]
+    fn status_query_joins_only_known_winners_when_facts_advance() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let goal = id(46);
+            let unseen_goal = id(47);
+            let initial = compass::status_fragment(
+                goal,
+                "todo",
+                None,
+                clock::point(Epoch::from_tai_seconds(1.0)).unwrap(),
+            )
+            .unwrap();
+            let initial_id = initial.root().unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, initial)
+                .unwrap();
+            sources.ensure(&mut pile).await.unwrap();
+            let watermark = pile.snapshot().unwrap();
+            let observation = maintain_and_observe_snapshot(&mut pile, &watermark, &sources)
+                .await
+                .unwrap();
+
+            let next = compass::status_fragment(
+                goal,
+                "done",
+                None,
+                clock::point(Epoch::from_tai_seconds(2.0)).unwrap(),
+            )
+            .unwrap();
+            let next_id = next.root().unwrap();
+            let unseen = compass::status_fragment(
+                unseen_goal,
+                "doing",
+                None,
+                clock::point(Epoch::from_tai_seconds(3.0)).unwrap(),
+            )
+            .unwrap();
+            let unseen_id = unseen.root().unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, next + unseen)
+                .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let facts = snapshot
+                .collection(sources.compass.source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            let facts = archive(&facts);
+            {
+                let mut query = observation.query(&snapshot);
+                query.compass = &facts;
+                assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
+                assert_eq!(latest_goal_status(&query, unseen_goal), None);
+            }
+
+            let ready = pile.maintain(sources.compass_status).await.unwrap();
+            let advanced = ready
+                .collection(sources.compass_status)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            {
+                let mut query = observation.query(&snapshot);
+                query.compass = &facts;
+                query.compass_status = &advanced;
+                assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
+                assert_eq!(
+                    latest_goal_status(&query, unseen_goal).unwrap().0,
+                    unseen_id
+                );
+            }
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
     fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark() {
         pollster::block_on(wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async())
     }
 
     async fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async() {
         let fixture = TestPile::new();
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
-        let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            .await
+            .unwrap();
         let persona = id(42);
         let profile = faculties::relations::ProfileInput {
             label: "test-persona".to_owned(),
             ..Default::default()
         };
         let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
-        pile.commit(sources.relations.facts.source(), &fixture.signer, person)
+        pile.commit(sources.relations.source, &fixture.signer, person)
             .unwrap();
         let watermark = pile.snapshot_at(Epoch::from_tai_seconds(42.0)).unwrap();
         let expected_support = watermark
-            .collection(sources.messages.facts.source())
+            .collection(sources.messages.source)
             .unwrap()
             .support()
             .clone();
@@ -3300,14 +3458,16 @@ mod tests {
         // maintainer also realizes that newer support before this reader runs.
         // The observation must still attach the exact support selected at its
         // own source watermark, rather than re-selecting from the later target.
-        let message_collection = sources.messages.facts.source();
+        let message_collection = sources.messages.source;
         pile.commit(
             message_collection,
             &fixture.signer,
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        drop(sources.messages.facts.maintain(&mut pile).await.unwrap());
+        drop(pile.ensure(sources.messages.source).await.unwrap());
+        drop(pile.maintain(sources.messages.succinct).await.unwrap());
+        drop(pile.maintain(sources.messages.rank9).await.unwrap());
         let attempt = load_wait_frame(
             &mut pile,
             &sources,
@@ -3393,13 +3553,201 @@ mod tests {
     #[test]
     fn a_missing_selected_payload_is_pending() {
         let fixture = TestPile::new();
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let handle = Inline::<inlineencodings::Handle<blobencodings::UTF8String>>::new([42; 32]);
 
         let error = read_utf8(&snapshot, handle, "selected test body").unwrap_err();
         assert!(is_payload_pending(&error));
+        assert_eq!(
+            error.downcast_ref::<MissingBlob>().unwrap().handle.raw,
+            handle.raw,
+        );
+        assert!(!pile.snapshot().unwrap().contains_blob(handle).unwrap());
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn news_acquires_only_its_selected_body_before_presenting_frozen_events() {
+        use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+        use triblespace::core::repo::WantRead;
+
+        struct Supply {
+            store: FacultyStore,
+            source: Collection<blobencodings::SimpleArchive>,
+            signer: SigningKey,
+            handle: Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>,
+            bytes: Bytes,
+            available: bool,
+            requested: Vec<Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>>,
+        }
+
+        impl SnapshotSource for Supply {
+            type Snapshot = PileSnapshot;
+            type SnapshotError = <FacultyStore as SnapshotSource>::SnapshotError;
+
+            fn snapshot_at(
+                &mut self,
+                instant: Epoch,
+            ) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+                self.store.snapshot_at(instant)
+            }
+        }
+
+        impl AsyncBlobStoreAcquire for Supply {
+            type AcquireError = io::Error;
+
+            async fn acquire(
+                &mut self,
+                handle: Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>,
+            ) -> std::result::Result<Option<Bytes>, Self::AcquireError> {
+                self.requested.push(handle);
+                assert_eq!(handle, self.handle, "an unrelated body must stay cold");
+                if !self.available {
+                    return Ok(None);
+                }
+                let cached = self
+                    .store
+                    .put::<blobencodings::UnknownBlob, _>(self.bytes.clone())
+                    .unwrap();
+                assert_eq!(cached, handle);
+                // Acquiring bytes races with an unrelated authoritative append.
+                // The render must not select this newer support.
+                self.store
+                    .commit(
+                        self.source,
+                        &self.signer,
+                        entity! { metadata::tag: &KIND_MESSAGE_ID },
+                    )
+                    .unwrap();
+                Ok(Some(self.bytes.clone()))
+            }
+        }
+
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let persona = id(43);
+            let sender = id(44);
+            let (person, _, _) = relations::person_fragment(
+                persona,
+                relations::ProfileInput {
+                    label: "lazy-reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, person)
+                .unwrap();
+
+            let mut remote = MemoryRepo::default();
+            let bytes: Bytes = Vec::from("newly synced message body").into();
+            let body = remote
+                .put::<blobencodings::UTF8String, _>("newly synced message body".to_owned())
+                .unwrap();
+            let unrelated = remote
+                .put::<blobencodings::UTF8String, _>("not addressed to this reader".to_owned())
+                .unwrap();
+            let instant = Epoch::from_tai_seconds(42.0);
+            let envelope = message::envelope_fragment(
+                sender,
+                persona,
+                body,
+                clock::point(instant).unwrap(),
+                None,
+                None,
+            );
+            let event = envelope.root().unwrap();
+            pile.commit(sources.messages.source, &fixture.signer, envelope)
+                .unwrap();
+            pile.commit(
+                sources.messages.source,
+                &fixture.signer,
+                message::envelope_fragment(
+                    sender,
+                    id(45),
+                    unrelated,
+                    clock::point(instant).unwrap(),
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+            sources.ensure(&mut pile).await.unwrap();
+            let watermark = pile.snapshot_at(instant).unwrap();
+            let observation = maintain_and_observe_snapshot(&mut pile, &watermark, &sources)
+                .await
+                .unwrap();
+            let support = observation.facts.messages.support().clone();
+            let handle = Inline::new(body.raw);
+            let mut supply = Supply {
+                store: pile,
+                source: sources.messages.source,
+                signer: fixture.signer.clone(),
+                handle,
+                bytes,
+                available: false,
+                requested: Vec::new(),
+            };
+
+            let pending = read(&mut supply, &observation.snapshot, |reader| {
+                prepare_news_once(&observation.query(reader), persona)
+            })
+            .await;
+            let Err(error) = pending else {
+                panic!("an unavailable selected body must not prepare an acknowledgment")
+            };
+            assert!(is_payload_pending(&error));
+            assert!(stored_presentations(&mut supply.store, &fixture.signer, persona).is_empty());
+
+            supply.available = true;
+            let (reader, news) = read(&mut supply, &observation.snapshot, |reader| {
+                assert_eq!(reader.instant(), instant);
+                let query = observation.query(reader);
+                let selected = resolve_native_persona(&query, "lazy-reader")?;
+                Ok((reader.clone(), prepare_news_once(&query, selected)?))
+            })
+            .await
+            .unwrap();
+            assert_eq!(supply.requested, [handle, handle]);
+            assert!(!observation.snapshot.contains_blob(handle).unwrap());
+            assert!(!reader.contains_blob(unrelated).unwrap());
+            assert_eq!(observation.facts.messages.support(), &support);
+            assert_ne!(
+                reader.collection(supply.source).unwrap().support(),
+                &support
+            );
+            assert!(reader.wants().unwrap().next().is_none());
+            let News::Report { text, events } = &news else {
+                panic!("the acquired body must make the selected message readable")
+            };
+            assert!(text.contains("newly synced message body"));
+            assert_eq!(events, &[event]);
+            assert!(stored_presentations(&mut supply.store, &fixture.signer, persona).is_empty());
+
+            let mut output = Vec::new();
+            apply_prepared_news(
+                &mut supply.store,
+                &fixture.signer,
+                persona,
+                false,
+                &news,
+                "",
+                &mut output,
+            )
+            .unwrap();
+            assert!(String::from_utf8(output)
+                .unwrap()
+                .contains("newly synced message body"));
+            assert_eq!(
+                stored_presentations(&mut supply.store, &fixture.signer, persona),
+                BTreeSet::from([event]),
+            );
+            supply.store.close().unwrap();
+        });
     }
 
     #[test]
@@ -3409,8 +3757,10 @@ mod tests {
 
     async fn a_missing_persona_preserves_the_wait_watermark_async() {
         let fixture = TestPile::new();
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
-        let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            .await
+            .unwrap();
         let watermark = pile.snapshot().unwrap();
 
         let attempt = load_wait_frame(
@@ -3483,7 +3833,7 @@ mod tests {
             text: "News: retry me\n".to_owned(),
             events: vec![event],
         };
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
         let error = apply_prepared_news(
             &mut pile,
             &fixture.signer,
@@ -3525,7 +3875,7 @@ mod tests {
             text: "News: peek\n".to_owned(),
             events: vec![event],
         };
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
         let mut output = Vec::new();
         apply_prepared_news(
             &mut pile,
@@ -3552,7 +3902,7 @@ mod tests {
         let mut view = AttentionView::default();
         view.insert(AttentionEvent::Message(first));
         view.insert(AttentionEvent::Mail(second));
-        let mut pile = open_pile_strict(&fixture.path).unwrap();
+        let mut pile = open_store(&fixture.path).unwrap();
 
         save_presentations(&mut pile, &fixture.signer, persona, view.ids()).unwrap();
         let presented = stored_presentations(&mut pile, &fixture.signer, persona);

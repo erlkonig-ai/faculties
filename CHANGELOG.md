@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Wiki frontiers now join the maintained positive `LatestIndex` relation;
+  Compass and Orient status queries likewise join known LWW winners. Facts
+  ahead of a derived relation cannot expose unseen current states. Ordinary
+  Wiki, Compass, and widget readers maintain facts and indexes independently,
+  while explicit migration and Orient watermark requests retain exact support.
+  Widget cache identities include each relation's support so index-only progress
+  refreshes projections. The latest descriptor uses the new core `(H, D)`
+  encoding; old observed-only artifacts are not reinterpreted.
+
+- Remove `storage::FactCollection`. Consumers register ordinary typed Succinct
+  and Rank9 collections explicitly, retaining the same descriptor policies and
+  identities. Ordinary fact readers advance each mapping with `maintain` and
+  read the resulting snapshot instead of preselecting a foundation-wide support.
+  Exact support remains explicit for paired indexes and retained observations;
+  no schema or pile migration is needed.
+
+- **Foreground Message, Orient, Wiki, Compass, and ordinary Files reads can
+  acquire cold blobs.** The shared
+  live store reuses `Peer<Pile>` and starts its network host only on a missing
+  exact-handle read. `TRIBLESPACE_PEERS` provides DHT bootstrap routes; transport
+  identity is separate from the durable signer. Selected-text preparation can
+  acquire missing bytes without changing frozen facts/support or authorization
+  time, repeating publication/output, or creating implicit `WANT` records.
+  Exact Relations IDs no longer fetch unrelated labels. Sparse-data regressions
+  cover delayed bodies, labels, MIME metadata, absent descriptors, unchanged
+  snapshots, and delayed presentation. File extraction prepares the selected
+  bytes before touching its destination; Wiki and Compass prepare their selected
+  payloads before rendering or publishing. Files similarity/embedding work and
+  other plain-Pile callers remain resident-only during the port, so this cohort
+  does not yet permit a deployment-wide switch to records-only replication.
+
 - **Secrets uses collection authority directly instead of maintaining a
   parallel vault-authority system.** One ordinary source collection is one
   actual policy boundary. Each immutable secret version has a fresh random DEK

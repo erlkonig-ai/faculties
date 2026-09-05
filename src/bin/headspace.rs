@@ -15,7 +15,10 @@ use faculties::schemas::headspace::DEFAULT_SCOPE_ID;
 use faculties::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
     load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-    FactArchive, FactCollection,
+    FactArchive,
+};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
@@ -190,12 +193,16 @@ impl Storage<'_> {
             .as_mut()
             .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
         let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
-        let collection = FactCollection::new(pile, source)
-            .context("register maintained Headspace fact collection")?;
+        let descriptor_snapshot = pile.snapshot()?;
+        let policy = source.policy(&descriptor_snapshot)?;
+        drop(descriptor_snapshot);
+        let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+        let collection_rank9 =
+            pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
         let secrets_collection = open_secrets_collection_read(pile, self.signer.verifying_key())?;
-        let (support, secrets) = pollster::block_on(async {
+        let secrets = pollster::block_on(async {
             for (label, source) in [
-                ("Headspace", collection.source()),
+                ("Headspace", source),
                 ("Secrets", secrets_collection.source()),
             ] {
                 drop(
@@ -204,23 +211,21 @@ impl Storage<'_> {
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
             }
-            // Both roots are ready before this common observation selects
-            // support. Neither later derivation can widen that boundary.
             let before = pile
                 .snapshot()
                 .context("freeze shared Headspace support snapshot")?;
-            let support = collection
-                .source()
-                .admitted(&before)
-                .context("admit Headspace collection support")?;
             let secrets_support = secrets_collection
                 .source()
                 .admitted(&before)
                 .context("admit Secrets collection support")?;
             drop(before);
             drop(
-                collection
-                    .maintain_exact(pile, &support)
+                pile.maintain(collection_succinct)
+                    .await
+                    .context("maintain Headspace fact collection")?,
+            );
+            drop(
+                pile.maintain(collection_rank9)
                     .await
                     .context("maintain Headspace fact collection")?,
             );
@@ -231,13 +236,13 @@ impl Storage<'_> {
             let secrets =
                 secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
                     .context("attach exact Secrets collection")?;
-            Ok::<_, anyhow::Error>((support, secrets))
+            Ok::<_, anyhow::Error>(secrets)
         })?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
         let reader = secrets.store_snapshot().clone();
         let facts = reader
-            .collection_exact(collection.rank9(), &support)
+            .collection(collection_rank9)
             .context("attach maintained Headspace collection")?
             .view::<FactArchive>()
             .context("read maintained Headspace collection")?;

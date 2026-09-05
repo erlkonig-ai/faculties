@@ -14,16 +14,20 @@ use faculties::schemas::headspace::{
 use faculties::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
@@ -292,13 +296,18 @@ impl WebStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = pollster::block_on(async {
             let source = open_configured(&mut pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
-            let headspace = FactCollection::new(&mut pile, source)
-                .context("register maintained Headspace fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = source.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let headspace_succinct =
+                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+            let headspace_rank9 =
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(headspace_succinct, (), policy)?;
 
             let secrets_collection =
                 open_secrets_collection_read(&mut pile, signer.verifying_key())?;
             for (label, source) in [
-                ("Headspace", headspace.source()),
+                ("Headspace", source),
                 ("Secrets", secrets_collection.source()),
             ] {
                 drop(
@@ -307,23 +316,21 @@ impl WebStorage<'_> {
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
             }
-            // Both roots are ready before this common observation selects
-            // the exact support carried through each derived representation.
             let before = pile
                 .snapshot()
                 .context("freeze shared Web credential support snapshot")?;
-            let support = headspace
-                .source()
-                .admitted(&before)
-                .context("admit Headspace collection support")?;
             let secrets_support = secrets_collection
                 .source()
                 .admitted(&before)
                 .context("admit Secrets collection support")?;
             drop(before);
             drop(
-                headspace
-                    .maintain_exact(&mut pile, &support)
+                pile.maintain(headspace_succinct)
+                    .await
+                    .context("maintain Headspace fact collection")?,
+            );
+            drop(
+                pile.maintain(headspace_rank9)
                     .await
                     .context("maintain Headspace fact collection")?,
             );
@@ -336,12 +343,11 @@ impl WebStorage<'_> {
                 secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
                     .context("attach exact Secrets collection")?;
 
-            // Secrets discovery owns a later immutable pile snapshot. Attach
-            // the exact maintained Headspace support through that same world,
-            // then project only the facts Web actually consumes.
+            // Observe Headspace and Secrets through one final immutable pile
+            // snapshot, then project only the facts Web actually consumes.
             let reader = secrets.store_snapshot();
             let facts = reader
-                .collection_exact(headspace.rank9(), &support)
+                .collection(headspace_rank9)
                 .context("attach maintained Headspace collection")?
                 .view::<FactArchive>()
                 .context("read maintained Headspace collection")?;
@@ -961,10 +967,23 @@ mod tests {
         let source =
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let collection = FactCollection::new(&mut pile, source).unwrap();
-        let store_snapshot = pollster::block_on(collection.maintain(&mut pile)).unwrap();
+        let descriptor_snapshot = pile.snapshot().unwrap();
+        let policy = source.policy(&descriptor_snapshot).unwrap();
+        drop(descriptor_snapshot);
+        let collection_succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let collection_rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)
+            .unwrap();
+        let store_snapshot = pollster::block_on(async {
+            drop(pile.ensure(source).await?);
+            drop(pile.maintain(collection_succinct).await?);
+            pile.maintain(collection_rank9).await
+        })
+        .unwrap();
         let facts = store_snapshot
-            .collection(collection.rank9())
+            .collection(collection_rank9)
             .unwrap()
             .view::<FactArchive>()
             .unwrap();

@@ -11,8 +11,13 @@ use clap::{Parser, Subcommand};
 use faculties::cognition;
 use faculties::collection_names::open_configured;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::repo::SnapshotSource;
 
 #[derive(Parser)]
 #[command(
@@ -41,13 +46,21 @@ fn check(cli: &Cli) -> Result<()> {
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
     let mut pile = open_pile_strict(&cli.pile)?;
     let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let collection = FactCollection::new(&mut pile, source)
-        .context("register maintained Cognition fact collection")?;
+    let descriptor_snapshot = pile.snapshot()?;
+    let policy = source.policy(&descriptor_snapshot)?;
+    drop(descriptor_snapshot);
+    let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let collection_rank9 =
+        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
     let result = (|| {
-        let snapshot = pollster::block_on(collection.maintain(&mut pile))
-            .context("maintain Cognition fact collection")?;
+        let snapshot = pollster::block_on(async {
+            drop(pile.ensure(source).await?);
+            drop(pile.maintain(collection_succinct).await?);
+            pile.maintain(collection_rank9).await
+        })
+        .context("maintain Cognition fact collection")?;
         let facts = snapshot
-            .collection(collection.rank9())
+            .collection(collection_rank9)
             .context("observe Cognition Rank9 collection")?
             .view::<FactArchive>()
             .context("read Cognition Rank9 collection")?;

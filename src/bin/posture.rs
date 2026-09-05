@@ -53,7 +53,7 @@ use faculties::schemas::posture::{
 };
 #[cfg(any(feature = "local-embed", test))]
 use faculties::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
 use regex::Regex;
@@ -61,6 +61,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -1895,49 +1898,45 @@ impl PostureStorage<'_> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
-            // Register every descriptor before freezing the one source
-            // boundary shared by this operation.
-            let maintained = scopes
-                .iter()
-                .map(|(scope, label)| {
-                    let collection = open_configured(&mut pile, *scope, signer.verifying_key())?;
-                    FactCollection::new(&mut pile, collection)
-                        .with_context(|| format!("register maintained Posture {label} collection"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let supports =
-                pollster::block_on(async {
-                    for ((_, label), collection) in scopes.iter().zip(&maintained) {
-                        drop(pile.ensure(collection.source()).await.with_context(|| {
-                            format!("ensure Posture {label} source collection")
-                        })?);
-                    }
-                    let before = pile
-                        .snapshot()
-                        .context("freeze shared Posture source snapshot")?;
-                    let supports = scopes
-                        .iter()
-                        .zip(&maintained)
-                        .map(|((_, label), collection)| {
-                            collection
-                                .source()
-                                .admitted(&before)
-                                .with_context(|| format!("admit Posture {label} source support"))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    drop(before);
-                    for (((_, label), collection), support) in
-                        scopes.iter().zip(&maintained).zip(&supports)
-                    {
-                        drop(
-                            collection
-                                .maintain_exact(&mut pile, support)
-                                .await
-                                .with_context(|| format!("maintain Posture {label} collection"))?,
-                        );
-                    }
-                    Ok::<_, anyhow::Error>(supports)
-                })?;
+            // Register every descriptor before advancing the fact chains.
+            let mut sources = Vec::with_capacity(scopes.len());
+            let mut succinct = Vec::with_capacity(scopes.len());
+            let mut rank9 = Vec::with_capacity(scopes.len());
+            for (scope, label) in scopes {
+                let collection = open_configured(&mut pile, *scope, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let succinct_collection = pile
+                    .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+                    .with_context(|| format!("register succinct Posture {label} collection"))?;
+                let rank9_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
+                    .with_context(|| format!("register Rank9 Posture {label} collection"))?;
+                sources.push(collection);
+                succinct.push(succinct_collection);
+                rank9.push(rank9_collection);
+            }
+            pollster::block_on(async {
+                for ((_, label), collection) in scopes.iter().zip(&sources) {
+                    drop(
+                        pile.ensure(*collection)
+                            .await
+                            .with_context(|| format!("ensure Posture {label} source collection"))?,
+                    );
+                }
+                for (index, (_, label)) in scopes.iter().enumerate() {
+                    drop(pile.maintain(succinct[index]).await.with_context(|| {
+                        format!("maintain succinct Posture {label} collection")
+                    })?);
+                    drop(
+                        pile.maintain(rank9[index])
+                            .await
+                            .with_context(|| format!("maintain Posture {label} collection"))?,
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
 
             // Every logical view is attached through this one immutable
             // post-maintenance watermark.
@@ -1946,11 +1945,10 @@ impl PostureStorage<'_> {
                 .context("freeze maintained Posture store snapshot")?;
             scopes
                 .iter()
-                .zip(maintained)
-                .zip(supports)
-                .map(|(((_, label), collection), support)| {
+                .zip(rank9)
+                .map(|((_, label), collection)| {
                     let facts = reader
-                        .collection_exact(collection.rank9(), &support)
+                        .collection(collection)
                         .with_context(|| format!("observe maintained Posture {label} collection"))?
                         .view::<FactArchive>()
                         .with_context(|| format!("read maintained Posture {label} collection"))?;

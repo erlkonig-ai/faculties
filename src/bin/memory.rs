@@ -11,24 +11,27 @@ use faculties::schemas::memory::{
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
 use faculties::schemas::{blockdag as archive_schema, cognition as cognition_schema};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 // The context-cover renderer and its chunk accessors live in the lib module
 // `faculties::memory_cover` so `orient wake` can assemble the same cover
 // in-process. Re-import the pieces this binary still uses elsewhere.
 use faculties::collection_names::open_configured;
 use faculties::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
-    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_references, chunk_span_str,
-    chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, CoverOpts,
-    DEFAULT_SIM_THRESHOLD,
+    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
+    chunk_span_str, chunk_start_at, chunk_summary_handle, collect_chunk_spans,
+    epoch_end_from_interval, epoch_from_interval, fmt_epoch, format_time_range, interval_key,
+    key_to_epoch, CoverOpts, DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
 use faculties::{clock, cognition as cognition_model, comb as comb_model, memory as memory_model};
-use hifitime::Epoch;
+use hifitime::{Duration, Epoch};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -46,7 +49,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the cover's structure; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about chooses prose within an equal-span position, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--detail N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the cover's structure; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about chooses prose within an equal-span position, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
@@ -57,7 +60,11 @@ use triblespace::prelude::*;
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
+             memory levels <detail>           — how well each tile of the cover is served at a reader's detail: the want, the count shown, the worst width ratio (a big ratio is the arc the comb should write)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
+             memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
+             memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
+             memory respan-seams [--dry-run]    — close one-second and one-minute seams between arcs written with rounded edges (an hour or wider): a coordinate correction, one commit\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
@@ -110,13 +117,12 @@ struct LoadedProvenance {
 
 impl MemoryStorage<'_> {
     fn attach_collection(
-        collection: FactCollection,
-        support: &Support,
+        collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
         label: &str,
     ) -> Result<CollectionView> {
         let facts = store_snapshot
-            .collection_exact(collection.rank9(), support)
+            .collection(collection)
             .with_context(|| format!("observe maintained {label} collection"))?
             .view::<FactArchive>()
             .with_context(|| format!("attach maintained {label} collection"))?;
@@ -139,11 +145,10 @@ impl MemoryStorage<'_> {
     }
 
     fn load_memory_from_snapshot(
-        collection: FactCollection,
-        support: &Support,
+        collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
     ) -> Result<LoadedMemory> {
-        let memory = Self::attach_collection(collection, support, store_snapshot, "Memory")?;
+        let memory = Self::attach_collection(collection, store_snapshot, "Memory")?;
         Ok(LoadedMemory { memory })
     }
 
@@ -153,21 +158,30 @@ impl MemoryStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = pollster::block_on(async {
             let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let collection = FactCollection::new(&mut pile, source)
-                .context("register maintained Memory collection")?;
-            let control = pile.ensure(source).await.context("ensure Memory source")?;
-            let support = control.collection(source)?.support().clone();
+            let policy = source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Memory descriptor snapshot")?,
+                )
+                .context("read Memory collection policy")?;
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .context("register Succinct Memory collection")?;
+            let collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .context("register Rank9 Memory collection")?;
+            drop(pile.ensure(source).await.context("ensure Memory source")?);
             drop(
-                collection
-                    .maintain_exact(&mut pile, &support)
+                pile.maintain(succinct)
                     .await
-                    .context("maintain Memory collection")?,
+                    .context("maintain Succinct Memory collection")?,
             );
-            drop(control);
             let store_snapshot = pile
-                .snapshot()
-                .context("freeze maintained Memory snapshot")?;
-            Self::load_memory_from_snapshot(collection, &support, &store_snapshot)
+                .maintain(collection)
+                .await
+                .context("maintain Rank9 Memory collection")?;
+            Self::load_memory_from_snapshot(collection, &store_snapshot)
         });
         Self::finish_pile(pile, result)
     }
@@ -180,66 +194,76 @@ impl MemoryStorage<'_> {
         let result = pollster::block_on(async {
             let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let memory_collection = FactCollection::new(&mut pile, memory_source)
-                .context("register maintained Memory collection")?;
-            let embeddings_collection = if with_embeddings {
+            let memory_policy = memory_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Memory descriptor snapshot")?,
+                )
+                .context("read Memory collection policy")?;
+            let memory_succinct = pile
+                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                .context("register Succinct Memory collection")?;
+            let memory_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
+                .context("register Rank9 Memory collection")?;
+            let embeddings_collections = if with_embeddings {
                 let source =
                     open_configured(&mut pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-                Some(
-                    FactCollection::new(&mut pile, source)
-                        .context("register maintained shared Embeddings collection")?,
-                )
+                let policy = source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze shared Embeddings descriptor snapshot")?,
+                    )
+                    .context("read shared Embeddings collection policy")?;
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .context("register Succinct shared Embeddings collection")?;
+                let rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .context("register Rank9 shared Embeddings collection")?;
+                Some((source, succinct, rank9))
             } else {
                 None
             };
             drop(pile.ensure(memory_source).await?);
-            if let Some(collection) = embeddings_collection {
-                drop(pile.ensure(collection.source()).await?);
+            if let Some((source, _, _)) = embeddings_collections {
+                drop(pile.ensure(source).await?);
             }
-            let control = pile
-                .snapshot()
-                .context("freeze Memory/Embeddings source snapshot")?;
-            let memory_support = control.collection(memory_source)?.support().clone();
-            let embeddings_support = match embeddings_collection {
-                Some(collection) => {
-                    Some(control.collection(collection.source())?.support().clone())
-                }
-                None => None,
-            };
             drop(
-                memory_collection
-                    .maintain_exact(&mut pile, &memory_support)
+                pile.maintain(memory_succinct)
                     .await
-                    .context("maintain Memory collection")?,
+                    .context("maintain Succinct Memory collection")?,
             );
-            if let (Some(collection), Some(support)) =
-                (embeddings_collection, embeddings_support.as_ref())
-            {
+            drop(
+                pile.maintain(memory_collection)
+                    .await
+                    .context("maintain Rank9 Memory collection")?,
+            );
+            if let Some((_, succinct, rank9)) = embeddings_collections {
                 drop(
-                    collection
-                        .maintain_exact(&mut pile, support)
+                    pile.maintain(succinct)
                         .await
-                        .context("maintain shared Embeddings collection")?,
+                        .context("maintain Succinct shared Embeddings collection")?,
+                );
+                drop(
+                    pile.maintain(rank9)
+                        .await
+                        .context("maintain Rank9 shared Embeddings collection")?,
                 );
             }
-            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Embeddings snapshot")?;
-            let memory = Self::load_memory_from_snapshot(
-                memory_collection,
-                &memory_support,
-                &store_snapshot,
-            )?;
-            let embeddings = match (embeddings_collection, embeddings_support.as_ref()) {
-                (Some(collection), Some(support)) => Some(Self::attach_collection(
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let embeddings = match embeddings_collections {
+                Some((_, _, collection)) => Some(Self::attach_collection(
                     collection,
-                    support,
                     &store_snapshot,
                     "shared Embeddings",
                 )?),
-                (None, None) => None,
-                _ => unreachable!("Embeddings collection and support are created together"),
+                None => None,
             };
             Ok(LoadedContext { memory, embeddings })
         });
@@ -253,42 +277,57 @@ impl MemoryStorage<'_> {
         let result = pollster::block_on(async {
             let memory_source =
                 open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let memory_collection = FactCollection::new(&mut pile, memory_source)
-                .context("register maintained Memory collection")?;
+            let memory_policy = memory_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Memory descriptor snapshot")?,
+                )
+                .context("read Memory collection policy")?;
+            let memory_succinct = pile
+                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                .context("register Succinct Memory collection")?;
+            let memory_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
+                .context("register Rank9 Memory collection")?;
             let comb_source =
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let comb_collection = FactCollection::new(&mut pile, comb_source)
-                .context("register maintained Comb collection")?;
+            let comb_policy = comb_source
+                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                .context("read Comb collection policy")?;
+            let comb_succinct = pile
+                .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
+                .context("register Succinct Comb collection")?;
+            let comb_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
+                .context("register Rank9 Comb collection")?;
             drop(pile.ensure(memory_source).await?);
             drop(pile.ensure(comb_source).await?);
-            let control = pile
-                .snapshot()
-                .context("freeze Memory/Comb source snapshot")?;
-            let memory_support = control.collection(memory_source)?.support().clone();
-            let comb_support = control.collection(comb_source)?.support().clone();
             drop(
-                memory_collection
-                    .maintain_exact(&mut pile, &memory_support)
+                pile.maintain(memory_succinct)
                     .await
-                    .context("maintain Memory collection")?,
+                    .context("maintain Succinct Memory collection")?,
             );
             drop(
-                comb_collection
-                    .maintain_exact(&mut pile, &comb_support)
+                pile.maintain(memory_collection)
                     .await
-                    .context("maintain Comb collection")?,
+                    .context("maintain Rank9 Memory collection")?,
             );
-            drop(control);
+            drop(
+                pile.maintain(comb_succinct)
+                    .await
+                    .context("maintain Succinct Comb collection")?,
+            );
+            drop(
+                pile.maintain(comb_collection)
+                    .await
+                    .context("maintain Rank9 Comb collection")?,
+            );
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Comb snapshot")?;
-            let memory = Self::load_memory_from_snapshot(
-                memory_collection,
-                &memory_support,
-                &store_snapshot,
-            )?;
-            let comb =
-                Self::attach_collection(comb_collection, &comb_support, &store_snapshot, "Comb")?;
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let comb = Self::attach_collection(comb_collection, &store_snapshot, "Comb")?;
             Ok(LoadedComb { memory, comb })
         });
         Self::finish_pile(pile, result)
@@ -312,56 +351,80 @@ impl MemoryStorage<'_> {
                 archive_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )?;
-            let memory_collection = FactCollection::new(&mut pile, memory_source)
-                .context("register maintained Memory collection")?;
-            let cognition_collection = FactCollection::new(&mut pile, cognition_source)
-                .context("register maintained Cognition collection")?;
-            let archive_collection = FactCollection::new(&mut pile, archive_source)
-                .context("register maintained Archive collection")?;
+            let memory_policy = memory_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Memory descriptor snapshot")?,
+                )
+                .context("read Memory collection policy")?;
+            let memory_succinct = pile
+                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                .context("register Succinct Memory collection")?;
+            let memory_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
+                .context("register Rank9 Memory collection")?;
+            let cognition_policy = cognition_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Cognition descriptor snapshot")?,
+                )
+                .context("read Cognition collection policy")?;
+            let cognition_succinct = pile
+                .derive::<SuccinctArchiveBlob>(cognition_source, (), cognition_policy.clone())
+                .context("register Succinct Cognition collection")?;
+            let cognition_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    cognition_succinct,
+                    (),
+                    cognition_policy,
+                )
+                .context("register Rank9 Cognition collection")?;
+            let archive_policy = archive_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Archive descriptor snapshot")?,
+                )
+                .context("read Archive collection policy")?;
+            let archive_succinct = pile
+                .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                .context("register Succinct Archive collection")?;
+            let archive_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(archive_succinct, (), archive_policy)
+                .context("register Rank9 Archive collection")?;
             for source in [memory_source, cognition_source, archive_source] {
                 drop(pile.ensure(source).await?);
             }
-            let control = pile
-                .snapshot()
-                .context("freeze Memory/Cognition/Archive source snapshot")?;
-            let memory_support = control.collection(memory_source)?.support().clone();
-            let cognition_support = control.collection(cognition_source)?.support().clone();
-            let archive_support = control.collection(archive_source)?.support().clone();
-            for (collection, support, label) in [
-                (memory_collection, &memory_support, "Memory"),
-                (cognition_collection, &cognition_support, "Cognition"),
-                (archive_collection, &archive_support, "Archive"),
+            for (succinct, collection, label) in [
+                (memory_succinct, memory_collection, "Memory"),
+                (cognition_succinct, cognition_collection, "Cognition"),
+                (archive_succinct, archive_collection, "Archive"),
             ] {
                 drop(
-                    collection
-                        .maintain_exact(&mut pile, support)
+                    pile.maintain(succinct)
                         .await
-                        .with_context(|| format!("maintain {label} collection"))?,
+                        .with_context(|| format!("maintain Succinct {label} collection"))?,
+                );
+                drop(
+                    pile.maintain(collection)
+                        .await
+                        .with_context(|| format!("maintain Rank9 {label} collection"))?,
                 );
             }
-            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Cognition/Archive snapshot")?;
-            let memory = Self::load_memory_from_snapshot(
-                memory_collection,
-                &memory_support,
-                &store_snapshot,
-            )?;
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
             Ok(LoadedProvenance {
                 memory,
                 cognition: Self::attach_collection(
                     cognition_collection,
-                    &cognition_support,
                     &store_snapshot,
                     "Cognition",
                 )?,
-                archive: Self::attach_collection(
-                    archive_collection,
-                    &archive_support,
-                    &store_snapshot,
-                    "Archive",
-                )?,
+                archive: Self::attach_collection(archive_collection, &store_snapshot, "Archive")?,
             })
         });
         Self::finish_pile(pile, result)
@@ -449,9 +512,43 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
     let Some((from_str, to_str)) = s.split_once("..") else {
         bail!("invalid time range (expected `from..to`): {s}");
     };
-    let from = parse_tai_timestamp(from_str).context("parsing range start")?;
-    let to = parse_tai_timestamp(to_str).context("parsing range end")?;
+    // Bare TAI is the written form; a trailing Z, a +HH:MM offset, a space for
+    // the T, or a missing seconds field are accepted and normalised, so a range
+    // can never fold into the summary because of one letter (three junk
+    // memories, 2026-09-05).
+    let from = parse_tai_timestamp(from_str)
+        .or_else(|_| {
+            parse_written_stamp(from_str).ok_or_else(|| anyhow!("invalid timestamp: {from_str}"))
+        })
+        .context("parsing range start")?;
+    let to = parse_tai_timestamp(to_str)
+        .or_else(|_| {
+            parse_written_stamp(to_str).ok_or_else(|| anyhow!("invalid timestamp: {to_str}"))
+        })
+        .context("parsing range end")?;
+    if to < from {
+        bail!("a time range runs forward, and this one ends before it starts: {s}");
+    }
     Ok((from, to))
+}
+
+/// A memory lasts. An explicit range that is an instant is refused with the
+/// remedy; a rangeless create spans the moment ending now (see
+/// [`memory_model::MOMENT_SECONDS`]).
+fn require_duration(range: (Epoch, Epoch)) -> Result<()> {
+    if range.1 <= range.0 {
+        bail!(
+            "a memory lasts: {} is an instant. Give the span it covers (from..to), or leave the \
+             range out to mean the moment ending now ({}s).",
+            format_time_range(range.0, range.1),
+            memory_model::MOMENT_SECONDS
+        );
+    }
+    Ok(())
+}
+
+fn moment() -> Duration {
+    Duration::from_seconds(memory_model::MOMENT_SECONDS)
 }
 
 /// Find the best chunk covering a query time range — the most *specific*
@@ -748,6 +845,19 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "create") {
         return cmd_create(storage, &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "respan") {
+        return cmd_respan(storage, &cli.ids[1..]);
+    }
+    if cli
+        .ids
+        .first()
+        .is_some_and(|value| value == "respan-instants")
+    {
+        return cmd_respan_instants(storage, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "respan-seams") {
+        return cmd_respan_seams(storage, &cli.ids[1..]);
+    }
     if cli.ids.first().is_some_and(|value| value == "image") {
         return cmd_image(storage, &cli.ids[1..]);
     }
@@ -786,6 +896,9 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "check") {
         return cmd_check(storage, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "levels") {
+        return cmd_levels(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "density") {
         return cmd_density(storage, &cli.ids[1..]);
@@ -882,13 +995,21 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // If the first argument looks like a time range, parse it.
     let mut explicit_range: Option<(Epoch, Epoch)> = None;
     let summary_start_idx;
-    if args[0].contains("..") {
-        if let Ok(range) = parse_time_range(&args[0]) {
-            explicit_range = Some(range);
-            summary_start_idx = 1;
-        } else {
-            summary_start_idx = 0;
-        }
+    // A first argument shaped like a range IS the range: if it does not parse,
+    // that is an error to fix, never a summary to store. (The old fallthrough
+    // stored `2026-09-05T13:20:00Z..2026-09-05T13:33:00Z` as prose, three
+    // times in one day.)
+    let looks_like_range = |t: &str| {
+        t.contains("..") && t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-'
+    };
+    if looks_like_range(&args[0]) {
+        explicit_range = Some(parse_time_range(&args[0]).with_context(|| {
+            format!(
+                "the first argument looks like a time range but does not parse: {}",
+                args[0]
+            )
+        })?);
+        summary_start_idx = 1;
     } else {
         summary_start_idx = 0;
     }
@@ -911,9 +1032,10 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         Some(range) => range,
         None => {
             let now = clock::now()?;
-            (now, now)
+            (now - moment(), now)
         }
     };
+    require_duration(range)?;
     let loaded = storage.load()?;
     let chunk_id = create_chunk(
         storage,
@@ -925,6 +1047,344 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     )?;
     println!("range: {}", format_time_range(range.0, range.1));
     println!("id: {chunk_id:x}");
+    Ok(())
+}
+
+/// `memory respan <id> <from>..<to>` -- the same memory over corrected time
+/// coordinates. A new chunk with the identical text, lens, references and
+/// provenance is written over the new range and supersedes the old one; the
+/// cover then shows the new coordinates and the old chunk stands aside, still
+/// a member of the journal and readable by id. The text cannot change here:
+/// that would be a new memory, and a journal is not a mutable fact store.
+fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    if args.len() != 2 || args.iter().any(|a| a == "--help" || a == "-h") {
+        bail!(
+            "usage: memory respan <id> <from>..<to>\n\
+             \n\
+             Write the same memory over corrected time coordinates: a new\n\
+             chunk with the identical text supersedes <id>, the cover shows\n\
+             the new range, and the old chunk stands aside but stays in the\n\
+             journal, readable by id. Only the coordinates move; to say\n\
+             something different, write another memory."
+        );
+    }
+    let loaded = storage.load()?;
+    let old = resolve_chunk_id(&loaded, &args[0])?;
+    let range = parse_time_range(&args[1])?;
+    require_duration(range)?;
+    let now = clock::now()?;
+    let (fragment, moved) = respan_fragment(&loaded, old, range, now)?;
+    storage.publish_memory(fragment)?;
+    println!("range: {}", format_time_range(range.0, range.1));
+    println!("id: {moved:x}");
+    println!(
+        "  the same memory as {old:x} ({}), which stands aside",
+        chunk_span_str(&loaded.memory.facts, old)
+    );
+    Ok(())
+}
+
+/// The respan itself: the old chunk's text, lens, references and provenance
+/// over `range`, plus the edge. Shared by `respan` and `respan-instants`.
+fn respan_fragment(
+    loaded: &LoadedMemory,
+    old: Id,
+    range: (Epoch, Epoch),
+    now: Epoch,
+) -> Result<(Fragment, Id)> {
+    let space = &loaded.memory.facts;
+    let reader = &loaded.memory.reader;
+    if let (Some(s), Some(e)) = (chunk_start_at(space, old), chunk_end_at(space, old)) {
+        if (epoch_from_interval(s), epoch_end_from_interval(e)) == range {
+            bail!(
+                "memory {old:x} already spans {}",
+                format_time_range(range.0, range.1)
+            );
+        }
+    }
+    let Some(summary_handle) = chunk_summary_handle(space, old) else {
+        bail!(
+            "memory {old:x} has no text summary; respanning an image memory is not supported yet"
+        );
+    };
+    let summary: View<str> = reader
+        .get(summary_handle)
+        .context("read the memory's text")?;
+    let lens = match chunk_lens_handle(space, old) {
+        Some(handle) => {
+            let lens: View<str> = reader.get(handle).context("read the memory's lens")?;
+            Some(lens.as_ref().to_owned())
+        }
+        None => None,
+    };
+    let (mut fragment, moved) = memory_model::chunk_fragment(memory_model::ChunkDraft {
+        content: memory_model::ChunkDraftContent::Text(summary.as_ref().to_owned()),
+        start_at: clock::point(range.0)?,
+        end_at: clock::point(range.1)?,
+        lens,
+        references: chunk_references(space, old).into_iter().collect(),
+        about_exec_result: chunk_about_exec_result(space, old),
+        about_archive_message: chunk_about_archive_message(space, old),
+        observed_at: BTreeSet::from([clock::point(now)?]),
+        aliases: BTreeSet::new(),
+    })?;
+    if moved == old {
+        bail!(
+            "memory {old:x} already spans {}",
+            format_time_range(range.0, range.1)
+        );
+    }
+    fragment += memory_model::respan_edge(moved, old);
+    Ok((fragment, moved))
+}
+
+/// Parse one timestamp as people actually wrote them at the head of a memory:
+/// `YYYY-MM-DDTHH:MM[:SS]`, a space instead of the `T`, a trailing `Z`, or a
+/// `+HH:MM`/`-HH:MM` offset (converted to the bare form everyone else writes).
+fn parse_written_stamp(raw: &str) -> Option<Epoch> {
+    let raw = raw.trim();
+    let bytes = raw.as_bytes();
+    let (body, offset_secs): (&str, i64) = if let Some(body) = raw.strip_suffix('Z') {
+        (body, 0)
+    } else if raw.len() > 6
+        && (bytes[raw.len() - 6] == b'+' || bytes[raw.len() - 6] == b'-')
+        && bytes[raw.len() - 3] == b':'
+    {
+        let (body, off) = raw.split_at(raw.len() - 6);
+        let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+        let hh: i64 = off[1..3].parse().ok()?;
+        let mm: i64 = off[4..6].parse().ok()?;
+        (body, sign * (hh * 3600 + mm * 60))
+    } else {
+        (raw, 0)
+    };
+    let mut body = body.replacen(' ', "T", 1);
+    if body.len() == 16 && body.as_bytes()[13] == b':' {
+        body.push_str(":00");
+    }
+    let epoch = parse_tai_timestamp(&body).ok()?;
+    Some(epoch - Duration::from_seconds(offset_secs as f64))
+}
+
+/// What the head of a memory's text says about its span, if anything:
+/// `A..B` or `A/B` with either stamp form above (a space between date and
+/// time allowed), or a duration such as `10m` / `2h` meaning the stretch that
+/// ended at the memory's stamp.
+fn leading_range(text: &str, stamp: Epoch) -> Option<(Epoch, Epoch)> {
+    let text = text.trim_start();
+    // Up to four whitespace-separated tokens can carry `DATE TIME..DATE TIME`.
+    let tokens: Vec<&str> = text.split_whitespace().take(4).collect();
+    let first = *tokens.first()?;
+    // A duration prefix.
+    if let Some(number) = first
+        .strip_suffix('m')
+        .or_else(|| first.strip_suffix('h'))
+        .or_else(|| first.strip_suffix('s'))
+    {
+        if let Ok(n) = number.parse::<f64>() {
+            if n > 0.0 && tokens.len() > 1 {
+                let unit = match first.chars().last()? {
+                    'h' => 3600.0,
+                    'm' => 60.0,
+                    _ => 1.0,
+                };
+                return Some((stamp - Duration::from_seconds(n * unit), stamp));
+            }
+        }
+    }
+    let looks_like_date =
+        |t: &str| t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-';
+    // Rejoin `DATE TIME` pairs so a range written with spaces still parses.
+    let mut joined = String::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if looks_like_date(t) && t.len() == 10 && i + 1 < tokens.len() {
+            joined.push_str(t);
+            joined.push('T');
+            joined.push_str(tokens[i + 1]);
+            i += 2;
+        } else {
+            joined.push_str(t);
+            i += 1;
+        }
+        if joined.contains("..") || joined.contains('/') {
+            break;
+        }
+        joined.push(' ');
+    }
+    let head = joined.split_whitespace().next()?;
+    if !looks_like_date(head) {
+        return None;
+    }
+    let (a, b) = head.split_once("..").or_else(|| head.split_once('/'))?;
+    let from = parse_written_stamp(a)?;
+    let to = parse_written_stamp(b)?;
+    (from < to).then_some((from, to))
+}
+
+/// `memory respan-instants [--dry-run]` -- give every zero-length memory the
+/// span it should have had: the range its own text begins with, a duration
+/// its text begins with, or else the moment ending at its stamp. An inverted
+/// range is turned forward. Each becomes one respan; all of them are published
+/// as one commit. Repeating it finds nothing to do.
+fn cmd_respan_instants(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args.iter().any(|a| a != "--dry-run") {
+        bail!("usage: memory respan-instants [--dry-run]");
+    }
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let reader = &loaded.memory.reader;
+    let now = clock::now()?;
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut examples = std::collections::BTreeMap::<&str, Vec<String>>::new();
+    let mut batch = Fragment::empty();
+    let mut planned = 0usize;
+    for id in all_chunk_ids(space) {
+        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
+            continue;
+        };
+        let (start, end) = (epoch_from_interval(s), epoch_end_from_interval(e));
+        if start < end {
+            continue;
+        }
+        let Some(summary_handle) = chunk_summary_handle(space, id) else {
+            *counts.entry("image (skipped)").or_default() += 1;
+            continue;
+        };
+        // Already respanned: a chunk with the same text supersedes it.
+        let already = find!(
+            n: Id,
+            pattern!(space, [{ ?n @ metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID, metadata::supersedes: id }])
+        )
+        .any(|n| chunk_summary_handle(space, n) == Some(summary_handle));
+        if already {
+            *counts.entry("already respanned").or_default() += 1;
+            continue;
+        }
+        let text: View<str> = reader.get(summary_handle).context("read a memory's text")?;
+        let (category, range) = if start > end {
+            ("inverted, turned forward", (end, start))
+        } else if let Some(range) = leading_range(text.as_ref(), start) {
+            // A range in the text nowhere near the stamp is a quotation, not a
+            // claim about this memory: give it a moment and list it for review.
+            let near = |t: Epoch| (t - start).abs() < Duration::from_days(2.0);
+            if near(range.0) || near(range.1) {
+                ("range in its own text", range)
+            } else {
+                (
+                    "far-off range in text (given a moment; review)",
+                    (start - moment(), start),
+                )
+            }
+        } else {
+            ("a moment ending at the stamp", (start - moment(), start))
+        };
+        *counts.entry(category).or_default() += 1;
+        let shown = examples.entry(category).or_default();
+        if shown.len() < 3 {
+            let head: String = text.as_ref().chars().take(70).collect();
+            shown.push(format!(
+                "  {:x} {} -> {}  {:?}",
+                id,
+                format_time_range(start, end),
+                format_time_range(range.0, range.1),
+                head
+            ));
+        }
+        if !dry_run {
+            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            batch += fragment;
+        }
+        planned += 1;
+    }
+    for (category, n) in &counts {
+        println!("{n:>6}  {category}");
+        for line in examples.get(category).into_iter().flatten() {
+            println!("{line}");
+        }
+    }
+    if dry_run {
+        println!("dry run: {planned} respan(s) would be written as one commit");
+        return Ok(());
+    }
+    if planned == 0 {
+        println!("nothing to do");
+        return Ok(());
+    }
+    storage.publish_memory(batch)?;
+    println!("{planned} respan(s) written as one commit");
+    Ok(())
+}
+
+/// `memory respan-seams [--dry-run]` -- close the seams between arcs written
+/// with rounded edges. An arc that ends "through 23:59:59" or "through hh:mm"
+/// and the next memory that starts one second or one minute later leave a
+/// sliver of time nobody lived through uncovered, and the cover, which is
+/// coarser further back and complete by construction, fills each sliver with
+/// the widest memory over it: a whole-life root paragraph for one second.
+/// Extending the arc to the next start is a coordinate correction with the
+/// text unchanged, so it is a respan. Only arcs an hour or wider, only gaps
+/// of a minute or less, one commit; a second run finds nothing.
+fn cmd_respan_seams(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args.iter().any(|a| a != "--dry-run") {
+        bail!("usage: memory respan-seams [--dry-run]");
+    }
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let now = clock::now()?;
+    let spans = collect_chunk_spans(space);
+    let mut starts: Vec<i128> = spans.iter().map(|s| s.0).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let hour: i128 = 3_600 * 1_000_000_000;
+    let minute: i128 = 60 * 1_000_000_000;
+    let mut batch = Fragment::empty();
+    let mut planned = Vec::new();
+    for &(start, end, id) in &spans {
+        if end - start < hour {
+            continue;
+        }
+        let next = match starts.binary_search(&end) {
+            Ok(k) => starts.get(k + 1).copied(),
+            Err(k) => starts.get(k).copied(),
+        };
+        let Some(next) = next else { continue };
+        if next <= end || next - end > minute {
+            continue;
+        }
+        let range = (key_to_epoch(start), key_to_epoch(next));
+        planned.push((
+            id,
+            format_time_range(key_to_epoch(start), key_to_epoch(end)),
+            format_time_range(range.0, range.1),
+        ));
+        if !dry_run {
+            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            batch += fragment;
+        }
+    }
+    for (id, from, to) in planned.iter().take(12) {
+        println!("  {id:x} {from} -> {to}");
+    }
+    if planned.len() > 12 {
+        println!("  ... {} more", planned.len() - 12);
+    }
+    if dry_run {
+        println!(
+            "dry run: {} seam(s) would be closed as one commit",
+            planned.len()
+        );
+        return Ok(());
+    }
+    if planned.is_empty() {
+        println!("nothing to do");
+        return Ok(());
+    }
+    storage.publish_memory(batch)?;
+    println!("{} seam(s) closed as one commit", planned.len());
     Ok(())
 }
 
@@ -1545,6 +2005,8 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // temporal coverage; it never changes the recency-first cover structure.
     let mut budget_chars: usize = 200_000;
     let mut chunk_overhead: usize = 0;
+    // `--detail N`: memories per tile, the reader's statement of its window.
+    let mut detail: Option<usize> = None;
     let mut about: Option<String> = None;
     // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
     // ELIGIBILITY by positive similarity to their query; `--sim-threshold <f>` is
@@ -1569,6 +2031,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                     | "--tokens"
                     | "--chars"
                     | "--chunk-overhead"
+                    | "--detail"
                     | "--sim-threshold"
             )
         };
@@ -1611,6 +2074,16 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 i += 2;
                 continue;
             }
+            if args[i] == "--detail" {
+                let raw = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--detail needs a count of memories per tile, e.g. `--detail 12`")
+                })?;
+                detail = Some(raw.parse().map_err(|_| {
+                    anyhow!("--detail expects a non-negative integer, got `{raw}`")
+                })?);
+                i += 2;
+                continue;
+            }
             // `--tokens N` is a backward-compatible ALIAS for `--chars N` (the
             // budget is characters now; there is no separate token path).
             if args[i] == "--tokens" || args[i] == "--chars" {
@@ -1645,6 +2118,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         filter_q.as_deref(),
         remove_q.as_deref(),
         sim_threshold,
+        detail,
     )?;
     print!("{cover}");
     Ok(())
@@ -1665,6 +2139,7 @@ fn build_context_cover(
     filter_q: Option<&str>,
     remove_q: Option<&str>,
     sim_threshold: f32,
+    detail: Option<usize>,
 ) -> Result<String> {
     if collect_chunk_spans(&loaded.memory.memory.facts).is_empty() {
         return Ok("no memory chunks\n".to_string());
@@ -1677,6 +2152,7 @@ fn build_context_cover(
         filter: filter_q.map(str::to_string),
         remove: remove_q.map(str::to_string),
         sim_threshold,
+        detail,
     };
     if let Some(embeddings) = loaded.embeddings.as_ref() {
         faculties::memory_cover::render_cover(
@@ -1963,6 +2439,7 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 None,
                 None,
                 DEFAULT_SIM_THRESHOLD,
+                None,
             )?;
             let now = clock::now().context("generate cover state timestamp")?;
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
@@ -2019,6 +2496,61 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 }
 
 /// the fine edge; `check 13w` finds regions with no coarse cover).
+/// `memory levels <detail>` -- how well the pile serves each tile of the cover
+/// at a reader's detail: what the tile wants, how many memories it showed, and
+/// the worst ratio between a shown width and the want. A ratio far from one is
+/// the arc the comb should write. This is the seam report the renderer no
+/// longer prints at load; an orient habit can run it off the wake path.
+fn cmd_levels(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let detail: usize = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: memory levels <detail: memories per tile, e.g. 12>"))?
+        .parse()
+        .context("detail must be a non-negative integer")?;
+    let loaded = storage.load()?;
+    let spans = collect_chunk_spans(&loaded.memory.facts);
+    if spans.is_empty() {
+        println!("no memory chunks");
+        return Ok(());
+    }
+    let earliest = spans.iter().map(|s| s.0).min().unwrap();
+    let latest = spans.iter().map(|s| s.1).max().unwrap();
+    let tiles = faculties::memory_cover::tiles(earliest, latest);
+    let mut report = faculties::memory_cover::tile_report(&spans, &tiles, detail);
+    println!(
+        "{} tile(s) at detail {}: {}",
+        tiles.len(),
+        detail,
+        faculties::memory_cover::describe_tiles(&tiles)
+    );
+    report.sort_by(|a, b| {
+        b.worst_ratio
+            .partial_cmp(&a.worst_ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.tile.start.cmp(&b.tile.start))
+    });
+    for r in &report {
+        let want = match r.want_ns {
+            Some(w) => humanize_ns(w),
+            None => "every memory".to_string(),
+        };
+        println!(
+            "  {}  {:>4}d  wants {:<12} shows {:>5}  worst x{:.1}{}",
+            format_time_range(key_to_epoch(r.tile.start), key_to_epoch(r.tile.end)),
+            r.tile.days,
+            want,
+            r.picked,
+            r.worst_ratio,
+            if r.worst_ratio > 4.0 {
+                "  <- an arc is missing"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
 fn cmd_check(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let Some(grain_raw) = args.first() else {
         bail!("usage: memory check <grain e.g. 1d/4w/13w>");
@@ -2263,6 +2795,66 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         );
     }
     println!("id: {chunk_id:x}");
+    let written: Vec<String> = chunk_observed_at(space, chunk_id)
+        .into_iter()
+        .map(|at| fmt_epoch(epoch_from_interval(at)))
+        .collect();
+    if !written.is_empty() {
+        println!("written_at: {}", written.join(", "));
+    }
+    // Read-only history. A retraction record or a `supersedes` edge from the
+    // old comb is evidence of what was once done; the journal gives neither
+    // any ordering or visibility meaning (memories coexist).
+    let span_of = |id: Id| match (chunk_start_at(space, id), chunk_end_at(space, id)) {
+        (Some(s), Some(e)) => format!(
+            "{} ({:x})",
+            format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
+            id
+        ),
+        _ => format!("{id:x}"),
+    };
+    let retractions: Vec<Id> = find!(
+        r: Id,
+        pattern!(space, [{ ?r @ metadata::tag: &faculties::schemas::memory::KIND_RETRACTION, metadata::supersedes: chunk_id }])
+    )
+    .collect();
+    if !retractions.is_empty() {
+        println!(
+            "retraction_records: {} (historical; the journal shows every memory)",
+            retractions
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let edges_out: Vec<Id> =
+        find!(o: Id, pattern!(space, [{ chunk_id @ metadata::supersedes: ?o }])).collect();
+    if !edges_out.is_empty() {
+        println!(
+            "supersedes: {} (a respan when the text is identical)",
+            edges_out
+                .iter()
+                .map(|id| span_of(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let edges_in: Vec<Id> = find!(
+        n: Id,
+        pattern!(space, [{ ?n @ metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID, metadata::supersedes: chunk_id }])
+    )
+    .collect();
+    if !edges_in.is_empty() {
+        println!(
+            "superseded_by: {} (a respan when the text is identical)",
+            edges_in
+                .iter()
+                .map(|id| span_of(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let outgoing = chunk_references(space, chunk_id);
     if !outgoing.is_empty() {
@@ -3081,9 +3673,17 @@ mod tests {
         let loaded = storage
             .load_context(false)
             .expect("load seeded collections");
-        let cover =
-            build_context_cover(&loaded, 10_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
-                .expect("build context cover");
+        let cover = build_context_cover(
+            &loaded,
+            10_000,
+            0,
+            None,
+            None,
+            None,
+            DEFAULT_SIM_THRESHOLD,
+            None,
+        )
+        .expect("build context cover");
         // The status header now goes to stderr, not into the returned/ingested
         // cover text (prefix-stability + ranges-are-the-drill-key de-noise).
         assert!(!cover.contains("memory context — "));
@@ -3118,7 +3718,7 @@ mod tests {
     /// quantizing what is left makes the pool a constant between steps, and the
     /// same 30-write sequence then re-cut nothing on 27 of them.
     #[test]
-    fn a_write_at_the_recent_edge_keeps_the_leading_cover_chunks() {
+    fn a_write_in_today_keeps_the_cover_before_today() {
         let pile = TestPile::new();
         let storage = pile.storage();
         let at =
@@ -3144,8 +3744,17 @@ mod tests {
             let loaded = storage
                 .load_context(false)
                 .expect("load seeded collections");
-            build_context_cover(&loaded, 4_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
-                .expect("build context cover")
+            build_context_cover(
+                &loaded,
+                4_000,
+                0,
+                None,
+                None,
+                None,
+                DEFAULT_SIM_THRESHOLD,
+                Some(6),
+            )
+            .expect("build context cover")
         };
         let before = cover_now();
         assert_eq!(before, cover_now(), "two renders with no write must agree");
@@ -3154,18 +3763,29 @@ mod tests {
             "budget must bind — the oldest day should still be coarse:\n{before}"
         );
 
-        // Writes past the apex's end, so each is a new top-level chunk: exactly
-        // the shape of journalling into a day that has no arc over it yet.
+        // Writes past the apex's end land in today, the open tile. With a
+        // stated detail the cover before today is the same bytes after each
+        // write: the prefix a resident's cache can keep.
+        let prefix = |cover: &str| -> String {
+            cover
+                .lines()
+                .take_while(|line| !line.trim_start().starts_with("2026-01-06T"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim_end()
+                .to_string()
+        };
         for h in [8u8, 10, 12] {
             write(format!("new{h} ").repeat(4), (at(6, h), at(6, h + 1)));
             let after = cover_now();
             assert!(
-                after.starts_with(&before),
-                "a write at the recent edge re-cut the leading chunks\nBEFORE:\n{before}\nAFTER:\n{after}"
-            );
-            assert!(
                 after.contains(&format!("new{h} ")),
                 "the new memory must appear"
+            );
+            assert_eq!(
+                prefix(&after),
+                prefix(&before),
+                "a write in today changed the cover before today\nBEFORE:\n{before}\nAFTER:\n{after}"
             );
         }
     }
@@ -3194,16 +3814,18 @@ mod tests {
 
         // Intrinsic lengths: root=4, children=3+3. With no consumer overhead,
         // a budget of six admits the two-child split exactly.
-        let intrinsic = build_context_cover(&loaded, 6, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect("intrinsic split");
+        let intrinsic =
+            build_context_cover(&loaded, 6, 0, None, None, None, DEFAULT_SIM_THRESHOLD, None)
+                .expect("intrinsic split");
         assert!(!intrinsic.contains("root"));
         assert!(intrinsic.contains("one"));
         assert!(intrinsic.contains("two"));
 
         // Charging two per selected chunk makes root=6 and children=10, so the
         // same budget remains complete by retaining the coarse root.
-        let charged = build_context_cover(&loaded, 6, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect("charged coarse cover");
+        let charged =
+            build_context_cover(&loaded, 6, 2, None, None, None, DEFAULT_SIM_THRESHOLD, None)
+                .expect("charged coarse cover");
         assert!(charged.contains("root"));
         assert!(!charged.contains("one"));
         assert!(!charged.contains("two"));
@@ -3215,13 +3837,23 @@ mod tests {
         let loaded = seed_cover_cost_fixture(&pile);
 
         // The coarsest complete cover costs root(4) + one overhead(2) = 6.
-        let error = build_context_cover(&loaded, 5, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect_err("budget below the charged root must remain incomplete");
+        let error =
+            build_context_cover(&loaded, 5, 2, None, None, None, DEFAULT_SIM_THRESHOLD, None)
+                .expect_err("budget below the charged root must remain incomplete");
         assert!(error.to_string().contains("needs ~6 characters"));
 
         // The refined cover costs (one(3)+2) + (two(3)+2) = 10 exactly.
-        let exact = build_context_cover(&loaded, 10, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect("exact charged split");
+        let exact = build_context_cover(
+            &loaded,
+            10,
+            2,
+            None,
+            None,
+            None,
+            DEFAULT_SIM_THRESHOLD,
+            None,
+        )
+        .expect("exact charged split");
         assert!(!exact.contains("root"));
         assert!(exact.contains("one"));
         assert!(exact.contains("two"));
@@ -3292,31 +3924,41 @@ mod tests {
         } else {
             ("amber", amber.as_str(), cobalt.as_str())
         };
-        let render = |budget, about| {
-            build_context_cover(&loaded, budget, 0, about, None, None, DEFAULT_SIM_THRESHOLD)
-                .expect("render cover")
+        let render = |detail, about| {
+            build_context_cover(
+                &loaded,
+                10_000,
+                0,
+                about,
+                None,
+                None,
+                DEFAULT_SIM_THRESHOLD,
+                Some(detail),
+            )
+            .expect("render cover")
         };
 
-        // 160 admits the root split but neither next split. The plain cover
+        // June 1-4 sit in one sixteen-day tile; at eight per tile it wants two
+        // days, which the equal-span position is exactly. The plain cover
         // deterministically selects the least-id account; context substitutes
         // the other, relevant account at that exact same position.
-        let plain = render(160, None);
-        let contextual = render(160, Some(query));
+        let plain = render(8, None);
+        let contextual = render(8, Some(query));
         assert!(plain.contains(plain_summary.trim_end()));
         assert!(!plain.contains(contextual_summary.trim_end()));
         assert!(contextual.contains(contextual_summary.trim_end()));
         assert!(!contextual.contains(plain_summary.trim_end()));
         assert_eq!(rendered_ranges(&plain), rendered_ranges(&contextual));
 
-        // Property-style budget sweep: even as the antichain walks through
-        // several levels, contextual ranking can never move a split.
-        for budget in [4usize, 32, 64, 128, 160, 192, 256, 384, 512, 768] {
-            let plain = render(budget, None);
-            let contextual = render(budget, Some(query));
+        // Property-style detail sweep: at every grain, contextual ranking can
+        // never move a position.
+        for detail in [0usize, 1, 2, 4, 8, 16, 64, 512] {
+            let plain = render(detail, None);
+            let contextual = render(detail, Some(query));
             assert_eq!(
                 rendered_ranges(&plain),
                 rendered_ranges(&contextual),
-                "context changed structural coverage at budget {budget}"
+                "context changed structural coverage at detail {detail}"
             );
         }
     }

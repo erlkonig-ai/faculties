@@ -44,14 +44,18 @@ use faculties::schemas::linkedin;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use faculties::storage;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
 
@@ -219,21 +223,35 @@ impl RelationsStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = pollster::block_on(async {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let maintained = FactCollection::new(&mut pile, collection)
-                .context("register maintained Relations fact collection")?;
-            let store_snapshot = maintained
-                .maintain(&mut pile)
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let maintained_succinct =
+                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                maintained_succinct,
+                (),
+                policy,
+            )?;
+            drop(pile.ensure(collection).await?);
+            drop(
+                pile.maintain(maintained_succinct)
+                    .await
+                    .context("maintain Relations fact collection")?,
+            );
+            let store_snapshot = pile
+                .maintain(maintained_rank9)
                 .await
                 .context("maintain Relations fact collection")?;
             let observed = store_snapshot
-                .collection(maintained.rank9())
+                .collection(maintained_rank9)
                 .context("observe Relations Rank9 projection")?;
             let facts = observed
                 .view::<FactArchive>()
                 .context("read Relations Rank9 projection")?;
             operation(
                 &mut pile,
-                maintained.source(),
+                collection,
                 &signer,
                 &RelationsView {
                     facts,
