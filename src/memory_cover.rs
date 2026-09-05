@@ -993,16 +993,36 @@ where
     let floor_used = used;
     let pool = refinement_pool(budget_chars, floor_used) as i128;
     let mut spent: i128 = 0;
+    // Two things a split is NOT, learned 2026-09-05 when JP felt the cover was
+    // too small and the numbers agreed: 1,623 leaves before 2026-06-16 — the
+    // whole life before the ladder — rendered at NO budget, and 36 of Sol's
+    // instant-stamped entries at the recent edge never rendered either.
+    //
+    // A chunk with exactly ONE chunk inside it is still splittable. Each life
+    // root was written one span wider than the last, so the top of the life is
+    // a chain of single children, and a rule that only split "two or more"
+    // stopped at the first link forever. A single-child split simply steps
+    // down the chain; the child's own children are the next candidates.
+    //
+    // A POINT — a zero-width memory, an entry stamped at an instant — is a
+    // memory AT a moment, not a refinement of the span around it. Splitting a
+    // span into its points would leave the span uncovered, which completeness
+    // forbids, so points never replace their container: they are emitted
+    // beside it. A container whose only children are points keeps its place
+    // and, once its points are out, is done.
+    let is_point = |i: usize| width(i) == 0;
+    let mut points_out: Vec<bool> = vec![false; n];
     loop {
         let remaining = pool - spent;
         if remaining <= 0 {
             break;
         }
-        let mut best: Option<usize> = None; // position in `cover`
+        let mut best: Option<(usize, bool)> = None; // position in `cover`, replaces the parent?
         let mut best_delta: i128 = 0;
         let mut best_key: Option<(f32, i128, i128, i128, Id)> = None;
         for (pos, &i) in cover.iter().enumerate() {
-            if children[i].len() < 2 {
+            let replaces = children[i].iter().any(|&k| !is_point(k));
+            if !replaces && (children[i].is_empty() || points_out[i]) {
                 continue;
             }
             let mut kids_charge = 0i128;
@@ -1034,14 +1054,21 @@ where
             // parent's own summary gives budget back; `saturating_sub` used to
             // round that to zero, so the pool was under-spent by however much
             // detail happened to be cheap. Consumer overhead participates in
-            // the same signed accounting once per selected chunk.
-            let delta = kids_charge - parent_charge;
+            // the same signed accounting once per selected chunk. Points joining
+            // a container that stays cost exactly what they add.
+            let delta = match replaces {
+                true => kids_charge - parent_charge,
+                false => kids_charge,
+            };
             if delta > remaining {
                 continue;
             }
             // Consumer overhead determines whether a split fits, while the
             // established priority still measures intrinsic prose growth.
-            let detail_gain = kids_intrinsic - parent_intrinsic;
+            let detail_gain = match replaces {
+                true => kids_intrinsic - parent_intrinsic,
+                false => kids_intrinsic,
+            };
             // Priority: explicit-filter relevance desc → recency (latest end)
             // desc → width desc → detail gained desc → stable structural id
             // asc. `--about` never appears in this key: context can substitute
@@ -1064,16 +1091,22 @@ where
                 }
             };
             if better {
-                best = Some(pos);
+                best = Some((pos, replaces));
                 best_delta = delta;
                 best_key = Some(key);
             }
         }
-        let Some(pos) = best else {
+        let Some((pos, replaces)) = best else {
             break;
         };
-        let kids = children[cover[pos]].clone();
-        cover.splice(pos..=pos, kids);
+        let i = cover[pos];
+        let kids = children[i].clone();
+        if replaces {
+            cover.splice(pos..=pos, kids);
+        } else {
+            points_out[i] = true;
+            cover.splice(pos + 1..pos + 1, kids);
+        }
         spent += best_delta;
     }
     used = (floor_used as i128 + spent).max(0) as usize;
