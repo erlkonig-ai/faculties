@@ -63,6 +63,7 @@ use triblespace::prelude::*;
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
+             memory respan-seams [--dry-run]    — close one-second and one-minute seams between arcs written with rounded edges (an hour or wider): a coordinate correction, one commit\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
@@ -853,6 +854,9 @@ fn main() -> Result<()> {
     {
         return cmd_respan_instants(storage, &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "respan-seams") {
+        return cmd_respan_seams(storage, &cli.ids[1..]);
+    }
     if cli.ids.first().is_some_and(|value| value == "image") {
         return cmd_image(storage, &cli.ids[1..]);
     }
@@ -1307,6 +1311,76 @@ fn cmd_respan_instants(storage: MemoryStorage<'_>, args: &[String]) -> Result<()
     }
     storage.publish_memory(batch)?;
     println!("{planned} respan(s) written as one commit");
+    Ok(())
+}
+
+/// `memory respan-seams [--dry-run]` -- close the seams between arcs written
+/// with rounded edges. An arc that ends "through 23:59:59" or "through hh:mm"
+/// and the next memory that starts one second or one minute later leave a
+/// sliver of time nobody lived through uncovered, and the cover, which is
+/// coarser further back and complete by construction, fills each sliver with
+/// the widest memory over it: a whole-life root paragraph for one second.
+/// Extending the arc to the next start is a coordinate correction with the
+/// text unchanged, so it is a respan. Only arcs an hour or wider, only gaps
+/// of a minute or less, one commit; a second run finds nothing.
+fn cmd_respan_seams(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args.iter().any(|a| a != "--dry-run") {
+        bail!("usage: memory respan-seams [--dry-run]");
+    }
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let now = clock::now()?;
+    let spans = collect_chunk_spans(space);
+    let mut starts: Vec<i128> = spans.iter().map(|s| s.0).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let hour: i128 = 3_600 * 1_000_000_000;
+    let minute: i128 = 60 * 1_000_000_000;
+    let mut batch = Fragment::empty();
+    let mut planned = Vec::new();
+    for &(start, end, id) in &spans {
+        if end - start < hour {
+            continue;
+        }
+        let next = match starts.binary_search(&end) {
+            Ok(k) => starts.get(k + 1).copied(),
+            Err(k) => starts.get(k).copied(),
+        };
+        let Some(next) = next else { continue };
+        if next <= end || next - end > minute {
+            continue;
+        }
+        let range = (key_to_epoch(start), key_to_epoch(next));
+        planned.push((
+            id,
+            format_time_range(key_to_epoch(start), key_to_epoch(end)),
+            format_time_range(range.0, range.1),
+        ));
+        if !dry_run {
+            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            batch += fragment;
+        }
+    }
+    for (id, from, to) in planned.iter().take(12) {
+        println!("  {id:x} {from} -> {to}");
+    }
+    if planned.len() > 12 {
+        println!("  ... {} more", planned.len() - 12);
+    }
+    if dry_run {
+        println!(
+            "dry run: {} seam(s) would be closed as one commit",
+            planned.len()
+        );
+        return Ok(());
+    }
+    if planned.is_empty() {
+        println!("nothing to do");
+        return Ok(());
+    }
+    storage.publish_memory(batch)?;
+    println!("{} seam(s) closed as one commit", planned.len());
     Ok(())
 }
 

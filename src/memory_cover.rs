@@ -553,42 +553,154 @@ impl CoverOpts {
 /// Containment forest over chunk spans: each chunk's tightest strict container,
 /// the children that induces, and the roots with no container at all.
 ///
-/// Shared by [`render_cover`] and [`cover_headroom`] so the two cannot disagree
-/// about what a root is. [`cover_headroom`] reports the intrinsic, zero-consumer-
-/// overhead floor; a caller using [`CoverOpts::chunk_overhead`] additionally
-/// charges that amount once for every selected root.
-fn containment_forest(
-    spans: &[(i128, i128, Id)],
-) -> (Vec<Option<usize>>, Vec<Vec<usize>>, Vec<usize>) {
+// ---------------------------------------------------------------------------
+// the field: coarseness by age
+// ---------------------------------------------------------------------------
+//
+// Memories have a coarseness -- their width -- and the cover is coarser
+// further back in time. That is the whole rule (JP, 2026-09-05). There is
+// no parent and no child: two memories over the same minutes are two
+// memories, and an arc over a day is a wider memory than an entry in it.
+// The tree this replaced was a rendering shortcut that grew semantics: it
+// walked a containment forest and never split a chunk with one child, so
+// six whole-life roots nested by their tails hid every leaf before June.
+
+/// A memory lasts at least a moment for the purpose of covering time: an
+/// instant-stamped memory has no interior an instant could fall into.
+const MOMENT_NS: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
+
+/// The fineness ladder. A step is a quarter of a doubling of the scalar that
+/// turns age into a coarseness threshold. A cover is cut AT a step, never
+/// between, so a new memory at the edge moves the cut by whole steps or not
+/// at all and the text before the edge stays byte-identical between steps.
+const FINENESS_STEPS: std::ops::RangeInclusive<i32> = -80..=120;
+
+fn fineness(step: i32) -> f64 {
+    2f64.powf(step as f64 / 4.0)
+}
+
+/// One cut through the field.
+///
+/// `now` is the latest end of any memory: a pure function of the pile, never
+/// the wall clock. At every instant of the extent, the memories covering it
+/// are ranked: a memory whose width clears the coarseness wanted at its age
+/// (`width >= age / k`, age measured at its end) is eligible, and the
+/// narrowest eligible is shown there; where none is eligible, the widest
+/// there is. A memory is in the cover if it is shown at any instant it
+/// covers. So arcs cover gaps and entries cover moments by arithmetic; two
+/// memories over the same minutes both show, each narrowest somewhere; and
+/// a moment inside an entry shows beside it rather than replacing it.
+/// `k = None` is the coarsest cut: nothing eligible, the widest everywhere,
+/// which is what completeness requires at the smallest budget.
+pub fn select_field(spans: &[(i128, i128, Id)], k: Option<f64>) -> Vec<usize> {
     let n = spans.len();
-    let strict_contains = |a: usize, b: usize| -> bool {
-        spans[a].0 <= spans[b].0
-            && spans[a].1 >= spans[b].1
-            && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
-    };
-    let width = |i: usize| spans[i].1 - spans[i].0;
-    let mut parent: Vec<Option<usize>> = vec![None; n];
-    for (i, parent_slot) in parent.iter_mut().enumerate() {
-        let mut best: Option<usize> = None;
-        for j in 0..n {
-            if j != i && strict_contains(j, i) {
-                best = Some(match best {
-                    Some(b) if width(b) <= width(j) => b,
-                    _ => j,
-                });
+    if n == 0 {
+        return Vec::new();
+    }
+    let now = spans.iter().map(|s| s.1).max().unwrap();
+    let width = |i: usize| (spans[i].1 - spans[i].0).max(MOMENT_NS);
+    let eligible: Vec<bool> = (0..n)
+        .map(|i| match k {
+            Some(k) => (width(i) as f64) * k >= (now - spans[i].1).max(0) as f64,
+            None => false,
+        })
+        .collect();
+    // Sweep the endpoints. At one coordinate, ends leave before starts arrive
+    // (0 sorts before 1), so a memory covers `[start, start + width)`.
+    let mut events: Vec<(i128, u8, usize)> = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        events.push((spans[i].0, 1, i));
+        events.push((spans[i].0 + width(i), 0, i));
+    }
+    events.sort_unstable();
+    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
+    let mut active_eligible: BTreeSet<(i128, usize)> = BTreeSet::new();
+    let mut shown = vec![false; n];
+    let mut at = 0;
+    while at < events.len() {
+        let coordinate = events[at].0;
+        while at < events.len() && events[at].0 == coordinate {
+            let (_, kind, i) = events[at];
+            let key = (width(i), i);
+            if kind == 0 {
+                active.remove(&key);
+                active_eligible.remove(&key);
+            } else {
+                active.insert(key);
+                if eligible[i] {
+                    active_eligible.insert(key);
+                }
+            }
+            at += 1;
+        }
+        // The elementary interval from here to the next coordinate.
+        if at < events.len() {
+            let pick = active_eligible
+                .iter()
+                .next()
+                .or_else(|| active.iter().next_back());
+            if let Some(&(_, i)) = pick {
+                shown[i] = true;
             }
         }
-        *parent_slot = best;
     }
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut roots: Vec<usize> = Vec::new();
-    for (i, parent) in parent.iter().copied().enumerate() {
-        match parent {
-            Some(p) => children[p].push(i),
-            None => roots.push(i),
+    (0..n).filter(|&i| shown[i]).collect()
+}
+
+/// A cut that fits: the finest step whose cover costs no more than the
+/// budget, walking the ladder from the coarsest cut upward and stopping at
+/// the first step that overflows. `fits` is false only when even the coarsest
+/// cut overflows, in which case `cover` is that coarsest cut and `used` its
+/// cost, so the caller can name the shortfall.
+pub struct FieldCut {
+    pub step: Option<i32>,
+    pub cover: Vec<usize>,
+    pub used: usize,
+    pub fits: bool,
+}
+
+pub fn fit_field(
+    spans: &[(i128, i128, Id)],
+    cost: &mut dyn FnMut(usize) -> Result<usize>,
+    budget: usize,
+) -> Result<FieldCut> {
+    let total = |cover: &[usize], cost: &mut dyn FnMut(usize) -> Result<usize>| -> Result<usize> {
+        let mut used = 0usize;
+        for &i in cover {
+            used = used.saturating_add(cost(i)?);
         }
+        Ok(used)
+    };
+    let coarsest = select_field(spans, None);
+    let floor = total(&coarsest, cost)?;
+    if floor > budget {
+        return Ok(FieldCut {
+            step: None,
+            cover: coarsest,
+            used: floor,
+            fits: false,
+        });
     }
-    (parent, children, roots)
+    let mut best = FieldCut {
+        step: None,
+        cover: coarsest,
+        used: floor,
+        fits: true,
+    };
+    for step in FINENESS_STEPS {
+        let cover = select_field(spans, Some(fineness(step)));
+        let used = total(&cover, cost)?;
+        if used > budget {
+            break;
+        }
+        best = FieldCut {
+            step: Some(step),
+            cover,
+            used,
+            fits: true,
+        };
+    }
+    Ok(best)
 }
 
 /// Collapse memories which are interchangeable to the temporal cover into one
@@ -739,11 +851,11 @@ pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
 ) -> Result<CoverHeadroom> {
     let raw_spans = collect_chunk_spans(space);
     let (spans, classes) = recollection_classes(&raw_spans);
-    let (_, _, roots) = containment_forest(&spans);
+    let coarsest = select_field(&spans, None);
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
     let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
     let mut used = 0usize;
-    for &i in &roots {
+    for &i in &coarsest {
         used = used.saturating_add(recollection_class_cost(
             ws,
             space,
@@ -755,57 +867,15 @@ pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
         )?);
     }
     Ok(CoverHeadroom {
-        roots: roots.len(),
+        roots: coarsest.len(),
         used,
         budget: budget_chars,
     })
 }
 
 // ---------------------------------------------------------------------------
-// prefix stability
+// the render
 // ---------------------------------------------------------------------------
-
-/// Resolution of the refinement pool, as a divisor of the budget.
-///
-/// The cover is EMITTED oldest-first but REFINED recency-first, so the last
-/// split the budget can afford is the *oldest splittable* chunk — which is the
-/// FRONT of the emitted text. When every split competes for one global
-/// remainder, the marginal decision is therefore a function of the TOTAL, and
-/// it sits at the front: perturb the total by anything and the whole cover
-/// after the first coarse chunk re-cuts.
-///
-/// Measured on `self.pile` (2026-08-27, plain `memory context`, 200,000-char
-/// budget, 202-chunk / 204,717-byte cover, one machine, pile held FIXED so
-/// only the budget number changed): raising the budget by 1,500 characters —
-/// 0.75% — moved the first differing byte to 9,200 of 204,317. One
-/// journal-sized memory does the same, for the same reason.
-///
-/// The fix is to stop letting the mandatory part fund the discretionary part.
-/// The floor — the coarsest antichain, which completeness REQUIRES — is not a
-/// decision, so it is subtracted once and the remainder is quantized to this
-/// resolution. Between quanta the pool is a literal constant, so a new memory
-/// enlarges the floor and moves nothing else, and every leading chunk survives.
-///
-/// The resolution is the one knob, and it is a resolution on the budget axis —
-/// the natural parameter — not a duration, not a calendar unit, and not a proxy
-/// for how often anyone happens to journal. It trades unspent budget against
-/// re-cut frequency, and with per-chunk KV checkpoints downstream those are not
-/// symmetric: a re-cut costs one re-prefill, unspent budget costs detail in
-/// EVERY wake. A journal entry measures ~1,300 characters, so a sixteenth of a
-/// 200,000-character budget absorbs about ten of them before the cover must be
-/// re-cut. Measured over 30 such writes on a clone of the live pile: 27 of 30
-/// re-cut nothing at all, against 3 of 30 unchanged, and a median of 2 of 200
-/// leading chunks surviving, under one global remainder. The price is 9,186
-/// characters (4.6% of the budget) left unspent, and 13 of 200 cover chunks.
-const REFINE_POOL_QUANTUM_DEN: usize = 16;
-
-/// Characters available for refinement: what the budget has left after the
-/// mandatory floor, rounded DOWN to a whole number of quanta so it is a
-/// constant between steps.
-fn refinement_pool(budget_chars: usize, floor_chars: usize) -> usize {
-    let quantum = (budget_chars / REFINE_POOL_QUANTUM_DEN).max(1);
-    budget_chars.saturating_sub(floor_chars) / quantum * quantum
-}
 
 pub fn render_cover<B, P, E>(
     space: &P,
@@ -836,15 +906,13 @@ where
     let (spans, classes) = recollection_classes(&raw_spans);
     let n = spans.len();
 
-    // Containment is time-range subsumption (the only hierarchy): a chunk's
-    // immediate parent is the *tightest* strictly-wider chunk that spans it.
-    let (parent, children, mut roots) = containment_forest(&spans);
+    // Only the emission needs containment, to indent a shown memory under the
+    // shown memories around it. Nothing else does.
     let strict_contains = |a: usize, b: usize| -> bool {
         spans[a].0 <= spans[b].0
             && spans[a].1 >= spans[b].1
             && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
     };
-    let width = |i: usize| spans[i].1 - spans[i].0;
 
     // Eligibility gates. `--filter` keeps only chunks whose positive
     // similarity to its query is ABOVE the threshold; `--remove` drops chunks
@@ -938,51 +1006,12 @@ where
         })
         .collect();
 
-    // `--filter` is an explicit eligibility transformation rather than ambient
-    // context. Preserve its established behavior of refining toward material
-    // that can survive the filter. Even when `--about` is also present, only
-    // the filter score participates here; contextual scores remain local to an
-    // already-fixed structural position.
-    let relevance: Vec<f32> = if let Some((scores, _)) = &filter_elig {
-        let mut r: Vec<f32> = classes
-            .iter()
-            .map(|members| {
-                members
-                    .iter()
-                    .filter_map(|&raw| scores.get(&raw_spans[raw].2).copied())
-                    .fold(0.0_f32, f32::max)
-            })
-            .collect();
-        // Narrow→wide so children precede parents; lift each subtree maximum up.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| spans[i].1 - spans[i].0);
-        for &i in &order {
-            if let Some(p) = parent[i] {
-                if r[i] > r[p] {
-                    r[p] = r[i];
-                }
-            }
-        }
-        r
-    } else {
-        vec![0.0; n]
-    };
-
-    // Floor of the cover: the coarsest antichain (all structural roots), oldest
-    // first. Completeness is invariant — never drop a temporal position to fit.
-    // If even this overflows, the hierarchy lacks a coarse-enough apex; tell the
-    // caller how to raise one instead of silently losing the past.
-    roots.sort_by(|&a, &b| {
-        spans[a]
-            .0
-            .cmp(&spans[b].0)
-            .then(spans[b].1.cmp(&spans[a].1))
-    });
+    // The cut. Cost is the recollection's exact character count plus the
+    // consumer overhead, once per shown chunk.
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
     let mut class_costs: Vec<Option<usize>> = vec![None; n];
-    let mut used = 0usize;
-    for &i in &roots {
-        let intrinsic = recollection_class_cost(
+    let mut cost_of = |i: usize| -> Result<usize> {
+        Ok(recollection_class_cost(
             reader,
             space,
             &raw_spans,
@@ -990,157 +1019,30 @@ where
             &classes,
             &mut class_costs,
             i,
-        )?;
-        used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
-    }
-    if used > budget_chars {
-        let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
-        let latest = roots.iter().map(|&i| spans[i].1).max().unwrap();
+        )?
+        .saturating_add(chunk_overhead))
+    };
+    let cut = fit_field(&spans, &mut cost_of, budget_chars)?;
+    if !cut.fits {
+        // Completeness is invariant -- never drop a temporal position to fit.
+        // Even the coarsest cut, the widest memory at every instant, overflows:
+        // the memories at the edge have no arc over them yet. Say where.
+        let earliest = spans.iter().map(|s| s.0).min().unwrap();
+        let latest = spans.iter().map(|s| s.1).max().unwrap();
         bail!(
             "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
-             Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
-             Comb the uncovered tail into arcs BESIDE the existing apex -- day or week arcs over the orphaned span (`memory density` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
+             {} memories are the widest thing over some stretch of time, so no in-budget cover can contain everything.\n\
+             Comb the uncovered stretch into arcs BESIDE what exists -- day or week arcs over it (`memory density` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
              (A well-maintained hierarchy keeps arcs over every span; the apex is the one you already have.)",
-            used,
-            roots.len(),
+            cut.used,
+            cut.cover.len(),
             fmt_epoch(key_to_epoch(earliest)),
             fmt_epoch(key_to_epoch(latest)),
         );
     }
-
-    // Refine recency-first: spend the remaining budget splitting the most
-    // recent splittable chunk into its immediate children, so detail
-    // concentrates toward now and the deep past stays coarse. (The playground
-    // gets this gradient from drop-oldest; we get it from the split order,
-    // since completeness forbids dropping.)
-    let mut cover: Vec<usize> = roots.clone();
-    // The floor is not a decision, so it must not compete with decisions. It is
-    // subtracted once, and what is left — quantized — is the pool every split
-    // is judged against for the rest of this render.
-    let floor_used = used;
-    let pool = refinement_pool(budget_chars, floor_used) as i128;
-    let mut spent: i128 = 0;
-    // Two things a split is NOT, learned 2026-09-05 when JP felt the cover was
-    // too small and the numbers agreed: 1,623 leaves before 2026-06-16 — the
-    // whole life before the ladder — rendered at NO budget, and 36 of Sol's
-    // instant-stamped entries at the recent edge never rendered either.
-    //
-    // A chunk with exactly ONE chunk inside it is still splittable. Each life
-    // root was written one span wider than the last, so the top of the life is
-    // a chain of single children, and a rule that only split "two or more"
-    // stopped at the first link forever. A single-child split simply steps
-    // down the chain; the child's own children are the next candidates.
-    //
-    // A POINT — a zero-width memory, an entry stamped at an instant — is a
-    // memory AT a moment, not a refinement of the span around it. Splitting a
-    // span into its points would leave the span uncovered, which completeness
-    // forbids, so points never replace their container: they are emitted
-    // beside it. A container whose only children are points keeps its place
-    // and, once its points are out, is done.
-    // A moment is the human present, MOMENT_SECONDS wide: an instant-stamped
-    // memory given its width by `memory respan-instants` is still a memory AT
-    // a moment, not a refinement of the span around it.
-    let moment_ns: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
-    let is_point = |i: usize| width(i) <= moment_ns;
-    let mut points_out: Vec<bool> = vec![false; n];
-    loop {
-        let remaining = pool - spent;
-        if remaining <= 0 {
-            break;
-        }
-        let mut best: Option<(usize, bool)> = None; // position in `cover`, replaces the parent?
-        let mut best_delta: i128 = 0;
-        let mut best_key: Option<(f32, i128, i128, i128, Id)> = None;
-        for (pos, &i) in cover.iter().enumerate() {
-            let replaces = children[i].iter().any(|&k| !is_point(k));
-            if !replaces && (children[i].is_empty() || points_out[i]) {
-                continue;
-            }
-            let mut kids_charge = 0i128;
-            let mut kids_intrinsic = 0i128;
-            for &k in &children[i] {
-                let intrinsic = recollection_class_cost(
-                    reader,
-                    space,
-                    &raw_spans,
-                    &mut raw_costs,
-                    &classes,
-                    &mut class_costs,
-                    k,
-                )? as i128;
-                kids_intrinsic += intrinsic;
-                kids_charge += intrinsic + chunk_overhead as i128;
-            }
-            let parent_intrinsic = recollection_class_cost(
-                reader,
-                space,
-                &raw_spans,
-                &mut raw_costs,
-                &classes,
-                &mut class_costs,
-                i,
-            )? as i128;
-            let parent_charge = parent_intrinsic + chunk_overhead as i128;
-            // SIGNED. A split whose children are collectively cheaper than the
-            // parent's own summary gives budget back; `saturating_sub` used to
-            // round that to zero, so the pool was under-spent by however much
-            // detail happened to be cheap. Consumer overhead participates in
-            // the same signed accounting once per selected chunk. Points joining
-            // a container that stays cost exactly what they add.
-            let delta = match replaces {
-                true => kids_charge - parent_charge,
-                false => kids_charge,
-            };
-            if delta > remaining {
-                continue;
-            }
-            // Consumer overhead determines whether a split fits, while the
-            // established priority still measures intrinsic prose growth.
-            let detail_gain = match replaces {
-                true => kids_intrinsic - parent_intrinsic,
-                false => kids_intrinsic,
-            };
-            // Priority: explicit-filter relevance desc → recency (latest end)
-            // desc → width desc → detail gained desc → stable structural id
-            // asc. `--about` never appears in this key: context can substitute
-            // prose at one position, never redirect the temporal refinement.
-            let key = (relevance[i], spans[i].1, width(i), detail_gain, spans[i].2);
-            let better = match best_key {
-                None => true,
-                Some((br, be, bw, bx, bid)) => {
-                    if key.0 != br {
-                        key.0 > br
-                    } else if key.1 != be {
-                        key.1 > be
-                    } else if key.2 != bw {
-                        key.2 > bw
-                    } else if key.3 != bx {
-                        key.3 > bx
-                    } else {
-                        key.4 < bid
-                    }
-                }
-            };
-            if better {
-                best = Some((pos, replaces));
-                best_delta = delta;
-                best_key = Some(key);
-            }
-        }
-        let Some((pos, replaces)) = best else {
-            break;
-        };
-        let i = cover[pos];
-        let kids = children[i].clone();
-        if replaces {
-            cover.splice(pos..=pos, kids);
-        } else {
-            points_out[i] = true;
-            cover.splice(pos + 1..pos + 1, kids);
-        }
-        spent += best_delta;
-    }
-    used = (floor_used as i128 + spent).max(0) as usize;
+    let step = cut.step;
+    let mut cover = cut.cover;
+    let mut used = cut.used;
 
     // Enforce eligibility at the chunk level the cover selected: a removed /
     // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
@@ -1152,16 +1054,7 @@ where
         // Recompute the conservative character tally over what survived.
         used = 0;
         for &i in &cover {
-            let intrinsic = recollection_class_cost(
-                reader,
-                space,
-                &raw_spans,
-                &mut raw_costs,
-                &classes,
-                &mut class_costs,
-                i,
-            )?;
-            used = used.saturating_add(intrinsic.saturating_add(chunk_overhead));
+            used = used.saturating_add(cost_of(i)?);
         }
     }
 
@@ -1176,7 +1069,7 @@ where
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("recollections about \"{q}\" within equal spans"),
-            None => "recent in most detail".to_string(),
+            None => "coarser further back".to_string(),
         }];
         if let Some(q) = filter_q {
             parts.push(format!("filtered to \"{q}\""));
@@ -1197,7 +1090,10 @@ where
     for &i in &cover {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
-        let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
+        let depth = cover
+            .iter()
+            .filter(|&&j| j != i && strict_contains(j, i))
+            .count();
         let indent = "  ".repeat(depth);
         writeln!(out)?;
         // Ranges are the drill key (`memory <from>..<to>`); the opaque hex id is
@@ -1215,14 +1111,18 @@ where
         }
     }
     // Only report a completed cover. A live caller may acquire a missing
-    // selected summary and retry this resident-only computation.
+    // selected summary and retry this resident-only computation. The status
+    // line goes to STDERR so its volatile counts never enter the cover text.
     eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode}); floor {} + refinement pool {}",
+        "memory context — {} chunk(s), ~{} of {} characters ({mode}); fineness step {}; coarsest cover {} chunk(s)",
         cover.len(),
         used,
         budget_chars,
-        floor_used,
-        refinement_pool(budget_chars, floor_used),
+        match step {
+            Some(step) => format!("{step} (age/{:.3})", fineness(step)),
+            None => "coarsest".to_string(),
+        },
+        select_field(&spans, None).len(),
     );
     Ok(out)
 }
@@ -1235,37 +1135,6 @@ mod headroom_tests {
     const A: Id = id_hex!("C1000000000000000000000000000001");
     const B: Id = id_hex!("C1000000000000000000000000000002");
     const C: Id = id_hex!("C1000000000000000000000000000003");
-
-    /// A chunk strictly inside another is not a root; only the container is.
-    #[test]
-    fn nesting_yields_one_root() {
-        let spans = vec![(0i128, 100i128, A), (10, 20, B), (30, 40, C)];
-        let (_, _, roots) = containment_forest(&spans);
-        assert_eq!(roots, vec![0]);
-    }
-
-    /// The shape that broke wake: an apex that stops short, and later chunks
-    /// that OVERLAP its tail without being contained by it. Overlap is not
-    /// containment, so both are roots and the coarsest cover is the sum of
-    /// both — which is how the roots grew unnoticed until they overflowed.
-    #[test]
-    fn overlap_is_not_containment() {
-        // apex 0..100; a chunk 90..150 overlaps its tail but escapes it.
-        let spans = vec![(0i128, 100i128, A), (90, 150, B)];
-        let (parent, _, roots) = containment_forest(&spans);
-        assert_eq!(parent, vec![None, None], "neither contains the other");
-        assert_eq!(roots.len(), 2, "both are top-level, so both cost budget");
-    }
-
-    /// Extending the apex over the escaping chunk re-parents it — the fix.
-    #[test]
-    fn a_wider_apex_adopts_the_orphan() {
-        let spans = vec![(0i128, 100i128, A), (90, 150, B), (0, 200, C)];
-        let (parent, _, roots) = containment_forest(&spans);
-        assert_eq!(roots, vec![2], "the wide apex is the only root");
-        assert_eq!(parent[0], Some(2));
-        assert_eq!(parent[1], Some(2));
-    }
 
     #[test]
     fn exact_span_is_the_structural_equivalence_class() {
@@ -1410,29 +1279,124 @@ mod headroom_tests {
         assert_eq!(selected, first.min(second));
     }
 
-    /// The pool is a whole number of quanta, so it is a CONSTANT while the
-    /// floor grows — which is the only reason a new memory can leave every
-    /// earlier split decision alone.
+    fn ids(n: usize) -> Vec<Id> {
+        (1..=n)
+            .map(|k| {
+                Id::new(u128::to_be_bytes(
+                    0xC1000000000000000000000000000000 + k as u128,
+                ))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn day(d: i128) -> i128 {
+        d * 86_400 * 1_000_000_000
+    }
+
+    /// The coarsest cut is the widest memory at every instant.
     #[test]
-    fn the_refinement_pool_is_constant_between_quanta() {
-        let budget = 200_000; // quantum = 12_500
-        let a = refinement_pool(budget, 60_000);
-        for floor in [60_001, 61_400, 62_500] {
-            assert_eq!(
-                refinement_pool(budget, floor),
-                a,
-                "floor {floor} moved the pool"
-            );
+    fn the_coarsest_cut_is_the_widest_at_every_instant() {
+        let id = ids(3);
+        let spans = vec![
+            (0, day(100), id[0]),
+            (day(10), day(20), id[1]),
+            (day(30), day(40), id[2]),
+        ];
+        assert_eq!(select_field(&spans, None), vec![0]);
+        // An overlapping tail that escapes the wide memory is the widest over
+        // its own overhang, so it shows too: completeness by arithmetic.
+        let spans = vec![(0, day(100), id[0]), (day(90), day(150), id[1])];
+        assert_eq!(select_field(&spans, None), vec![0, 1]);
+    }
+
+    /// Coarser further back: entries show only where they clear the
+    /// coarseness their age asks for; the arc always covers the gaps.
+    #[test]
+    fn coarser_further_back() {
+        let id = ids(11);
+        let mut spans = vec![(0, day(100), id[0])];
+        for i in 0..10 {
+            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
         }
-        assert_eq!(a, 137_500);
-        // Crossing a quantum steps it, once, by exactly one quantum. At ~1,300
-        // characters a journal entry that is about ten writes apart.
-        assert_eq!(refinement_pool(budget, 62_501), 125_000);
-        // A floor that eats the budget leaves nothing discretionary — and does
-        // not underflow. (`render_cover` has already failed loud by then.)
-        assert_eq!(refinement_pool(budget, 200_000), 0);
-        assert_eq!(refinement_pool(budget, 999_999), 0);
-        // A budget smaller than the divisor still has a usable quantum of 1.
-        assert_eq!(refinement_pool(8, 3), 5);
+        // Finest: every entry, and the arc over the gaps between them.
+        let fine = select_field(&spans, Some(1e9));
+        assert_eq!(fine, (0..11).collect::<Vec<_>>());
+        // Coarsest: the arc alone.
+        assert_eq!(select_field(&spans, Some(1e-9)), vec![0]);
+        // In between: an entry 5 days wide clears an age of at most 5 days
+        // at k = 1 -- the last entry (age 5 days, ending at day 95) shows,
+        // the one before it (age 15 days) does not.
+        let mid = select_field(&spans, Some(1.0));
+        assert!(mid.contains(&10), "the newest entry shows: {mid:?}");
+        assert!(
+            !mid.contains(&9),
+            "an older entry is below the coarseness for its age: {mid:?}"
+        );
+        assert!(mid.contains(&0), "the arc covers the rest");
+    }
+
+    /// Two memories over the same minutes both show, each narrowest somewhere,
+    /// whether they overlap or one sits inside the other.
+    #[test]
+    fn overlapping_memories_both_show() {
+        let id = ids(3);
+        let nested = vec![
+            (0, day(1), id[0]),
+            (day(1) / 2, day(1) / 2 + 60_000_000_000, id[1]),
+        ];
+        assert_eq!(select_field(&nested, Some(1e9)), vec![0, 1]);
+        let overlapping = vec![(0, day(1), id[0]), (day(1) / 2, day(1) + day(1) / 2, id[1])];
+        assert_eq!(select_field(&overlapping, Some(1e9)), vec![0, 1]);
+    }
+
+    /// An instant lasts a moment: it shows beside its container, not instead.
+    #[test]
+    fn a_moment_shows_beside_its_container() {
+        let id = ids(2);
+        let spans = vec![(0, day(1), id[0]), (day(1) / 2, day(1) / 2, id[1])];
+        assert_eq!(select_field(&spans, Some(1e9)), vec![0, 1]);
+    }
+
+    /// The cut fits the budget at the finest step that does, and names an
+    /// overflow of even the coarsest cut instead of dropping time.
+    #[test]
+    fn fit_picks_the_finest_step_within_budget() {
+        let id = ids(11);
+        let mut spans = vec![(0, day(100), id[0])];
+        for i in 0..10 {
+            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
+        }
+        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
+        let tight = fit_field(&spans, &mut cost, 120).unwrap();
+        assert!(tight.fits);
+        assert!(tight.cover.contains(&0));
+        assert!(tight.cover.len() <= 3, "{:?}", tight.cover);
+        assert!(tight.used <= 120);
+        let loose = fit_field(&spans, &mut cost, 1_000).unwrap();
+        assert_eq!(loose.cover, (0..11).collect::<Vec<_>>());
+        assert_eq!(loose.used, 200);
+        let impossible = fit_field(&spans, &mut cost, 50).unwrap();
+        assert!(!impossible.fits);
+        assert_eq!(impossible.cover, vec![0]);
+        assert_eq!(impossible.used, 100);
+    }
+
+    /// A finer step never costs less than a coarser one on this shape, so
+    /// walking the ladder from coarse to fine and stopping at the first
+    /// overflow finds the finest cut that fits.
+    #[test]
+    fn steps_are_cut_at_the_ladder() {
+        let id = ids(11);
+        let mut spans = vec![(0, day(100), id[0])];
+        for i in 0..10 {
+            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
+        }
+        let mut last = 0usize;
+        for step in FINENESS_STEPS {
+            let n = select_field(&spans, Some(fineness(step))).len();
+            assert!(n >= last, "step {step}: {n} < {last}");
+            last = n;
+        }
     }
 }
