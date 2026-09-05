@@ -1901,7 +1901,7 @@ mod tests {
             );
             assert!(entry(&facts, &current, new).unwrap().frontier.is_empty());
             assert!(!exists!(
-                (state),
+                (state: Id),
                 and!(current.has(state), state.is(next.to_inline()))
             ));
 
@@ -2024,7 +2024,7 @@ mod tests {
         let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
         assert!(exists!(
-            (id),
+            (id: Id),
             and!(snapshot.latest().has(id), id.is(root.to_inline()))
         ));
 
