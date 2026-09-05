@@ -16,10 +16,14 @@ use faculties::relations::{self, Head, SelectorOutcome};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::status::DEFAULT_SCOPE_ID;
 use faculties::status;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -109,62 +113,67 @@ impl StatusStorage<'_> {
 }
 
 fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<StatusObservation> {
-    // Register every descriptor before fixing the one shared source boundary.
+    // Register every descriptor before advancing the two fact chains.
     let status_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let status = FactCollection::new(pile, status_source)
-        .context("register maintained Status fact collection")?;
+    let descriptor_snapshot = pile.snapshot()?;
+    let policy = status_source.policy(&descriptor_snapshot)?;
+    drop(descriptor_snapshot);
+    let status_succinct = pile.derive::<SuccinctArchiveBlob>(status_source, (), policy.clone())?;
+    let status_rank9 =
+        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(status_succinct, (), policy)?;
     let relations_source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-    let relations = FactCollection::new(pile, relations_source)
-        .context("register maintained Relations fact collection")?;
+    let descriptor_snapshot = pile.snapshot()?;
+    let policy = relations_source.policy(&descriptor_snapshot)?;
+    drop(descriptor_snapshot);
+    let relations_succinct =
+        pile.derive::<SuccinctArchiveBlob>(relations_source, (), policy.clone())?;
+    let relations_rank9 =
+        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
 
-    let (status_support, relations_support) = pollster::block_on(async {
+    pollster::block_on(async {
         drop(
-            pile.ensure(status.source())
+            pile.ensure(status_source)
                 .await
                 .context("ensure Status source collection")?,
         );
         drop(
-            pile.ensure(relations.source())
+            pile.ensure(relations_source)
                 .await
                 .context("ensure Relations source collection")?,
         );
-        let before = pile
-            .snapshot()
-            .context("freeze shared Status/Relations source snapshot")?;
-        let status_support = status
-            .source()
-            .admitted(&before)
-            .context("admit Status support")?;
-        let relations_support = relations
-            .source()
-            .admitted(&before)
-            .context("admit Relations support")?;
-        drop(before);
         drop(
-            status
-                .maintain_exact(pile, &status_support)
+            pile.maintain(status_succinct)
                 .await
                 .context("maintain Status fact collection")?,
         );
         drop(
-            relations
-                .maintain_exact(pile, &relations_support)
+            pile.maintain(status_rank9)
+                .await
+                .context("maintain Status fact collection")?,
+        );
+        drop(
+            pile.maintain(relations_succinct)
                 .await
                 .context("maintain Relations fact collection")?,
         );
-        Ok::<_, anyhow::Error>((status_support, relations_support))
+        drop(
+            pile.maintain(relations_rank9)
+                .await
+                .context("maintain Relations fact collection")?,
+        );
+        Ok::<_, anyhow::Error>(())
     })?;
 
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Status/Relations snapshot")?;
     let status = snapshot
-        .collection_exact(status.rank9(), &status_support)
+        .collection(status_rank9)
         .context("observe Status Rank9 collection")?
         .view::<FactArchive>()
         .context("read Status Rank9 collection")?;
     let relations = snapshot
-        .collection_exact(relations.rank9(), &relations_support)
+        .collection(relations_rank9)
         .context("observe Relations Rank9 collection")?
         .view::<FactArchive>()
         .context("read Relations Rank9 collection")?;
@@ -180,12 +189,20 @@ fn maintain_and_observe_relations(
     signer: &SigningKey,
 ) -> Result<RelationsObservation> {
     let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-    let collection = FactCollection::new(pile, source)
-        .context("register maintained Relations fact collection")?;
-    let snapshot = pollster::block_on(collection.maintain(pile))
-        .context("maintain Relations fact collection")?;
+    let descriptor_snapshot = pile.snapshot()?;
+    let policy = source.policy(&descriptor_snapshot)?;
+    drop(descriptor_snapshot);
+    let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let collection_rank9 =
+        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
+    let snapshot = pollster::block_on(async {
+        drop(pile.ensure(source).await?);
+        drop(pile.maintain(collection_succinct).await?);
+        pile.maintain(collection_rank9).await
+    })
+    .context("maintain Relations fact collection")?;
     let relations = snapshot
-        .collection(collection.rank9())
+        .collection(collection_rank9)
         .context("observe Relations Rank9 collection")?
         .view::<FactArchive>()
         .context("read Relations Rank9 collection")?;

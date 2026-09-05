@@ -8,9 +8,7 @@ use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use faculties::storage::{
-    load_signer, open_store, read, runtime, FactArchive, FactCollection, FacultyStore,
-};
+use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -19,6 +17,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -420,32 +421,39 @@ fn with_files_view<T>(
 ) -> Result<T> {
     with_files_store(pile, |store, collection, signer| {
         let runtime = runtime()?;
-        let facts = FactCollection::new(store, collection)
-            .context("register maintained Files fact collection")?;
-        let (support, instant) = runtime.block_on(async {
-            let control = store
-                .ensure(facts.source())
-                .await
-                .context("ensure Files source collection")?;
-            let support = facts
-                .source()
-                .admitted(&control)
-                .context("admit Files support")?;
-            let instant = control.instant();
-            drop(control);
+        let descriptors = store
+            .snapshot()
+            .context("freeze Files source policy snapshot")?;
+        let policy = collection
+            .policy(&descriptors)
+            .context("read Files source collection policy")?;
+        drop(descriptors);
+        let succinct = store
+            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+            .context("register Files Succinct collection")?;
+        let rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .context("register Files Rank9 collection")?;
+        let reader = runtime.block_on(async {
             drop(
-                facts
-                    .maintain_exact(store, &support)
+                store
+                    .ensure(collection)
                     .await
-                    .context("maintain Files fact collection")?,
+                    .context("ensure Files source collection")?,
             );
-            Ok::<_, anyhow::Error>((support, instant))
+            drop(
+                store
+                    .maintain(succinct)
+                    .await
+                    .context("maintain Files Succinct collection")?,
+            );
+            store
+                .maintain(rank9)
+                .await
+                .context("maintain Files Rank9 collection")
         })?;
-        let reader = store
-            .snapshot_at(instant)
-            .context("freeze maintained Files snapshot")?;
         let space = reader
-            .collection_exact(facts.rank9(), &support)
+            .collection(rank9)
             .context("observe Files fact collection")?
             .view::<FactArchive>()
             .context("read Files fact collection")?;

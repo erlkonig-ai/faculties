@@ -434,6 +434,7 @@ mod tests {
 
     use std::fs::File;
 
+    use crate::schemas::wiki::TAG_SPECS;
     use crate::storage::open_pile_strict;
     use crate::test_support::initialize_open_collection_fixture;
     use crate::widgets::storage::{SourceKey, StorageState};

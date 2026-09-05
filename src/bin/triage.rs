@@ -25,7 +25,7 @@ use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use faculties::schemas::triage::cog;
 use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
-    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
+    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive,
 };
 use faculties::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
@@ -35,7 +35,10 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -155,6 +158,9 @@ impl TriageSnapshot {
         let signer = load_signer(&cli.pile, cli.key.as_deref())?;
         let mut pile = open_pile_strict(&cli.pile)?;
         let mut registered = Vec::new();
+        let mut sources = Vec::new();
+        let mut succinct = Vec::new();
+        let mut rank9 = Vec::new();
         for (scope, label) in [
             (COGNITION_SCOPE_ID, "Cognition"),
             (HEADSPACE_SCOPE_ID, "Headspace"),
@@ -168,16 +174,26 @@ impl TriageSnapshot {
                 signer.verifying_key(),
             )
             .with_context(|| format!("register {label} collection"))?;
-            let facts = FactCollection::new(&mut pile, source)
-                .with_context(|| format!("register maintained {label} collection"))?;
-            registered.push((scope, label, facts));
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = source.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let succinct_collection = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .with_context(|| format!("register succinct {label} collection"))?;
+            let rank9_collection = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
+                .with_context(|| format!("register Rank9 {label} collection"))?;
+            registered.push((scope, label));
+            sources.push(source);
+            succinct.push(succinct_collection);
+            rank9.push(rank9_collection);
         }
 
         let secrets_collection = open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-        let (supports, secrets) = pollster::block_on(async {
-            for (_, label, facts) in &registered {
+        let secrets = pollster::block_on(async {
+            for ((_, label), source) in registered.iter().zip(&sources) {
                 drop(
-                    pile.ensure(facts.source())
+                    pile.ensure(*source)
                         .await
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
@@ -187,30 +203,23 @@ impl TriageSnapshot {
                     .await
                     .context("ensure Secrets source collection")?,
             );
-            // All roots are ready before this common observation selects
-            // the exact supports carried through every later derivation.
             let before = pile
                 .snapshot()
                 .context("freeze shared Triage support snapshot")?;
-            let mut supports = Vec::<Support>::with_capacity(registered.len());
-            for (_, label, facts) in &registered {
-                supports.push(
-                    facts
-                        .source()
-                        .admitted(&before)
-                        .with_context(|| format!("admit {label} collection support"))?,
-                );
-            }
             let secrets_support = secrets_collection
                 .source()
                 .admitted(&before)
                 .context("admit Secrets collection support")?;
             drop(before);
 
-            for ((_, label, facts), support) in registered.iter().zip(&supports) {
+            for (index, (_, label)) in registered.iter().enumerate() {
                 drop(
-                    facts
-                        .maintain_exact(&mut pile, support)
+                    pile.maintain(succinct[index])
+                        .await
+                        .with_context(|| format!("maintain {label} succinct fact archive"))?,
+                );
+                drop(
+                    pile.maintain(rank9[index])
                         .await
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
@@ -222,7 +231,7 @@ impl TriageSnapshot {
             let secrets =
                 secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
                     .context("attach exact Secrets collection")?;
-            Ok::<_, anyhow::Error>((supports, secrets))
+            Ok::<_, anyhow::Error>(secrets)
         })?;
 
         // Secrets attachment already owns the one later immutable snapshot.
@@ -230,9 +239,9 @@ impl TriageSnapshot {
         // the same known-prefix observation.
         let store_snapshot = secrets.store_snapshot().clone();
         let mut collections = BTreeMap::new();
-        for ((scope, label, facts), support) in registered.iter().zip(&supports) {
+        for ((scope, label), collection) in registered.iter().zip(&rank9) {
             let archive = store_snapshot
-                .collection_exact(facts.rank9(), support)
+                .collection(*collection)
                 .with_context(|| format!("attach maintained {label} collection"))?
                 .view::<FactArchive>()
                 .with_context(|| format!("read maintained {label} collection"))?;

@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
@@ -33,11 +35,9 @@ use triblespace_search::portable_bm25::PortableBM25Blob;
 use crate::archive_bm25;
 use crate::blockdag;
 use crate::schemas::blockdag as schema;
-use crate::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use crate::storage::{load_signer, open_pile_strict, FactArchive};
 
 use crate::collection_names::open_configured;
-#[cfg(test)]
-use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 #[cfg(test)]
 use triblespace::core::collection::{
     CollectionDerivation, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
@@ -69,13 +69,11 @@ impl ArchiveImportWriter {
         let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let facts = FactCollection::new(&mut pile, source)
-                .context("register maintained Archive fact collection")?;
-            let observed = ensure_facts(&mut pile, facts).await?;
+            let observed = ensure_facts(&mut pile, source).await?;
             let current = observed
                 .view::<FactArchive>()
                 .context("read Archive facts")?;
-            Ok((facts.source(), current))
+            Ok((source, current))
         }
         .await;
         match result {
@@ -269,49 +267,58 @@ pub async fn ensure_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    let (mut pile, collections, _signer) = open_local(pile_path, key_path)?;
-    let result = ensure_facts(&mut pile, collections).await;
+    let (mut pile, source, _signer) = open_local(pile_path, key_path)?;
+    let result = ensure_facts(&mut pile, source).await;
     close_pile(pile, result, "closing Archive pile")
 }
 
 fn open_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
-) -> Result<(Pile, FactCollection, SigningKey)> {
+) -> Result<(Pile, Collection<SimpleArchive>, SigningKey)> {
     let signer = load_signer(pile_path, key_path)?;
     let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
-        let source = open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        FactCollection::new(&mut pile, source)
-            .context("register maintained Archive fact collection")
-    })();
+    let result = open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key());
     match result {
-        Ok(collections) => Ok((pile, collections, signer)),
+        Ok(source) => Ok((pile, source, signer)),
         Err(error) => close_pile(pile, Err(error), "closing Archive pile after failed open"),
     }
 }
 
 async fn ensure_facts(
     pile: &mut Pile,
-    collections: FactCollection,
+    source: Collection<SimpleArchive>,
 ) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    let prepared = pile
-        .ensure(collections.source())
+    let policy = source
+        .policy(
+            &pile
+                .snapshot()
+                .context("freeze Archive descriptor snapshot")?,
+        )
+        .context("read Archive collection policy")?;
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .context("register Succinct Archive fact collection")?;
+    let rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .context("register Rank9 Archive fact collection")?;
+    drop(
+        pile.ensure(source)
+            .await
+            .context("ensure Archive source dependencies")?,
+    );
+    drop(
+        pile.maintain(succinct)
+            .await
+            .context("maintain Succinct Archive fact collection")?,
+    );
+    let after = pile
+        .maintain(rank9)
         .await
-        .context("ensure Archive source dependencies")?;
-    let support = prepared
-        .collection(collections.source())
-        .context("observe Archive source support")?
-        .support()
-        .clone();
-    drop(prepared);
-    let after = collections
-        .maintain_exact(pile, &support)
-        .await
-        .context("maintain Archive fact collection")?;
+        .context("maintain Rank9 Archive fact collection")?;
     after
-        .collection_exact(collections.rank9(), &support)
-        .context("attach exact Archive fact collection")
+        .collection(rank9)
+        .context("attach Archive fact collection")
 }
 
 /// Exact accelerated-Succinct derivation summary. Source membership is measured
@@ -388,9 +395,9 @@ pub async fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<Bm25IndexReport> {
-    let (mut pile, collections, signer) = open_local(pile_path, key_path)?;
+    let (mut pile, source, signer) = open_local(pile_path, key_path)?;
     let result = async {
-        let observed = ensure_facts(&mut pile, collections).await?;
+        let observed = ensure_facts(&mut pile, source).await?;
         Ok(
             ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key())
                 .await?
@@ -411,9 +418,9 @@ pub async fn ensure_search_local(
     CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     archive_bm25::ArchiveBM25Index,
 )> {
-    let (mut pile, collections, signer) = open_local(pile_path, key_path)?;
+    let (mut pile, source, signer) = open_local(pile_path, key_path)?;
     let result = async {
-        let observed = ensure_facts(&mut pile, collections).await?;
+        let observed = ensure_facts(&mut pile, source).await?;
         let ensured =
             ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key()).await?;
         // Search maintenance may have acquired referenced text payloads. Attach
@@ -422,7 +429,7 @@ pub async fn ensure_search_local(
             .snapshot()
             .context("freeze prepared Archive search snapshot")?;
         let observed = after
-            .collection_exact(collections.rank9(), observed.support())
+            .collection_exact(observed.cover().collection(), observed.support())
             .context("reattach exact Archive search facts")?;
         Ok((observed, ensured.index))
     }
@@ -1953,15 +1960,20 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let collections = FactCollection::new(&mut pile, source).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
         let (_, facts, _metadata, blobs) = fragment.into_parts();
         stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
         let data = pile.put::<SimpleArchive, _>(facts).unwrap();
         let support = source.cover([data]);
-        let after = pollster::block_on(collections.maintain_exact(&mut pile, &support)).unwrap();
-        let observed = after
-            .collection_exact(collections.rank9(), &support)
-            .unwrap();
+        drop(pollster::block_on(pile.maintain_exact(succinct, &support)).unwrap());
+        let after = pollster::block_on(pile.maintain_exact(rank9, &support)).unwrap();
+        let observed = after.collection_exact(rank9, &support).unwrap();
         assert!(observed
             .support()
             .commits(observed.snapshot())

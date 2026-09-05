@@ -1541,15 +1541,16 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::SigningKey;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
     use triblespace::core::collection::CollectionSnapshotExt;
     use triblespace::core::repo::pile::Pile;
 
     use crate::collection_names::open_configured;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
-    use crate::storage::{
-        open_secrets_collection, open_secrets_collection_read, FactArchive, FactCollection,
-    };
+    use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1568,10 +1569,20 @@ mod tests {
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (FactArchive, PileSnapshot) {
         let source = open_configured(pile, scope, signer.verifying_key()).unwrap();
-        let collection = FactCollection::new(pile, source).unwrap();
-        let reader = pollster::block_on(collection.maintain(pile)).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let reader = pollster::block_on(async {
+            drop(pile.ensure(source).await.unwrap());
+            drop(pile.maintain(succinct).await.unwrap());
+            pile.maintain(rank9).await.unwrap()
+        });
         let facts = reader
-            .collection(collection.rank9())
+            .collection(rank9)
             .unwrap()
             .view::<FactArchive>()
             .unwrap();

@@ -29,7 +29,10 @@ use crate::schemas::wiki::{
     revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
     KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
 };
-use crate::storage::{FactArchive, FactCollection};
+use crate::storage::FactArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
@@ -1614,36 +1617,42 @@ pub fn materialize_collection(
 /// Capture one durable Wiki snapshot with shard-preserving facts and its exact
 /// maintained supersession index.
 ///
-/// The ensured root's snapshot chooses the foundational support. Both fact
-/// derivation hops and the supersession projection are maintained for exactly
-/// that support, then attached through one later immutable snapshot. Normal
+/// Ordinary maintenance advances both fact derivation hops. The realized fact
+/// snapshot then chooses the support for the supersession projection, and both
+/// are attached through one later immutable snapshot. Normal
 /// reads therefore never flatten the collection or validate a closed-world
 /// catalog before asking their actual query.
 pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let facts = FactCollection::new(pile, collection)
-        .context("register maintained Wiki fact collection")?;
+    let policy = collection.policy(&pile.snapshot()?)?;
+    let succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let target = observed_collection(pile, signer.verifying_key())?;
-    let source_snapshot = pile
-        .ensure(collection)
-        .await
-        .context("ensure Wiki source collection")?;
-    let support = collection
-        .admitted(&source_snapshot)
-        .context("admit ensured Wiki source support")?;
-    drop(source_snapshot);
     drop(
-        facts
-            .maintain_exact(pile, &support)
+        pile.ensure(collection)
             .await
-            .context("maintain Wiki fact collection")?,
+            .context("ensure Wiki source collection")?,
     );
-    let store_snapshot = pile
-        .maintain_exact(target, &support)
+    drop(
+        pile.maintain(succinct)
+            .await
+            .context("maintain Wiki Succinct collection")?,
+    );
+    let ready = pile
+        .maintain(rank9)
         .await
-        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
+        .context("maintain Wiki fact collection")?;
+    let support = ready.collection(rank9)?.support().clone();
+    let instant = ready.instant();
+    drop(ready);
+    drop(
+        pile.maintain_exact(target, &support)
+            .await
+            .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?,
+    );
+    let store_snapshot = pile.snapshot_at(instant)?;
     let facts = store_snapshot
-        .collection_exact(facts.rank9(), &support)
+        .collection_exact(rank9, &support)
         .context("observe Wiki fact collection")?
         .view::<FactArchive>()
         .context("read Wiki fact collection")?;

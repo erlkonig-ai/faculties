@@ -22,15 +22,19 @@ use faculties::schemas::{
 use faculties::secrets::{storage as secret_storage, SecretsSnapshot};
 use faculties::storage::{
     load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-    FactArchive, FactCollection,
+    FactArchive,
 };
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -202,120 +206,134 @@ impl Storage<'_> {
                 open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
             let secrets_collection =
                 open_secrets_collection_read(pile, self.signer.verifying_key())?;
-            let mail = FactCollection::new(pile, mail_collection)
-                .context("register maintained Mail fact collection")?;
-            let files = FactCollection::new(pile, files_collection)
-                .context("register maintained Files fact collection")?;
-            let decide = FactCollection::new(pile, decide_collection)
-                .context("register maintained Decide fact collection")?;
-            let relations = FactCollection::new(pile, relations_collection)
-                .context("register maintained Relations fact collection")?;
-            // Ensure every root before one common snapshot fixes all support,
-            // including Secrets. Later maintenance cannot widen any scope.
-            let (mail_support, files_support, decide_support, relations_support, secrets) =
-                pollster::block_on(async {
-                    for (label, source) in [
-                        ("Mail", mail.source()),
-                        ("Files", files.source()),
-                        ("Decide", decide.source()),
-                        ("Relations", relations.source()),
-                        ("Secrets", secrets_collection.source()),
-                    ] {
-                        drop(
-                            pile.ensure(source)
-                                .await
-                                .with_context(|| format!("ensure {label} source collection"))?,
-                        );
-                    }
-                    let before = pile
-                        .snapshot()
-                        .context("freeze shared Mail support snapshot")?;
-                    let mail_support = mail
-                        .source()
-                        .admitted(&before)
-                        .context("admit Mail collection support")?;
-                    let files_support = files
-                        .source()
-                        .admitted(&before)
-                        .context("admit Files collection support")?;
-                    let decide_support = decide
-                        .source()
-                        .admitted(&before)
-                        .context("admit Decide collection support")?;
-                    let relations_support = relations
-                        .source()
-                        .admitted(&before)
-                        .context("admit Relations collection support")?;
-                    let secrets_support = secrets_collection
-                        .source()
-                        .admitted(&before)
-                        .context("admit Secrets collection support")?;
-                    drop(before);
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = mail_collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let mail_succinct =
+                pile.derive::<SuccinctArchiveBlob>(mail_collection, (), policy.clone())?;
+            let mail_rank9 =
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(mail_succinct, (), policy)?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = files_collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let files_succinct =
+                pile.derive::<SuccinctArchiveBlob>(files_collection, (), policy.clone())?;
+            let files_rank9 =
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(files_succinct, (), policy)?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = decide_collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let decide_succinct =
+                pile.derive::<SuccinctArchiveBlob>(decide_collection, (), policy.clone())?;
+            let decide_rank9 =
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(decide_succinct, (), policy)?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = relations_collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let relations_succinct =
+                pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
+            let relations_rank9 =
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
+            // Ensure every root, then advance each ordinary fact chain before
+            // observing the views through one final snapshot.
+            let secrets = pollster::block_on(async {
+                for (label, source) in [
+                    ("Mail", mail_collection),
+                    ("Files", files_collection),
+                    ("Decide", decide_collection),
+                    ("Relations", relations_collection),
+                    ("Secrets", secrets_collection.source()),
+                ] {
+                    drop(
+                        pile.ensure(source)
+                            .await
+                            .with_context(|| format!("ensure {label} source collection"))?,
+                    );
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Mail support snapshot")?;
+                let secrets_support = secrets_collection
+                    .source()
+                    .admitted(&before)
+                    .context("admit Secrets collection support")?;
+                drop(before);
 
-                    drop(
-                        mail.maintain_exact(pile, &mail_support)
-                            .await
-                            .context("maintain Mail fact collection")?,
-                    );
-                    drop(
-                        files
-                            .maintain_exact(pile, &files_support)
-                            .await
-                            .context("maintain Files fact collection")?,
-                    );
-                    drop(
-                        decide
-                            .maintain_exact(pile, &decide_support)
-                            .await
-                            .context("maintain Decide fact collection")?,
-                    );
-                    drop(
-                        relations
-                            .maintain_exact(pile, &relations_support)
-                            .await
-                            .context("maintain Relations fact collection")?,
-                    );
-
-                    let store_snapshot = secrets_collection
-                        .ensure_exact(pile, &secrets_support)
+                drop(
+                    pile.maintain(mail_succinct)
                         .await
-                        .context("ensure configured Secrets collection")?;
-                    let secrets = secret_storage::snapshot_exact(
-                        store_snapshot,
-                        secrets_collection,
-                        secrets_support,
-                    )
-                    .context("attach exact Secrets collection")?;
-                    Ok::<_, anyhow::Error>((
-                        mail_support,
-                        files_support,
-                        decide_support,
-                        relations_support,
-                        secrets,
-                    ))
-                })?;
+                        .context("maintain Mail fact collection")?,
+                );
+                drop(
+                    pile.maintain(mail_rank9)
+                        .await
+                        .context("maintain Mail fact collection")?,
+                );
+                drop(
+                    pile.maintain(files_succinct)
+                        .await
+                        .context("maintain Files fact collection")?,
+                );
+                drop(
+                    pile.maintain(files_rank9)
+                        .await
+                        .context("maintain Files fact collection")?,
+                );
+                drop(
+                    pile.maintain(decide_succinct)
+                        .await
+                        .context("maintain Decide fact collection")?,
+                );
+                drop(
+                    pile.maintain(decide_rank9)
+                        .await
+                        .context("maintain Decide fact collection")?,
+                );
+                drop(
+                    pile.maintain(relations_succinct)
+                        .await
+                        .context("maintain Relations fact collection")?,
+                );
+                drop(
+                    pile.maintain(relations_rank9)
+                        .await
+                        .context("maintain Relations fact collection")?,
+                );
+
+                let store_snapshot = secrets_collection
+                    .ensure_exact(pile, &secrets_support)
+                    .await
+                    .context("ensure configured Secrets collection")?;
+                let secrets = secret_storage::snapshot_exact(
+                    store_snapshot,
+                    secrets_collection,
+                    secrets_support,
+                )
+                .context("attach exact Secrets collection")?;
+                Ok::<_, anyhow::Error>(secrets)
+            })?;
             // Secrets attachment owns the final immutable pile snapshot. Attach
-            // every exact maintained support through that same world so Mail
+            // every maintained view through that same world so Mail
             // facts, file payloads, decisions, relations, and credentials can
             // never be assembled from different store prefixes.
             let store_snapshot = secrets.store_snapshot().clone();
             let mail_facts = store_snapshot
-                .collection_exact(mail.rank9(), &mail_support)
+                .collection(mail_rank9)
                 .context("attach maintained Mail fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Mail fact collection")?;
             let files_facts = store_snapshot
-                .collection_exact(files.rank9(), &files_support)
+                .collection(files_rank9)
                 .context("attach maintained Files fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Files fact collection")?;
             let decide_facts = store_snapshot
-                .collection_exact(decide.rank9(), &decide_support)
+                .collection(decide_rank9)
                 .context("attach maintained Decide fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Decide fact collection")?;
             let relations_facts = store_snapshot
-                .collection_exact(relations.rank9(), &relations_support)
+                .collection(relations_rank9)
                 .context("attach maintained Relations fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Relations fact collection")?;

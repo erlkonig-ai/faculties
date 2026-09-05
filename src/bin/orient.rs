@@ -36,9 +36,7 @@ use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
-use faculties::storage::{
-    load_signer, open_store, read, runtime, FactArchive, FactCollection, FacultyStore,
-};
+use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
 use faculties::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
     teams as teams_model, wiki as wiki_model,
@@ -48,7 +46,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{
     next_authorization_change, Collection, CollectionSnapshot, CollectionSnapshotExt,
@@ -246,9 +247,11 @@ fn visible_notes<P: TriblePattern>(
     notes
 }
 
-/// One authored fact collection and its maintained Succinct projection.
+/// One Orient input's authored collection and explicit query projections.
 struct OrientSource {
-    facts: FactCollection,
+    source: Collection<SimpleArchive>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &'static str,
 }
 
@@ -260,7 +263,7 @@ impl OrientSource {
         label: &'static str,
     ) -> Result<Self> {
         let authority = signer.verifying_key();
-        let collection = if let Some(handle) = configured_handle(scope)? {
+        let source = if let Some(handle) = configured_handle(scope)? {
             let snapshot = pile.snapshot()?;
             read(pile, &snapshot, |reader| {
                 open_exact_in(reader, scope, handle)
@@ -269,29 +272,49 @@ impl OrientSource {
         } else {
             open_configured(pile, scope, authority)?
         };
-        let facts = FactCollection::new(pile, collection)
-            .with_context(|| format!("register {label} maintained fact collection"))?;
-        Ok(Self { facts, label })
+        let descriptors = pile
+            .snapshot()
+            .with_context(|| format!("freeze {label} source policy snapshot"))?;
+        let policy = source
+            .policy(&descriptors)
+            .with_context(|| format!("read {label} source policy"))?;
+        drop(descriptors);
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .with_context(|| format!("register {label} Succinct collection"))?;
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .with_context(|| format!("register {label} Rank9 collection"))?;
+        Ok(Self {
+            source,
+            succinct,
+            rank9,
+            label,
+        })
     }
 
     async fn maintain(&self, pile: &mut FacultyStore, snapshot: &PileSnapshot) -> Result<Support> {
         let support = snapshot
-            .collection(self.facts.source())
+            .collection(self.source)
             .map_err(|error| anyhow!("observe admitted {} support: {error}", self.label))?
             .support()
             .clone();
         drop(
-            self.facts
-                .maintain_exact(pile, &support)
+            pile.maintain_exact(self.succinct, &support)
                 .await
-                .with_context(|| format!("maintain {} fact collection", self.label))?,
+                .with_context(|| format!("maintain {} Succinct collection", self.label))?,
+        );
+        drop(
+            pile.maintain_exact(self.rank9, &support)
+                .await
+                .with_context(|| format!("maintain {} Rank9 collection", self.label))?,
         );
         Ok(support)
     }
 
     fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_exact(self.facts.rank9(), support)
+            .collection_exact(self.rank9, support)
             .with_context(|| format!("observe exact {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
@@ -329,7 +352,7 @@ impl OrientSources {
         .flatten()
         {
             drop(
-                pile.ensure(source.facts.source())
+                pile.ensure(source.source)
                     .await
                     .with_context(|| format!("ensure {} source collection", source.label))?,
             );
@@ -2718,8 +2741,7 @@ fn retained_habit_support_is_admitted(
         return Ok(true);
     };
     let admitted = source
-        .facts
-        .source()
+        .source
         .admitted(snapshot)
         .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
     facts
@@ -3036,14 +3058,11 @@ async fn cmd_wake(
         // after that work, from one later immutable pile snapshot.
         let sources = OrientSources::open(&mut storage, &signer, false).await?;
         let memory_collection =
-            OrientSource::open(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory")
-                .await?
-                .facts;
-        let memory_source = memory_collection.source();
-        let wiki_collection = OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki")
-            .await?
-            .facts;
-        let wiki_source = wiki_collection.source();
+            OrientSource::open(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory").await?;
+        let memory_source = memory_collection.source;
+        let wiki_collection =
+            OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki").await?;
+        let wiki_source = wiki_collection.source;
         let wiki_observed = wiki_model::observed_collection(&mut storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
         sources.ensure(&mut storage).await?;
@@ -3055,16 +3074,28 @@ async fn cmd_wake(
         let memory_support = source_snapshot.collection(memory_source)?.support().clone();
         let wiki_support = source_snapshot.collection(wiki_source)?.support().clone();
         drop(
-            memory_collection
-                .maintain_exact(&mut storage, &memory_support)
+            storage
+                .maintain_exact(memory_collection.succinct, &memory_support)
                 .await
-                .context("maintain Memory collection")?,
+                .context("maintain Memory Succinct collection")?,
         );
         drop(
-            wiki_collection
-                .maintain_exact(&mut storage, &wiki_support)
+            storage
+                .maintain_exact(memory_collection.rank9, &memory_support)
                 .await
-                .context("maintain Wiki collection")?,
+                .context("maintain Memory Rank9 collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact(wiki_collection.succinct, &wiki_support)
+                .await
+                .context("maintain Wiki Succinct collection")?,
+        );
+        drop(
+            storage
+                .maintain_exact(wiki_collection.rank9, &wiki_support)
+                .await
+                .context("maintain Wiki Rank9 collection")?,
         );
         drop(
             storage
@@ -3077,13 +3108,13 @@ async fn cmd_wake(
         drop(source_snapshot);
         let memory_facts = observation
             .snapshot
-            .collection_exact(memory_collection.rank9(), &memory_support)
+            .collection_exact(memory_collection.rank9, &memory_support)
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;
         let wiki_facts = observation
             .snapshot
-            .collection_exact(wiki_collection.rank9(), &wiki_support)
+            .collection_exact(wiki_collection.rank9, &wiki_support)
             .context("observe maintained Wiki collection")?
             .view::<FactArchive>()
             .context("attach maintained Wiki collection")?;
@@ -3336,11 +3367,11 @@ mod tests {
             ..Default::default()
         };
         let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
-        pile.commit(sources.relations.facts.source(), &fixture.signer, person)
+        pile.commit(sources.relations.source, &fixture.signer, person)
             .unwrap();
         let watermark = pile.snapshot_at(Epoch::from_tai_seconds(42.0)).unwrap();
         let expected_support = watermark
-            .collection(sources.messages.facts.source())
+            .collection(sources.messages.source)
             .unwrap()
             .support()
             .clone();
@@ -3349,14 +3380,16 @@ mod tests {
         // maintainer also realizes that newer support before this reader runs.
         // The observation must still attach the exact support selected at its
         // own source watermark, rather than re-selecting from the later target.
-        let message_collection = sources.messages.facts.source();
+        let message_collection = sources.messages.source;
         pile.commit(
             message_collection,
             &fixture.signer,
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        drop(sources.messages.facts.maintain(&mut pile).await.unwrap());
+        drop(pile.ensure(sources.messages.source).await.unwrap());
+        drop(pile.maintain(sources.messages.succinct).await.unwrap());
+        drop(pile.maintain(sources.messages.rank9).await.unwrap());
         let attempt = load_wait_frame(
             &mut pile,
             &sources,
@@ -3529,7 +3562,7 @@ mod tests {
                 },
             )
             .unwrap();
-            pile.commit(sources.relations.facts.source(), &fixture.signer, person)
+            pile.commit(sources.relations.source, &fixture.signer, person)
                 .unwrap();
 
             let mut remote = MemoryRepo::default();
@@ -3550,10 +3583,10 @@ mod tests {
                 None,
             );
             let event = envelope.root().unwrap();
-            pile.commit(sources.messages.facts.source(), &fixture.signer, envelope)
+            pile.commit(sources.messages.source, &fixture.signer, envelope)
                 .unwrap();
             pile.commit(
-                sources.messages.facts.source(),
+                sources.messages.source,
                 &fixture.signer,
                 message::envelope_fragment(
                     sender,
@@ -3574,7 +3607,7 @@ mod tests {
             let handle = Inline::new(body.raw);
             let mut supply = Supply {
                 store: pile,
-                source: sources.messages.facts.source(),
+                source: sources.messages.source,
                 signer: fixture.signer.clone(),
                 handle,
                 bytes,

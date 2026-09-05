@@ -19,7 +19,7 @@ use faculties::collection_names::open_configured;
 use faculties::comb::{self as comb_model, CursorDraft, CursorResolution, CursorState};
 use faculties::schemas::blockdag as archive_schema;
 use faculties::schemas::memory::DEFAULT_COMB_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use hifitime::Epoch;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
@@ -33,7 +33,9 @@ use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
 
 use anybytes::View;
-use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::metadata;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::Handle;
@@ -158,37 +160,42 @@ impl ArchiveStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = pollster::block_on(async {
             let source = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let collection = FactCollection::new(&mut pile, source)
-                .context("register maintained Comb cursor collection")?;
-            let prepared = pile
-                .ensure(collection.source())
+            let policy = source
+                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                .context("read Comb collection policy")?;
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .context("register Succinct Comb cursor collection")?;
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .context("register Rank9 Comb cursor collection")?;
+            drop(
+                pile.ensure(source)
+                    .await
+                    .context("ensure Comb source dependencies")?,
+            );
+            drop(
+                pile.maintain(succinct)
+                    .await
+                    .context("maintain Succinct Comb cursor collection")?,
+            );
+            let after = pile
+                .maintain(rank9)
                 .await
-                .context("ensure Comb source dependencies")?;
-            let support = prepared
-                .collection(collection.source())
-                .context("observe Comb cursor support")?
-                .support()
-                .clone();
-            drop(prepared);
-            let after = collection
-                .maintain_exact(&mut pile, &support)
-                .await
-                .context("maintain Comb cursor collection")?;
+                .context("maintain Rank9 Comb cursor collection")?;
             after
-                .collection_exact(collection.rank9(), &support)
-                .context("attach exact Comb cursor collection")?
+                .collection(rank9)
+                .context("attach Comb cursor collection")?
                 .view::<FactArchive>()
-                .context("read exact Comb cursor collection")
+                .context("read Comb cursor collection")
         });
         finish_pile(pile, result)
     }
 
     /// Attach Archive and its separate Comb cursor collection at one watermark.
     ///
-    /// Both foundational supports come from `before`; both maintained views
-    /// are then attached through Archive's final immutable store snapshot.
-    /// The cursor view therefore cannot come from a later source watermark
-    /// than the Archive view read alongside it.
+    /// Both maintained views are observed through Archive's final immutable
+    /// store snapshot. Later payload reads keep that same boundary.
     fn load_replay(&self) -> Result<ReplayView> {
         let signer = load_signer(self.pile, self.key)?;
         let mut pile = open_pile_strict(self.pile)?;
@@ -198,58 +205,70 @@ impl ArchiveStorage<'_> {
                 archive_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )?;
-            let archive_collections = FactCollection::new(&mut pile, archive_source)
-                .context("register maintained Archive fact collection")?;
+            let archive_policy = archive_source
+                .policy(
+                    &pile
+                        .snapshot()
+                        .context("freeze Archive descriptor snapshot")?,
+                )
+                .context("read Archive collection policy")?;
+            let archive_succinct = pile
+                .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                .context("register Succinct Archive fact collection")?;
+            let archive_rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(archive_succinct, (), archive_policy)
+                .context("register Rank9 Archive fact collection")?;
             let comb_source =
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let comb_collections = FactCollection::new(&mut pile, comb_source)
-                .context("register maintained Comb cursor collection")?;
+            let comb_policy = comb_source
+                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                .context("read Comb collection policy")?;
+            let comb_succinct = pile
+                .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
+                .context("register Succinct Comb cursor collection")?;
+            let comb_rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
+                .context("register Rank9 Comb cursor collection")?;
 
-            // Acquire both root closures before selecting either support.
-            // One later observation supplies the common semantic watermark.
+            // Acquire the roots, maintain each immediate derivation, then
+            // observe both representations through one final snapshot.
             drop(
-                pile.ensure(archive_collections.source())
+                pile.ensure(archive_source)
                     .await
                     .context("ensure Archive source dependencies")?,
             );
             drop(
-                pile.ensure(comb_collections.source())
+                pile.ensure(comb_source)
                     .await
                     .context("ensure Comb cursor dependencies")?,
             );
-            let before = pile
-                .snapshot()
-                .context("freeze Archive replay source snapshot")?;
-            let comb_support = before
-                .collection(comb_collections.source())
-                .context("observe Comb cursor support")?
-                .support()
-                .clone();
-            let archive_support = before
-                .collection(archive_collections.source())
-                .context("observe Archive support")?
-                .support()
-                .clone();
-            drop(before);
-
             drop(
-                comb_collections
-                    .maintain_exact(&mut pile, &comb_support)
+                pile.maintain(comb_succinct)
                     .await
-                    .context("maintain Comb cursor collection")?,
+                    .context("maintain Succinct Comb cursor collection")?,
             );
-            let after = archive_collections
-                .maintain_exact(&mut pile, &archive_support)
+            drop(
+                pile.maintain(comb_rank9)
+                    .await
+                    .context("maintain Rank9 Comb cursor collection")?,
+            );
+            drop(
+                pile.maintain(archive_succinct)
+                    .await
+                    .context("maintain Succinct Archive replay facts")?,
+            );
+            let after = pile
+                .maintain(archive_rank9)
                 .await
-                .context("maintain Archive replay facts")?;
+                .context("maintain Rank9 Archive replay facts")?;
             let archive = after
-                .collection_exact(archive_collections.rank9(), &archive_support)
-                .context("attach exact Archive replay facts")?;
+                .collection(archive_rank9)
+                .context("attach Archive replay facts")?;
             let comb_facts = after
-                .collection_exact(comb_collections.rank9(), &comb_support)
-                .context("attach exact Comb cursor collection")?
+                .collection(comb_rank9)
+                .context("attach Comb cursor collection")?
                 .view::<FactArchive>()
-                .context("read exact Comb cursor collection")?;
+                .context("read Comb cursor collection")?;
             Ok(ReplayView {
                 archive,
                 comb_facts,

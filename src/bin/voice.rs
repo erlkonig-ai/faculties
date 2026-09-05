@@ -69,16 +69,20 @@ use faculties::collection_names::open_configured;
 use faculties::schemas::voice::{
     CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID, KIND_LIVE_RECORD,
 };
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use faculties::voice as voice_model;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 type U256 = Inline<inlineencodings::U256BE>;
@@ -530,12 +534,24 @@ impl VoiceStorage<'_> {
         let result = (|| {
             let collection =
                 open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-            let maintained = FactCollection::new(&mut pile, collection)
-                .context("register maintained Voice fact collection")?;
-            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
-                .context("maintain Voice fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let maintained_succinct =
+                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                maintained_succinct,
+                (),
+                policy,
+            )?;
+            let store_snapshot = pollster::block_on(async {
+                drop(pile.ensure(collection).await?);
+                drop(pile.maintain(maintained_succinct).await?);
+                pile.maintain(maintained_rank9).await
+            })
+            .context("maintain Voice fact collection")?;
             let facts = store_snapshot
-                .collection(maintained.rank9())
+                .collection(maintained_rank9)
                 .context("observe maintained Voice fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Voice fact collection")?;

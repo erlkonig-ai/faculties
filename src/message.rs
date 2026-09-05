@@ -981,9 +981,12 @@ mod tests {
     use crate::schemas::relations::{
         DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID, KIND_GROUP, KIND_PERSON_ID,
     };
-    use crate::storage::{discover_target, open_pile_strict, FactArchive, FactCollection};
+    use crate::storage::{discover_target, open_pile_strict, FactArchive};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
     use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -1530,7 +1533,13 @@ mod tests {
         let team = signer.verifying_key();
         let messages =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let messages = FactCollection::new(&mut pile, messages).unwrap();
+        let policy = messages.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(messages, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
         let (fragment, message_id) = message_fragment(
             sender,
             &Recipient::Person(recipient),
@@ -1541,10 +1550,8 @@ mod tests {
         validate_catalog_union(&reader, &TribleSet::new(), &fragment, &relation_facts).unwrap();
         drop(reader);
 
-        let first = pile
-            .commit(messages.source(), &signer, fragment.clone())
-            .unwrap();
-        let second = pile.commit(messages.source(), &signer, fragment).unwrap();
+        let first = pile.commit(messages, &signer, fragment.clone()).unwrap();
+        let second = pile.commit(messages, &signer, fragment).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             discover_target(&mut pile, DEFAULT_SCOPE_ID, team)
@@ -1553,8 +1560,12 @@ mod tests {
                 .len(),
             1
         );
-        let store_snapshot = pollster::block_on(messages.maintain(&mut pile)).unwrap();
-        let observed = store_snapshot.collection(messages.rank9()).unwrap();
+        let store_snapshot = pollster::block_on(async {
+            drop(pile.ensure(messages).await.unwrap());
+            drop(pile.maintain(succinct).await.unwrap());
+            pile.maintain(rank9).await.unwrap()
+        });
+        let observed = store_snapshot.collection(rank9).unwrap();
         let message_facts = observed.view::<FactArchive>().unwrap();
         assert_eq!(load_message_rows(&message_facts).unwrap()[0].id, message_id);
         drop(message_facts);

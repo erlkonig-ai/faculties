@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Remove `storage::FactCollection`. Consumers register ordinary typed Succinct
+  and Rank9 collections explicitly, retaining the same descriptor policies and
+  identities. Ordinary fact readers advance each mapping with `maintain` and
+  read the resulting snapshot instead of preselecting a foundation-wide support.
+  Exact support remains explicit for paired indexes and retained observations;
+  no schema or pile migration is needed.
+
 - **Foreground Message, Orient, Wiki, Compass, and ordinary Files reads can
   acquire cold blobs.** The shared
   live store reuses `Peer<Pile>` and starts its network host only on a missing

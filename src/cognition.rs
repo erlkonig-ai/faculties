@@ -481,8 +481,11 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 mod tests {
     use std::fs::File;
 
-    use crate::storage::{load_signer, FactCollection};
+    use crate::storage::load_signer;
     use crate::test_support::initialize_open_collection_fixture;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
     use triblespace::core::collection::CollectionSnapshotExt;
 
     use super::*;
@@ -521,10 +524,20 @@ mod tests {
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let collection = FactCollection::new(&mut pile, source).unwrap();
-        let snapshot = pollster::block_on(collection.maintain(&mut pile)).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let snapshot = pollster::block_on(async {
+            drop(pile.ensure(source).await.unwrap());
+            drop(pile.maintain(succinct).await.unwrap());
+            pile.maintain(rank9).await.unwrap()
+        });
         let facts = snapshot
-            .collection(collection.rank9())
+            .collection(rank9)
             .unwrap()
             .view::<FactArchive>()
             .unwrap();

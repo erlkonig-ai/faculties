@@ -15,10 +15,11 @@ use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents, TextHandle};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
-use faculties::storage::{
-    self, load_signer, open_store, runtime, FactArchive, FactCollection, FacultyStore,
-};
+use faculties::storage::{self, load_signer, open_store, runtime, FactArchive, FacultyStore};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -425,67 +426,78 @@ fn main() -> Result<()> {
                 .await?;
             }
         }
-        // Register every descriptor before freezing the one shared source
-        // boundary used by both maintenance operations.
+        // Register the representations, then maintain each edge from its
+        // realized immediate source. Both reads use one final snapshot.
         let relations_source = open_configured(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
             signer.verifying_key(),
         )?;
         let message_source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let relations = FactCollection::new(&mut pile, relations_source)
-            .context("register maintained Relations fact collection")?;
-        let messages = FactCollection::new(&mut pile, message_source)
-            .context("register maintained Message fact collection")?;
+        let descriptors = pile.snapshot().context("freeze Message source policies")?;
+        let relations_policy = relations_source
+            .policy(&descriptors)
+            .context("read Relations source policy")?;
+        let message_policy = message_source
+            .policy(&descriptors)
+            .context("read Message source policy")?;
+        drop(descriptors);
+        let relations_succinct = pile
+            .derive::<SuccinctArchiveBlob>(relations_source, (), relations_policy.clone())
+            .context("register Relations Succinct collection")?;
+        let relations_rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), relations_policy)
+            .context("register Relations Rank9 collection")?;
+        let message_succinct = pile
+            .derive::<SuccinctArchiveBlob>(message_source, (), message_policy.clone())
+            .context("register Message Succinct collection")?;
+        let message_rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
+            .context("register Message Rank9 collection")?;
         drop(
-            pile.ensure(relations.source())
+            pile.ensure(relations_source)
                 .await
                 .context("ensure Relations source collection")?,
         );
         drop(
-            pile.ensure(messages.source())
+            pile.ensure(message_source)
                 .await
                 .context("ensure Message source collection")?,
         );
-        let control = pile
-            .snapshot()
-            .context("freeze shared Message pre-maintenance snapshot")?;
-        let relations_support = relations
-            .source()
-            .admitted(&control)
-            .context("admit Relations support")?;
-        let messages_support = messages
-            .source()
-            .admitted(&control)
-            .context("admit Message support")?;
-        let instant = control.instant();
-        drop(control);
         drop(
-            relations
-                .maintain_exact(&mut pile, &relations_support)
+            pile.maintain(relations_succinct)
                 .await
-                .context("maintain Relations fact collection")?,
+                .context("maintain Relations Succinct collection")?,
         );
         drop(
-            messages
-                .maintain_exact(&mut pile, &messages_support)
+            pile.maintain(relations_rank9)
                 .await
-                .context("maintain Message fact collection")?,
+                .context("maintain Relations Rank9 collection")?,
+        );
+        drop(
+            pile.maintain(message_succinct)
+                .await
+                .context("maintain Message Succinct collection")?,
+        );
+        drop(
+            pile.maintain(message_rank9)
+                .await
+                .context("maintain Message Rank9 collection")?,
         );
 
-        // Both query views retain this exact support. Later selected-text
+        // Both query views retain their selected support. Later selected-text
         // acquisition may add bytes, but never replaces these frozen facts.
         let reader = pile
-            .snapshot_at(instant)
+            .snapshot()
             .context("freeze maintained Message snapshot")?;
         let relation_collection = reader
-            .collection_exact(relations.rank9(), &relations_support)
+            .collection(relations_rank9)
             .context("observe Relations Rank9 projection")?;
         let relation_facts = relation_collection
             .view::<FactArchive>()
             .context("read Relations Rank9 projection")?;
         let message_collection = reader
-            .collection_exact(messages.rank9(), &messages_support)
+            .collection(message_rank9)
             .context("observe Message Rank9 projection")?;
         let message_facts = message_collection
             .view::<FactArchive>()
@@ -493,7 +505,7 @@ fn main() -> Result<()> {
         let mut storage = MessageStorage {
             pile: &mut pile,
             signer: &signer,
-            collection: messages.source(),
+            collection: message_source,
             reader: &reader,
             messages: &message_facts,
             relations: &relation_facts,
@@ -821,9 +833,21 @@ mod tests {
         )
         .unwrap();
         store.pile.commit(source, &signer, fragment).unwrap();
-        let maintained = FactCollection::new(&mut store.pile, source).unwrap();
-        let before = pollster::block_on(maintained.maintain(&mut store.pile)).unwrap();
-        let observed = before.collection(maintained.rank9()).unwrap();
+        let policy = source.policy(&store.pile.snapshot().unwrap()).unwrap();
+        let succinct = store
+            .pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = store
+            .pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let before = pollster::block_on(async {
+            drop(store.pile.ensure(source).await.unwrap());
+            drop(store.pile.maintain(succinct).await.unwrap());
+            store.pile.maintain(rank9).await.unwrap()
+        });
+        let observed = before.collection(rank9).unwrap();
         let facts = observed.view::<FactArchive>().unwrap();
         let original_support = observed.support().clone();
         let successor = relations::profile_fragment(

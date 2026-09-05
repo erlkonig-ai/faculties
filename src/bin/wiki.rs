@@ -12,15 +12,16 @@ use faculties::collection_names::{configured_handle, open_configured, open_exact
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use faculties::schemas::wiki::{self as schema, extract_link_targets};
-use faculties::storage::{
-    load_signer, open_store, read, runtime, FactArchive, FactCollection, FacultyStore,
-};
+use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
     RevisionRecord,
 };
 #[cfg(test)]
 use hifitime::Epoch;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
@@ -269,65 +270,90 @@ impl WikiStorage<'_> {
             runtime.block_on(async {
                 let authority = signer.verifying_key();
                 let wiki_source = open_source(pile, schema::DEFAULT_SCOPE_ID, authority).await?;
-                let wiki_facts = FactCollection::new(pile, wiki_source)
-                    .context("register maintained Wiki fact collection")?;
+                let descriptors = pile
+                    .snapshot()
+                    .context("freeze Wiki source policy snapshot")?;
+                let policy = wiki_source
+                    .policy(&descriptors)
+                    .context("read Wiki source policy")?;
+                drop(descriptors);
+                let wiki_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(wiki_source, (), policy.clone())
+                    .context("register Wiki Succinct collection")?;
+                let wiki_rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_succinct, (), policy)
+                    .context("register Wiki Rank9 collection")?;
                 let observed = wiki_model::observed_collection(pile, authority)?;
                 let mut auxiliaries = Vec::with_capacity(scopes.len());
                 for &(scope, label) in scopes {
                     let source = open_source(pile, scope, authority).await?;
-                    let facts = FactCollection::new(pile, source)
-                        .with_context(|| format!("register maintained {label} fact collection"))?;
-                    auxiliaries.push((source, facts, label));
+                    let descriptors = pile
+                        .snapshot()
+                        .with_context(|| format!("freeze {label} source policy snapshot"))?;
+                    let policy = source
+                        .policy(&descriptors)
+                        .with_context(|| format!("read {label} source policy"))?;
+                    drop(descriptors);
+                    let succinct = pile
+                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                        .with_context(|| format!("register {label} Succinct collection"))?;
+                    let rank9 = pile
+                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                        .with_context(|| format!("register {label} Rank9 collection"))?;
+                    auxiliaries.push((source, succinct, rank9, label));
                 }
                 drop(
                     pile.ensure(wiki_source)
                         .await
                         .context("ensure Wiki source collection")?,
                 );
-                for (source, _, label) in &auxiliaries {
+                for (source, _, _, label) in &auxiliaries {
                     drop(
                         pile.ensure(*source)
                             .await
                             .with_context(|| format!("ensure {label} source collection"))?,
                     );
                 }
-                let shared_control = pile
-                    .snapshot()
-                    .context("freeze Wiki and auxiliary source snapshot")?;
-
-                let wiki_support = wiki_source
-                    .admitted(&shared_control)
-                    .context("admit Wiki source support")?;
-                let mut auxiliary_supports = Vec::with_capacity(auxiliaries.len());
-                for (source, _, label) in &auxiliaries {
-                    auxiliary_supports.push(
-                        source
-                            .admitted(&shared_control)
-                            .with_context(|| format!("admit {label} source support"))?,
+                drop(
+                    pile.maintain(wiki_succinct)
+                        .await
+                        .context("maintain Wiki Succinct collection")?,
+                );
+                drop(
+                    pile.maintain(wiki_rank9)
+                        .await
+                        .context("maintain Wiki Rank9 collection")?,
+                );
+                for (_, succinct, rank9, label) in &auxiliaries {
+                    drop(
+                        pile.maintain(*succinct)
+                            .await
+                            .with_context(|| format!("maintain {label} Succinct collection"))?,
+                    );
+                    drop(
+                        pile.maintain(*rank9)
+                            .await
+                            .with_context(|| format!("maintain {label} Rank9 collection"))?,
                     );
                 }
-                let instant = shared_control.instant();
-                drop(shared_control);
 
-                drop(
-                    wiki_facts
-                        .maintain_exact(pile, &wiki_support)
-                        .await
-                        .context("maintain Wiki fact collection")?,
-                );
+                // The supersession index must describe exactly the Wiki facts
+                // selected here, not every foundational member known upstream.
+                let selected = pile
+                    .snapshot()
+                    .context("freeze realized Wiki fact selection")?;
+                let wiki_support = selected
+                    .collection(wiki_rank9)
+                    .context("select realized Wiki fact support")?
+                    .support()
+                    .clone();
+                let instant = selected.instant();
+                drop(selected);
                 drop(
                     pile.maintain_exact(observed, &wiki_support)
                         .await
                         .context("maintain Wiki supersession index")?,
                 );
-                for ((_, facts, label), support) in auxiliaries.iter().zip(&auxiliary_supports) {
-                    drop(
-                        facts
-                            .maintain_exact(pile, support)
-                            .await
-                            .with_context(|| format!("maintain {label} fact collection"))?,
-                    );
-                }
 
                 // Attach every maintained view from one later snapshot. No
                 // command can accidentally combine Wiki facts from one revision
@@ -336,7 +362,7 @@ impl WikiStorage<'_> {
                     .snapshot_at(instant)
                     .context("freeze maintained Wiki and auxiliary snapshot")?;
                 let facts = reader
-                    .collection_exact(wiki_facts.rank9(), &wiki_support)
+                    .collection_exact(wiki_rank9, &wiki_support)
                     .context("observe Wiki fact collection")?
                     .view::<FactArchive>()
                     .context("read Wiki fact collection")?;
@@ -346,11 +372,10 @@ impl WikiStorage<'_> {
                     .view::<ObservedIndex>()
                     .context("read Wiki supersession index")?;
                 let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
-                for ((_, collection, label), support) in auxiliaries.iter().zip(&auxiliary_supports)
-                {
+                for (_, _, rank9, label) in &auxiliaries {
                     auxiliary_facts.push(
                         reader
-                            .collection_exact(collection.rank9(), support)
+                            .collection(*rank9)
                             .with_context(|| format!("observe {label} fact collection"))?
                             .view::<FactArchive>()
                             .with_context(|| format!("read {label} fact collection"))?,

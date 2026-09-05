@@ -10,12 +10,16 @@ use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::habits::{self, DeclaredState, Habit, State};
 use faculties::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -114,12 +118,21 @@ fn with_habits<T>(
     let mut pile = open_pile_strict(pile_path)?;
     let result = (|| {
         let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let maintained = FactCollection::new(&mut pile, collection)
-            .context("register maintained Habit fact collection")?;
-        let reader = pollster::block_on(maintained.maintain(&mut pile))
-            .context("maintain Habit fact collection")?;
+        let descriptor_snapshot = pile.snapshot()?;
+        let policy = collection.policy(&descriptor_snapshot)?;
+        drop(descriptor_snapshot);
+        let maintained_succinct =
+            pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+        let maintained_rank9 =
+            pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(maintained_succinct, (), policy)?;
+        let reader = pollster::block_on(async {
+            drop(pile.ensure(collection).await?);
+            drop(pile.maintain(maintained_succinct).await?);
+            pile.maintain(maintained_rank9).await
+        })
+        .context("maintain Habit fact collection")?;
         let facts = reader
-            .collection(maintained.rank9())
+            .collection(maintained_rank9)
             .context("observe maintained Habit fact collection")?
             .view::<FactArchive>()
             .context("read maintained Habit fact collection")?;

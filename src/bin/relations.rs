@@ -19,10 +19,14 @@ use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -1121,12 +1125,20 @@ fn main() -> Result<()> {
     let mut pile = open_pile_strict(&cli.pile)?;
     let result = (|| {
         let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let facts = FactCollection::new(&mut pile, collection)
-            .context("register maintained Relations fact collection")?;
-        let reader = pollster::block_on(facts.maintain(&mut pile))
-            .context("maintain Relations fact collection")?;
+        let descriptor_snapshot = pile.snapshot()?;
+        let policy = collection.policy(&descriptor_snapshot)?;
+        drop(descriptor_snapshot);
+        let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+        let facts_rank9 =
+            pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
+        let reader = pollster::block_on(async {
+            drop(pile.ensure(collection).await?);
+            drop(pile.maintain(facts_succinct).await?);
+            pile.maintain(facts_rank9).await
+        })
+        .context("maintain Relations fact collection")?;
         let observed = reader
-            .collection(facts.rank9())
+            .collection(facts_rank9)
             .context("observe Relations Rank9 projection")?;
         let view = observed
             .view::<FactArchive>()
@@ -1134,7 +1146,7 @@ fn main() -> Result<()> {
         let mut storage = RelationsStorage {
             pile: &mut pile,
             signer: &signer,
-            collection: facts.source(),
+            collection,
             facts: &view,
             reader: &reader,
         };
@@ -1273,7 +1285,15 @@ mod tests {
         let mut store = open_pile_strict(&pile).unwrap();
         let collection =
             open_configured(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let facts = FactCollection::new(&mut store, collection).unwrap();
+        let descriptor_snapshot = store.snapshot().unwrap();
+        let policy = collection.policy(&descriptor_snapshot).unwrap();
+        drop(descriptor_snapshot);
+        let facts_succinct = store
+            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+            .unwrap();
+        let facts_rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)
+            .unwrap();
 
         let person = genid().id;
         let (fragment, initial, _) = relations::person_fragment(person, profile("Ada")).unwrap();
@@ -1284,8 +1304,13 @@ mod tests {
         store.commit(collection, &signer, left).unwrap();
         store.commit(collection, &signer, right).unwrap();
 
-        let reader = pollster::block_on(facts.maintain(&mut store)).unwrap();
-        let observed = reader.collection(facts.rank9()).unwrap();
+        let reader = pollster::block_on(async {
+            drop(store.ensure(collection).await?);
+            drop(store.maintain(facts_succinct).await?);
+            store.maintain(facts_rank9).await
+        })
+        .unwrap();
+        let observed = reader.collection(facts_rank9).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
         match relations::profile_head(&view, person).unwrap() {
             Head::Forked(heads) => assert_eq!(heads.len(), 2),

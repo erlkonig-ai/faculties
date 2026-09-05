@@ -1,6 +1,6 @@
 //! Durable signing identity and native-collection plumbing shared by every faculty.
 //!
-//! Four concerns that every faculty needs before it can read or write
+//! Three concerns that every faculty needs before it can read or write
 //! anything, and that none of them should re-implement:
 //!
 //! - **Signing identity.** [`signer_path`], [`load_signer`], and [`initialize_signer`]
@@ -11,9 +11,6 @@
 //!   [`open_pile_strict`] is the local-only boundary used by migrations and
 //!   not-yet-ported callers. Both report a malformed suffix as evidence through
 //!   [`pile_read_error`] rather than silently truncating it.
-//! - **Read models.** [`FactCollection`] names the canonical maintained
-//!   SimpleArchive → Succinct → Rank9 descriptor chain without hiding either
-//!   maintenance writes or immutable snapshot attachment.
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.
@@ -29,9 +26,7 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-};
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
@@ -40,7 +35,6 @@ use triblespace::core::collection::{
 use triblespace::core::id::Id;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::Store;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StoreRead,
     StoreSnapshot,
@@ -199,113 +193,6 @@ where
     .context("open configured Secrets source collection for READ")?;
     crate::secrets::storage::SecretsCollection::from_source(store, source)
         .context("register maintained Secrets collection descriptors")
-}
-
-/// The three typed lattice coordinates of one maintained Faculty fact collection.
-///
-/// This value owns no facts and performs no reads. It is only the canonical
-/// descriptor chain from authored [`SimpleArchive`] commits, through portable
-/// Succinct archives, to Rank9-accelerated Succinct archives. Keeping those
-/// handles together prevents every Faculty from growing its own lifecycle
-/// facade while leaving the actual write/read boundary explicit:
-/// [`Self::maintain`] may append derivations, and callers subsequently use
-/// [`CollectionSnapshotExt::collection`] on one immutable store snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FactCollection {
-    source: Collection<SimpleArchive>,
-    succinct: Collection<SuccinctArchiveBlob>,
-    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-}
-
-impl FactCollection {
-    /// Register the two canonical derived descriptors above an existing root.
-    ///
-    /// Descriptor registration is content-addressed and idempotent. Both
-    /// derived collections inherit the root's immutable admission policy; this
-    /// function does not maintain either target or materialize any facts.
-    pub fn new<S>(store: &mut S, source: Collection<SimpleArchive>) -> Result<Self>
-    where
-        S: CollectionStoreExt + SnapshotSource,
-        S::Snapshot: BlobStoreGet,
-    {
-        let snapshot = store
-            .snapshot()
-            .context("freeze fact collection descriptor snapshot")?;
-        let policy = source
-            .policy(&snapshot)
-            .context("read fact collection policy")?;
-        drop(snapshot);
-        let succinct = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .context("register Succinct fact collection")?;
-        let rank9 = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .context("register Rank9 fact collection")?;
-        Ok(Self {
-            source,
-            succinct,
-            rank9,
-        })
-    }
-
-    /// Authored foundational collection.
-    pub const fn source(self) -> Collection<SimpleArchive> {
-        self.source
-    }
-
-    /// Portable Succinct collection derived directly from [`Self::source`].
-    pub const fn succinct(self) -> Collection<SuccinctArchiveBlob> {
-        self.succinct
-    }
-
-    /// Rank9-accelerated Succinct collection used by normal readers.
-    pub const fn rank9(self) -> Collection<Rank9AcceleratedSuccinctArchiveBlob> {
-        self.rank9
-    }
-
-    /// Ensure the root and maintain both derivation hops for its admitted support.
-    ///
-    /// Root acquisition finishes before one snapshot selects support. That
-    /// exact support crosses both mapping edges; later records and proofs
-    /// cannot widen it, and a downstream edge never constructs its source.
-    /// For a batch with one common observation, ensure every root first, take
-    /// one snapshot, select all supports, and call [`Self::maintain_exact`].
-    pub async fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
-    where
-        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
-    {
-        let ready = store
-            .ensure(self.source)
-            .await
-            .context("ensure fact collection source")?;
-        let support = self
-            .source
-            .admitted(&ready)
-            .context("admit ensured fact collection support")?;
-        drop(ready);
-        self.maintain_exact(store, &support).await
-    }
-
-    /// Maintain both derivation hops for one explicit foundational support.
-    ///
-    /// This is useful when several physical views must be pinned to the same
-    /// denotational support. It performs no admission or source observation of
-    /// its own.
-    pub async fn maintain_exact<S>(self, store: &mut S, support: &Support) -> Result<S::Snapshot>
-    where
-        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
-    {
-        drop(
-            store
-                .maintain_exact(self.succinct, support)
-                .await
-                .context("maintain Succinct fact collection")?,
-        );
-        store
-            .maintain_exact(self.rank9, support)
-            .await
-            .context("maintain Rank9 fact collection")
-    }
 }
 
 /// Canonical records currently known for one scoped target collection.
@@ -787,7 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn fact_collection_maintains_a_shard_preserving_rank9_view() {
+    fn explicit_derivation_chain_maintains_a_shard_preserving_rank9_view() {
+        use triblespace::core::blob::encodings::succinctarchive::{
+            Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+        };
+
         let signer = SigningKey::from_bytes(&[7; 32]);
         let mut store = MemoryRepo::default();
         let source = crate::collection_names::open(
@@ -796,7 +687,13 @@ mod tests {
             signer.verifying_key(),
         )
         .unwrap();
-        let maintained = FactCollection::new(&mut store, source).unwrap();
+        let policy = source.policy(&store.snapshot().unwrap()).unwrap();
+        let succinct = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
         let fragment = entity! {
             metadata::tag: &id(9),
             metadata::name: "maintained facts",
@@ -804,8 +701,12 @@ mod tests {
         let expected = fragment.facts().clone();
         store.commit(source, &signer, fragment).unwrap();
 
-        let after = pollster::block_on(maintained.maintain(&mut store)).unwrap();
-        let observed = after.collection(maintained.rank9()).unwrap();
+        let after = pollster::block_on(async {
+            drop(store.ensure(source).await.unwrap());
+            drop(store.maintain(succinct).await.unwrap());
+            store.maintain(rank9).await.unwrap()
+        });
+        let observed = after.collection(rank9).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
         let actual: TribleSet = view.iter().collect();
 

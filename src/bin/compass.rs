@@ -6,9 +6,7 @@ use faculties::schemas::compass::{
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use faculties::storage::{
-    self, load_signer, open_store, runtime, FactArchive, FactCollection, FacultyStore,
-};
+use faculties::storage::{self, load_signer, open_store, runtime, FactArchive, FacultyStore};
 use faculties::{clock, compass, relations};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,6 +14,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -280,12 +281,23 @@ impl CompassStorage<'_> {
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            // Register every descriptor before fixing the one shared source
-            // boundary used by this action.
+            // Register every representation before maintenance, then freeze
+            // one query snapshot for this action.
             let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
-            let compass_facts = FactCollection::new(pile, compass_source)
-                .context("register maintained Compass fact collection")?;
-            let relation_facts = if persona.is_some() {
+            let descriptors = pile
+                .snapshot()
+                .context("freeze Compass source policy snapshot")?;
+            let compass_policy = compass_source
+                .policy(&descriptors)
+                .context("read Compass source policy")?;
+            drop(descriptors);
+            let compass_succinct = pile
+                .derive::<SuccinctArchiveBlob>(compass_source, (), compass_policy.clone())
+                .context("register Compass Succinct collection")?;
+            let compass_rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(compass_succinct, (), compass_policy)
+                .context("register Compass Rank9 collection")?;
+            let relation_collections = if persona.is_some() {
                 if let Some(handle) = configured_handle(RELATIONS_SCOPE_ID)? {
                     let reader = pile
                         .snapshot()
@@ -295,79 +307,75 @@ impl CompassStorage<'_> {
                     }))?;
                 }
                 let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-                Some(
-                    FactCollection::new(pile, source)
-                        .context("register maintained Relations fact collection")?,
-                )
+                let descriptors = pile
+                    .snapshot()
+                    .context("freeze Relations source policy snapshot")?;
+                let policy = source
+                    .policy(&descriptors)
+                    .context("read Relations source policy")?;
+                drop(descriptors);
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .context("register Relations Succinct collection")?;
+                let rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .context("register Relations Rank9 collection")?;
+                Some((source, succinct, rank9))
             } else {
                 None
             };
 
-            let (compass_support, relation_support, instant) = runtime.block_on(async {
+            runtime.block_on(async {
                 drop(
-                    pile.ensure(compass_facts.source())
+                    pile.ensure(compass_source)
                         .await
                         .context("ensure Compass source collection")?,
                 );
-                if let Some(relation_facts) = relation_facts {
+                if let Some((source, _, _)) = relation_collections {
                     drop(
-                        pile.ensure(relation_facts.source())
+                        pile.ensure(source)
                             .await
                             .context("ensure Relations source collection for Compass persona")?,
                     );
                 }
-                let before = pile
-                    .snapshot()
-                    .context("freeze shared Compass/Relations source snapshot")?;
-                let compass_support = compass_facts
-                    .source()
-                    .admitted(&before)
-                    .context("admit Compass support")?;
-                let relation_support = match relation_facts {
-                    Some(relation_facts) => Some(
-                        relation_facts
-                            .source()
-                            .admitted(&before)
-                            .context("admit Relations support for Compass persona")?,
-                    ),
-                    None => None,
-                };
-                let instant = before.instant();
-                drop(before);
                 drop(
-                    compass_facts
-                        .maintain_exact(pile, &compass_support)
+                    pile.maintain(compass_succinct)
                         .await
-                        .context("maintain Compass fact collection")?,
+                        .context("maintain Compass Succinct collection")?,
                 );
-                if let (Some(relation_facts), Some(relation_support)) =
-                    (relation_facts, relation_support.as_ref())
-                {
+                drop(
+                    pile.maintain(compass_rank9)
+                        .await
+                        .context("maintain Compass Rank9 collection")?,
+                );
+                if let Some((_, succinct, rank9)) = relation_collections {
                     drop(
-                        relation_facts
-                            .maintain_exact(pile, relation_support)
+                        pile.maintain(succinct).await.context(
+                            "maintain Relations Succinct collection for Compass persona",
+                        )?,
+                    );
+                    drop(
+                        pile.maintain(rank9)
                             .await
-                            .context("maintain Relations fact collection for Compass persona")?,
+                            .context("maintain Relations Rank9 collection for Compass persona")?,
                     );
                 }
-                Ok::<_, anyhow::Error>((compass_support, relation_support, instant))
+                Ok::<_, anyhow::Error>(())
             })?;
             // Attach every view through one immutable post-maintenance store
             // boundary, so validation and persona resolution cannot mix
             // collection watermarks.
             let reader = pile
-                .snapshot_at(instant)
+                .snapshot()
                 .context("freeze maintained Compass/Relations snapshot")?;
             let facts = reader
-                .collection_exact(compass_facts.rank9(), &compass_support)
+                .collection(compass_rank9)
                 .context("observe Compass fact collection")?
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
-            let by = if let (Some(persona), Some(relation_facts), Some(relation_support)) =
-                (persona, relation_facts, relation_support.as_ref())
-            {
+            let by = if let (Some(persona), Some((_, _, rank9))) = (persona, relation_collections) {
                 let relations = reader
-                    .collection_exact(relation_facts.rank9(), relation_support)
+                    .collection(rank9)
                     .context("observe Relations fact collection for Compass persona")?
                     .view::<FactArchive>()
                     .context("read Relations fact collection for Compass persona")?;

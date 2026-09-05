@@ -38,14 +38,18 @@ use faculties::discord as discord_model;
 use faculties::files as file_capability;
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{discord, DEFAULT_SCOPE_ID};
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::{
     records::CollectionHandle, Collection, CollectionCommit, CollectionSnapshotExt,
     CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
@@ -135,7 +139,8 @@ struct CollectionView {
 struct DiscordSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
-    maintained: FactCollection,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     signer: SigningKey,
     facts: FactArchive,
     reader: PileSnapshot,
@@ -155,11 +160,15 @@ impl DiscordSession<'_> {
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
-        self.reader = pollster::block_on(self.maintained.maintain(self.pile))
-            .context("maintain Discord fact collection after commit")?;
+        self.reader = pollster::block_on(async {
+            drop(self.pile.ensure(self.collection).await?);
+            drop(self.pile.maintain(self.succinct).await?);
+            self.pile.maintain(self.rank9).await
+        })
+        .context("maintain Discord fact collection after commit")?;
         self.facts = self
             .reader
-            .collection(self.maintained.rank9())
+            .collection(self.rank9)
             .context("observe maintained Discord fact collection after commit")?
             .view::<FactArchive>()
             .context("read maintained Discord fact collection after commit")?;
@@ -211,19 +220,32 @@ impl DiscordStorage<'_> {
         let mut pile = open_pile_strict(self.pile)?;
         let result = (|| {
             let collection = self.open_collection(&mut pile, signer.verifying_key())?;
-            let maintained = FactCollection::new(&mut pile, collection)
-                .context("register maintained Discord fact collection")?;
-            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
-                .context("maintain Discord fact collection")?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = collection.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let maintained_succinct =
+                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                maintained_succinct,
+                (),
+                policy,
+            )?;
+            let store_snapshot = pollster::block_on(async {
+                drop(pile.ensure(collection).await?);
+                drop(pile.maintain(maintained_succinct).await?);
+                pile.maintain(maintained_rank9).await
+            })
+            .context("maintain Discord fact collection")?;
             let facts = store_snapshot
-                .collection(maintained.rank9())
+                .collection(maintained_rank9)
                 .context("observe maintained Discord fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Discord fact collection")?;
             operation(&mut DiscordSession {
                 pile: &mut pile,
                 collection,
-                maintained,
+                succinct: maintained_succinct,
+                rank9: maintained_rank9,
                 signer,
                 facts,
                 reader: store_snapshot,

@@ -8,9 +8,9 @@
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
 //! not participate in this boundary. The interactive viewer loads all sources;
 //! focused capture binaries request only their source dependency
-//! closure. Loading ensures each root before one common snapshot selects the
-//! exact admitted supports carried through deterministic derived views;
-//! those unsigned artifacts are cache exhaust, not
+//! closure. Loading ensures roots and maintains each immediate derivation.
+//! One common fact snapshot then selects realized supports to pair with
+//! matching indexes; those unsigned artifacts are cache exhaust, not
 //! authoritative writes. Most sources are
 //! fixed descriptor-handle collections. Secrets uses the same explicit
 //! collection configuration and is attached only when the pile signer is
@@ -20,10 +20,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{
-    CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
+    Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
@@ -48,9 +51,7 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{
-    load_signer, open_pile_strict, open_secrets_collection_read, FactArchive, FactCollection,
-};
+use crate::storage::{load_signer, open_pile_strict, open_secrets_collection_read, FactArchive};
 
 /// Stable logical input requested by a widget.
 ///
@@ -633,7 +634,8 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = async {
-        let mut by_scope = BTreeMap::<Id, (FactCollection, Support)>::new();
+        let mut by_scope =
+            BTreeMap::<Id, (Collection<Rank9AcceleratedSuccinctArchiveBlob>, Support)>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
         let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
 
@@ -641,9 +643,20 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
         for (scope, label) in collection_scopes(sources) {
             let source = open_configured(&mut pile, scope, signer.verifying_key())
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
-            let collection = FactCollection::new(&mut pile, source)
-                .map_err(|error| format!("register maintained {label} collection: {error:#}"))?;
-            collections.push((scope, label, collection));
+            let descriptor_snapshot = pile
+                .snapshot()
+                .map_err(|error| format!("freeze {label} descriptor snapshot: {error}"))?;
+            let policy = source
+                .policy(&descriptor_snapshot)
+                .map_err(|error| format!("read {label} collection policy: {error:#}"))?;
+            drop(descriptor_snapshot);
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .map_err(|error| format!("register Succinct {label} collection: {error:#}"))?;
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .map_err(|error| format!("register Rank9 {label} collection: {error:#}"))?;
+            collections.push((scope, label, source, succinct, rank9));
         }
 
         let compass_register = sources
@@ -669,9 +682,9 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             })
             .transpose()?;
 
-        for (_, label, collection) in &collections {
+        for (_, label, source, _, _) in &collections {
             drop(
-                pile.ensure(collection.source())
+                pile.ensure(*source)
                     .await
                     .map_err(|error| format!("ensure {label} source collection: {error:#}"))?,
             );
@@ -684,18 +697,11 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             );
         }
 
-        // Root acquisition is finished. All ordinary, indexed, and Secrets
-        // views select support from one immutable records/proofs/time boundary.
+        // Keep the Secrets credential path pinned to its existing explicit
+        // support boundary after root acquisition.
         let before = pile
             .snapshot()
             .map_err(|error| format!("freeze shared viewer support snapshot: {error}"))?;
-        for (scope, label, collection) in collections {
-            let support = collection
-                .source()
-                .admitted(&before)
-                .map_err(|error| format!("admit {label} collection support: {error:#}"))?;
-            by_scope.insert(scope, (collection, support));
-        }
         let secrets_support = secrets_collection
             .map(|collection| {
                 collection
@@ -707,19 +713,32 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             .transpose()?;
         drop(before);
 
-        for (scope, (collection, support)) in &by_scope {
-            let label = COLLECTION_SOURCE_CATALOG
-                .iter()
-                .find(|source| source.scope == *scope)
-                .expect("every maintained viewer scope has a source label")
-                .label;
+        for (_, label, _, succinct, rank9) in &collections {
             drop(
-                collection
-                    .maintain_exact(&mut pile, support)
+                pile.maintain(*succinct).await.map_err(|error| {
+                    format!("maintain Succinct {label} fact archive: {error:#}")
+                })?,
+            );
+            drop(
+                pile.maintain(*rank9)
                     .await
-                    .map_err(|error| format!("maintain {label} fact archive: {error:#}"))?,
+                    .map_err(|error| format!("maintain Rank9 {label} fact archive: {error:#}"))?,
             );
         }
+
+        // Index requests come from the fact representations actually visible
+        // together now, not from an earlier foundational frontier. Retain
+        // these supports when later index/credential work changes residency.
+        let fact_snapshot = pile
+            .snapshot()
+            .map_err(|error| format!("freeze realized viewer fact snapshot: {error}"))?;
+        for (scope, label, _, _, rank9) in collections {
+            let observed = fact_snapshot
+                .collection(rank9)
+                .map_err(|error| format!("observe maintained {label} collection: {error}"))?;
+            by_scope.insert(scope, (rank9, observed.support().clone()));
+        }
+        drop(fact_snapshot);
 
         if let (Some(target), Some((_, support))) =
             (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
@@ -796,14 +815,14 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
         }
 
         let mut facts_by_scope = BTreeMap::new();
-        for (scope, (collection, support)) in &by_scope {
+        for (scope, (rank9, support)) in &by_scope {
             let label = COLLECTION_SOURCE_CATALOG
                 .iter()
                 .find(|source| source.scope == *scope)
                 .expect("every maintained viewer scope has a source label")
                 .label;
             let facts = store_snapshot
-                .collection_exact(collection.rank9(), support)
+                .collection_exact(*rank9, support)
                 .map_err(|error| format!("attach maintained {label} collection: {error}"))?
                 .view::<FactArchive>()
                 .map_err(|error| format!("read maintained {label} collection: {error}"))?;
@@ -814,7 +833,7 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             .iter()
             .filter(|source| sources.contains(&source.key))
             .map(|source| {
-                let (collection, support) = by_scope
+                let (_, support) = by_scope
                     .get(&source.scope)
                     .expect("every fixed viewer scope was maintained");
                 let facts = facts_by_scope
@@ -828,7 +847,7 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
                 (
                     source.key,
                     LoadedDataset::new(
-                        collection.source().handle(),
+                        support.collection().handle(),
                         facts.clone(),
                         support,
                         store_snapshot.clone(),
@@ -1113,12 +1132,10 @@ mod tests {
         let observed = dataset
             .observed_order(metadata::supersedes.id())
             .expect("Wiki dataset carries its maintained observation order");
-        let indexed =
-            crate::wiki::validate_catalog_with_order(dataset.reader, dataset.facts, observed)
-                .unwrap();
-        let jit = crate::wiki::validate_catalog(dataset.reader, dataset.facts).unwrap();
-        assert_eq!(indexed, jit);
-        assert_eq!(indexed.revisions.all_entries()[0].frontier[0].id, successor);
+        let entries = crate::wiki::entries(dataset.facts, observed);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].frontier.len(), 1);
+        assert_eq!(entries[0].frontier[0].id, successor);
 
         let mut pile = open_pile_strict(&path).unwrap();
         let collection =

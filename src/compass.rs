@@ -27,7 +27,10 @@ use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
-use crate::storage::{FactArchive, FactCollection};
+use crate::storage::FactArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -1066,24 +1069,27 @@ where
     S: Store<Snapshot = PileSnapshot> + AsyncBlobStoreAcquire + Send,
 {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let facts =
-        FactCollection::new(pile, source).context("register maintained Compass fact collection")?;
+    let policy = source.policy(&pile.snapshot()?)?;
+    let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let status_target = status_register_for_source(pile, source)?;
-    let source_snapshot = pile
-        .ensure(source)
-        .await
-        .context("ensure Compass source collection")?;
-    let support = source
-        .admitted(&source_snapshot)
-        .context("admit ensured Compass source support")?;
-    let instant = source_snapshot.instant();
-    drop(source_snapshot);
     drop(
-        facts
-            .maintain_exact(pile, &support)
+        pile.ensure(source)
             .await
-            .context("maintain Compass fact collection")?,
+            .context("ensure Compass source collection")?,
     );
+    drop(
+        pile.maintain(succinct)
+            .await
+            .context("maintain Compass Succinct collection")?,
+    );
+    let ready = pile
+        .maintain(rank9)
+        .await
+        .context("maintain Compass fact collection")?;
+    let support = ready.collection(rank9)?.support().clone();
+    let instant = ready.instant();
+    drop(ready);
     drop(
         pile.maintain_exact(status_target, &support)
             .await
@@ -1091,9 +1097,9 @@ where
     );
     let store_snapshot = pile
         .snapshot_at(instant)
-        .context("freeze maintained Compass snapshot at its source instant")?;
+        .context("freeze indexed Compass snapshot at its fact observation instant")?;
     let fact_archive = store_snapshot
-        .collection_exact(facts.rank9(), &support)
+        .collection_exact(rank9, &support)
         .context("observe Compass fact collection")?
         .view::<FactArchive>()
         .context("read Compass fact collection")?;
