@@ -7,9 +7,18 @@
 //!
 //! Historical native chunks may carry `metadata::supersedes` because those
 //! edges participated in their content-derived identities. They have no
-//! ordering or visibility semantics, and new chunks never emit them. Entity
-//! ids remain opaque: old random ids and newer intrinsic ids are ordinary,
-//! additive members of the same journal.
+//! ordering or visibility semantics, and new chunks never emit them at
+//! creation. Entity ids remain opaque: old random ids and newer intrinsic
+//! ids are ordinary, additive members of the same journal.
+//!
+//! One edge is written on purpose, after the fact: `memory respan <id>
+//! <from>..<to>` writes the SAME memory over corrected time coordinates -- a
+//! new chunk with the identical text, superseding the old one. The cover lets
+//! the old chunk stand aside from its temporal structure only when the text
+//! is identical, so the one thing this can change is where a memory sits in
+//! time, never what it says (JP, 2026-09-05: allow superseding, but limit the
+//! interface to time-range adjustments; a journal is not a mutable fact
+//! store). Both chunks remain members of the journal and answer by id.
 
 use std::collections::BTreeSet;
 
@@ -113,6 +122,13 @@ fn annotate_chunk(
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::anchor: alias };
     }
     fragment
+}
+
+/// The edge a respan writes: `newer` is the same memory as `older`, over
+/// corrected time coordinates. The cover honours it only when the two texts
+/// are identical (see [`crate::memory_cover::collect_chunk_spans`]).
+pub fn respan_edge(newer: Id, older: Id) -> Fragment {
+    entity! { ExclusiveId::force_ref(&newer) @ metadata::supersedes: older }
 }
 
 pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
@@ -350,6 +366,51 @@ mod tests {
         )
         .collect();
         assert_eq!(predecessors, BTreeSet::from([base]));
+    }
+
+    /// A respan -- the same text over corrected coordinates -- takes the old
+    /// chunk's place in the cover's structure; a different text that claims to
+    /// supersede changes nothing, because that is not a time-range adjustment.
+    #[test]
+    fn a_respan_stands_in_for_the_old_coordinates_and_nothing_else_does() {
+        let (old_fragment, old) = chunk_fragment(draft("the same words")).unwrap();
+        let mut moved = draft("the same words");
+        moved.start_at = point(5.0);
+        moved.end_at = point(25.0);
+        let (moved_fragment, moved) = chunk_fragment(moved).unwrap();
+
+        let (kept_fragment, kept) = chunk_fragment(draft("a second memory")).unwrap();
+        let mut rewrite = draft("different words over a wider span");
+        rewrite.start_at = point(0.0);
+        rewrite.end_at = point(30.0);
+        let (rewrite_fragment, rewrite) = chunk_fragment(rewrite).unwrap();
+
+        let facts = facts([
+            old_fragment,
+            moved_fragment,
+            kept_fragment,
+            rewrite_fragment,
+            respan_edge(moved, old),
+            respan_edge(rewrite, kept),
+        ]);
+        let shown: BTreeSet<Id> = crate::memory_cover::collect_chunk_spans(&facts)
+            .into_iter()
+            .map(|(_, _, id)| id)
+            .collect();
+        assert!(shown.contains(&moved), "the respan stands");
+        assert!(!shown.contains(&old), "the old coordinates stand aside");
+        assert!(shown.contains(&kept), "a different text supersedes nothing");
+        assert!(shown.contains(&rewrite));
+        let all: BTreeSet<Id> = find!(
+            id: Id,
+            pattern!(&facts, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])
+        )
+        .collect();
+        assert_eq!(
+            all,
+            BTreeSet::from([old, moved, kept, rewrite]),
+            "all remain members"
+        );
     }
 
     #[test]

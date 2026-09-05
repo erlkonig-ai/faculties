@@ -61,6 +61,7 @@ use triblespace::prelude::*;
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
+             memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
@@ -807,6 +808,9 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "create") {
         return cmd_create(storage, &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "respan") {
+        return cmd_respan(storage, &cli.ids[1..]);
+    }
     if cli.ids.first().is_some_and(|value| value == "image") {
         return cmd_image(storage, &cli.ids[1..]);
     }
@@ -984,6 +988,81 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     )?;
     println!("range: {}", format_time_range(range.0, range.1));
     println!("id: {chunk_id:x}");
+    Ok(())
+}
+
+/// `memory respan <id> <from>..<to>` -- the same memory over corrected time
+/// coordinates. A new chunk with the identical text, lens, references and
+/// provenance is written over the new range and supersedes the old one; the
+/// cover then shows the new coordinates and the old chunk stands aside, still
+/// a member of the journal and readable by id. The text cannot change here:
+/// that would be a new memory, and a journal is not a mutable fact store.
+fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    if args.len() != 2 || args.iter().any(|a| a == "--help" || a == "-h") {
+        bail!(
+            "usage: memory respan <id> <from>..<to>\n\
+             \n\
+             Write the same memory over corrected time coordinates: a new\n\
+             chunk with the identical text supersedes <id>, the cover shows\n\
+             the new range, and the old chunk stands aside but stays in the\n\
+             journal, readable by id. Only the coordinates move; to say\n\
+             something different, write another memory."
+        );
+    }
+    let loaded = storage.load()?;
+    let old = resolve_chunk_id(&loaded, &args[0])?;
+    let range = parse_time_range(&args[1])?;
+    let space = &loaded.memory.facts;
+    let reader = &loaded.memory.reader;
+    if let (Some(s), Some(e)) = (chunk_start_at(space, old), chunk_end_at(space, old)) {
+        if (epoch_from_interval(s), epoch_end_from_interval(e)) == range {
+            bail!(
+                "memory {old:x} already spans {}",
+                format_time_range(range.0, range.1)
+            );
+        }
+    }
+    let Some(summary_handle) = chunk_summary_handle(space, old) else {
+        bail!(
+            "memory {old:x} has no text summary; respanning an image memory is not supported yet"
+        );
+    };
+    let summary: View<str> = reader
+        .get(summary_handle)
+        .context("read the memory's text")?;
+    let lens = match chunk_lens_handle(space, old) {
+        Some(handle) => {
+            let lens: View<str> = reader.get(handle).context("read the memory's lens")?;
+            Some(lens.as_ref().to_owned())
+        }
+        None => None,
+    };
+    let now = clock::now()?;
+    let (mut fragment, moved) = memory_model::chunk_fragment(memory_model::ChunkDraft {
+        content: memory_model::ChunkDraftContent::Text(summary.as_ref().to_owned()),
+        start_at: clock::point(range.0)?,
+        end_at: clock::point(range.1)?,
+        lens,
+        references: chunk_references(space, old).into_iter().collect(),
+        about_exec_result: chunk_about_exec_result(space, old),
+        about_archive_message: chunk_about_archive_message(space, old),
+        observed_at: BTreeSet::from([clock::point(now)?]),
+        aliases: BTreeSet::new(),
+    })?;
+    if moved == old {
+        bail!(
+            "memory {old:x} already spans {}",
+            format_time_range(range.0, range.1)
+        );
+    }
+    fragment += memory_model::respan_edge(moved, old);
+    storage.publish_memory(fragment)?;
+    println!("range: {}", format_time_range(range.0, range.1));
+    println!("id: {moved:x}");
+    println!(
+        "  the same memory as {old:x} ({}), which stands aside",
+        chunk_span_str(space, old)
+    );
     Ok(())
 }
 
@@ -2359,7 +2438,7 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         find!(o: Id, pattern!(space, [{ chunk_id @ metadata::supersedes: ?o }])).collect();
     if !edges_out.is_empty() {
         println!(
-            "historical_supersedes: {}",
+            "supersedes: {} (a respan when the text is identical)",
             edges_out
                 .iter()
                 .map(|id| span_of(*id))
@@ -2374,7 +2453,7 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     .collect();
     if !edges_in.is_empty() {
         println!(
-            "historical_superseded_by: {}",
+            "superseded_by: {} (a respan when the text is identical)",
             edges_in
                 .iter()
                 .map(|id| span_of(*id))

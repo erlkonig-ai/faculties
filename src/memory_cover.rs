@@ -224,6 +224,34 @@ pub fn collect_chunk_spans<P: TriblePattern>(space: &P) -> Vec<(i128, i128, Id)>
     .collect();
     spans.sort_unstable();
     spans.dedup();
+
+    // A respan -- `memory respan` -- is the same memory over corrected time
+    // coordinates: a chunk with the IDENTICAL text that supersedes the old
+    // one. The old coordinates stand aside from the temporal structure; the
+    // old chunk stays in the journal and answers by id. Any other supersedes
+    // edge (a different text, the old comb's history) means nothing here: the
+    // one thing an edge may move is where a memory sits in time.
+    let content_of = |id: Id| -> Option<[u8; 32]> {
+        chunk_summary_handle(space, id)
+            .map(|h| h.raw)
+            .or_else(|| chunk_image_handle(space, id).map(|h| h.raw))
+    };
+    let respanned: BTreeSet<Id> = find!(
+        (newer: Id, older: Id),
+        pattern!(space, [{
+            ?newer @ metadata::tag: &KIND_CHUNK_ID,
+            metadata::supersedes: ?older,
+        }])
+    )
+    .filter(|(newer, older)| {
+        let newer = content_of(*newer);
+        newer.is_some() && newer == content_of(*older)
+    })
+    .map(|(_, older)| older)
+    .collect();
+    if !respanned.is_empty() {
+        spans.retain(|(_, _, id)| !respanned.contains(id));
+    }
     spans
 }
 
