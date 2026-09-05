@@ -2,8 +2,8 @@
 //!
 //! Archive authorship has one durable Ed25519 signer and one fixed canonical
 //! SimpleArchive-union descriptor. Imports stage independently derivable source
-//! fragments which contribute new evidence, validate the candidate block DAG,
-//! and cross exactly one signed COMMIT visibility edge. Reads snapshot that same collection;
+//! fragments which contribute new evidence and cross exactly one signed COMMIT
+//! visibility edge per publication. Reads snapshot that same collection;
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
@@ -31,7 +31,7 @@ use triblespace::prelude::*;
 use triblespace_search::portable_bm25::PortableBM25Blob;
 
 use crate::archive_bm25;
-use crate::blockdag::{self, CatalogValidation};
+use crate::blockdag;
 use crate::schemas::blockdag as schema;
 use crate::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 
@@ -47,7 +47,10 @@ use triblespace::core::repo::BlobStoreMeta;
 
 type RawHandle = Inline<Handle<RawBytes>>;
 
-/// One atomic canonical Archive import.
+/// Stage Archive fragments for commit-last publication.
+///
+/// Supplied facts remain open-world relations, including opaque ids and further
+/// annotations. Publication does not require a closed-world catalog decode.
 pub struct ArchiveImportWriter {
     pile: Pile,
     collection: Collection<SimpleArchive>,
@@ -119,8 +122,8 @@ impl ArchiveImportWriter {
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
         // keeping payload bytes out of the long-lived logical delta. They
-        // remain semantically unreachable until the signed COMMIT written by
-        // `finish` names the facts which reference them.
+        // remain semantically unreachable until a signed COMMIT names the
+        // facts which reference them.
         let embedded = embedded_blobs(blobs);
         stage_embedded_blobs(&mut self.pile, embedded)?;
 
@@ -153,14 +156,6 @@ impl ArchiveImportWriter {
         if self.delta.facts().is_empty() {
             return Ok(None);
         }
-        let reader = self
-            .pile
-            .snapshot()
-            .context("open staged Archive dependency reader")?;
-        let candidate = candidate_archive(&self.current, &self.delta);
-        let validation = blockdag::validate_succinct_catalog(&reader, &candidate)
-            .context("validate staged Archive union")?;
-        require_accepted(validation, "staged Archive union")?;
         let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
         let published = fragment.facts().clone();
         let commit = self
@@ -189,17 +184,6 @@ impl ArchiveImportWriter {
             if self.delta.facts().is_empty() {
                 return Ok((value, None));
             }
-            // `PileSnapshot` snapshots are immutable. Open this view only after
-            // every staged blob append so import validation sees those
-            // dependencies without retaining them in the Fragment overlay.
-            let reader = self
-                .pile
-                .snapshot()
-                .context("open staged Archive dependency reader")?;
-            let candidate = candidate_archive(&self.current, &self.delta);
-            let validation = blockdag::validate_succinct_catalog(&reader, &candidate)
-                .context("validate staged Archive union")?;
-            require_accepted(validation, "staged Archive union")?;
             let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
             let commit = self
                 .pile
@@ -215,7 +199,7 @@ impl ArchiveImportWriter {
     }
 }
 
-/// Write one validated streaming payload batch into content-addressed storage.
+/// Write one constructed streaming payload batch into content-addressed storage.
 ///
 /// A failed put abandons only this batch. Replaying the fragment repeats the
 /// same idempotent content-addressed writes; the later signed collection commit
@@ -258,15 +242,6 @@ fn fact_archive_contains(facts: &FactArchive, fact: &Trible) -> bool {
     ))
 }
 
-/// Shallow candidate view for the explicit Archive import boundary.
-///
-/// The already-maintained durable facts keep their mmap-backed shards. Only
-/// facts published or staged by this writer become one transient Succinct
-/// shard, so validation never rebuilds the historical six-PATCH `TribleSet`.
-fn candidate_archive(current: &FactArchive, delta: &Fragment) -> FactArchive {
-    extend_archive(current, delta.facts())
-}
-
 fn extend_archive(current: &FactArchive, additions: &TribleSet) -> FactArchive {
     if additions.is_empty() {
         return current.clone();
@@ -274,23 +249,6 @@ fn extend_archive(current: &FactArchive, additions: &TribleSet) -> FactArchive {
     current.with_segments([
         triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(additions),
     ])
-}
-
-fn require_accepted(validation: CatalogValidation, label: &str) -> Result<()> {
-    match validation {
-        CatalogValidation::Accepted => Ok(()),
-        CatalogValidation::Pending { missing } => bail!(
-            "{label} is missing {} attachment blob(s): {}",
-            missing.len(),
-            missing
-                .iter()
-                .take(8)
-                .map(hex::encode_upper)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        CatalogValidation::Rejected(reason) => bail!("{label} is invalid: {reason}"),
-    }
 }
 
 fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result<T> {
@@ -935,28 +893,24 @@ mod tests {
     }
 
     #[test]
-    fn rejected_staged_union_closes_without_publishing_a_collection_commit() {
+    fn source_failure_closes_without_publishing_a_collection_commit() {
         let directory = TempDir::new().unwrap();
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile, &key);
 
-        let invalid_id = Id::new([0x42; 16]).unwrap();
-        let mut invalid = entity! { ExclusiveId::force_ref(&invalid_id) @
-            metadata::tag: &schema::source_projection::KIND,
-        };
-        let embedded = invalid.put::<RawBytes, _>(b"unreachable after rejection".to_vec());
-        let embedded: Inline<Handle<UnknownBlob>> = embedded.transmute();
+        let fragment = projection("session:aborted", "unreachable after source failure");
+        let embedded = first_embedded_handle(&fragment);
 
         let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
-        writer.stage_fragment(invalid).unwrap();
-        let error = writer.finish(Ok(())).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("staged Archive union is invalid"));
+        writer.stage_fragment(fragment).unwrap();
+        let error = writer
+            .finish::<()>(Err(anyhow!("source projection failed")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "source projection failed");
 
-        // `finish` closed the writer even on validation failure. Reopening is
+        // `finish` closed the writer even on source failure. Reopening is
         // sound, no semantic edge escaped, and the dependency is merely an
         // unreachable content-addressed record available for later GC.
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
@@ -973,6 +927,88 @@ mod tests {
         let _: Blob<UnknownBlob> = reader.get(embedded).unwrap();
         drop(reader);
         physical.close().unwrap();
+    }
+
+    #[test]
+    fn writer_publishes_opaque_annotations_and_multiple_bodies_idempotently() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile, &key);
+
+        let fact = fucid();
+        let annotation_kind = fucid();
+        let fragment = entity! { &fact @
+            metadata::tag*: [&schema::content_fact::KIND, &annotation_kind.id],
+            metadata::name*: ["first annotation", "second annotation"],
+            schema::content_fact::modality: &schema::content_fact::modality::TEXT,
+            schema::content_fact::direction: &schema::content_fact::direction::IN,
+            schema::content_fact::payload*: ["first body", "second body"],
+        };
+        let annotation = entity! { &fact @
+            metadata::name: "later annotation",
+        };
+
+        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        writer.stage_fragment(fragment.clone()).unwrap();
+        assert!(writer.commit_unit().unwrap().is_some());
+        writer.stage_fragment(fragment.clone()).unwrap();
+        assert_eq!(writer.delta_len(), 0);
+        assert!(writer.commit_unit().unwrap().is_none());
+        writer.stage_fragment(annotation.clone()).unwrap();
+        assert!(writer.finish(Ok(())).unwrap().1.is_some());
+
+        let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert_eq!(snapshot.support().len(), 2);
+        let facts = snapshot.view::<FactArchive>().unwrap();
+        let tags: BTreeSet<_> = find!(
+            tag: Id,
+            pattern!(&facts, [{ fact.id @ metadata::tag: ?tag }])
+        )
+        .collect();
+        assert_eq!(
+            tags,
+            BTreeSet::from([schema::content_fact::KIND, annotation_kind.id])
+        );
+        let names: BTreeSet<_> = find!(
+            name: Inline<Handle<UTF8String>>,
+            pattern!(&facts, [{ fact.id @ metadata::name: ?name }])
+        )
+        .map(|handle| {
+            let name: View<str> = snapshot.snapshot().get(handle).unwrap();
+            name.to_string()
+        })
+        .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "first annotation".to_owned(),
+                "second annotation".to_owned(),
+                "later annotation".to_owned(),
+            ])
+        );
+        let bodies: BTreeSet<_> = find!(
+            payload: Inline<Handle<UTF8String>>,
+            pattern!(&facts, [{ fact.id @ schema::content_fact::payload: ?payload }])
+        )
+        .map(|handle| {
+            let body: View<str> = snapshot.snapshot().get(handle).unwrap();
+            body.to_string()
+        })
+        .collect();
+        assert_eq!(
+            bodies,
+            BTreeSet::from(["first body".to_owned(), "second body".to_owned()])
+        );
+        drop(facts);
+        drop(snapshot);
+
+        let mut retry = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        retry.stage_fragment(fragment).unwrap();
+        retry.stage_fragment(annotation).unwrap();
+        assert_eq!(retry.delta_len(), 0);
+        assert!(retry.finish(Ok(())).unwrap().1.is_none());
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
