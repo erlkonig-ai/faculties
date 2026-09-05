@@ -648,10 +648,13 @@ pub fn select_field(spans: &[(i128, i128, Id)], k: Option<f64>) -> Vec<usize> {
 }
 
 /// A cut that fits: the finest step whose cover costs no more than the
-/// budget, walking the ladder from the coarsest cut upward and stopping at
-/// the first step that overflows. `fits` is false only when even the coarsest
-/// cut overflows, in which case `cover` is that coarsest cut and `used` its
-/// cost, so the caller can name the shortfall.
+/// budget. The ladder is walked from the finest step downward and the first
+/// step that fits wins, because cost is not monotone in fineness: between
+/// two steps a wide memory may still pay in full for the old half of its span
+/// while narrow memories already pay for the new half, so a cut can overflow
+/// at a middle step and fit again at a finer one. `fits` is false only when
+/// even the coarsest cut overflows, in which case `cover` is that coarsest
+/// cut and `used` its cost, so the caller can name the shortfall.
 pub struct FieldCut {
     pub step: Option<i32>,
     pub cover: Vec<usize>,
@@ -681,26 +684,24 @@ pub fn fit_field(
             fits: false,
         });
     }
-    let mut best = FieldCut {
+    for step in FINENESS_STEPS.rev() {
+        let cover = select_field(spans, Some(fineness(step)));
+        let used = total(&cover, cost)?;
+        if used <= budget {
+            return Ok(FieldCut {
+                step: Some(step),
+                cover,
+                used,
+                fits: true,
+            });
+        }
+    }
+    Ok(FieldCut {
         step: None,
         cover: coarsest,
         used: floor,
         fits: true,
-    };
-    for step in FINENESS_STEPS {
-        let cover = select_field(spans, Some(fineness(step)));
-        let used = total(&cover, cost)?;
-        if used > budget {
-            break;
-        }
-        best = FieldCut {
-            step: Some(step),
-            cover,
-            used,
-            fits: true,
-        };
-    }
-    Ok(best)
+    })
 }
 
 /// Collapse memories which are interchangeable to the temporal cover into one
@@ -1382,9 +1383,9 @@ mod headroom_tests {
         assert_eq!(impossible.used, 100);
     }
 
-    /// A finer step never costs less than a coarser one on this shape, so
-    /// walking the ladder from coarse to fine and stopping at the first
-    /// overflow finds the finest cut that fits.
+    /// On this shape a finer step never shows fewer memories than a coarser
+    /// one. That is not true in general -- see `fit_finds_a_fit_past_a_bump`
+    /// -- which is why `fit_field` walks the ladder from the fine end.
     #[test]
     fn steps_are_cut_at_the_ladder() {
         let id = ids(11);
@@ -1398,5 +1399,34 @@ mod headroom_tests {
             assert!(n >= last, "step {step}: {n} < {last}");
             last = n;
         }
+    }
+
+    /// Cost is not monotone in fineness: with a root over two halves, the
+    /// middle steps show the root (still paying for the old half) beside the
+    /// new half, which costs more than either the root alone or both halves.
+    /// The fit must not stop at that bump.
+    #[test]
+    fn fit_finds_a_fit_past_a_bump() {
+        let id = ids(3);
+        let spans = vec![
+            (0, day(2), id[0]),
+            (0, day(1), id[1]),
+            (day(1), day(2), id[2]),
+        ];
+        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 4 } else { 3 }) };
+        let bump = select_field(&spans, Some(fineness(-4)));
+        assert_eq!(
+            bump,
+            vec![0, 2],
+            "the middle step shows the root beside the new half"
+        );
+        let cut = fit_field(&spans, &mut cost, 6).unwrap();
+        assert!(cut.fits);
+        assert_eq!(cut.cover, vec![1, 2]);
+        assert_eq!(cut.used, 6);
+        let coarse = fit_field(&spans, &mut cost, 5).unwrap();
+        assert!(coarse.fits);
+        assert_eq!(coarse.cover, vec![0]);
+        assert_eq!(coarse.step, None);
     }
 }

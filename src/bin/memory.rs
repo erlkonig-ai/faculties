@@ -3634,7 +3634,7 @@ mod tests {
     /// quantizing what is left makes the pool a constant between steps, and the
     /// same 30-write sequence then re-cut nothing on 27 of them.
     #[test]
-    fn a_write_at_the_recent_edge_keeps_the_leading_cover_chunks() {
+    fn a_write_at_the_recent_edge_only_coarsens_the_past() {
         let pile = TestPile::new();
         let storage = pile.storage();
         let at =
@@ -3671,18 +3671,49 @@ mod tests {
         );
 
         // Writes past the apex's end, so each is a new top-level chunk: exactly
-        // the shape of journalling into a day that has no arc over it yet.
+        // the shape of journalling into a day that has no arc over it yet. Time
+        // is the latest end of any memory, so a write at the edge is time
+        // passing. The field promises one thing about the past across it:
+        // coarseness is monotone in age -- wherever an hour of an old day is
+        // shown, every newer hour is shown too. The cut may move by whole steps
+        // of the ladder as the ages shift, in either direction, never by less.
+        let ranges = |cover: &str| -> Vec<(Epoch, Epoch)> {
+            rendered_ranges(cover)
+                .into_iter()
+                .map(|line| {
+                    let (a, b) = line.split_once("..").expect("a rendered range");
+                    (
+                        parse_tai_timestamp(a.trim()).unwrap(),
+                        parse_tai_timestamp(b.trim()).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let hours: Vec<(Epoch, Epoch)> = (1..=5u8)
+            .flat_map(|d| [1u8, 9, 17].map(move |h| (at(d, h), at(d, h + 1))))
+            .collect();
+        let monotone = |cover: &str| {
+            let shown = ranges(cover);
+            for (i, hour) in hours.iter().enumerate() {
+                if shown.contains(hour) {
+                    for newer in &hours[i + 1..] {
+                        assert!(
+                            shown.contains(newer),
+                            "an older hour is shown while a newer one is coarse:\n{cover}"
+                        );
+                    }
+                }
+            }
+        };
+        monotone(&before);
         for h in [8u8, 10, 12] {
             write(format!("new{h} ").repeat(4), (at(6, h), at(6, h + 1)));
             let after = cover_now();
             assert!(
-                after.starts_with(&before),
-                "a write at the recent edge re-cut the leading chunks\nBEFORE:\n{before}\nAFTER:\n{after}"
-            );
-            assert!(
                 after.contains(&format!("new{h} ")),
                 "the new memory must appear"
             );
+            monotone(&after);
         }
     }
 
@@ -3813,11 +3844,13 @@ mod tests {
                 .expect("render cover")
         };
 
-        // 160 admits the root split but neither next split. The plain cover
-        // deterministically selects the least-id account; context substitutes
-        // the other, relevant account at that exact same position.
-        let plain = render(160, None);
-        let contextual = render(160, Some(query));
+        // At 400 the finest cut that fits shows the equal-span position beside
+        // the two newest days (70 + 126 + 140 = 336); the next finer cut adds a
+        // day on the old side and overflows. The plain cover deterministically
+        // selects the least-id account; context substitutes the other, relevant
+        // account at that exact same position.
+        let plain = render(400, None);
+        let contextual = render(400, Some(query));
         assert!(plain.contains(plain_summary.trim_end()));
         assert!(!plain.contains(contextual_summary.trim_end()));
         assert!(contextual.contains(contextual_summary.trim_end()));
