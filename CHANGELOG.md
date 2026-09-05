@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Wiki frontiers now join the maintained positive `LatestIndex` relation;
+  Compass and Orient status queries likewise join known LWW winners. Facts
+  ahead of a derived relation cannot expose unseen current states. Ordinary
+  Wiki, Compass, and widget readers maintain facts and indexes independently,
+  while explicit migration and Orient watermark requests retain exact support.
+  Widget cache identities include each relation's support so index-only progress
+  refreshes projections. The latest descriptor uses the new core `(H, D)`
+  encoding; old observed-only artifacts are not reinterpreted.
+
 - Remove `storage::FactCollection`. Consumers register ordinary typed Succinct
   and Rank9 collections explicitly, retaining the same descriptor policies and
   identities. Ordinary fact readers advance each mapping with `maintain` and

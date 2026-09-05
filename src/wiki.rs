@@ -14,7 +14,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
-use triblespace::core::collection::observed_union::{ObservedIndex, ObservedSetBlob};
+use triblespace::core::collection::latest::{LatestBlob, LatestIndex};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
@@ -182,12 +182,12 @@ pub struct WikiCatalog {
     pub author_keys: BTreeMap<Id, PublicKeyValue>,
 }
 
-/// One coherent, shard-preserving Wiki query snapshot and its exact maintained
-/// observation order.
+/// One coherent, shard-preserving Wiki query snapshot and its maintained
+/// positive latest-state relation.
 pub struct WikiQuerySnapshot {
     facts: FactArchive,
     store_snapshot: PileSnapshot,
-    observed: ObservedIndex,
+    latest: LatestIndex,
 }
 
 impl WikiQuerySnapshot {
@@ -201,14 +201,14 @@ impl WikiQuerySnapshot {
         &self.store_snapshot
     }
 
-    /// Maintained observation order attached for this snapshot's source cover.
-    pub fn observed(&self) -> &ObservedIndex {
-        &self.observed
+    /// Known latest states attached from the same immutable store observation.
+    pub fn latest(&self) -> &LatestIndex {
+        &self.latest
     }
 
     /// Consume the coherent snapshot into its query substrate and indexes.
-    pub fn into_parts(self) -> (FactArchive, PileSnapshot, ObservedIndex) {
-        (self.facts, self.store_snapshot, self.observed)
+    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LatestIndex) {
+        (self.facts, self.store_snapshot, self.latest)
     }
 }
 
@@ -217,7 +217,7 @@ impl WikiQuerySnapshot {
 pub struct WikiSnapshot {
     facts: TribleSet,
     store_snapshot: PileSnapshot,
-    observed: ObservedIndex,
+    latest: LatestIndex,
     catalog: WikiCatalog,
 }
 
@@ -230,30 +230,30 @@ impl WikiSnapshot {
         &self.store_snapshot
     }
 
-    pub fn observed(&self) -> &ObservedIndex {
-        &self.observed
+    pub fn latest(&self) -> &LatestIndex {
+        &self.latest
     }
 
     pub fn catalog(&self) -> &WikiCatalog {
         &self.catalog
     }
 
-    pub fn into_parts(self) -> (TribleSet, PileSnapshot, ObservedIndex, WikiCatalog) {
-        (self.facts, self.store_snapshot, self.observed, self.catalog)
+    pub fn into_parts(self) -> (TribleSet, PileSnapshot, LatestIndex, WikiCatalog) {
+        (self.facts, self.store_snapshot, self.latest, self.catalog)
     }
 }
 
-/// Exact maintained dominated-set projection used for Wiki frontiers.
-pub fn observed_collection<S>(
+/// Maintained positive latest-state projection used for Wiki frontiers.
+pub fn latest_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
-) -> Result<Collection<ObservedSetBlob>>
+) -> Result<Collection<LatestBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    let target = store.derive::<ObservedSetBlob>(
+    let target = store.derive::<LatestBlob>(
         source,
         metadata::supersedes.id(),
         crate::collection_names::private_policy(authority),
@@ -490,11 +490,7 @@ fn adjacent_revisions<P: TriblePattern>(space: &P, revision: Id) -> BTreeSet<Id>
 /// The connected revision entry containing `seed`, projected at the point of
 /// use. Only the supersession relation is traversed; no whole-Wiki catalog is
 /// constructed.
-pub fn entry<P, O>(space: &P, order: &O, seed: Id) -> Option<EntryRecord>
-where
-    P: TriblePattern,
-    O: RegisterOrder + ?Sized,
-{
+pub fn entry<P: TriblePattern>(space: &P, latest: &LatestIndex, seed: Id) -> Option<EntryRecord> {
     if revision_records(space, seed).is_empty() {
         return None;
     }
@@ -512,13 +508,16 @@ where
         .copied()
         .filter(|id| id_values(space, *id, &metadata::supersedes).is_disjoint(&members))
         .collect();
-    let frontier = resolve(order, members.iter().copied())
-        .into_iter()
-        .flat_map(|id| revision_records(space, id))
-        .collect();
+    let members: Vec<Id> = members.into_iter().collect();
+    let frontier =
+        find!(id: Id, and!(latest.has(id), SortedSlice::new_unchecked(&members).has(id)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .flat_map(|id| revision_records(space, id))
+            .collect();
     Some(EntryRecord {
         roots,
-        members: members.into_iter().collect(),
+        members,
         frontier,
     })
 }
@@ -526,15 +525,11 @@ where
 /// Every connected Wiki entry, discovered from typed revision rows and
 /// projected independently. This is intended only for commands whose answer
 /// genuinely ranges over the whole Wiki (list, search, audits, export).
-pub fn entries<P, O>(space: &P, order: &O) -> Vec<EntryRecord>
-where
-    P: TriblePattern,
-    O: RegisterOrder + ?Sized,
-{
+pub fn entries<P: TriblePattern>(space: &P, latest: &LatestIndex) -> Vec<EntryRecord> {
     let mut remaining = revision_ids(space);
     let mut entries = Vec::new();
     while let Some(seed) = remaining.pop_first() {
-        if let Some(entry) = entry(space, order, seed) {
+        if let Some(entry) = entry(space, latest, seed) {
             for member in &entry.members {
                 remaining.remove(member);
             }
@@ -1145,17 +1140,12 @@ pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 /// a tag named `cover` is returned. Concurrent untagged heads likewise do not
 /// erase a tagged head. Callers therefore see the authored revision DAG's
 /// actual frontier rather than a timestamp-selected legacy approximation.
-pub fn cover_fragments<P, O>(
+pub fn cover_fragments<P: TriblePattern>(
     reader: &PileSnapshot,
     facts: &P,
-    order: &O,
-) -> Result<Vec<(String, String)>>
-where
-    P: TriblePattern,
-    O: RegisterOrder + ?Sized,
-{
-    let frontier: Vec<RevisionRecord> = resolve(order, revision_ids(facts))
-        .into_iter()
+    latest: &LatestIndex,
+) -> Result<Vec<(String, String)>> {
+    let frontier: Vec<RevisionRecord> = find!(revision: Id, latest.has(revision))
         .flat_map(|revision| revision_records(facts, revision))
         .collect();
     let candidate_tags: BTreeSet<Id> = frontier
@@ -1301,12 +1291,12 @@ pub struct FrontierModel {
 }
 
 impl FrontierModel {
-    pub fn load<P, O>(reader: &PileSnapshot, facts: &P, order: &O) -> Result<Self>
-    where
-        P: TriblePattern,
-        O: RegisterOrder + ?Sized,
-    {
-        let records = entries(facts, order);
+    pub fn load<P: TriblePattern>(
+        reader: &PileSnapshot,
+        facts: &P,
+        latest: &LatestIndex,
+    ) -> Result<Self> {
+        let records = entries(facts, latest);
         let mut entries = Vec::with_capacity(records.len());
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
 
@@ -1614,12 +1604,12 @@ pub fn materialize_collection(
     Ok((facts, store_snapshot))
 }
 
-/// Capture one durable Wiki snapshot with shard-preserving facts and its exact
+/// Capture one durable Wiki snapshot with shard-preserving facts and its
 /// maintained supersession index.
 ///
-/// Ordinary maintenance advances both fact derivation hops. The realized fact
-/// snapshot then chooses the support for the supersession projection, and both
-/// are attached through one later immutable snapshot. Normal
+/// Ordinary maintenance advances the fact derivation hops and latest relation
+/// independently, then attaches them through one immutable snapshot. Positive
+/// latest membership never admits states unseen by a lagging index. Normal
 /// reads therefore never flatten the collection or validate a closed-world
 /// catalog before asking their actual query.
 pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
@@ -1627,7 +1617,7 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     let policy = collection.policy(&pile.snapshot()?)?;
     let succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-    let target = observed_collection(pile, signer.verifying_key())?;
+    let target = latest_collection(pile, signer.verifying_key())?;
     drop(
         pile.ensure(collection)
             .await
@@ -1638,33 +1628,29 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
             .await
             .context("maintain Wiki Succinct collection")?,
     );
-    let ready = pile
-        .maintain(rank9)
-        .await
-        .context("maintain Wiki fact collection")?;
-    let support = ready.collection(rank9)?.support().clone();
-    let instant = ready.instant();
-    drop(ready);
     drop(
-        pile.maintain_exact(target, &support)
+        pile.maintain(rank9)
             .await
-            .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?,
+            .context("maintain Wiki fact collection")?,
     );
-    let store_snapshot = pile.snapshot_at(instant)?;
+    let store_snapshot = pile
+        .maintain(target)
+        .await
+        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let facts = store_snapshot
-        .collection_exact(rank9, &support)
+        .collection(rank9)
         .context("observe Wiki fact collection")?
         .view::<FactArchive>()
         .context("read Wiki fact collection")?;
-    let observed = store_snapshot
-        .collection_exact(target, &support)
+    let latest = store_snapshot
+        .collection(target)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .view::<ObservedIndex>()
+        .view::<LatestIndex>()
         .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
     Ok(WikiQuerySnapshot {
         facts,
         store_snapshot,
-        observed,
+        latest,
     })
 }
 
@@ -1682,21 +1668,23 @@ pub async fn materialize_indexed_collection(
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
-    let target = observed_collection(pile, signer.verifying_key())?;
+    let target = latest_collection(pile, signer.verifying_key())?;
     let maintained = pile
         .maintain_exact(target, &cover)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
-    let observed = maintained
+    let latest = maintained
         .collection_exact(target, &cover)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .view::<ObservedIndex>()
+        .view::<LatestIndex>()
         .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
-    let catalog = validate_catalog_with_order(&store_snapshot, &facts, &observed)?;
+    // This explicit migration/import projection retains the complete-facts
+    // reference oracle; ordinary readers join the positive index directly.
+    let catalog = validate_catalog(&store_snapshot, &facts)?;
     Ok(WikiSnapshot {
         facts,
         store_snapshot,
-        observed,
+        latest,
         catalog,
     })
 }
@@ -1747,14 +1735,14 @@ mod tests {
         }
     }
 
-    fn observed_index(facts: &TribleSet) -> ObservedIndex {
+    fn latest_index(facts: &TribleSet) -> LatestIndex {
         let archive = facts.clone().to_blob();
-        let observed = triblespace::core::collection::observed_union::derive_element(
+        let observed = triblespace::core::collection::latest::derive_element(
             &archive,
             metadata::supersedes.id(),
         )
         .unwrap();
-        ObservedIndex::decode(&observed).unwrap()
+        LatestIndex::decode(&observed).unwrap()
     }
 
     #[test]
@@ -1818,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn maintained_order_matches_jit_across_fork_and_merge() {
+    fn maintained_latest_matches_jit_across_fork_and_merge() {
         let signer = SigningKey::from_bytes(&[31; 32]);
         let (author_fragment, author) = author_record(&signer.verifying_key());
         let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
@@ -1828,26 +1816,158 @@ mod tests {
             revision_record(draft(author, "merge", [left, right])).unwrap();
 
         let mut fork = author_fragment + root_fragment + left_fragment + right_fragment;
-        let fork_index = observed_index(fork.facts());
+        let fork_index = latest_index(fork.facts());
         assert_eq!(
-            load_catalog_with_order(fork.facts(), &fork_index).unwrap(),
-            load_catalog(fork.facts()).unwrap()
+            entries(fork.facts(), &fork_index),
+            load_catalog(fork.facts()).unwrap().revisions.all_entries()
         );
         assert_eq!(
-            resolve(&fork_index, [root, left, right]),
+            find!(id: Id, and!(fork_index.has(id),
+                pattern!(fork.facts(), [{ ?id @ metadata::tag: &KIND_REVISION }]))
+            )
+            .collect::<BTreeSet<_>>(),
             BTreeSet::from([left, right])
         );
 
         fork += merge_fragment;
-        let merge_index = observed_index(fork.facts());
+        let merge_index = latest_index(fork.facts());
         assert_eq!(
-            load_catalog_with_order(fork.facts(), &merge_index).unwrap(),
-            load_catalog(fork.facts()).unwrap()
+            entries(fork.facts(), &merge_index),
+            load_catalog(fork.facts()).unwrap().revisions.all_entries()
         );
         assert_eq!(
-            resolve(&merge_index, [root, left, right, merge]),
+            find!(id: Id, and!(merge_index.has(id),
+                pattern!(fork.facts(), [{ ?id @ metadata::tag: &KIND_REVISION }]))
+            )
+            .collect::<BTreeSet<_>>(),
             BTreeSet::from([merge])
         );
+    }
+
+    #[test]
+    fn facts_ahead_of_latest_stay_unseen_until_maintenance() {
+        pollster::block_on(async {
+            let signer = SigningKey::from_bytes(&[34; 32]);
+            let (author_fragment, author) = author_record(&signer.verifying_key());
+            let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+            let (next_fragment, next) = revision_record(draft(author, "next", [root])).unwrap();
+            let (new_fragment, new) = revision_record(draft(author, "new entry", [])).unwrap();
+            let mut store = MemoryRepo::default();
+            let source = store
+                .collection(
+                    "latest-lag",
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            let target = store
+                .derive::<LatestBlob>(
+                    source,
+                    metadata::supersedes.id(),
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            store
+                .commit(source, &signer, author_fragment + root_fragment)
+                .unwrap();
+            let ready = store.maintain(target).await.unwrap();
+            let lagging = ready
+                .collection(target)
+                .unwrap()
+                .view::<LatestIndex>()
+                .unwrap();
+            store
+                .commit(source, &signer, next_fragment + new_fragment)
+                .unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let facts = snapshot
+                .collection(source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            let current = snapshot.collection(target).unwrap();
+            assert_ne!(
+                current.support(),
+                snapshot.collection(source).unwrap().support()
+            );
+            let current = current.view::<LatestIndex>().unwrap();
+            assert_eq!(
+                entry(&facts, &current, root)
+                    .unwrap()
+                    .frontier
+                    .iter()
+                    .map(|r| r.id)
+                    .collect::<Vec<_>>(),
+                vec![root],
+            );
+            assert!(entry(&facts, &current, new).unwrap().frontier.is_empty());
+            assert!(!exists!(
+                (state),
+                and!(current.has(state), state.is(next.to_inline()))
+            ));
+
+            let ready = store.maintain(target).await.unwrap();
+            let advanced = ready
+                .collection(target)
+                .unwrap()
+                .view::<LatestIndex>()
+                .unwrap();
+            assert_eq!(
+                entry(&facts, &advanced, root)
+                    .unwrap()
+                    .frontier
+                    .iter()
+                    .map(|r| r.id)
+                    .collect::<Vec<_>>(),
+                vec![next],
+            );
+            assert_eq!(entry(&facts, &advanced, new).unwrap().frontier[0].id, new);
+            assert_eq!(
+                entry(&facts, &lagging, root).unwrap().frontier[0].id,
+                root,
+                "maintenance must not mutate a frozen latest view"
+            );
+        });
+    }
+
+    #[test]
+    fn latest_projection_converges_when_successors_arrive_before_ancestors() {
+        use triblespace::core::collection::latest::{derive_element, empty, join};
+
+        let author = genid().id;
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+        let (middle_fragment, middle) = revision_record(draft(author, "middle", [root])).unwrap();
+        let (tip_fragment, tip) = revision_record(draft(author, "tip", [middle])).unwrap();
+        let (fork_fragment, fork) = revision_record(draft(author, "fork", [root])).unwrap();
+        let fragments = [root_fragment, middle_fragment, tip_fragment, fork_fragment];
+        let mut complete = TribleSet::new();
+        for fragment in &fragments {
+            complete += fragment.facts().clone();
+        }
+        let expected =
+            derive_element(&complete.clone().to_blob(), metadata::supersedes.id()).unwrap();
+
+        for arrival in [[2, 1, 3, 0], [0, 1, 2, 3], [3, 0, 2, 1]] {
+            let mut joined = empty();
+            for position in arrival {
+                let delta = derive_element(
+                    &fragments[position].facts().clone().to_blob(),
+                    metadata::supersedes.id(),
+                )
+                .unwrap();
+                joined = join(&joined, &delta).unwrap();
+            }
+            assert_eq!(joined.bytes.as_ref(), expected.bytes.as_ref());
+            let latest = LatestIndex::decode(&joined).unwrap();
+            assert_eq!(
+                entry(&complete, &latest, root)
+                    .unwrap()
+                    .frontier
+                    .iter()
+                    .map(|r| r.id)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([tip, fork]),
+            );
+        }
     }
 
     #[test]
@@ -1903,7 +2023,10 @@ mod tests {
         let store_snapshot = pile.snapshot_at(instant).unwrap();
         let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
-        assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
+        assert!(exists!(
+            (id),
+            and!(snapshot.latest().has(id), id.is(root.to_inline()))
+        ));
 
         pile.close().unwrap();
     }
@@ -1938,7 +2061,7 @@ mod tests {
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let order = latest_index(&facts);
         assert_eq!(
             cover_fragments(&reader, &facts, &order).unwrap(),
             vec![
@@ -2307,7 +2430,7 @@ mod tests {
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let order = latest_index(&facts);
         let model = FrontierModel::load(&reader, &facts, &order).unwrap();
 
         let index_of = |target: Id| match model.resolve(target) {
@@ -2393,7 +2516,7 @@ mod tests {
         )
         .unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let order = latest_index(&facts);
         let model = FrontierModel::load(&reader, &facts, &order).unwrap();
         let audit = model.audit();
         assert_eq!(audit.live, 1, "the citation resolves");
@@ -2441,7 +2564,7 @@ mod tests {
         // Exactly what `wiki links` and `wiki check` do, and nothing else.
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
-        let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+        let order = latest_index(&facts);
         let model = FrontierModel::load(&reader, &facts, &order).unwrap();
         let audit = model.audit();
         let _ = model.unreferenced(&audit);

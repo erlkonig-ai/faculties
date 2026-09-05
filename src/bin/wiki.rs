@@ -22,7 +22,7 @@ use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::observed_union::ObservedIndex;
+use triblespace::core::collection::latest::LatestIndex;
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -231,7 +231,7 @@ struct WikiStorage<'a> {
 struct WikiView {
     facts: FactArchive,
     reader: PileSnapshot,
-    observed: ObservedIndex,
+    latest: LatestIndex,
 }
 
 impl WikiStorage<'_> {
@@ -283,7 +283,7 @@ impl WikiStorage<'_> {
                 let wiki_rank9 = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_succinct, (), policy)
                     .context("register Wiki Rank9 collection")?;
-                let observed = wiki_model::observed_collection(pile, authority)?;
+                let latest = wiki_model::latest_collection(pile, authority)?;
                 let mut auxiliaries = Vec::with_capacity(scopes.len());
                 for &(scope, label) in scopes {
                     let source = open_source(pile, scope, authority).await?;
@@ -337,20 +337,10 @@ impl WikiStorage<'_> {
                     );
                 }
 
-                // The supersession index must describe exactly the Wiki facts
-                // selected here, not every foundational member known upstream.
-                let selected = pile
-                    .snapshot()
-                    .context("freeze realized Wiki fact selection")?;
-                let wiki_support = selected
-                    .collection(wiki_rank9)
-                    .context("select realized Wiki fact support")?
-                    .support()
-                    .clone();
-                let instant = selected.instant();
-                drop(selected);
+                // Positive membership makes latest a normal joined relation:
+                // a lagging index never admits an unseen Wiki revision.
                 drop(
-                    pile.maintain_exact(observed, &wiki_support)
+                    pile.maintain(latest)
                         .await
                         .context("maintain Wiki supersession index")?,
                 );
@@ -359,17 +349,17 @@ impl WikiStorage<'_> {
                 // command can accidentally combine Wiki facts from one revision
                 // of the pile with Files or Embeddings from another.
                 let reader = pile
-                    .snapshot_at(instant)
+                    .snapshot()
                     .context("freeze maintained Wiki and auxiliary snapshot")?;
                 let facts = reader
-                    .collection_exact(wiki_rank9, &wiki_support)
+                    .collection(wiki_rank9)
                     .context("observe Wiki fact collection")?
                     .view::<FactArchive>()
                     .context("read Wiki fact collection")?;
-                let observed = reader
-                    .collection_exact(observed, &wiki_support)
+                let latest = reader
+                    .collection(latest)
                     .context("observe Wiki supersession index")?
-                    .view::<ObservedIndex>()
+                    .view::<LatestIndex>()
                     .context("read Wiki supersession index")?;
                 let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
                 for (_, _, rank9, label) in &auxiliaries {
@@ -384,12 +374,12 @@ impl WikiStorage<'_> {
                 let mut view = WikiView {
                     facts,
                     reader,
-                    observed,
+                    latest,
                 };
                 let snapshot = view.reader.clone();
                 read(pile, &snapshot, |reader| {
                     // New bytes may be resident, but the fact archives and
-                    // exact observed order never select a newer frontier.
+                    // latest relation never select a newer frontier.
                     view.reader = reader.clone();
                     prepare(&view, &auxiliary_facts)
                 })
@@ -507,7 +497,7 @@ fn selector_revisions(
         bail!("unknown Wiki selector {selector:x}");
     }
     if follow_frontier {
-        Ok(wiki_model::entry(&view.facts, &view.observed, selector)
+        Ok(wiki_model::entry(&view.facts, &view.latest, selector)
             .expect("queryable revision belongs to one entry")
             .frontier)
     } else {
@@ -517,7 +507,7 @@ fn selector_revisions(
 
 fn mutation_entry(view: &WikiView, raw: &str) -> Result<EntryRecord> {
     let selector = resolve_prefix(&view.facts, raw)?;
-    wiki_model::entry(&view.facts, &view.observed, selector)
+    wiki_model::entry(&view.facts, &view.latest, selector)
         .ok_or_else(|| anyhow!("unknown Wiki selector {selector:x}"))
 }
 
@@ -1219,7 +1209,7 @@ fn backlink_summaries(
 fn cmd_links(storage: WikiStorage<'_>, id: Option<String>, top: usize, strict: bool) -> Result<()> {
     let Some(id) = id else {
         let model =
-            storage.view(|view| FrontierModel::load(&view.reader, &view.facts, &view.observed))?;
+            storage.view(|view| FrontierModel::load(&view.reader, &view.facts, &view.latest))?;
         return cmd_link_audit(&model, top, strict);
     };
     let (outgoing, incoming) = storage.view(|view| {
@@ -1253,7 +1243,7 @@ fn explain_selector(view: &WikiView, raw: &str, error: anyhow::Error) -> Result<
     let Some(target) = Id::from_hex(raw.trim()) else {
         return Ok(error);
     };
-    let model = FrontierModel::load(&view.reader, &view.facts, &view.observed)?;
+    let model = FrontierModel::load(&view.reader, &view.facts, &view.latest)?;
     let entry = |index: usize| {
         let entry = &model.entries[index];
         format!("{} [wiki:{:x}]", short(&entry.title(), 55), entry.label)
@@ -1490,7 +1480,7 @@ fn cmd_list(
         } else {
             None
         };
-        let mut entries = wiki_model::entries(&view.facts, &view.observed);
+        let mut entries = wiki_model::entries(&view.facts, &view.latest);
         if !all {
             entries.retain(|entry| {
                 !entry
@@ -1691,7 +1681,7 @@ fn cmd_import(storage: WikiStorage<'_>, path: PathBuf, tags: Vec<String>) -> Res
 fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool) -> Result<()> {
     let needle = query.to_ascii_lowercase();
     let report = storage.view(|view| {
-        let mut entries = wiki_model::entries(&view.facts, &view.observed);
+        let mut entries = wiki_model::entries(&view.facts, &view.latest);
         if !all {
             entries.retain(|entry| {
                 !entry
@@ -1746,13 +1736,13 @@ fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool)
 /// and counted as neither. `wiki links` is the full classified report.
 fn cmd_check(storage: WikiStorage<'_>, compile: bool) -> Result<()> {
     let (summary, diagnostics, issues) = storage.view(|view| {
-        let model = FrontierModel::load(&view.reader, &view.facts, &view.observed)?;
+        let model = FrontierModel::load(&view.reader, &view.facts, &view.latest)?;
         let mut diagnostics = String::new();
         let mut issues = 0usize;
         let mut legacy = 0usize;
         let mut unwritten = 0usize;
         let mut archived = 0usize;
-        let entries = wiki_model::entries(&view.facts, &view.observed);
+        let entries = wiki_model::entries(&view.facts, &view.latest);
         for entry in &entries {
             // An archived page citing an archived page is not actionable, and
             // scoping links to the LIVE frontier is what keeps this command and
@@ -1862,7 +1852,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool) -> Result<()> {
             let mut report = String::new();
             let mut revisions = Vec::new();
             let mut changed = 0usize;
-            for entry in wiki_model::entries(&view.facts, &view.observed) {
+            for entry in wiki_model::entries(&view.facts, &view.latest) {
                 for head in &entry.frontier {
                     let content = revision_content(&view.reader, head)?;
                     let revised = lint_fix(&content, resolver);
@@ -1913,7 +1903,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool) -> Result<()> {
 fn cmd_batch_export(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
     let exports = storage.view(|view| {
         let mut exports = Vec::new();
-        for entry in wiki_model::entries(&view.facts, &view.observed) {
+        for entry in wiki_model::entries(&view.facts, &view.latest) {
             for head in &entry.frontier {
                 exports.push((head.id, revision_content(&view.reader, head)?));
             }
@@ -1943,7 +1933,7 @@ fn cmd_batch_import(storage: WikiStorage<'_>, dir: PathBuf) -> Result<()> {
         let mut revisions = Vec::new();
         for (revision_id, content) in &imports {
             let revision_id = *revision_id;
-            let entry = wiki_model::entry(&view.facts, &view.observed, revision_id)
+            let entry = wiki_model::entry(&view.facts, &view.latest, revision_id)
                 .ok_or_else(|| anyhow!("unknown revision {revision_id:x}"))?;
             if entry.frontier.len() != 1 || entry.frontier[0].id != revision_id {
                 bail!("stale batch file {revision_id:x}: entry frontier changed");
@@ -1994,7 +1984,7 @@ fn cmd_embed(storage: WikiStorage<'_>) -> Result<()> {
             )
             .collect();
             let mut documents = Vec::new();
-            for entry in wiki_model::entries(&view.facts, &view.observed)
+            for entry in wiki_model::entries(&view.facts, &view.latest)
                 .into_iter()
                 .filter(|entry| {
                     !entry
@@ -2043,7 +2033,7 @@ fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<()> {
         EMBEDDINGS_SCOPE_ID,
         "Embeddings",
         |view, embedding_facts| {
-            let current: BTreeSet<Id> = wiki_model::entries(&view.facts, &view.observed)
+            let current: BTreeSet<Id> = wiki_model::entries(&view.facts, &view.latest)
                 .into_iter()
                 .filter(|entry| {
                     !entry
@@ -2413,7 +2403,7 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view(|view| Ok(view.clone())).unwrap();
-        let entry = wiki_model::entry(&current.facts, &current.observed, root).unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
         let mut forks = Fragment::empty();
         let left = stage_revision(
             storage,
@@ -2445,7 +2435,7 @@ mod tests {
         )
         .unwrap();
         let after = storage.view(|view| Ok(view.clone())).unwrap();
-        let entry = wiki_model::entry(&after.facts, &after.observed, left).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.latest, left).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         assert_eq!(entry.frontier[0].supersedes, BTreeSet::from([left, right]));
     }
@@ -2475,7 +2465,7 @@ mod tests {
         .unwrap();
 
         let after = storage.view(|view| Ok(view.clone())).unwrap();
-        let entry = wiki_model::entry(&after.facts, &after.observed, root).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.latest, root).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         (root, entry.frontier[0].id)
     }
@@ -2566,7 +2556,7 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view(|view| Ok(view.clone())).unwrap();
-        let entry = wiki_model::entry(&current.facts, &current.observed, root).unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
         let mut forks = Fragment::empty();
         let left = stage_revision(
             storage,
@@ -2635,7 +2625,7 @@ mod tests {
             resolve_prefix(&after.facts, &format!("{revision:x}")).unwrap(),
             revision
         );
-        let entry = wiki_model::entry(&after.facts, &after.observed, revision).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.latest, revision).unwrap();
         assert_eq!(entry.roots, vec![revision]);
     }
 
@@ -2703,7 +2693,7 @@ mod tests {
 
         // A2: same page, citation removed.
         let current = storage.view(|view| Ok(view.clone())).unwrap();
-        let source_entry = wiki_model::entry(&current.facts, &current.observed, citing).unwrap();
+        let source_entry = wiki_model::entry(&current.facts, &current.latest, citing).unwrap();
         let mut edit = Fragment::empty();
         let dropped = stage_revision(
             storage,
@@ -2719,7 +2709,7 @@ mod tests {
         let after = storage.view(|view| Ok(view.clone())).unwrap();
         // `dropped` really is the page's current text, so an entry-scoped
         // answer would have had a live entry to name.
-        let source_entry = wiki_model::entry(&after.facts, &after.observed, citing).unwrap();
+        let source_entry = wiki_model::entry(&after.facts, &after.latest, citing).unwrap();
         assert_eq!(
             source_entry
                 .frontier
@@ -2729,7 +2719,7 @@ mod tests {
             vec![dropped]
         );
 
-        let target_entry = wiki_model::entry(&after.facts, &after.observed, target).unwrap();
+        let target_entry = wiki_model::entry(&after.facts, &after.latest, target).unwrap();
         let incoming = incoming_revisions(&after, &target_entry).unwrap();
         assert!(
             incoming.contains(&citing),
@@ -2774,7 +2764,7 @@ mod tests {
         storage.publish(genesis).unwrap();
 
         let current = storage.view(|view| Ok(view.clone())).unwrap();
-        let source_entry = wiki_model::entry(&current.facts, &current.observed, citing).unwrap();
+        let source_entry = wiki_model::entry(&current.facts, &current.latest, citing).unwrap();
         let mut edit = Fragment::empty();
         stage_revision(
             storage,
@@ -2960,7 +2950,7 @@ mod tests {
             format!("see #link(\"wiki:{truncated}\")[the page]"),
             "the original revision is content-addressed and must be untouched"
         );
-        let entry = wiki_model::entry(&after.facts, &after.observed, citing).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.latest, citing).unwrap();
         assert_eq!(entry.frontier.len(), 1);
         let head = &entry.frontier[0];
         assert_ne!(head.id, citing, "the fix is a successor, not a mutation");

@@ -9,8 +9,8 @@
 //! not participate in this boundary. The interactive viewer loads all sources;
 //! focused capture binaries request only their source dependency
 //! closure. Loading ensures roots and maintains each immediate derivation.
-//! One common fact snapshot then selects realized supports to pair with
-//! matching indexes; those unsigned artifacts are cache exhaust, not
+//! One common store snapshot attaches facts and positive latest/LWW indexes
+//! independently; those unsigned artifacts are cache exhaust, not
 //! authoritative writes. Most sources are
 //! fixed descriptor-handle collections. Secrets uses the same explicit
 //! collection configuration and is attached only when the pile signer is
@@ -23,8 +23,8 @@ use std::time::SystemTime;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
+use triblespace::core::collection::latest::LatestIndex;
 use triblespace::core::collection::lww_register::LwwIndex;
-use triblespace::core::collection::observed_union::ObservedIndex;
 use triblespace::core::collection::{
     Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
@@ -136,8 +136,8 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 /// Opaque cache identity for one logical dataset view.
 ///
 /// Widgets compare revisions for equality; the storage backend owns their
-/// construction. The digest combines the foundational descriptor handle with
-/// its exact resident support. It is a widget cache token, not a durable
+/// construction. The digest includes each attached relation's descriptor and
+/// its own resident support. It is a widget cache token, not a durable
 /// collection record or an authorization proof, and physical Succinct
 /// compaction cannot perturb it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -158,9 +158,17 @@ impl DatasetRevision {
 
     fn from_collection(collection: CollectionHandle, support: &Support) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.dataset-revision.v2");
+        hasher.update(b"faculties.viewer.dataset-revision.v3");
         Self::hash_collection_support(&mut hasher, collection, support);
         Self(*hasher.finalize().as_bytes())
+    }
+
+    fn include_collection(&mut self, collection: CollectionHandle, support: &Support) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"faculties.viewer.dataset-relation.v1");
+        hasher.update(&self.0);
+        Self::hash_collection_support(&mut hasher, collection, support);
+        self.0 = *hasher.finalize().as_bytes();
     }
 
     fn from_secrets(snapshot: &SecretsSnapshot<PileSnapshot>) -> Self {
@@ -178,7 +186,7 @@ pub struct DatasetView<'a> {
     pub reader: &'a PileSnapshot,
     pub revision: DatasetRevision,
     lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
-    observed_orders: &'a BTreeMap<Id, ObservedIndex>,
+    latest_indexes: &'a BTreeMap<Id, LatestIndex>,
 }
 
 impl DatasetView<'_> {
@@ -187,9 +195,9 @@ impl DatasetView<'_> {
         self.lww_registers.get(&(identity, orders))
     }
 
-    /// Maintained observation order for the requested edge attribute.
-    pub fn observed_order(&self, observes: Id) -> Option<&ObservedIndex> {
-        self.observed_orders.get(&observes)
+    /// Known latest states for the requested supersession edge attribute.
+    pub fn latest_index(&self, observes: Id) -> Option<&LatestIndex> {
+        self.latest_indexes.get(&observes)
     }
 }
 
@@ -235,25 +243,23 @@ struct LoadedDataset {
     reader: PileSnapshot,
     revision: DatasetRevision,
     lww_registers: BTreeMap<(Id, Id), LwwIndex>,
-    observed_orders: BTreeMap<Id, ObservedIndex>,
+    latest_indexes: BTreeMap<Id, LatestIndex>,
 }
 
 impl LoadedDataset {
     fn new(
-        collection: CollectionHandle,
         facts: FactArchive,
-        support: &Support,
+        revision: DatasetRevision,
         reader: PileSnapshot,
         lww_registers: BTreeMap<(Id, Id), LwwIndex>,
-        observed_orders: BTreeMap<Id, ObservedIndex>,
+        latest_indexes: BTreeMap<Id, LatestIndex>,
     ) -> Self {
-        let revision = DatasetRevision::from_collection(collection, support);
         Self {
             facts,
             reader,
             revision,
             lww_registers,
-            observed_orders,
+            latest_indexes,
         }
     }
 
@@ -263,7 +269,7 @@ impl LoadedDataset {
             reader: &self.reader,
             revision: self.revision,
             lww_registers: &self.lww_registers,
-            observed_orders: &self.observed_orders,
+            latest_indexes: &self.latest_indexes,
         }
     }
 }
@@ -634,10 +640,9 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
     let loaded = async {
-        let mut by_scope =
-            BTreeMap::<Id, (Collection<Rank9AcceleratedSuccinctArchiveBlob>, Support)>::new();
+        let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
-        let mut observed_by_scope = BTreeMap::<Id, BTreeMap<Id, ObservedIndex>>::new();
+        let mut latest_by_scope = BTreeMap::<Id, BTreeMap<Id, LatestIndex>>::new();
 
         let mut collections = Vec::new();
         for (scope, label) in collection_scopes(sources) {
@@ -666,10 +671,10 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
                     .map_err(|error| format!("register Compass status collection: {error:#}"))
             })
             .transpose()?;
-        let wiki_observations = sources
+        let wiki_latest = sources
             .contains(&SourceKey::Wiki)
             .then(|| {
-                crate::wiki::observed_collection(&mut pile, signer.verifying_key())
+                crate::wiki::latest_collection(&mut pile, signer.verifying_key())
                     .map_err(|error| format!("register Wiki observation collection: {error:#}"))
             })
             .transpose()?;
@@ -726,35 +731,23 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             );
         }
 
-        // Index requests come from the fact representations actually visible
-        // together now, not from an earlier foundational frontier. Retain
-        // these supports when later index/credential work changes residency.
-        let fact_snapshot = pile
-            .snapshot()
-            .map_err(|error| format!("freeze realized viewer fact snapshot: {error}"))?;
-        for (scope, label, _, _, rank9) in collections {
-            let observed = fact_snapshot
-                .collection(rank9)
-                .map_err(|error| format!("observe maintained {label} collection: {error}"))?;
-            by_scope.insert(scope, (rank9, observed.support().clone()));
+        for (scope, _, _, _, rank9) in collections {
+            by_scope.insert(scope, rank9);
         }
-        drop(fact_snapshot);
 
-        if let (Some(target), Some((_, support))) =
-            (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
-        {
+        // Positive indexes are independently maintained query relations. Their
+        // support need not equal fact support to admit only known winners.
+        if let Some(target) = compass_register {
             drop(
-                pile.maintain_exact(target, support)
+                pile.maintain(target)
                     .await
                     .map_err(|error| format!("maintain Compass status register: {error}"))?,
             );
         }
 
-        if let (Some(target), Some((_, support))) =
-            (wiki_observations, by_scope.get(&WIKI_SCOPE_ID))
-        {
+        if let Some(target) = wiki_latest {
             drop(
-                pile.maintain_exact(target, support)
+                pile.maintain(target)
                     .await
                     .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
             );
@@ -783,14 +776,38 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
                 .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?,
         };
 
-        if let (Some(target), Some((_, support))) =
-            (compass_register, by_scope.get(&COMPASS_SCOPE_ID))
-        {
-            let index = store_snapshot
-                .collection_exact(target, support)
-                .map_err(|error| format!("attach Compass status register: {error}"))?
+        let mut facts_by_scope = BTreeMap::new();
+        let mut revisions_by_scope = BTreeMap::new();
+        for (scope, rank9) in &by_scope {
+            let label = COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|source| source.scope == *scope)
+                .expect("every maintained viewer scope has a source label")
+                .label;
+            let collection = store_snapshot
+                .collection(*rank9)
+                .map_err(|error| format!("attach maintained {label} collection: {error}"))?;
+            let facts = collection
+                .view::<FactArchive>()
+                .map_err(|error| format!("read maintained {label} collection: {error}"))?;
+            revisions_by_scope.insert(
+                *scope,
+                DatasetRevision::from_collection(rank9.handle(), collection.support()),
+            );
+            facts_by_scope.insert(*scope, facts);
+        }
+
+        if let Some(target) = compass_register {
+            let collection = store_snapshot
+                .collection(target)
+                .map_err(|error| format!("attach Compass status register: {error}"))?;
+            let index = collection
                 .view::<LwwIndex>()
                 .map_err(|error| format!("read Compass status register: {error}"))?;
+            revisions_by_scope
+                .get_mut(&COMPASS_SCOPE_ID)
+                .expect("Compass facts were attached")
+                .include_collection(target.handle(), collection.support());
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -800,59 +817,46 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             );
         }
 
-        if let (Some(target), Some((_, support))) =
-            (wiki_observations, by_scope.get(&WIKI_SCOPE_ID))
-        {
-            let index = store_snapshot
-                .collection_exact(target, support)
-                .map_err(|error| format!("attach Wiki supersession index: {error}"))?
-                .view::<ObservedIndex>()
+        if let Some(target) = wiki_latest {
+            let collection = store_snapshot
+                .collection(target)
+                .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
+            let index = collection
+                .view::<LatestIndex>()
                 .map_err(|error| format!("read Wiki supersession index: {error}"))?;
-            observed_by_scope
+            revisions_by_scope
+                .get_mut(&WIKI_SCOPE_ID)
+                .expect("Wiki facts were attached")
+                .include_collection(target.handle(), collection.support());
+            latest_by_scope
                 .entry(WIKI_SCOPE_ID)
                 .or_default()
                 .insert(triblespace::core::metadata::supersedes.id(), index);
-        }
-
-        let mut facts_by_scope = BTreeMap::new();
-        for (scope, (rank9, support)) in &by_scope {
-            let label = COLLECTION_SOURCE_CATALOG
-                .iter()
-                .find(|source| source.scope == *scope)
-                .expect("every maintained viewer scope has a source label")
-                .label;
-            let facts = store_snapshot
-                .collection_exact(*rank9, support)
-                .map_err(|error| format!("attach maintained {label} collection: {error}"))?
-                .view::<FactArchive>()
-                .map_err(|error| format!("read maintained {label} collection: {error}"))?;
-            facts_by_scope.insert(*scope, facts);
         }
 
         let datasets = COLLECTION_SOURCE_CATALOG
             .iter()
             .filter(|source| sources.contains(&source.key))
             .map(|source| {
-                let (_, support) = by_scope
+                let revision = revisions_by_scope
                     .get(&source.scope)
                     .expect("every fixed viewer scope was maintained");
                 let facts = facts_by_scope
                     .get(&source.scope)
                     .expect("every maintained viewer scope was attached");
                 let lww_registers = lww_by_scope.get(&source.scope).cloned().unwrap_or_default();
-                let observed_orders = observed_by_scope
+                let latest_indexes = latest_by_scope
                     .get(&source.scope)
                     .cloned()
                     .unwrap_or_default();
                 (
                     source.key,
                     LoadedDataset::new(
-                        support.collection().handle(),
                         facts.clone(),
-                        support,
+                        *revision,
                         store_snapshot.clone(),
                         lww_registers,
-                        observed_orders,
+                        latest_indexes,
                     ),
                 )
             })
@@ -905,6 +909,7 @@ mod tests {
     use std::fs::File;
 
     use anybytes::View;
+    use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::metadata;
     use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
@@ -1087,9 +1092,60 @@ mod tests {
     }
 
     #[test]
-    fn wiki_dataset_attaches_exact_observed_order_without_advancing_source() {
+    fn dataset_revision_changes_when_only_latest_support_advances() {
+        pollster::block_on(async {
+            use triblespace::core::collection::latest::LatestBlob;
+
+            let signer = SigningKey::from_bytes(&[35; 32]);
+            let mut store = MemoryRepo::default();
+            let source = store
+                .collection(
+                    "latest-cache",
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            let target = store
+                .derive::<LatestBlob>(
+                    source,
+                    metadata::supersedes.id(),
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            let root = genid();
+            let next = genid();
+            store
+                .commit(source, &signer, entity! { &root @ metadata::name: "root" })
+                .unwrap();
+            let ready = store.maintain(target).await.unwrap();
+            let lagging = ready.collection(target).unwrap();
+            store
+                .commit(
+                    source,
+                    &signer,
+                    entity! { &next @ metadata::supersedes: &root },
+                )
+                .unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let facts = snapshot.collection(source).unwrap();
+            let mut before = DatasetRevision::from_collection(source.handle(), facts.support());
+            before.include_collection(target.handle(), lagging.support());
+
+            let ready = store.maintain(target).await.unwrap();
+            let advanced = ready.collection(target).unwrap();
+            let mut after = DatasetRevision::from_collection(source.handle(), facts.support());
+            after.include_collection(target.handle(), advanced.support());
+            assert_ne!(
+                before, after,
+                "index-only progress invalidates widget projections"
+            );
+            assert_eq!(facts.support(), ready.collection(source).unwrap().support());
+        });
+    }
+
+    #[test]
+    fn wiki_dataset_attaches_positive_latest_index_without_advancing_source() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("wiki-observed.pile");
+        let path = directory.path().join("wiki-latest.pile");
         create_pile(&path);
         let signer = load_signer(&path, None).unwrap();
         let (author_fragment, author) = crate::wiki::author_record(&signer.verifying_key());
@@ -1129,10 +1185,10 @@ mod tests {
 
         let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
         let dataset = storage.context().dataset(SourceKey::Wiki).unwrap();
-        let observed = dataset
-            .observed_order(metadata::supersedes.id())
-            .expect("Wiki dataset carries its maintained observation order");
-        let entries = crate::wiki::entries(dataset.facts, observed);
+        let latest = dataset
+            .latest_index(metadata::supersedes.id())
+            .expect("Wiki dataset carries its positive latest relation");
+        let entries = crate::wiki::entries(dataset.facts, latest);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].frontier.len(), 1);
         assert_eq!(entries[0].frontier[0].id, successor);

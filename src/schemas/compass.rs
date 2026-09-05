@@ -88,9 +88,9 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
 /// Deterministic latest status event for one goal.
 ///
 /// `register` is the maintained LWW index for `board::status_of` ordered by
-/// `metadata::created_at`. `maximal` never proposes, so the pattern enumerates
-/// the goal's status events and the index kills the dominated ones; its
-/// `(created_at, event-id)` total order leaves exactly one.
+/// `metadata::created_at`. Positive membership joins only known complete
+/// winners, so facts ahead of the index cannot surface unseen events. Its
+/// `(created_at, event-id)` total order leaves exactly one per register.
 pub fn latest_status_event<P: TriblePattern>(
     space: &P,
     register: &LwwIndex,
@@ -105,7 +105,7 @@ pub fn latest_status_event<P: TriblePattern>(
                 board::status: ?status,
                 metadata::created_at: ?at,
             }]),
-            maximal(event, register),
+            register.has(event),
         )
     )
     .next();

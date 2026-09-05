@@ -513,9 +513,9 @@ fn observe_sources(
         .attach_exact(&snapshot, &supports.messages)?;
     let mail = sources.mail.attach_exact(&snapshot, &supports.mail)?;
     let teams = sources.teams.attach_exact(&snapshot, &supports.teams)?;
-    // Compass facts and their maintained LWW index are one logical query
-    // substrate. Pin both to the same resident foundational support so a
-    // concurrent maintainer cannot expose one half of a newer support here.
+    // Orient explicitly preserves its whole source watermark across later
+    // maintenance. The positive status relation shares that chosen boundary;
+    // ordinary joins do not themselves require equal support.
     let compass = sources.compass.attach_exact(&snapshot, &supports.compass)?;
     let relations = sources
         .relations
@@ -1367,7 +1367,7 @@ fn latest_goal_status(query: &OrientQuery<'_>, goal: Id) -> Option<(Id, String, 
                 board::status: ?status,
                 metadata::created_at: ?at,
             }]),
-            maximal(event, query.compass_status),
+            query.compass_status.has(event),
         )
     )
     .next()
@@ -3063,7 +3063,7 @@ async fn cmd_wake(
         let wiki_collection =
             OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki").await?;
         let wiki_source = wiki_collection.source;
-        let wiki_observed = wiki_model::observed_collection(&mut storage, signer.verifying_key())
+        let wiki_latest = wiki_model::latest_collection(&mut storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
         sources.ensure(&mut storage).await?;
         drop(storage.ensure(memory_source).await?);
@@ -3099,7 +3099,7 @@ async fn cmd_wake(
         );
         drop(
             storage
-                .maintain_exact(wiki_observed, &wiki_support)
+                .maintain_exact(wiki_latest, &wiki_support)
                 .await
                 .context("maintain Wiki supersession index")?,
         );
@@ -3120,9 +3120,9 @@ async fn cmd_wake(
             .context("attach maintained Wiki collection")?;
         let wiki_order = observation
             .snapshot
-            .collection_exact(wiki_observed, &wiki_support)
+            .collection_exact(wiki_latest, &wiki_support)
             .context("observe maintained Wiki supersession index")?
-            .view::<triblespace::core::collection::observed_union::ObservedIndex>()
+            .view::<triblespace::core::collection::latest::LatestIndex>()
             .context("attach maintained Wiki supersession index")?;
         let persona_id = read(&mut storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
@@ -3348,6 +3348,84 @@ mod tests {
 
         assert_eq!(person_anchors(&message_source), BTreeSet::from([person_id]));
         assert!(person_anchors(&relations_source).is_empty());
+    }
+
+    #[test]
+    fn status_query_joins_only_known_winners_when_facts_advance() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let goal = id(46);
+            let unseen_goal = id(47);
+            let initial = compass::status_fragment(
+                goal,
+                "todo",
+                None,
+                clock::point(Epoch::from_tai_seconds(1.0)).unwrap(),
+            )
+            .unwrap();
+            let initial_id = initial.root().unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, initial)
+                .unwrap();
+            sources.ensure(&mut pile).await.unwrap();
+            let watermark = pile.snapshot().unwrap();
+            let observation = maintain_and_observe_snapshot(&mut pile, &watermark, &sources)
+                .await
+                .unwrap();
+
+            let next = compass::status_fragment(
+                goal,
+                "done",
+                None,
+                clock::point(Epoch::from_tai_seconds(2.0)).unwrap(),
+            )
+            .unwrap();
+            let next_id = next.root().unwrap();
+            let unseen = compass::status_fragment(
+                unseen_goal,
+                "doing",
+                None,
+                clock::point(Epoch::from_tai_seconds(3.0)).unwrap(),
+            )
+            .unwrap();
+            let unseen_id = unseen.root().unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, next + unseen)
+                .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let facts = snapshot
+                .collection(sources.compass.source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            let facts = archive(&facts);
+            {
+                let mut query = observation.query(&snapshot);
+                query.compass = &facts;
+                assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
+                assert_eq!(latest_goal_status(&query, unseen_goal), None);
+            }
+
+            let ready = pile.maintain(sources.compass_status).await.unwrap();
+            let advanced = ready
+                .collection(sources.compass_status)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            {
+                let mut query = observation.query(&snapshot);
+                query.compass = &facts;
+                query.compass_status = &advanced;
+                assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
+                assert_eq!(
+                    latest_goal_status(&query, unseen_goal).unwrap().0,
+                    unseen_id
+                );
+            }
+            pile.close().unwrap();
+        });
     }
 
     #[test]

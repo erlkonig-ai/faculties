@@ -321,7 +321,7 @@ fn with_model<T>(
         let model = GaugeModel::load(
             snapshot.store_snapshot(),
             snapshot.facts(),
-            snapshot.observed(),
+            snapshot.latest(),
         )?;
         operation(&model)
     })();

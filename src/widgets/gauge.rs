@@ -89,7 +89,7 @@ struct GaugeLive {
 impl GaugeLive {
     fn refresh(dataset: DatasetView<'_>) -> Result<Self, String> {
         let observed = dataset
-            .observed_order(metadata::supersedes.id())
+            .latest_index(metadata::supersedes.id())
             .ok_or_else(|| "maintained Wiki supersession index missing".to_owned())?;
         let entries = wiki::entries(dataset.facts, observed)
             .into_iter()

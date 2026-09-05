@@ -37,8 +37,8 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 /// One coherent Compass source snapshot plus its maintained status register.
 ///
-/// Facts, cover, and blob reader are captured at one collection observation;
-/// the index is then attached for exactly that source cover. Maintained
+/// Facts, positive status membership, and blob reader are captured at one
+/// immutable store observation without requiring equal support. Maintained
 /// artifacts are cache exhaust, never additional semantic authority.
 pub struct CompassSnapshot {
     facts: FactArchive,
@@ -57,7 +57,7 @@ impl CompassSnapshot {
         &self.store_snapshot
     }
 
-    /// Maintained LWW order attached for this snapshot's source cover.
+    /// Known complete LWW winners attached from the same store observation.
     pub fn status_register(&self) -> &LwwIndex {
         &self.status
     }
@@ -1059,8 +1059,8 @@ pub fn materialize_collection(
     Ok((facts, store_snapshot))
 }
 
-/// Capture Compass facts and attach the maintained status LWW index for that
-/// exact source cover, constructing missing derived artifacts if necessary.
+/// Capture Compass facts and the positive status LWW index through one store
+/// observation, constructing missing derived artifacts if necessary.
 pub async fn materialize_indexed_collection<S>(
     pile: &mut S,
     signer: &SigningKey,
@@ -1083,28 +1083,22 @@ where
             .await
             .context("maintain Compass Succinct collection")?,
     );
-    let ready = pile
-        .maintain(rank9)
-        .await
-        .context("maintain Compass fact collection")?;
-    let support = ready.collection(rank9)?.support().clone();
-    let instant = ready.instant();
-    drop(ready);
     drop(
-        pile.maintain_exact(status_target, &support)
+        pile.maintain(rank9)
             .await
-            .context("maintain Compass status register")?,
+            .context("maintain Compass fact collection")?,
     );
     let store_snapshot = pile
-        .snapshot_at(instant)
-        .context("freeze indexed Compass snapshot at its fact observation instant")?;
+        .maintain(status_target)
+        .await
+        .context("maintain Compass status register")?;
     let fact_archive = store_snapshot
-        .collection_exact(rank9, &support)
+        .collection(rank9)
         .context("observe Compass fact collection")?
         .view::<FactArchive>()
         .context("read Compass fact collection")?;
     let status = store_snapshot
-        .collection_exact(status_target, &support)
+        .collection(status_target)
         .context("observe Compass status register")?
         .view::<LwwIndex>()
         .context("read Compass status register")?;
@@ -1159,6 +1153,72 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
 
         assert_eq!(register.policy(&snapshot).unwrap(), policy,);
+    }
+
+    #[test]
+    fn facts_ahead_of_status_register_do_not_admit_unknown_winners() {
+        pollster::block_on(async {
+            let signer = SigningKey::from_bytes(&[14; 32]);
+            let goal = genid().id;
+            let unseen_goal = genid().id;
+            let initial = status_fragment(goal, "todo", None, at(1)).unwrap();
+            let initial_id = initial.root().unwrap();
+            let next = status_fragment(goal, "done", None, at(2)).unwrap();
+            let next_id = next.root().unwrap();
+            let unseen = status_fragment(unseen_goal, "doing", None, at(3)).unwrap();
+            let unseen_id = unseen.root().unwrap();
+            let mut store = MemoryRepo::default();
+            let source = store
+                .collection(
+                    "status-lag",
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )
+                .unwrap();
+            let target = status_register_for_source(&mut store, source).unwrap();
+            store.commit(source, &signer, initial).unwrap();
+            let ready = store.maintain(target).await.unwrap();
+            let lagging = ready
+                .collection(target)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            store.commit(source, &signer, next + unseen).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let facts = snapshot
+                .collection(source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &lagging, goal)
+                    .unwrap()
+                    .0,
+                initial_id
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &lagging, unseen_goal),
+                None
+            );
+
+            let ready = store.maintain(target).await.unwrap();
+            let advanced = ready
+                .collection(target)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &advanced, goal)
+                    .unwrap()
+                    .0,
+                next_id
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(&facts, &advanced, unseen_goal)
+                    .unwrap()
+                    .0,
+                unseen_id
+            );
+        });
     }
 
     #[test]
