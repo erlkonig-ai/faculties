@@ -224,6 +224,38 @@ pub fn collect_chunk_spans<P: TriblePattern>(space: &P) -> Vec<(i128, i128, Id)>
     .collect();
     spans.sort_unstable();
     spans.dedup();
+
+    // A rendering that was rendered again stands aside from the structure:
+    // `memory supersede <newer> <older>` with the newer span strictly wider.
+    // Two renderings of one life nested by their tails would otherwise make
+    // the older the newer's single child and hide everything beneath both
+    // (six whole-life roots, 2026-09-05). Equal spans are not touched -- a
+    // retelling of the same time coexists as an alternate recollection -- and
+    // no episode is hidden by a historical edge between episodes, because
+    // those never widen. The text of a superseded rendering stays in the
+    // journal and answers by id.
+    let by_id: HashMap<Id, (i128, i128)> = spans
+        .iter()
+        .map(|&(start, end, id)| (id, (start, end)))
+        .collect();
+    let hidden: BTreeSet<Id> = find!(
+        (newer: Id, older: Id),
+        pattern!(space, [{
+            ?newer @ metadata::tag: &KIND_CHUNK_ID,
+            metadata::supersedes: ?older,
+        }])
+    )
+    .filter(
+        |(newer, older)| match (by_id.get(newer), by_id.get(older)) {
+            (Some(&(ns, ne)), Some(&(os, oe))) => ns <= os && ne >= oe && (ne - ns) > (oe - os),
+            _ => false,
+        },
+    )
+    .map(|(_, older)| older)
+    .collect();
+    if !hidden.is_empty() {
+        spans.retain(|(_, _, id)| !hidden.contains(id));
+    }
     spans
 }
 
@@ -971,9 +1003,10 @@ where
         bail!(
             "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
              Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
-             Raise a coarser apex over the whole extent, then retry:\n    \
-             memory create {}..{} \"<one coarse summary of this whole span>\"\n\
-             (A well-maintained hierarchy keeps a coarse summary over its full extent — this is how you add the missing layer.)",
+             Comb the uncovered tail into arcs beside the apex (`memory density` and `memory check` show where), or render the whole extent again and let the old root stand aside:\n    \
+             memory create {}..{} \"<one coarse summary of this whole span>\"\n    \
+             memory supersede <that new id> <the old root's id>\n\
+             (Never nest a new root over the old one without superseding it: two renderings of one life, one a tail wider than the other, make a chain the cover cannot descend.)",
             used,
             roots.len(),
             fmt_epoch(key_to_epoch(earliest)),

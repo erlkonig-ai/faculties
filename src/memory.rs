@@ -7,9 +7,18 @@
 //!
 //! Historical native chunks may carry `metadata::supersedes` because those
 //! edges participated in their content-derived identities. They have no
-//! ordering or visibility semantics, and new chunks never emit them. Entity
-//! ids remain opaque: old random ids and newer intrinsic ids are ordinary,
-//! additive members of the same journal.
+//! ordering or visibility semantics for EPISODES, and new chunks never emit
+//! them at creation. Entity ids remain opaque: old random ids and newer
+//! intrinsic ids are ordinary, additive members of the same journal.
+//!
+//! One edge is written deliberately, after the fact: `memory supersede
+//! <newer> <older>` says a later RENDERING of a span replaces an earlier one
+//! -- a whole-life root written again with a longer tail, an arc summarized
+//! again. Both texts stay in the journal and answer by id; the cover's
+//! temporal structure keeps only the newer, and only when its span is
+//! strictly wider than the older's. Found 2026-09-05: six whole-life roots,
+//! each one span wider than the last, had nested into a chain of single
+//! children, and every leaf before June rendered at no budget.
 
 use std::collections::BTreeSet;
 
@@ -113,6 +122,13 @@ fn annotate_chunk(
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::anchor: alias };
     }
     fragment
+}
+
+/// `newer` is a later rendering of the time `older` renders: the cover keeps
+/// `newer` in its structure and lets `older` stand aside, when `newer` spans
+/// strictly more. Nothing else changes; both remain memories.
+pub fn supersede_fragment(newer: Id, older: Id) -> Fragment {
+    entity! { ExclusiveId::force_ref(&newer) @ metadata::supersedes: older }
 }
 
 pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
@@ -350,6 +366,40 @@ mod tests {
         )
         .collect();
         assert_eq!(predecessors, BTreeSet::from([base]));
+    }
+
+    /// A wider re-rendering that supersedes an earlier one takes its place in
+    /// the cover's structure; an equal-span retelling coexists as before.
+    #[test]
+    fn a_wider_rendering_that_supersedes_leaves_the_structure() {
+        let (older_fragment, older) = chunk_fragment(draft("the year, first telling")).unwrap();
+        let mut wide = draft("the year and a bit more, told again");
+        wide.start_at = point(0.0);
+        wide.end_at = point(30.0);
+        let (wide_fragment, wide) = chunk_fragment(wide).unwrap();
+        let (retold_fragment, retold) = chunk_fragment(draft("the year, retold")).unwrap();
+
+        let facts = facts([
+            older_fragment,
+            wide_fragment,
+            retold_fragment,
+            supersede_fragment(wide, older),
+            supersede_fragment(retold, older),
+        ]);
+        let ids: BTreeSet<Id> = crate::memory_cover::collect_chunk_spans(&facts)
+            .into_iter()
+            .map(|(_, _, id)| id)
+            .collect();
+        assert!(ids.contains(&wide), "the wider rendering stands");
+        assert!(ids.contains(&retold), "an equal-span retelling coexists");
+        assert!(!ids.contains(&older), "the older rendering stands aside");
+        // Every chunk is still a member of the journal.
+        let all: BTreeSet<Id> = find!(
+            id: Id,
+            pattern!(&facts, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])
+        )
+        .collect();
+        assert_eq!(all, BTreeSet::from([older, wide, retold]));
     }
 
     #[test]
