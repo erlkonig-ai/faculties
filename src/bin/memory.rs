@@ -2535,9 +2535,9 @@ fn cmd_levels(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             None => "every memory".to_string(),
         };
         println!(
-            "  {}  {:>4}d  wants {:<12} shows {:>5}  worst x{:.1}{}",
+            "  {}  {:>7}  wants {:<12} shows {:>5}  worst x{:.1}{}",
             format_time_range(key_to_epoch(r.tile.start), key_to_epoch(r.tile.end)),
-            r.tile.days,
+            r.tile.width(),
             want,
             r.picked,
             r.worst_ratio,
@@ -3718,7 +3718,7 @@ mod tests {
     /// quantizing what is left makes the pool a constant between steps, and the
     /// same 30-write sequence then re-cut nothing on 27 of them.
     #[test]
-    fn a_write_in_today_keeps_the_cover_before_today() {
+    fn a_write_in_the_open_tile_keeps_the_cover_before_it() {
         let pile = TestPile::new();
         let storage = pile.storage();
         let at =
@@ -3763,29 +3763,57 @@ mod tests {
             "budget must bind — the oldest day should still be coarse:\n{before}"
         );
 
-        // Writes past the apex's end land in today, the open tile. With a
-        // stated detail the cover before today is the same bytes after each
-        // write: the prefix a resident's cache can keep.
+        // Writes in the open tile. With a stated detail the cover before the
+        // open tile is the same bytes after each write: the prefix a
+        // resident's cache can keep.
+        let (open_start, open_end) = {
+            let loaded = storage.load_context(false).expect("load");
+            let spans = collect_chunk_spans(&loaded.memory.memory.facts);
+            let earliest = spans.iter().map(|s| s.0).min().unwrap();
+            let now = spans.iter().map(|s| s.1).max().unwrap();
+            let open = *faculties::memory_cover::tiles(earliest, now)
+                .last()
+                .unwrap();
+            assert!(open.open);
+            (open.start, open.end)
+        };
         let prefix = |cover: &str| -> String {
             cover
                 .lines()
-                .take_while(|line| !line.trim_start().starts_with("2026-01-06T"))
+                .take_while(|line| {
+                    let line = line.trim_start();
+                    !(line.starts_with("2026-")
+                        && line
+                            .split_once("..")
+                            .and_then(|(a, _)| parse_tai_timestamp(a.trim()).ok())
+                            .is_some_and(|start| {
+                                start.to_tai_duration().total_nanoseconds() >= open_start
+                            }))
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
                 .trim_end()
                 .to_string()
         };
-        for h in [8u8, 10, 12] {
-            write(format!("new{h} ").repeat(4), (at(6, h), at(6, h + 1)));
+        let now = at(6, 0).to_tai_duration().total_nanoseconds();
+        let room = open_end - now;
+        assert!(
+            room > 16 * 60_000_000_000,
+            "the fixture's now sits at the open tile's edge"
+        );
+        for k in [2i128, 4, 8] {
+            let start = key_to_epoch(now + room / k);
+            let end = key_to_epoch(now + room / k + 60_000_000_000);
+            write(format!("new{k} ").repeat(4), (start, end));
             let after = cover_now();
             assert!(
-                after.contains(&format!("new{h} ")),
+                after.contains(&format!("new{k} ")),
                 "the new memory must appear"
             );
             assert_eq!(
                 prefix(&after),
                 prefix(&before),
-                "a write in today changed the cover before today\nBEFORE:\n{before}\nAFTER:\n{after}"
+                "a write in the open tile changed the cover before it\nBEFORE:\n{before}\nAFTER:\n{after}"
             );
         }
     }
@@ -3938,21 +3966,13 @@ mod tests {
             .expect("render cover")
         };
 
-        // June 1-4 sit in one sixteen-day tile; at eight per tile it wants two
-        // days, which the equal-span position is exactly. The plain cover
-        // deterministically selects the least-id account; context substitutes
-        // the other, relevant account at that exact same position.
-        let plain = render(8, None);
-        let contextual = render(8, Some(query));
-        assert!(plain.contains(plain_summary.trim_end()));
-        assert!(!plain.contains(contextual_summary.trim_end()));
-        assert!(contextual.contains(contextual_summary.trim_end()));
-        assert!(!contextual.contains(plain_summary.trim_end()));
-        assert_eq!(rendered_ranges(&plain), rendered_ranges(&contextual));
-
-        // Property-style detail sweep: at every grain, contextual ranking can
-        // never move a position.
-        for detail in [0usize, 1, 2, 4, 8, 16, 64, 512] {
+        // The equal-span position shows at whatever detail wants about two
+        // days of the tile it sits in; wherever it shows, the plain cover
+        // deterministically selects the least-id account and context
+        // substitutes the other, relevant account at that exact position. At
+        // every detail, contextual ranking never moves a position.
+        let mut shown_somewhere = false;
+        for detail in [0usize, 1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 64, 512] {
             let plain = render(detail, None);
             let contextual = render(detail, Some(query));
             assert_eq!(
@@ -3960,6 +3980,13 @@ mod tests {
                 rendered_ranges(&contextual),
                 "context changed structural coverage at detail {detail}"
             );
+            if plain.contains(plain_summary.trim_end()) {
+                shown_somewhere = true;
+                assert!(!plain.contains(contextual_summary.trim_end()));
+                assert!(contextual.contains(contextual_summary.trim_end()));
+                assert!(!contextual.contains(plain_summary.trim_end()));
+            }
         }
+        assert!(shown_somewhere, "no detail showed the equal-span position");
     }
 }
