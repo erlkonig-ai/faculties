@@ -31,6 +31,13 @@ use triblespace::prelude::*;
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+
+/// The human-perceptible present, about three seconds: a memory stamped at
+/// one instant lasted at least a moment. A rangeless `memory create` spans
+/// the moment ending now, and `memory respan-instants` gives an instant that
+/// carries no range of its own this much time (JP, 2026-09-05: no zero-length
+/// memories; give them the length of a moment).
+pub const MOMENT_SECONDS: f64 = 3.0;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ImageHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 

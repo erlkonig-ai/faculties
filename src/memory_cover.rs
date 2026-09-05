@@ -1037,7 +1037,11 @@ where
     // forbids, so points never replace their container: they are emitted
     // beside it. A container whose only children are points keeps its place
     // and, once its points are out, is done.
-    let is_point = |i: usize| width(i) == 0;
+    // A moment is the human present, MOMENT_SECONDS wide: an instant-stamped
+    // memory given its width by `memory respan-instants` is still a memory AT
+    // a moment, not a refinement of the span around it.
+    let moment_ns: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
+    let is_point = |i: usize| width(i) <= moment_ns;
     let mut points_out: Vec<bool> = vec![false; n];
     loop {
         let remaining = pool - spent;

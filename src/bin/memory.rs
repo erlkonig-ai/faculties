@@ -26,7 +26,7 @@ use faculties::memory_cover::{
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
 use faculties::{clock, cognition as cognition_model, comb as comb_model, memory as memory_model};
-use hifitime::Epoch;
+use hifitime::{Duration, Epoch};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -62,6 +62,7 @@ use triblespace::prelude::*;
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
+             memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
@@ -509,9 +510,43 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
     let Some((from_str, to_str)) = s.split_once("..") else {
         bail!("invalid time range (expected `from..to`): {s}");
     };
-    let from = parse_tai_timestamp(from_str).context("parsing range start")?;
-    let to = parse_tai_timestamp(to_str).context("parsing range end")?;
+    // Bare TAI is the written form; a trailing Z, a +HH:MM offset, a space for
+    // the T, or a missing seconds field are accepted and normalised, so a range
+    // can never fold into the summary because of one letter (three junk
+    // memories, 2026-09-05).
+    let from = parse_tai_timestamp(from_str)
+        .or_else(|_| {
+            parse_written_stamp(from_str).ok_or_else(|| anyhow!("invalid timestamp: {from_str}"))
+        })
+        .context("parsing range start")?;
+    let to = parse_tai_timestamp(to_str)
+        .or_else(|_| {
+            parse_written_stamp(to_str).ok_or_else(|| anyhow!("invalid timestamp: {to_str}"))
+        })
+        .context("parsing range end")?;
+    if to < from {
+        bail!("a time range runs forward, and this one ends before it starts: {s}");
+    }
     Ok((from, to))
+}
+
+/// A memory lasts. An explicit range that is an instant is refused with the
+/// remedy; a rangeless create spans the moment ending now (see
+/// [`memory_model::MOMENT_SECONDS`]).
+fn require_duration(range: (Epoch, Epoch)) -> Result<()> {
+    if range.1 <= range.0 {
+        bail!(
+            "a memory lasts: {} is an instant. Give the span it covers (from..to), or leave the \
+             range out to mean the moment ending now ({}s).",
+            format_time_range(range.0, range.1),
+            memory_model::MOMENT_SECONDS
+        );
+    }
+    Ok(())
+}
+
+fn moment() -> Duration {
+    Duration::from_seconds(memory_model::MOMENT_SECONDS)
 }
 
 /// Find the best chunk covering a query time range — the most *specific*
@@ -811,6 +846,13 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "respan") {
         return cmd_respan(storage, &cli.ids[1..]);
     }
+    if cli
+        .ids
+        .first()
+        .is_some_and(|value| value == "respan-instants")
+    {
+        return cmd_respan_instants(storage, &cli.ids[1..]);
+    }
     if cli.ids.first().is_some_and(|value| value == "image") {
         return cmd_image(storage, &cli.ids[1..]);
     }
@@ -945,13 +987,21 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // If the first argument looks like a time range, parse it.
     let mut explicit_range: Option<(Epoch, Epoch)> = None;
     let summary_start_idx;
-    if args[0].contains("..") {
-        if let Ok(range) = parse_time_range(&args[0]) {
-            explicit_range = Some(range);
-            summary_start_idx = 1;
-        } else {
-            summary_start_idx = 0;
-        }
+    // A first argument shaped like a range IS the range: if it does not parse,
+    // that is an error to fix, never a summary to store. (The old fallthrough
+    // stored `2026-09-05T13:20:00Z..2026-09-05T13:33:00Z` as prose, three
+    // times in one day.)
+    let looks_like_range = |t: &str| {
+        t.contains("..") && t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-'
+    };
+    if looks_like_range(&args[0]) {
+        explicit_range = Some(parse_time_range(&args[0]).with_context(|| {
+            format!(
+                "the first argument looks like a time range but does not parse: {}",
+                args[0]
+            )
+        })?);
+        summary_start_idx = 1;
     } else {
         summary_start_idx = 0;
     }
@@ -974,9 +1024,10 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         Some(range) => range,
         None => {
             let now = clock::now()?;
-            (now, now)
+            (now - moment(), now)
         }
     };
+    require_duration(range)?;
     let loaded = storage.load()?;
     let chunk_id = create_chunk(
         storage,
@@ -1012,6 +1063,27 @@ fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let loaded = storage.load()?;
     let old = resolve_chunk_id(&loaded, &args[0])?;
     let range = parse_time_range(&args[1])?;
+    require_duration(range)?;
+    let now = clock::now()?;
+    let (fragment, moved) = respan_fragment(&loaded, old, range, now)?;
+    storage.publish_memory(fragment)?;
+    println!("range: {}", format_time_range(range.0, range.1));
+    println!("id: {moved:x}");
+    println!(
+        "  the same memory as {old:x} ({}), which stands aside",
+        chunk_span_str(&loaded.memory.facts, old)
+    );
+    Ok(())
+}
+
+/// The respan itself: the old chunk's text, lens, references and provenance
+/// over `range`, plus the edge. Shared by `respan` and `respan-instants`.
+fn respan_fragment(
+    loaded: &LoadedMemory,
+    old: Id,
+    range: (Epoch, Epoch),
+    now: Epoch,
+) -> Result<(Fragment, Id)> {
     let space = &loaded.memory.facts;
     let reader = &loaded.memory.reader;
     if let (Some(s), Some(e)) = (chunk_start_at(space, old), chunk_end_at(space, old)) {
@@ -1037,7 +1109,6 @@ fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         }
         None => None,
     };
-    let now = clock::now()?;
     let (mut fragment, moved) = memory_model::chunk_fragment(memory_model::ChunkDraft {
         content: memory_model::ChunkDraftContent::Text(summary.as_ref().to_owned()),
         start_at: clock::point(range.0)?,
@@ -1056,13 +1127,186 @@ fn cmd_respan(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         );
     }
     fragment += memory_model::respan_edge(moved, old);
-    storage.publish_memory(fragment)?;
-    println!("range: {}", format_time_range(range.0, range.1));
-    println!("id: {moved:x}");
-    println!(
-        "  the same memory as {old:x} ({}), which stands aside",
-        chunk_span_str(space, old)
-    );
+    Ok((fragment, moved))
+}
+
+/// Parse one timestamp as people actually wrote them at the head of a memory:
+/// `YYYY-MM-DDTHH:MM[:SS]`, a space instead of the `T`, a trailing `Z`, or a
+/// `+HH:MM`/`-HH:MM` offset (converted to the bare form everyone else writes).
+fn parse_written_stamp(raw: &str) -> Option<Epoch> {
+    let raw = raw.trim();
+    let bytes = raw.as_bytes();
+    let (body, offset_secs): (&str, i64) = if let Some(body) = raw.strip_suffix('Z') {
+        (body, 0)
+    } else if raw.len() > 6
+        && (bytes[raw.len() - 6] == b'+' || bytes[raw.len() - 6] == b'-')
+        && bytes[raw.len() - 3] == b':'
+    {
+        let (body, off) = raw.split_at(raw.len() - 6);
+        let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+        let hh: i64 = off[1..3].parse().ok()?;
+        let mm: i64 = off[4..6].parse().ok()?;
+        (body, sign * (hh * 3600 + mm * 60))
+    } else {
+        (raw, 0)
+    };
+    let mut body = body.replacen(' ', "T", 1);
+    if body.len() == 16 && body.as_bytes()[13] == b':' {
+        body.push_str(":00");
+    }
+    let epoch = parse_tai_timestamp(&body).ok()?;
+    Some(epoch - Duration::from_seconds(offset_secs as f64))
+}
+
+/// What the head of a memory's text says about its span, if anything:
+/// `A..B` or `A/B` with either stamp form above (a space between date and
+/// time allowed), or a duration such as `10m` / `2h` meaning the stretch that
+/// ended at the memory's stamp.
+fn leading_range(text: &str, stamp: Epoch) -> Option<(Epoch, Epoch)> {
+    let text = text.trim_start();
+    // Up to four whitespace-separated tokens can carry `DATE TIME..DATE TIME`.
+    let tokens: Vec<&str> = text.split_whitespace().take(4).collect();
+    let first = *tokens.first()?;
+    // A duration prefix.
+    if let Some(number) = first
+        .strip_suffix('m')
+        .or_else(|| first.strip_suffix('h'))
+        .or_else(|| first.strip_suffix('s'))
+    {
+        if let Ok(n) = number.parse::<f64>() {
+            if n > 0.0 && tokens.len() > 1 {
+                let unit = match first.chars().last()? {
+                    'h' => 3600.0,
+                    'm' => 60.0,
+                    _ => 1.0,
+                };
+                return Some((stamp - Duration::from_seconds(n * unit), stamp));
+            }
+        }
+    }
+    let looks_like_date =
+        |t: &str| t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-';
+    // Rejoin `DATE TIME` pairs so a range written with spaces still parses.
+    let mut joined = String::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if looks_like_date(t) && t.len() == 10 && i + 1 < tokens.len() {
+            joined.push_str(t);
+            joined.push('T');
+            joined.push_str(tokens[i + 1]);
+            i += 2;
+        } else {
+            joined.push_str(t);
+            i += 1;
+        }
+        if joined.contains("..") || joined.contains('/') {
+            break;
+        }
+        joined.push(' ');
+    }
+    let head = joined.split_whitespace().next()?;
+    if !looks_like_date(head) {
+        return None;
+    }
+    let (a, b) = head.split_once("..").or_else(|| head.split_once('/'))?;
+    let from = parse_written_stamp(a)?;
+    let to = parse_written_stamp(b)?;
+    (from < to).then_some((from, to))
+}
+
+/// `memory respan-instants [--dry-run]` -- give every zero-length memory the
+/// span it should have had: the range its own text begins with, a duration
+/// its text begins with, or else the moment ending at its stamp. An inverted
+/// range is turned forward. Each becomes one respan; all of them are published
+/// as one commit. Repeating it finds nothing to do.
+fn cmd_respan_instants(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if args.iter().any(|a| a != "--dry-run") {
+        bail!("usage: memory respan-instants [--dry-run]");
+    }
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let reader = &loaded.memory.reader;
+    let now = clock::now()?;
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut examples = std::collections::BTreeMap::<&str, Vec<String>>::new();
+    let mut batch = Fragment::empty();
+    let mut planned = 0usize;
+    for id in all_chunk_ids(space) {
+        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
+            continue;
+        };
+        let (start, end) = (epoch_from_interval(s), epoch_end_from_interval(e));
+        if start < end {
+            continue;
+        }
+        let Some(summary_handle) = chunk_summary_handle(space, id) else {
+            *counts.entry("image (skipped)").or_default() += 1;
+            continue;
+        };
+        // Already respanned: a chunk with the same text supersedes it.
+        let already = find!(
+            n: Id,
+            pattern!(space, [{ ?n @ metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID, metadata::supersedes: id }])
+        )
+        .any(|n| chunk_summary_handle(space, n) == Some(summary_handle));
+        if already {
+            *counts.entry("already respanned").or_default() += 1;
+            continue;
+        }
+        let text: View<str> = reader.get(summary_handle).context("read a memory's text")?;
+        let (category, range) = if start > end {
+            ("inverted, turned forward", (end, start))
+        } else if let Some(range) = leading_range(text.as_ref(), start) {
+            // A range in the text nowhere near the stamp is a quotation, not a
+            // claim about this memory: give it a moment and list it for review.
+            let near = |t: Epoch| (t - start).abs() < Duration::from_days(2.0);
+            if near(range.0) || near(range.1) {
+                ("range in its own text", range)
+            } else {
+                (
+                    "far-off range in text (given a moment; review)",
+                    (start - moment(), start),
+                )
+            }
+        } else {
+            ("a moment ending at the stamp", (start - moment(), start))
+        };
+        *counts.entry(category).or_default() += 1;
+        let shown = examples.entry(category).or_default();
+        if shown.len() < 3 {
+            let head: String = text.as_ref().chars().take(70).collect();
+            shown.push(format!(
+                "  {:x} {} -> {}  {:?}",
+                id,
+                format_time_range(start, end),
+                format_time_range(range.0, range.1),
+                head
+            ));
+        }
+        if !dry_run {
+            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            batch += fragment;
+        }
+        planned += 1;
+    }
+    for (category, n) in &counts {
+        println!("{n:>6}  {category}");
+        for line in examples.get(category).into_iter().flatten() {
+            println!("{line}");
+        }
+    }
+    if dry_run {
+        println!("dry run: {planned} respan(s) would be written as one commit");
+        return Ok(());
+    }
+    if planned == 0 {
+        println!("nothing to do");
+        return Ok(());
+    }
+    storage.publish_memory(batch)?;
+    println!("{planned} respan(s) written as one commit");
     Ok(())
 }
 
