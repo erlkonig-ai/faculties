@@ -18,10 +18,10 @@ use faculties::storage::{load_signer, open_pile_strict, FactArchive};
 use faculties::collection_names::open_configured;
 use faculties::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
-    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_references, chunk_span_str,
-    chunk_start_at, chunk_summary_handle, collect_chunk_spans, epoch_end_from_interval,
-    epoch_from_interval, fmt_epoch, format_time_range, interval_key, key_to_epoch, CoverOpts,
-    DEFAULT_SIM_THRESHOLD,
+    chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
+    chunk_span_str, chunk_start_at, chunk_summary_handle, collect_chunk_spans,
+    epoch_end_from_interval, epoch_from_interval, fmt_epoch, format_time_range, interval_key,
+    key_to_epoch, CoverOpts, DEFAULT_SIM_THRESHOLD,
 };
 #[cfg(feature = "local-embed")]
 use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
@@ -2322,6 +2322,66 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         );
     }
     println!("id: {chunk_id:x}");
+    let written: Vec<String> = chunk_observed_at(space, chunk_id)
+        .into_iter()
+        .map(|at| fmt_epoch(epoch_from_interval(at)))
+        .collect();
+    if !written.is_empty() {
+        println!("written_at: {}", written.join(", "));
+    }
+    // Read-only history. A retraction record or a `supersedes` edge from the
+    // old comb is evidence of what was once done; the journal gives neither
+    // any ordering or visibility meaning (memories coexist).
+    let span_of = |id: Id| match (chunk_start_at(space, id), chunk_end_at(space, id)) {
+        (Some(s), Some(e)) => format!(
+            "{} ({:x})",
+            format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
+            id
+        ),
+        _ => format!("{id:x}"),
+    };
+    let retractions: Vec<Id> = find!(
+        r: Id,
+        pattern!(space, [{ ?r @ metadata::tag: &faculties::schemas::memory::KIND_RETRACTION, metadata::supersedes: chunk_id }])
+    )
+    .collect();
+    if !retractions.is_empty() {
+        println!(
+            "retraction_records: {} (historical; the journal shows every memory)",
+            retractions
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let edges_out: Vec<Id> =
+        find!(o: Id, pattern!(space, [{ chunk_id @ metadata::supersedes: ?o }])).collect();
+    if !edges_out.is_empty() {
+        println!(
+            "historical_supersedes: {}",
+            edges_out
+                .iter()
+                .map(|id| span_of(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let edges_in: Vec<Id> = find!(
+        n: Id,
+        pattern!(space, [{ ?n @ metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID, metadata::supersedes: chunk_id }])
+    )
+    .collect();
+    if !edges_in.is_empty() {
+        println!(
+            "historical_superseded_by: {}",
+            edges_in
+                .iter()
+                .map(|id| span_of(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let outgoing = chunk_references(space, chunk_id);
     if !outgoing.is_empty() {

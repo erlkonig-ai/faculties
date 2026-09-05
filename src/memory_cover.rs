@@ -971,9 +971,8 @@ where
         bail!(
             "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
              Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
-             Raise a coarser apex over the whole extent, then retry:\n    \
-             memory create {}..{} \"<one coarse summary of this whole span>\"\n\
-             (A well-maintained hierarchy keeps a coarse summary over its full extent — this is how you add the missing layer.)",
+             Comb the uncovered tail into arcs BESIDE the existing apex -- day or week arcs over the orphaned span (`memory density` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
+             (A well-maintained hierarchy keeps arcs over every span; the apex is the one you already have.)",
             used,
             roots.len(),
             fmt_epoch(key_to_epoch(earliest)),
