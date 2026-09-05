@@ -524,6 +524,10 @@ pub struct CoverOpts {
     pub remove: Option<String>,
     /// Cosine cutoff for `--filter`/`--remove` eligibility.
     pub sim_threshold: f32,
+    /// Memories per tile, stated by the reader with its window. `None` searches
+    /// for the finest detail that fits the budget; a reader that wants the same
+    /// cover tomorrow states the detail that search printed.
+    pub detail: Option<usize>,
 }
 
 impl CoverOpts {
@@ -536,6 +540,7 @@ impl CoverOpts {
             filter: None,
             remove: None,
             sim_threshold: DEFAULT_SIM_THRESHOLD,
+            detail: None,
         }
     }
 }
@@ -569,139 +574,329 @@ impl CoverOpts {
 /// instant-stamped memory has no interior an instant could fall into.
 const MOMENT_NS: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
 
-/// The fineness ladder. A step is a quarter of a doubling of the scalar that
-/// turns age into a coarseness threshold. A cover is cut AT a step, never
-/// between, so a new memory at the edge moves the cut by whole steps or not
-/// at all and the text before the edge stays byte-identical between steps.
-const FINENESS_STEPS: std::ops::RangeInclusive<i32> = -80..=120;
+const DAY_NS: i128 = 86_400 * 1_000_000_000;
 
-fn fineness(step: i32) -> f64 {
-    2f64.powf(step as f64 / 4.0)
+/// Tiles grow by this factor per level, and a level holds at most this many
+/// complete tiles before they merge into one tile of the next level.
+pub const TILE_BASE: i128 = 4;
+
+/// The most memories per tile a reader may ask for, and the far end of the
+/// search when it asks for none.
+pub const DETAIL_CAP: usize = 4096;
+
+/// One tile of the cover: a block of whole TAI days on an absolute grid.
+/// `open` is today, the day `now` falls in, still being written; it wants leaf
+/// grain. A closed tile of `days` days wants a grain of `days / detail`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tile {
+    pub start: i128,
+    pub end: i128,
+    pub days: i128,
+    pub open: bool,
 }
 
-/// One cut through the field.
+/// The tiling for a pile whose earliest memory starts at `earliest` and whose
+/// latest ends at `now` (TAI keys): a pure function of the pile.
 ///
-/// `now` is the latest end of any memory: a pure function of the pile, never
-/// the wall clock. At every instant of the extent, the memories covering it
-/// are ranked: a memory whose width clears the coarseness wanted at its age
-/// (`width >= age / k`, age measured at its end) is eligible, and the
-/// narrowest eligible is shown there; where none is eligible, the widest
-/// there is. A memory is in the cover if it is shown at any instant it
-/// covers. So arcs cover gaps and entries cover moments by arithmetic; two
-/// memories over the same minutes both show, each narrowest somewhere; and
-/// a moment inside an entry shows beside it rather than replacing it.
-/// `k = None` is the coarsest cut: nothing eligible, the widest everywhere,
-/// which is what completeness requires at the smallest budget.
-pub fn select_field(spans: &[(i128, i128, Id)], k: Option<f64>) -> Vec<usize> {
+/// It is the base-`TILE_BASE` counter of the day `now` falls in. Level 0 is
+/// today, open. Level `l` holds the complete tiles of `TILE_BASE^l` days that
+/// lie before the current block at that level and inside the current block of
+/// the level above: the digit of the counter, zero to `TILE_BASE - 1` tiles.
+/// So when today closes it becomes a one-day tile; when a level fills, its
+/// tiles merge into one tile of the next level and are re-rendered at that
+/// level's grain. Between merges the cover changes only by appends in today,
+/// a merge rewrites a suffix, and a merge into a deep level is rare in
+/// proportion to its depth. That is what lets a resident reuse the prefix of
+/// her cover across recomputes.
+pub fn tiles(earliest: i128, now: i128) -> Vec<Tile> {
+    let first = earliest.div_euclid(DAY_NS);
+    let today = now.div_euclid(DAY_NS);
+    let mut out = vec![Tile {
+        start: today * DAY_NS,
+        end: (today + 1) * DAY_NS,
+        days: 1,
+        open: true,
+    }];
+    let mut size = 1i128;
+    loop {
+        // The current block at this level already reaches the first memory:
+        // nothing lies to its left.
+        let block = today - today.rem_euclid(size);
+        if block <= first {
+            break;
+        }
+        let up = size * TILE_BASE;
+        let block_up = today - today.rem_euclid(up);
+        let left = block_up.max(first - first.rem_euclid(size));
+        let mut t = left;
+        while t < block {
+            out.push(Tile {
+                start: t * DAY_NS,
+                end: (t + size) * DAY_NS,
+                days: size,
+                open: false,
+            });
+            t += size;
+        }
+        size = up;
+    }
+    out.sort_by_key(|t| t.start);
+    out
+}
+
+/// The grain a tile wants at `detail` memories per tile. `detail == 0` wants
+/// the widest memory everywhere: the completeness floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    Widest,
+    Narrowest,
+    Width(i128),
+}
+
+fn want(tile: &Tile, detail: usize) -> Want {
+    if detail == 0 {
+        Want::Widest
+    } else if tile.open {
+        Want::Narrowest
+    } else {
+        Want::Width((tile.days * DAY_NS / detail as i128).max(MOMENT_NS))
+    }
+}
+
+/// Of the active memories, keyed `(width, index)`, the one whose width is
+/// closest to the want as a ratio; ties go to the narrower.
+fn closest(active: &BTreeSet<(i128, usize)>, want: Want) -> usize {
+    match want {
+        Want::Widest => active.iter().next_back().unwrap().1,
+        Want::Narrowest => active.iter().next().unwrap().1,
+        Want::Width(w) => {
+            let narrower = active.range(..(w + 1, 0)).next_back();
+            let wider = active.range((w + 1, 0)..).next();
+            match (narrower, wider) {
+                (Some(&(nw, ni)), Some(&(ww, wi))) => {
+                    // w / nw <= ww / w  <=>  w * w <= nw * ww
+                    if w * w <= nw * ww {
+                        ni
+                    } else {
+                        wi
+                    }
+                }
+                (Some(&(_, i)), None) | (None, Some(&(_, i))) => i,
+                (None, None) => unreachable!("closest of an empty set"),
+            }
+        }
+    }
+}
+
+/// Sweep the tiled field left to right and report every elementary interval:
+/// `(tile index, from, to, picked span index)`. At every point, of the
+/// memories covering it, the one whose width is closest to the grain the
+/// point's tile wants. Instants are a moment wide, so a moment inside an entry
+/// is picked beside it, and overlapping memories are each picked where they
+/// are closest.
+fn sweep(
+    spans: &[(i128, i128, Id)],
+    tiles: &[Tile],
+    detail: usize,
+    mut visit: impl FnMut(usize, i128, i128, usize),
+) {
     let n = spans.len();
     if n == 0 {
-        return Vec::new();
+        return;
     }
-    let now = spans.iter().map(|s| s.1).max().unwrap();
     let width = |i: usize| (spans[i].1 - spans[i].0).max(MOMENT_NS);
-    let eligible: Vec<bool> = (0..n)
-        .map(|i| match k {
-            Some(k) => (width(i) as f64) * k >= (now - spans[i].1).max(0) as f64,
-            None => false,
-        })
-        .collect();
-    // Sweep the endpoints. At one coordinate, ends leave before starts arrive
-    // (0 sorts before 1), so a memory covers `[start, start + width)`.
-    let mut events: Vec<(i128, u8, usize)> = Vec::with_capacity(2 * n);
+    // (coordinate, kind, index): ends leave before starts arrive at one
+    // coordinate (0 sorts before 1), and a tile boundary (2) only breaks the
+    // sweep so the want can change there.
+    let mut events: Vec<(i128, u8, usize)> = Vec::with_capacity(2 * n + tiles.len());
     for i in 0..n {
         events.push((spans[i].0, 1, i));
         events.push((spans[i].0 + width(i), 0, i));
     }
+    for (t, tile) in tiles.iter().enumerate() {
+        events.push((tile.start, 2, t));
+    }
     events.sort_unstable();
     let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
-    let mut active_eligible: BTreeSet<(i128, usize)> = BTreeSet::new();
-    let mut shown = vec![false; n];
+    let mut tile_at = 0usize;
     let mut at = 0;
     while at < events.len() {
         let coordinate = events[at].0;
         while at < events.len() && events[at].0 == coordinate {
             let (_, kind, i) = events[at];
-            let key = (width(i), i);
-            if kind == 0 {
-                active.remove(&key);
-                active_eligible.remove(&key);
-            } else {
-                active.insert(key);
-                if eligible[i] {
-                    active_eligible.insert(key);
+            match kind {
+                0 => {
+                    active.remove(&(width(i), i));
                 }
+                1 => {
+                    active.insert((width(i), i));
+                }
+                _ => tile_at = tile_at.max(i),
             }
             at += 1;
         }
-        // The elementary interval from here to the next coordinate.
-        if at < events.len() {
-            let pick = active_eligible
-                .iter()
-                .next()
-                .or_else(|| active.iter().next_back());
-            if let Some(&(_, i)) = pick {
-                shown[i] = true;
-            }
+        if at < events.len() && !active.is_empty() {
+            let pick = closest(&active, want(&tiles[tile_at], detail));
+            visit(tile_at, coordinate, events[at].0, pick);
         }
     }
-    (0..n).filter(|&i| shown[i]).collect()
 }
 
-/// A cut that fits: the finest step whose cover costs no more than the
-/// budget. The ladder is walked from the finest step downward and the first
-/// step that fits wins, because cost is not monotone in fineness: between
-/// two steps a wide memory may still pay in full for the old half of its span
-/// while narrow memories already pay for the new half, so a cut can overflow
-/// at a middle step and fit again at a finer one. `fits` is false only when
-/// even the coarsest cut overflows, in which case `cover` is that coarsest
-/// cut and `used` its cost, so the caller can name the shortfall.
-pub struct FieldCut {
-    pub step: Option<i32>,
+/// One cut through the tiled field at `detail` memories per tile: a memory is
+/// in the cover wherever it was the closest to what its tile wants. `detail`
+/// zero is the widest memory at every point, the completeness floor.
+pub fn select_tiled(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) -> Vec<usize> {
+    let mut shown = vec![false; spans.len()];
+    sweep(spans, tiles, detail, |_, _, _, pick| shown[pick] = true);
+    (0..spans.len()).filter(|&i| shown[i]).collect()
+}
+
+/// How well the pile serves one tile at a detail: what the tile wanted, how
+/// many memories were picked in it, and the worst ratio between a picked
+/// width and the want over the tile. A ratio far from one is a missing arc
+/// (or, for today, nothing: today wants everything).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileReport {
+    pub tile: Tile,
+    pub want_ns: Option<i128>,
+    pub picked: usize,
+    pub worst_ratio: f64,
+}
+
+pub fn tile_report(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) -> Vec<TileReport> {
+    let mut picked: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tiles.len()];
+    let mut worst: Vec<f64> = vec![1.0; tiles.len()];
+    let width = |i: usize| (spans[i].1 - spans[i].0).max(MOMENT_NS);
+    sweep(spans, tiles, detail, |t, _, _, pick| {
+        picked[t].insert(pick);
+        if let Want::Width(w) = want(&tiles[t], detail) {
+            let ratio = (width(pick) as f64 / w as f64).max(w as f64 / width(pick) as f64);
+            worst[t] = worst[t].max(ratio);
+        }
+    });
+    tiles
+        .iter()
+        .enumerate()
+        .map(|(t, tile)| TileReport {
+            tile: *tile,
+            want_ns: match want(tile, detail) {
+                Want::Width(w) => Some(w),
+                _ => None,
+            },
+            picked: picked[t].len(),
+            worst_ratio: worst[t],
+        })
+        .collect()
+}
+
+/// A cut that fits. `detail` is what the reader asked for, `asked`; the cut
+/// steps down from there until it fits, because a complete cover that fits
+/// must always be produced. `fits` is false only when even the floor (the
+/// widest memory at every point) overflows, in which case `cover` is that
+/// floor and `used` its cost, so the caller can name the shortfall. With no
+/// detail asked, the finest detail that fits is searched for: doubling from
+/// one, then bisecting; a reader that wants a stable cover states the detail
+/// this prints.
+pub struct TiledCut {
+    pub detail: usize,
+    pub asked: Option<usize>,
     pub cover: Vec<usize>,
     pub used: usize,
     pub fits: bool,
 }
 
-pub fn fit_field(
+pub fn fit_tiled(
     spans: &[(i128, i128, Id)],
+    tiles: &[Tile],
     cost: &mut dyn FnMut(usize) -> Result<usize>,
     budget: usize,
-) -> Result<FieldCut> {
-    let total = |cover: &[usize], cost: &mut dyn FnMut(usize) -> Result<usize>| -> Result<usize> {
+    asked: Option<usize>,
+) -> Result<TiledCut> {
+    let mut render = |detail: usize| -> Result<(Vec<usize>, usize)> {
+        let cover = select_tiled(spans, tiles, detail);
         let mut used = 0usize;
-        for &i in cover {
+        for &i in &cover {
             used = used.saturating_add(cost(i)?);
         }
-        Ok(used)
+        Ok((cover, used))
     };
-    let coarsest = select_field(spans, None);
-    let floor = total(&coarsest, cost)?;
+    let (floor_cover, floor) = render(0)?;
     if floor > budget {
-        return Ok(FieldCut {
-            step: None,
-            cover: coarsest,
+        return Ok(TiledCut {
+            detail: 0,
+            asked,
+            cover: floor_cover,
             used: floor,
             fits: false,
         });
     }
-    for step in FINENESS_STEPS.rev() {
-        let cover = select_field(spans, Some(fineness(step)));
-        let used = total(&cover, cost)?;
-        if used <= budget {
-            return Ok(FieldCut {
-                step: Some(step),
-                cover,
-                used,
-                fits: true,
-            });
+    let done = |detail, (cover, used)| TiledCut {
+        detail,
+        asked,
+        cover,
+        used,
+        fits: true,
+    };
+    match asked {
+        Some(wanted) => {
+            for detail in (1..=wanted.min(DETAIL_CAP)).rev() {
+                let cut = render(detail)?;
+                if cut.1 <= budget {
+                    return Ok(done(detail, cut));
+                }
+            }
+            Ok(done(0, (floor_cover, floor)))
+        }
+        None => {
+            let mut best = (0usize, (floor_cover, floor));
+            let mut detail = 1usize;
+            let mut over = None;
+            while detail <= DETAIL_CAP {
+                let cut = render(detail)?;
+                if cut.1 <= budget {
+                    best = (detail, cut);
+                    detail *= 2;
+                } else {
+                    over = Some(detail);
+                    break;
+                }
+            }
+            if let Some(mut hi) = over {
+                let mut lo = best.0;
+                while hi - lo > 1 {
+                    let mid = (lo + hi) / 2;
+                    let cut = render(mid)?;
+                    if cut.1 <= budget {
+                        lo = mid;
+                        best = (mid, cut);
+                    } else {
+                        hi = mid;
+                    }
+                }
+            }
+            Ok(done(best.0, best.1))
         }
     }
-    Ok(FieldCut {
-        step: None,
-        cover: coarsest,
-        used: floor,
-        fits: true,
-    })
+}
+
+/// The tiles in one line, newest last: `today, 3x1d, 2x4d, 1x16d`.
+pub fn describe_tiles(tiles: &[Tile]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut runs: Vec<(i128, usize)> = Vec::new();
+    for tile in tiles.iter().rev() {
+        if tile.open {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((days, count)) if *days == tile.days => *count += 1,
+            _ => runs.push((tile.days, 1)),
+        }
+    }
+    parts.push("today".to_string());
+    for (days, count) in runs {
+        parts.push(format!("{count}x{days}d"));
+    }
+    parts.join(", ")
 }
 
 /// Collapse memories which are interchangeable to the temporal cover into one
@@ -852,7 +1047,13 @@ pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
 ) -> Result<CoverHeadroom> {
     let raw_spans = collect_chunk_spans(space);
     let (spans, classes) = recollection_classes(&raw_spans);
-    let coarsest = select_field(&spans, None);
+    let coarsest = match (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) {
+        (Some(earliest), Some(latest)) => select_tiled(&spans, &tiles(earliest, latest), 0),
+        _ => Vec::new(),
+    };
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
     let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
     let mut used = 0usize;
@@ -905,6 +1106,10 @@ where
         return Ok(out);
     }
     let (spans, classes) = recollection_classes(&raw_spans);
+    if spans.is_empty() {
+        eprintln!("memory context — 0 chunk(s)");
+        return Ok(String::new());
+    }
     let n = spans.len();
 
     // Only the emission needs containment, to indent a shown memory under the
@@ -1023,17 +1228,18 @@ where
         )?
         .saturating_add(chunk_overhead))
     };
-    let cut = fit_field(&spans, &mut cost_of, budget_chars)?;
+    let earliest = spans.iter().map(|s| s.0).min().unwrap();
+    let latest = spans.iter().map(|s| s.1).max().unwrap();
+    let tiles = tiles(earliest, latest);
+    let cut = fit_tiled(&spans, &tiles, &mut cost_of, budget_chars, opts.detail)?;
     if !cut.fits {
         // Completeness is invariant -- never drop a temporal position to fit.
-        // Even the coarsest cut, the widest memory at every instant, overflows:
-        // the memories at the edge have no arc over them yet. Say where.
-        let earliest = spans.iter().map(|s| s.0).min().unwrap();
-        let latest = spans.iter().map(|s| s.1).max().unwrap();
+        // Even the floor, the widest memory at every point, overflows: the
+        // memories at the edge have no arc over them yet. Say where.
         bail!(
             "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
              {} memories are the widest thing over some stretch of time, so no in-budget cover can contain everything.\n\
-             Comb the uncovered stretch into arcs BESIDE what exists -- day or week arcs over it (`memory density` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
+             Comb the uncovered stretch into arcs BESIDE what exists -- day or week arcs over it (`memory levels` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
              (A well-maintained hierarchy keeps arcs over every span; the apex is the one you already have.)",
             cut.used,
             cut.cover.len(),
@@ -1041,7 +1247,8 @@ where
             fmt_epoch(key_to_epoch(latest)),
         );
     }
-    let step = cut.step;
+    let detail = cut.detail;
+    let asked = cut.asked;
     let mut cover = cut.cover;
     let mut used = cut.used;
 
@@ -1115,15 +1322,18 @@ where
     // selected summary and retry this resident-only computation. The status
     // line goes to STDERR so its volatile counts never enter the cover text.
     eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode}); fineness step {}; coarsest cover {} chunk(s)",
+        "memory context — {} chunk(s), ~{} of {} characters ({mode}); detail {} per tile{}; tiles: {}; floor {} chunk(s)",
         cover.len(),
         used,
         budget_chars,
-        match step {
-            Some(step) => format!("{step} (age/{:.3})", fineness(step)),
-            None => "coarsest".to_string(),
+        detail,
+        match asked {
+            Some(wanted) if wanted != detail => format!(" (asked {wanted}, stepped down to fit)"),
+            Some(_) => String::new(),
+            None => " (fit; state it to keep the cover stable)".to_string(),
         },
-        select_field(&spans, None).len(),
+        describe_tiles(&tiles),
+        select_tiled(&spans, &tiles, 0).len(),
     );
     Ok(out)
 }
@@ -1291,142 +1501,243 @@ mod headroom_tests {
             .collect()
     }
 
-    fn day(d: i128) -> i128 {
-        d * 86_400 * 1_000_000_000
+    fn at(day: i128, hour: i128) -> i128 {
+        day * DAY_NS + hour * 3_600_000_000_000
     }
 
-    /// The coarsest cut is the widest memory at every instant.
-    #[test]
-    fn the_coarsest_cut_is_the_widest_at_every_instant() {
-        let id = ids(3);
-        let spans = vec![
-            (0, day(100), id[0]),
-            (day(10), day(20), id[1]),
-            (day(30), day(40), id[2]),
-        ];
-        assert_eq!(select_field(&spans, None), vec![0]);
-        // An overlapping tail that escapes the wide memory is the widest over
-        // its own overhang, so it shows too: completeness by arithmetic.
-        let spans = vec![(0, day(100), id[0]), (day(90), day(150), id[1])];
-        assert_eq!(select_field(&spans, None), vec![0, 1]);
+    fn minutes(m: i128) -> i128 {
+        m * 60_000_000_000
     }
 
-    /// Coarser further back: entries show only where they clear the
-    /// coarseness their age asks for; the arc always covers the gaps.
-    #[test]
-    fn coarser_further_back() {
-        let id = ids(11);
-        let mut spans = vec![(0, day(100), id[0])];
-        for i in 0..10 {
-            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
-        }
-        // Finest: every entry, and the arc over the gaps between them.
-        let fine = select_field(&spans, Some(1e9));
-        assert_eq!(fine, (0..11).collect::<Vec<_>>());
-        // Coarsest: the arc alone.
-        assert_eq!(select_field(&spans, Some(1e-9)), vec![0]);
-        // In between: an entry 5 days wide clears an age of at most 5 days
-        // at k = 1 -- the last entry (age 5 days, ending at day 95) shows,
-        // the one before it (age 15 days) does not.
-        let mid = select_field(&spans, Some(1.0));
-        assert!(mid.contains(&10), "the newest entry shows: {mid:?}");
-        assert!(
-            !mid.contains(&9),
-            "an older entry is below the coarseness for its age: {mid:?}"
-        );
-        assert!(mid.contains(&0), "the arc covers the rest");
+    fn tile_days(tiles: &[Tile]) -> Vec<(i128, i128)> {
+        tiles.iter().map(|t| (t.start / DAY_NS, t.days)).collect()
     }
 
-    /// Two memories over the same minutes both show, each narrowest somewhere,
-    /// whether they overlap or one sits inside the other.
+    /// The tiling is the base-4 counter of today: one open day, then the
+    /// complete tiles of each level before the current block at that level.
     #[test]
-    fn overlapping_memories_both_show() {
-        let id = ids(3);
-        let nested = vec![
-            (0, day(1), id[0]),
-            (day(1) / 2, day(1) / 2 + 60_000_000_000, id[1]),
-        ];
-        assert_eq!(select_field(&nested, Some(1e9)), vec![0, 1]);
-        let overlapping = vec![(0, day(1), id[0]), (day(1) / 2, day(1) + day(1) / 2, id[1])];
-        assert_eq!(select_field(&overlapping, Some(1e9)), vec![0, 1]);
-    }
-
-    /// An instant lasts a moment: it shows beside its container, not instead.
-    #[test]
-    fn a_moment_shows_beside_its_container() {
-        let id = ids(2);
-        let spans = vec![(0, day(1), id[0]), (day(1) / 2, day(1) / 2, id[1])];
-        assert_eq!(select_field(&spans, Some(1e9)), vec![0, 1]);
-    }
-
-    /// The cut fits the budget at the finest step that does, and names an
-    /// overflow of even the coarsest cut instead of dropping time.
-    #[test]
-    fn fit_picks_the_finest_step_within_budget() {
-        let id = ids(11);
-        let mut spans = vec![(0, day(100), id[0])];
-        for i in 0..10 {
-            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
-        }
-        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
-        let tight = fit_field(&spans, &mut cost, 120).unwrap();
-        assert!(tight.fits);
-        assert!(tight.cover.contains(&0));
-        assert!(tight.cover.len() <= 3, "{:?}", tight.cover);
-        assert!(tight.used <= 120);
-        let loose = fit_field(&spans, &mut cost, 1_000).unwrap();
-        assert_eq!(loose.cover, (0..11).collect::<Vec<_>>());
-        assert_eq!(loose.used, 200);
-        let impossible = fit_field(&spans, &mut cost, 50).unwrap();
-        assert!(!impossible.fits);
-        assert_eq!(impossible.cover, vec![0]);
-        assert_eq!(impossible.used, 100);
-    }
-
-    /// On this shape a finer step never shows fewer memories than a coarser
-    /// one. That is not true in general -- see `fit_finds_a_fit_past_a_bump`
-    /// -- which is why `fit_field` walks the ladder from the fine end.
-    #[test]
-    fn steps_are_cut_at_the_ladder() {
-        let id = ids(11);
-        let mut spans = vec![(0, day(100), id[0])];
-        for i in 0..10 {
-            spans.push((day(10 * i), day(10 * i) + day(5), id[i as usize + 1]));
-        }
-        let mut last = 0usize;
-        for step in FINENESS_STEPS {
-            let n = select_field(&spans, Some(fineness(step))).len();
-            assert!(n >= last, "step {step}: {n} < {last}");
-            last = n;
-        }
-    }
-
-    /// Cost is not monotone in fineness: with a root over two halves, the
-    /// middle steps show the root (still paying for the old half) beside the
-    /// new half, which costs more than either the root alone or both halves.
-    /// The fit must not stop at that bump.
-    #[test]
-    fn fit_finds_a_fit_past_a_bump() {
-        let id = ids(3);
-        let spans = vec![
-            (0, day(2), id[0]),
-            (0, day(1), id[1]),
-            (day(1), day(2), id[2]),
-        ];
-        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 4 } else { 3 }) };
-        let bump = select_field(&spans, Some(fineness(-4)));
+    fn the_tiling_is_the_counter_of_today() {
+        // 85 = 1*64 + 1*16 + 1*4 + 1: one tile at every level.
+        let t = tiles(at(0, 0), at(85, 12));
         assert_eq!(
-            bump,
-            vec![0, 2],
-            "the middle step shows the root beside the new half"
+            tile_days(&t),
+            vec![(0, 64), (64, 16), (80, 4), (84, 1), (85, 1)]
         );
-        let cut = fit_field(&spans, &mut cost, 6).unwrap();
+        assert!(t.last().unwrap().open);
+        assert_eq!(describe_tiles(&t), "today, 1x1d, 1x4d, 1x16d, 1x64d");
+        // 87 = 1*64 + 1*16 + 1*4 + 3: three day tiles.
+        let t = tiles(at(0, 0), at(87, 0));
+        assert_eq!(
+            tile_days(&t),
+            vec![
+                (0, 64),
+                (64, 16),
+                (80, 4),
+                (84, 1),
+                (85, 1),
+                (86, 1),
+                (87, 1)
+            ]
+        );
+        // 88 = 1*64 + 1*16 + 2*4: the three days merged into a 4-day tile.
+        let t = tiles(at(0, 0), at(88, 0));
+        assert_eq!(
+            tile_days(&t),
+            vec![(0, 64), (64, 16), (80, 4), (84, 4), (88, 1)]
+        );
+        // A life that began two days ago has no tiles left of the first memory.
+        let t = tiles(at(83, 0), at(85, 12));
+        assert_eq!(tile_days(&t), vec![(80, 4), (84, 1), (85, 1)]);
+        // A life that began today is one open tile.
+        assert_eq!(tile_days(&tiles(at(85, 1), at(85, 12))), vec![(85, 1)]);
+    }
+
+    /// Today wants leaf grain: every memory in it, nested, overlapping, and
+    /// the instant beside its container.
+    #[test]
+    fn today_wants_every_memory() {
+        let id = ids(5);
+        let spans = vec![
+            (at(85, 0), at(85, 6), id[0]),
+            (at(85, 1), at(85, 1) + minutes(15), id[1]),
+            (at(85, 2), at(85, 2), id[2]),
+            (at(85, 5), at(85, 9), id[3]),
+            (at(85, 9), at(85, 9) + minutes(1), id[4]),
+        ];
+        let t = tiles(at(85, 0), at(85, 12));
+        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 1, 2, 3, 4]);
+        assert_eq!(select_tiled(&spans, &t, 4096), vec![0, 1, 2, 3, 4]);
+        // The floor is the widest at every point: the two arcs, and the last
+        // minute that escapes them.
+        assert_eq!(select_tiled(&spans, &t, 0), vec![0, 3, 4]);
+    }
+
+    /// A closed tile wants its width over the detail; at every point the
+    /// memory closest to that, as a ratio.
+    #[test]
+    fn a_closed_tile_wants_its_grain() {
+        let id = ids(16);
+        let mut spans = vec![(at(84, 0), at(85, 0), id[0])];
+        for q in 0..6 {
+            spans.push((at(84, 4 * q), at(84, 4 * q + 4), id[1 + q as usize]));
+        }
+        for e in 0..8 {
+            let s = at(84, 0) + minutes(15 * e);
+            spans.push((s, s + minutes(15), id[7 + e as usize]));
+        }
+        spans.push((at(85, 3), at(85, 3) + minutes(10), id[15]));
+        let t = tiles(at(84, 0), at(85, 12));
+        // One per tile: the day arc, and today's entry.
+        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 15]);
+        // Six per tile: the four-hour arcs.
+        assert_eq!(select_tiled(&spans, &t, 6), vec![1, 2, 3, 4, 5, 6, 15]);
+        // Ninety-six per tile: the entries where they exist, and where none
+        // does, the four-hour arcs (closer to fifteen minutes than the day).
+        assert_eq!(
+            select_tiled(&spans, &t, 96),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    /// Closest as a ratio, from either side: a point covered by an entry and a
+    /// life root, wanting a day, shows the entry; add an arc between and it
+    /// shows the arc.
+    #[test]
+    fn closest_by_ratio_takes_the_entry_over_the_root() {
+        let id = ids(3);
+        let root = (at(0, 0), at(400, 0), id[0]);
+        let entry = (at(82, 10), at(82, 10) + minutes(15), id[1]);
+        let t = tiles(at(0, 0), at(85, 12));
+        assert_eq!(select_tiled(&[root, entry], &t, 4), vec![0, 1]);
+        let arc = (at(82, 8), at(82, 11), id[2]);
+        assert_eq!(select_tiled(&[root, entry, arc], &t, 4), vec![0, 2]);
+        // Ties go to the narrower: a two-hour and an eight-hour memory over a
+        // point wanting four hours.
+        let t = tiles(at(84, 0), at(85, 12));
+        let two = (at(84, 6), at(84, 8), id[1]);
+        let eight = (at(84, 0), at(84, 8), id[2]);
+        assert_eq!(select_tiled(&[two, eight], &t, 6), vec![0, 1]);
+        assert_eq!(select_tiled(&[eight, two], &t, 6), vec![0, 1]);
+    }
+
+    /// The floor is the widest memory at every point, and an overhang that
+    /// escapes the wide memory is the widest over itself.
+    #[test]
+    fn the_floor_is_the_widest_at_every_point() {
+        let id = ids(3);
+        let t = tiles(at(0, 0), at(150, 0));
+        let spans = vec![
+            (at(0, 0), at(100, 0), id[0]),
+            (at(10, 0), at(20, 0), id[1]),
+            (at(30, 0), at(40, 0), id[2]),
+        ];
+        assert_eq!(select_tiled(&spans, &t, 0), vec![0]);
+        let spans = vec![
+            (at(0, 0), at(100, 0), id[0]),
+            (at(90, 0), at(150, 0), id[1]),
+        ];
+        assert_eq!(select_tiled(&spans, &t, 0), vec![0, 1]);
+    }
+
+    /// The reader asks for a detail; the cut steps down until a complete cover
+    /// fits, and only the floor overflowing is a failure. With no detail asked,
+    /// the finest that fits is found.
+    #[test]
+    fn the_cut_steps_down_and_never_strands() {
+        let id = ids(30);
+        let mut spans = vec![(at(84, 0), at(85, 0), id[0])];
+        for e in 0..24 {
+            spans.push((at(84, e), at(84, e + 1), id[1 + e as usize]));
+        }
+        spans.push((at(85, 1), at(85, 1) + minutes(5), id[25]));
+        let t = tiles(at(84, 0), at(85, 12));
+        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
+        // Asked twenty-four (every hour, 250): only the day arc fits 200.
+        let cut = fit_tiled(&spans, &t, &mut cost, 200, Some(24)).unwrap();
         assert!(cut.fits);
-        assert_eq!(cut.cover, vec![1, 2]);
-        assert_eq!(cut.used, 6);
-        let coarse = fit_field(&spans, &mut cost, 5).unwrap();
-        assert!(coarse.fits);
-        assert_eq!(coarse.cover, vec![0]);
-        assert_eq!(coarse.step, None);
+        assert_eq!(cut.asked, Some(24));
+        assert!(cut.detail < 24);
+        assert_eq!(cut.cover, vec![0, 25]);
+        // Asked twenty-four with room: every hour.
+        let cut = fit_tiled(&spans, &t, &mut cost, 300, Some(24)).unwrap();
+        assert_eq!(cut.detail, 24);
+        assert_eq!(cut.cover.len(), 25);
+        // Below the floor: not fitting, and the floor is what comes back.
+        let cut = fit_tiled(&spans, &t, &mut cost, 50, Some(24)).unwrap();
+        assert!(!cut.fits);
+        assert_eq!(cut.detail, 0);
+        assert_eq!(cut.cover, vec![0, 25]);
+        // Nothing asked: the search finds the hours when they fit.
+        let cut = fit_tiled(&spans, &t, &mut cost, 300, None).unwrap();
+        assert_eq!(cut.asked, None);
+        assert!(cut.detail >= 24, "{}", cut.detail);
+        assert_eq!(cut.cover.len(), 25);
+    }
+
+    /// Consecutive covers differ only in a suffix: a write in today changes
+    /// nothing before today; a midnight closes today into a day tile and
+    /// changes nothing before it; a merge rewrites the merged tiles and
+    /// nothing before them.
+    #[test]
+    fn consecutive_covers_differ_only_in_a_suffix() {
+        let mut spans = Vec::new();
+        let mut next = 1u128;
+        let mut mint = || {
+            let id = Id::new(u128::to_be_bytes(0xC1000000000000000000000000000000 + next)).unwrap();
+            next += 1;
+            id
+        };
+        for d in 0..86 {
+            spans.push((at(d, 0), at(d + 1, 0), mint()));
+            for h in [3, 9, 15, 21] {
+                spans.push((at(d, h), at(d, h + 1), mint()));
+            }
+        }
+        let shown_before = |spans: &[(i128, i128, Id)], now: i128, limit: i128| -> Vec<Id> {
+            let t = tiles(at(0, 0), now);
+            select_tiled(spans, &t, 6)
+                .into_iter()
+                .filter(|&i| spans[i].1 <= limit)
+                .map(|i| spans[i].2)
+                .collect()
+        };
+        let a = shown_before(&spans, at(85, 12), at(85, 0));
+        // A write in today.
+        spans.push((at(85, 13), at(85, 13) + minutes(15), mint()));
+        assert_eq!(shown_before(&spans, at(85, 14), at(85, 0)), a);
+        // Midnight: day 85 closes; nothing before it moves.
+        spans.push((at(86, 1), at(86, 1) + minutes(15), mint()));
+        assert_eq!(shown_before(&spans, at(86, 2), at(85, 0)), a);
+        // Day 88: days 84 to 87 merge into one tile; nothing before 84 moves,
+        // and the merged stretch is rendered coarser.
+        let before_84 = shown_before(&spans, at(86, 2), at(84, 0));
+        spans.push((at(88, 1), at(88, 1) + minutes(15), mint()));
+        assert_eq!(shown_before(&spans, at(88, 2), at(84, 0)), before_84);
+        let merged_fine = shown_before(&spans, at(87, 23), at(88, 0)).len();
+        let merged_coarse = shown_before(&spans, at(88, 2), at(88, 0)).len();
+        assert!(
+            merged_coarse < merged_fine,
+            "{merged_coarse} < {merged_fine}"
+        );
+    }
+
+    /// The report names a tile whose memories are far from its want.
+    #[test]
+    fn the_report_names_the_missing_arc() {
+        let id = ids(9);
+        let mut spans = Vec::new();
+        for e in 0..8 {
+            let s = at(84, e);
+            spans.push((s, s + minutes(15), id[e as usize]));
+        }
+        let t = tiles(at(84, 0), at(85, 12));
+        let report = tile_report(&spans, &t, 1);
+        assert_eq!(report[0].picked, 8);
+        assert!(report[0].worst_ratio > 90.0, "{}", report[0].worst_ratio);
+        assert_eq!(report[1].want_ns, None, "today wants leaf grain");
+        spans.push((at(84, 0), at(85, 0), id[8]));
+        let report = tile_report(&spans, &t, 1);
+        assert_eq!(report[0].picked, 1);
+        assert_eq!(report[0].worst_ratio, 1.0);
     }
 }
