@@ -27,7 +27,6 @@ use triblespace::core::collection::{
     CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
-use triblespace::core::inline::encodings::time::NsTAIInterval;
 use triblespace::core::inline::{Inline, TryFromInline, TryToInline};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};

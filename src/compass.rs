@@ -1051,8 +1051,7 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
@@ -1068,13 +1067,14 @@ pub async fn materialize_indexed_collection(
     let facts =
         FactCollection::new(pile, source).context("register maintained Compass fact collection")?;
     let status_target = status_register_for_source(pile, source)?;
-    let instant = crate::clock::now()?;
-    let before = pile.snapshot().context("freeze Compass source snapshot")?;
-    let support = pile
-        .acquire_admitted_support_at(source, &before, instant)
+    let source_snapshot = pile
+        .ensure(source)
         .await
-        .context("acquire admitted Compass source support")?;
-    drop(before);
+        .context("ensure Compass source collection")?;
+    let support = source
+        .admitted(&source_snapshot)
+        .context("admit ensured Compass source support")?;
+    drop(source_snapshot);
     drop(
         facts
             .maintain_exact(pile, &support)

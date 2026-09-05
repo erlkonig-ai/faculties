@@ -1569,12 +1569,9 @@ mod tests {
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (FactArchive, PileSnapshot) {
         let source = open_configured(pile, scope, signer.verifying_key()).unwrap();
         let collection = FactCollection::new(pile, source).unwrap();
-        let instant = crate::clock::now().unwrap();
-        let before = pile.snapshot().unwrap();
-        let reader = pollster::block_on(collection.maintain_at(pile, &before, instant)).unwrap();
-        drop(before);
+        let reader = pollster::block_on(collection.maintain(pile)).unwrap();
         let facts = reader
-            .collection_at(collection.rank9(), instant)
+            .collection(collection.rank9())
             .unwrap()
             .view::<FactArchive>()
             .unwrap();
@@ -1734,13 +1731,10 @@ mod tests {
         .unwrap();
         secrets::storage::add_secret(&mut pile, &signer, collection, "hs/model", b"second", at(4))
             .unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let collection =
-            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
-        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
-            &mut pile, collection, instant,
-        ))
-        .unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let secrets =
+            pollster::block_on(secrets::storage::ensure_and_snapshot(&mut pile, collection))
+                .unwrap();
 
         let anchor = test_id(0x42);
         let mut profile = default_profile(anchor, "exact");
@@ -1776,13 +1770,10 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let collection =
-            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant).unwrap();
-        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
-            &mut pile, collection, instant,
-        ))
-        .unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let secrets =
+            pollster::block_on(secrets::storage::ensure_and_snapshot(&mut pile, collection))
+                .unwrap();
         let error = validate_secret_references(&catalog, &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));
         pile.close().unwrap();

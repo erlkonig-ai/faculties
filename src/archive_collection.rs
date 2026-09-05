@@ -1892,7 +1892,10 @@ mod tests {
         let chunk_b = fucid();
         let snapshot_id = fucid();
         let block = fucid();
-        let timestamp: Inline<NsTAIInterval> = (1i128, 1i128).try_to_inline().unwrap();
+        let timestamp = crate::clock::point(hifitime::Epoch::from_tai_duration(
+            hifitime::Duration::from_total_nanoseconds(1),
+        ))
+        .unwrap();
         let mut fragment = entity! { &chunk_a @
             schema::source_chunk::offset: 0u128,
             schema::source_chunk::bytes: b"raw".to_vec(),
@@ -1918,7 +1921,7 @@ mod tests {
         let (_, facts, _metadata, blobs) = fragment.into_parts();
         stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
         let data = pile.put::<SimpleArchive, _>(facts).unwrap();
-        let support = Support::from_data(source, [data]);
+        let support = source.cover([data]);
         let after = pollster::block_on(collections.maintain_exact(&mut pile, &support)).unwrap();
         let observed = after
             .collection_exact(collections.rank9(), &support)
@@ -1964,27 +1967,36 @@ mod tests {
         let reader = fragment.blobs().clone().snapshot().unwrap();
         let names: Vec<_> = find!(
             name: Inline<Handle<UTF8String>>,
-            pattern!(&fragment, [{ source.id @ metadata::name: ?name }])
+            pattern!(fragment.facts(), [{ source.id @ metadata::name: ?name }])
         )
         .collect();
         assert_eq!(names.len(), 1);
-        let error =
-            write_source_snapshot(&fragment, &reader, source.id, &mut Vec::new()).unwrap_err();
+        let error = write_source_snapshot(fragment.facts(), &reader, source.id, &mut Vec::new())
+            .unwrap_err();
         assert!(error.to_string().contains("expected 0"));
     }
 
     #[test]
     fn timeline_uses_all_timestamp_annotations_without_scalar_validation() {
         let block = fucid();
-        let later: Inline<NsTAIInterval> = (9i128, 9i128).try_to_inline().unwrap();
-        let earlier: Inline<NsTAIInterval> = (4i128, 4i128).try_to_inline().unwrap();
+        let later = crate::clock::point(hifitime::Epoch::from_tai_duration(
+            hifitime::Duration::from_total_nanoseconds(9),
+        ))
+        .unwrap();
+        let earlier = crate::clock::point(hifitime::Epoch::from_tai_duration(
+            hifitime::Duration::from_total_nanoseconds(4),
+        ))
+        .unwrap();
         let fragment = entity! { &block @
             metadata::tag: &schema::block::KIND,
             schema::block::timestamp*: [later, earlier],
             metadata::name*: ["one", "two"],
         };
-        let timeline =
-            timeline_after(&fragment, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
+        let timeline = timeline_after(
+            fragment.facts(),
+            ArchiveTimelineCursor::AfterTime(i128::MIN),
+        )
+        .unwrap();
         assert_eq!(
             timeline,
             [ArchiveTimelineBlock {

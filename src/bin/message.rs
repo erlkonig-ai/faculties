@@ -397,18 +397,28 @@ fn main() -> Result<()> {
             .context("register maintained Relations fact collection")?;
         let messages = FactCollection::new(&mut pile, message_source)
             .context("register maintained Message fact collection")?;
+        drop(
+            pile.ensure(relations.source())
+                .await
+                .context("ensure Relations source collection")?,
+        );
+        drop(
+            pile.ensure(messages.source())
+                .await
+                .context("ensure Message source collection")?,
+        );
         let control = pile
             .snapshot()
             .context("freeze shared Message pre-maintenance snapshot")?;
-        let instant = clock::now()?;
-        let relations_support = pile
-            .acquire_admitted_support_at(relations.source(), &control, instant)
-            .await
-            .context("acquire admitted Relations support")?;
-        let messages_support = pile
-            .acquire_admitted_support_at(messages.source(), &control, instant)
-            .await
-            .context("acquire admitted Message support")?;
+        let relations_support = relations
+            .source()
+            .admitted(&control)
+            .context("admit Relations support")?;
+        let messages_support = messages
+            .source()
+            .admitted(&control)
+            .context("admit Message support")?;
+        drop(control);
         drop(
             relations
                 .maintain_exact(&mut pile, &relations_support)
@@ -421,7 +431,6 @@ fn main() -> Result<()> {
                 .await
                 .context("maintain Message fact collection")?,
         );
-        drop(control);
 
         // Both query views and every attachment read share this one later
         // immutable boundary.

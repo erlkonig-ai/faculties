@@ -155,12 +155,8 @@ impl MemoryStorage<'_> {
             let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(&mut pile, source)
                 .context("register maintained Memory collection")?;
-            let instant = clock::now()?;
-            let control = pile.snapshot().context("freeze Memory source snapshot")?;
-            let support = pile
-                .acquire_admitted_support_at(collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Memory support")?;
+            let control = pile.ensure(source).await.context("ensure Memory source")?;
+            let support = control.collection(source)?.support().clone();
             drop(
                 collection
                     .maintain_exact(&mut pile, &support)
@@ -196,20 +192,18 @@ impl MemoryStorage<'_> {
             } else {
                 None
             };
-            let instant = clock::now()?;
+            drop(pile.ensure(memory_source).await?);
+            if let Some(collection) = embeddings_collection {
+                drop(pile.ensure(collection.source()).await?);
+            }
             let control = pile
                 .snapshot()
                 .context("freeze Memory/Embeddings source snapshot")?;
-            let memory_support = pile
-                .acquire_admitted_support_at(memory_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Memory support")?;
+            let memory_support = control.collection(memory_source)?.support().clone();
             let embeddings_support = match embeddings_collection {
-                Some(collection) => Some(
-                    pile.acquire_admitted_support_at(collection.source(), &control, instant)
-                        .await
-                        .context("acquire admitted shared Embeddings support")?,
-                ),
+                Some(collection) => {
+                    Some(control.collection(collection.source())?.support().clone())
+                }
                 None => None,
             };
             drop(
@@ -265,18 +259,13 @@ impl MemoryStorage<'_> {
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let comb_collection = FactCollection::new(&mut pile, comb_source)
                 .context("register maintained Comb collection")?;
-            let instant = clock::now()?;
+            drop(pile.ensure(memory_source).await?);
+            drop(pile.ensure(comb_source).await?);
             let control = pile
                 .snapshot()
                 .context("freeze Memory/Comb source snapshot")?;
-            let memory_support = pile
-                .acquire_admitted_support_at(memory_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Memory support")?;
-            let comb_support = pile
-                .acquire_admitted_support_at(comb_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Comb support")?;
+            let memory_support = control.collection(memory_source)?.support().clone();
+            let comb_support = control.collection(comb_source)?.support().clone();
             drop(
                 memory_collection
                     .maintain_exact(&mut pile, &memory_support)
@@ -329,22 +318,15 @@ impl MemoryStorage<'_> {
                 .context("register maintained Cognition collection")?;
             let archive_collection = FactCollection::new(&mut pile, archive_source)
                 .context("register maintained Archive collection")?;
-            let instant = clock::now()?;
+            for source in [memory_source, cognition_source, archive_source] {
+                drop(pile.ensure(source).await?);
+            }
             let control = pile
                 .snapshot()
                 .context("freeze Memory/Cognition/Archive source snapshot")?;
-            let memory_support = pile
-                .acquire_admitted_support_at(memory_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Memory support")?;
-            let cognition_support = pile
-                .acquire_admitted_support_at(cognition_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Cognition support")?;
-            let archive_support = pile
-                .acquire_admitted_support_at(archive_collection.source(), &control, instant)
-                .await
-                .context("acquire admitted Archive support")?;
+            let memory_support = control.collection(memory_source)?.support().clone();
+            let cognition_support = control.collection(cognition_source)?.support().clone();
+            let archive_support = control.collection(archive_source)?.support().clone();
             for (collection, support, label) in [
                 (memory_collection, &memory_support, "Memory"),
                 (cognition_collection, &cognition_support, "Cognition"),

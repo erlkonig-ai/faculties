@@ -28,7 +28,7 @@ use triblespace::core::collection::{
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource,
+    BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource, StoreSnapshot,
 };
 use triblespace::core::trible::TribleSet;
 
@@ -203,14 +203,12 @@ where
 ///
 /// Unlike [`open_configured`], an exact override requires READ rather than
 /// WRITE admission. This is the appropriate boundary for consumers of a
-/// shared collection which never publish to it. The caller supplies the
-/// authorization instant so one composite read cannot observe companion
-/// collections at different wall-clock times.
+/// shared collection which never publish to it. Admission uses the frozen
+/// instant of the snapshot which supplies the descriptor and proof evidence.
 pub fn open_configured_read<S>(
     storage: &mut S,
     scope: Id,
     subject: VerifyingKey,
-    instant: hifitime::Epoch,
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
     S: CollectionStoreExt + SnapshotSource,
@@ -223,7 +221,7 @@ where
     let snapshot = storage
         .snapshot()
         .context("freeze store while opening configured collection descriptor")?;
-    open_exact_read_in(&snapshot, scope, subject, handle, instant)
+    open_exact_read_in(&snapshot, scope, subject, handle)
 }
 
 /// Open and validate one exact faculty descriptor in an existing snapshot.
@@ -243,21 +241,20 @@ where
 }
 
 /// Open and validate one exact faculty descriptor for a READ-only consumer at
-/// a caller-selected authorization instant.
+/// the snapshot's frozen authorization instant.
 pub fn open_exact_read_in<S>(
     snapshot: &S,
     scope: Id,
     subject: VerifyingKey,
     handle: CollectionHandle,
-    instant: hifitime::Epoch,
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
-    S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead,
 {
     let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
     let expected = require_name(scope);
     if !collection
-        .reader_is_admitted_at(snapshot, subject, instant)
+        .reader_is_admitted(snapshot, subject)
         .context("check configured collection READ admission")?
     {
         bail!(
@@ -330,10 +327,16 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ed25519_dalek::SigningKey;
+    use hifitime::Epoch;
+    use triblespace::core::capability::{
+        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+        CapabilityValidity,
+    };
     use triblespace::core::collection::grant_collection_read;
+    use triblespace::core::collection::ACTION_READ;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::SnapshotSource;
+    use triblespace::core::repo::{CapabilityProofStore, SnapshotSource};
     use triblespace::core::trible::TribleSet;
     use triblespace::macros::entity;
 
@@ -370,18 +373,13 @@ mod tests {
         store
             .commit(collection, &foreign, evidence.clone())
             .unwrap();
-        let instant = triblespace::core::clock::epoch_now();
         let store_snapshot = store.snapshot().unwrap();
-        let facts = collection
-            .read_at::<TribleSet, _>(&store_snapshot, instant)
-            .unwrap();
+        let facts = collection.read::<TribleSet, _>(&store_snapshot).unwrap();
         assert!(facts.is_empty());
 
         store.commit(collection, &local, evidence).unwrap();
         let store_snapshot = store.snapshot().unwrap();
-        let facts = collection
-            .read_at::<TribleSet, _>(&store_snapshot, instant)
-            .unwrap();
+        let facts = collection.read::<TribleSet, _>(&store_snapshot).unwrap();
         assert!(expected.difference(&facts).is_empty());
     }
 
@@ -443,13 +441,11 @@ mod tests {
             .unwrap();
 
         let snapshot = store.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
         let error = open_exact_read_in(
             &snapshot,
             wiki::DEFAULT_SCOPE_ID,
             reader.verifying_key(),
             shared.handle(),
-            instant,
         )
         .unwrap_err();
         assert!(error.to_string().contains("is not admitted to READ"));
@@ -469,7 +465,51 @@ mod tests {
                 wiki::DEFAULT_SCOPE_ID,
                 reader.verifying_key(),
                 shared.handle(),
-                instant,
+            )
+            .unwrap(),
+            shared
+        );
+    }
+
+    #[test]
+    fn exact_read_open_uses_the_snapshots_frozen_instant() {
+        let operator = SigningKey::from_bytes(&[0x63; 32]);
+        let reader = SigningKey::from_bytes(&[0x64; 32]);
+        let mut store = MemoryRepo::default();
+        let shared = store
+            .collection("wiki", private_policy(operator.verifying_key()))
+            .unwrap();
+        store
+            .insert_proof(CapabilityProof::issue_root(
+                &operator,
+                CapabilityResource::from(shared.handle()),
+                Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+                Some(
+                    CapabilityValidity::new(
+                        Epoch::from_unix_seconds(10.0),
+                        Epoch::from_unix_seconds(20.0),
+                    )
+                    .unwrap(),
+                ),
+                reader.verifying_key(),
+            ))
+            .unwrap();
+        let valid = store.snapshot_at(Epoch::from_unix_seconds(15.0)).unwrap();
+        let expired = store.snapshot_at(Epoch::from_unix_seconds(21.0)).unwrap();
+        assert!(expired.changes_since(&valid).is_empty());
+        assert!(open_exact_read_in(
+            &expired,
+            wiki::DEFAULT_SCOPE_ID,
+            reader.verifying_key(),
+            shared.handle(),
+        )
+        .is_err());
+        assert_eq!(
+            open_exact_read_in(
+                &valid.clone(),
+                wiki::DEFAULT_SCOPE_ID,
+                reader.verifying_key(),
+                shared.handle(),
             )
             .unwrap(),
             shared

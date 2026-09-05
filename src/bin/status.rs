@@ -117,19 +117,29 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
     let relations = FactCollection::new(pile, relations_source)
         .context("register maintained Relations fact collection")?;
 
-    let instant = clock::now()?;
-    let before = pile
-        .snapshot()
-        .context("freeze shared Status/Relations source snapshot")?;
     let (status_support, relations_support) = pollster::block_on(async {
-        let status_support = pile
-            .acquire_admitted_support_at(status.source(), &before, instant)
-            .await
-            .context("acquire admitted Status support")?;
-        let relations_support = pile
-            .acquire_admitted_support_at(relations.source(), &before, instant)
-            .await
-            .context("acquire admitted Relations support")?;
+        drop(
+            pile.ensure(status.source())
+                .await
+                .context("ensure Status source collection")?,
+        );
+        drop(
+            pile.ensure(relations.source())
+                .await
+                .context("ensure Relations source collection")?,
+        );
+        let before = pile
+            .snapshot()
+            .context("freeze shared Status/Relations source snapshot")?;
+        let status_support = status
+            .source()
+            .admitted(&before)
+            .context("admit Status support")?;
+        let relations_support = relations
+            .source()
+            .admitted(&before)
+            .context("admit Relations support")?;
+        drop(before);
         drop(
             status
                 .maintain_exact(pile, &status_support)
@@ -144,7 +154,6 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
         );
         Ok::<_, anyhow::Error>((status_support, relations_support))
     })?;
-    drop(before);
 
     let snapshot = pile
         .snapshot()
@@ -173,23 +182,10 @@ fn maintain_and_observe_relations(
     let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
     let collection = FactCollection::new(pile, source)
         .context("register maintained Relations fact collection")?;
-    let instant = clock::now()?;
-    let before = pile
-        .snapshot()
-        .context("freeze Relations source snapshot")?;
-    pollster::block_on(async {
-        collection
-            .maintain_at(pile, &before, instant)
-            .await
-            .context("maintain Relations fact collection")
-    })?;
-    drop(before);
-
-    let snapshot = pile
-        .snapshot()
-        .context("freeze maintained Relations snapshot")?;
+    let snapshot = pollster::block_on(collection.maintain(pile))
+        .context("maintain Relations fact collection")?;
     let relations = snapshot
-        .collection_at(collection.rank9(), instant)
+        .collection(collection.rank9())
         .context("observe Relations Rank9 collection")?
         .view::<FactArchive>()
         .context("read Relations Rank9 collection")?;
@@ -530,8 +526,7 @@ mod tests {
 
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let store_snapshot = pile.snapshot()?;
-                let instant = triblespace::core::clock::epoch_now();
-                assert!(collection.admitted_at(&store_snapshot, instant)?.is_empty());
+                assert!(collection.admitted(&store_snapshot)?.is_empty());
                 let discovered =
                     triblespace::core::collection::discover_collection_records(&store_snapshot)?;
                 let resident = discovered

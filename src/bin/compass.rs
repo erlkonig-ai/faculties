@@ -267,23 +267,36 @@ impl CompassStorage<'_> {
                 None
             };
 
-            let instant = clock::now()?;
-            let before = pile
-                .snapshot()
-                .context("freeze shared Compass/Relations source snapshot")?;
             let (compass_support, relation_support) = pollster::block_on(async {
-                let compass_support = pile
-                    .acquire_admitted_support_at(compass_facts.source(), &before, instant)
-                    .await
-                    .context("acquire admitted Compass support")?;
+                drop(
+                    pile.ensure(compass_facts.source())
+                        .await
+                        .context("ensure Compass source collection")?,
+                );
+                if let Some(relation_facts) = relation_facts {
+                    drop(
+                        pile.ensure(relation_facts.source())
+                            .await
+                            .context("ensure Relations source collection for Compass persona")?,
+                    );
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Compass/Relations source snapshot")?;
+                let compass_support = compass_facts
+                    .source()
+                    .admitted(&before)
+                    .context("admit Compass support")?;
                 let relation_support = match relation_facts {
                     Some(relation_facts) => Some(
-                        pile.acquire_admitted_support_at(relation_facts.source(), &before, instant)
-                            .await
-                            .context("acquire admitted Relations support for Compass persona")?,
+                        relation_facts
+                            .source()
+                            .admitted(&before)
+                            .context("admit Relations support for Compass persona")?,
                     ),
                     None => None,
                 };
+                drop(before);
                 drop(
                     compass_facts
                         .maintain_exact(pile, &compass_support)
@@ -302,8 +315,6 @@ impl CompassStorage<'_> {
                 }
                 Ok::<_, anyhow::Error>((compass_support, relation_support))
             })?;
-            drop(before);
-
             // Attach every view through one immutable post-maintenance store
             // boundary, so validation and persona resolution cannot mix
             // collection watermarks.

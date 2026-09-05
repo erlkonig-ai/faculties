@@ -142,13 +142,10 @@ impl PlannerStorage<'_> {
             let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(&mut pile, source)
                 .context("register maintained Planner fact collection")?;
-            let before = pile.snapshot().context("freeze Planner source snapshot")?;
-            let instant = clock::now()?;
-            let store_snapshot =
-                pollster::block_on(collection.maintain_at(&mut pile, &before, instant))
-                    .context("maintain Planner fact collection")?;
+            let store_snapshot = pollster::block_on(collection.maintain(&mut pile))
+                .context("maintain Planner fact collection")?;
             let facts = store_snapshot
-                .collection_at(collection.rank9(), instant)
+                .collection(collection.rank9())
                 .context("observe maintained Planner fact collection")?
                 .view::<FactArchive>()
                 .context("attach maintained Planner fact collection")?;
@@ -189,8 +186,7 @@ impl PlannerStorage<'_> {
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
-            let instant = clock::now()?;
-            let cover = collection.admitted_at(&store_snapshot, instant)?;
+            let cover = collection.admitted(&store_snapshot)?;
             Ok(cover
                 .commits(&store_snapshot)?
                 .iter()

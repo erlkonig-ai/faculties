@@ -12,7 +12,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{
-    collection_read_audience_at, Collection, CollectionHandle, CollectionPolicy,
+    collection_read_audience, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
@@ -127,19 +127,20 @@ impl SecretsCollection {
             .context("ensure Rank9 Secrets collection")
     }
 
-    /// Ensure the source support admitted at the caller's authorization instant.
-    pub async fn ensure<S>(self, store: &mut S, instant: hifitime::Epoch) -> Result<S::Snapshot>
+    /// Ensure the root, then realize its selected support across both encodings.
+    pub async fn ensure<S>(self, store: &mut S) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let before = store
-            .snapshot()
-            .context("freeze Secrets support before ensure")?;
-        let support = store
-            .acquire_admitted_support_at(self.source, &before, instant)
+        let ready = store
+            .ensure(self.source)
             .await
+            .context("ensure Secrets source collection")?;
+        let support = self
+            .source
+            .admitted(&ready)
             .context("admit Secrets source support")?;
-        drop(before);
+        drop(ready);
         self.ensure_exact(store, &support).await
     }
 
@@ -164,19 +165,20 @@ impl SecretsCollection {
             .context("maintain Rank9 Secrets collection")
     }
 
-    /// Maintain the source support admitted at the caller's authorization instant.
-    pub async fn maintain<S>(self, store: &mut S, instant: hifitime::Epoch) -> Result<S::Snapshot>
+    /// Ensure the root, then maintain its selected support across both encodings.
+    pub async fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let before = store
-            .snapshot()
-            .context("freeze Secrets support before maintenance")?;
-        let support = store
-            .acquire_admitted_support_at(self.source, &before, instant)
+        let ready = store
+            .ensure(self.source)
             .await
+            .context("ensure Secrets source collection")?;
+        let support = self
+            .source
+            .admitted(&ready)
             .context("admit Secrets source support")?;
-        drop(before);
+        drop(ready);
         self.maintain_exact(store, &support).await
     }
 }
@@ -185,16 +187,12 @@ impl SecretsCollection {
 ///
 /// This never performs maintenance. It reports exactly the support physically
 /// realized in `snapshot`, preserving the snapshot/derivation boundary.
-pub fn snapshot<R>(
-    store_snapshot: R,
-    collection: SecretsCollection,
-    instant: hifitime::Epoch,
-) -> Result<SecretsSnapshot<R>>
+pub fn snapshot<R>(store_snapshot: R, collection: SecretsCollection) -> Result<SecretsSnapshot<R>>
 where
     R: StoreRead,
 {
     let observed = store_snapshot
-        .collection_at(collection.rank9, instant)
+        .collection(collection.rank9)
         .context("observe maintained Secrets collection")?;
     let support = observed.support().clone();
     let facts = if observed.cover().is_empty() {
@@ -208,7 +206,6 @@ where
     };
     Ok(SecretsSnapshot::new(
         store_snapshot,
-        instant,
         collection.handle(),
         support,
         facts,
@@ -219,12 +216,11 @@ where
 ///
 /// Active maintenance must use this path: re-running admission against the
 /// later residency snapshot could accidentally admit concurrent proofs or
-/// commits that were outside the caller's shared control snapshot.
-fn snapshot_exact<R>(
+/// commits that were outside the support-selection snapshot.
+pub fn snapshot_exact<R>(
     store_snapshot: R,
     collection: SecretsCollection,
     support: Support,
-    instant: hifitime::Epoch,
 ) -> Result<SecretsSnapshot<R>>
 where
     R: StoreRead,
@@ -244,77 +240,66 @@ where
     };
     Ok(SecretsSnapshot::new(
         store_snapshot,
-        instant,
         collection.handle(),
         support,
         facts,
     ))
 }
 
-/// Maintain the configured collection at one authorization instant, then
+/// Ensure the root and maintain the configured collection's selected support, then
 /// attach its exact support to the resulting store snapshot.
 pub async fn maintain_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
-    instant: hifitime::Epoch,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
     S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
 {
-    let before = store
-        .snapshot()
-        .context("freeze Secrets support before maintenance")?;
-    let support = store
-        .acquire_admitted_support_at(collection.source, &before, instant)
+    let ready = store
+        .ensure(collection.source)
         .await
+        .context("ensure Secrets source collection")?;
+    let support = collection
+        .source
+        .admitted(&ready)
         .context("admit Secrets source support")?;
-    drop(before);
-    drop(collection.maintain_exact(store, &support).await?);
-    let store_snapshot = store
-        .snapshot()
-        .context("freeze maintained Secrets snapshot")?;
-    snapshot_exact(store_snapshot, collection, support, instant)
+    drop(ready);
+    let store_snapshot = collection.maintain_exact(store, &support).await?;
+    snapshot_exact(store_snapshot, collection, support)
 }
 
-/// Ensure the configured collection at one authorization instant, then attach
+/// Ensure the root and the configured collection's selected support, then attach
 /// its exact support to the resulting store snapshot.
 ///
-/// Source support is selected from one frozen record/proof frontier while
-/// immutable dependencies may become resident. This is the ordinary
+/// Source support is selected from one snapshot after root acquisition and
+/// remains fixed across both derivations. This is the ordinary
 /// consumer path; unlike [`maintain_and_snapshot`] it performs no
 /// opportunistic LSM compaction.
 pub async fn ensure_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
-    instant: hifitime::Epoch,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
     S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
 {
-    let before = store
-        .snapshot()
-        .context("freeze Secrets support before ensure")?;
-    let support = store
-        .acquire_admitted_support_at(collection.source, &before, instant)
+    let ready = store
+        .ensure(collection.source)
         .await
+        .context("ensure Secrets source collection")?;
+    let support = collection
+        .source
+        .admitted(&ready)
         .context("admit Secrets source support")?;
-    drop(before);
-    drop(collection.ensure_exact(store, &support).await?);
-    let store_snapshot = store
-        .snapshot()
-        .context("freeze ensured Secrets snapshot")?;
-    snapshot_exact(store_snapshot, collection, support, instant)
+    drop(ready);
+    let store_snapshot = collection.ensure_exact(store, &support).await?;
+    snapshot_exact(store_snapshot, collection, support)
 }
 
-fn admitted_readers<R>(
-    snapshot: &R,
-    collection: SecretsCollection,
-    instant: hifitime::Epoch,
-) -> Result<Vec<VerifyingKey>>
+fn admitted_readers<R>(snapshot: &R, collection: SecretsCollection) -> Result<Vec<VerifyingKey>>
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
 {
-    let audience = collection_read_audience_at(snapshot, collection.handle(), instant)
+    let audience = collection_read_audience(snapshot, collection.handle())
         .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
     finite_readers(audience)
 }
@@ -347,11 +332,10 @@ pub fn add_secret<S>(
 where
     S: Store + CollectionStoreExt,
 {
-    let instant = triblespace::core::clock::epoch_now();
     let snapshot = store
         .snapshot()
         .context("freeze Secrets audience before publication")?;
-    let recipients = admitted_readers(&snapshot, collection, instant)?;
+    let recipients = admitted_readers(&snapshot, collection)?;
     drop(snapshot);
     let sealed = seal_version(name, plaintext, recipients, created_at)?;
     let secret = sealed.secret;
@@ -383,12 +367,8 @@ where
     let Some(facts) = secrets.facts() else {
         return Ok(0);
     };
-    let audience = collection_read_audience_at(
-        secrets.store_snapshot(),
-        collection.handle(),
-        secrets.instant(),
-    )
-    .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
+    let audience = collection_read_audience(secrets.store_snapshot(), collection.handle())
+        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
     let recipients = finite_readers(audience)?;
     let secret_ids = find!(
         id: triblespace::core::id::Id,
@@ -462,7 +442,7 @@ mod tests {
         inner: MemoryRepo,
         offered: BTreeMap<CollectionData, Bytes>,
         acquired: Vec<CollectionData>,
-        inject_proof_on_acquire: Option<CapabilityProof>,
+        inject_proof_on_derive: Option<CapabilityProof>,
     }
 
     impl AcquiringStore {
@@ -480,8 +460,11 @@ mod tests {
         type Snapshot = MemoryRepoSnapshot;
         type SnapshotError = Infallible;
 
-        fn snapshot(&mut self) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
-            self.inner.snapshot()
+        fn snapshot_at(
+            &mut self,
+            instant: Epoch,
+        ) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot_at(instant)
         }
     }
 
@@ -505,7 +488,15 @@ mod tests {
             &mut self,
             record: CollectionRecord,
         ) -> std::result::Result<(), Self::InsertError> {
-            self.inner.insert(record)
+            self.inner.insert(record)?;
+            if matches!(record, CollectionRecord::Derive(_)) {
+                if let Some(proof) = self.inject_proof_on_derive.take() {
+                    self.inner
+                        .insert_proof(proof)
+                        .expect("injected test proof has valid signed structure");
+                }
+            }
+            Ok(())
         }
     }
 
@@ -530,9 +521,6 @@ mod tests {
                + Send {
             let data = Handle::<UnknownBlob>::to_hash(handle);
             self.acquired.push(data);
-            if let Some(proof) = self.inject_proof_on_acquire.take() {
-                self.inner.insert_proof(proof).unwrap();
-            }
             let bytes = self.offered.get(&data).cloned();
             if let Some(bytes) = &bytes {
                 self.inner.put::<UnknownBlob, _>(bytes.clone()).unwrap();
@@ -604,16 +592,19 @@ mod tests {
                 at(1),
             )
             .unwrap();
-            let instant = Epoch::from_unix_seconds(100.0);
-            let secrets = maintain_and_snapshot(&mut store, collection, instant)
-                .await
-                .unwrap();
-
-            assert_eq!(secrets.instant(), instant);
+            let secrets = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            assert_eq!(secrets.instant(), secrets.store_snapshot().instant());
             assert_eq!(secrets.collection(), collection.handle());
             assert!(secrets.contains(secret));
             assert_eq!(secrets.open(secret, &alice).unwrap(), b"hunter2");
             assert_eq!(secrets.open(secret, &bob).unwrap(), b"hunter2");
+
+            let instant = Epoch::from_unix_seconds(100.0);
+            let frozen = snapshot(store.snapshot_at(instant).unwrap(), collection).unwrap();
+            let copied = snapshot(frozen.store_snapshot().clone(), collection).unwrap();
+            assert_eq!(frozen.instant(), instant);
+            assert_eq!(copied.instant(), instant);
+            assert_eq!(copied.open(secret, &bob).unwrap(), b"hunter2");
         });
     }
 
@@ -657,10 +648,7 @@ mod tests {
                 at(3),
             )
             .unwrap();
-            let before =
-                ensure_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let before = ensure_and_snapshot(&mut store, collection).await.unwrap();
             assert!(!before.contains(secret));
             drop(before);
 
@@ -671,16 +659,13 @@ mod tests {
                 offline_writer.verifying_key(),
             )
             .unwrap();
-            let after =
-                ensure_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let after = ensure_and_snapshot(&mut store, collection).await.unwrap();
             assert_eq!(after.open(secret, &owner).unwrap(), b"authored offline");
         });
     }
 
     #[test]
-    fn exact_snapshot_hydrates_cold_data_without_admitting_a_concurrent_proof() {
+    fn exact_snapshot_hydrates_cold_data_without_widening_support_during_derivation() {
         pollster::block_on(async {
             let authority = SigningKey::generate(&mut OsRng);
             let left_writer = SigningKey::generate(&mut OsRng);
@@ -739,20 +724,18 @@ mod tests {
                 None,
                 right_writer.verifying_key(),
             );
-            store.inject_proof_on_acquire = Some(right_proof);
+            // Root acquisition finishes before support is selected. This
+            // proof arrives later, during the first mapping edge, and must
+            // not widen the exact support carried across the second edge.
+            store.inject_proof_on_derive = Some(right_proof);
 
-            let instant = Epoch::from_unix_seconds(100.0);
-            let first = ensure_and_snapshot(&mut store, collection, instant)
-                .await
-                .unwrap();
+            let first = ensure_and_snapshot(&mut store, collection).await.unwrap();
             assert!(first.contains(left_secret));
             assert!(!first.contains(right_secret));
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
             drop(first);
 
-            let second = ensure_and_snapshot(&mut store, collection, instant)
-                .await
-                .unwrap();
+            let second = ensure_and_snapshot(&mut store, collection).await.unwrap();
             assert!(second.contains(left_secret));
             assert!(second.contains(right_secret));
         });
@@ -774,10 +757,7 @@ mod tests {
                 add_secret(&mut store, &alice, collection, "token", b"value", at(4)).unwrap();
             let second =
                 add_secret(&mut store, &alice, collection, "password", b"other", at(5)).unwrap();
-            let before =
-                maintain_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let before = maintain_and_snapshot(&mut store, collection).await.unwrap();
             assert!(before.open(first, &bob).is_err());
             assert!(before.open(second, &bob).is_err());
 
@@ -789,19 +769,13 @@ mod tests {
                     .unwrap(),
                 0
             );
-            let current =
-                maintain_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let current = maintain_and_snapshot(&mut store, collection).await.unwrap();
             let added =
                 maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
                     .unwrap();
             assert_eq!(added, 2);
 
-            let after =
-                maintain_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let after = maintain_and_snapshot(&mut store, collection).await.unwrap();
             assert_eq!(after.open(first, &bob).unwrap(), b"value");
             assert_eq!(after.open(second, &bob).unwrap(), b"other");
             assert!(before.open(first, &bob).is_err());
@@ -837,10 +811,7 @@ mod tests {
             );
             store.insert_proof(proof).unwrap();
 
-            let current =
-                maintain_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let current = maintain_and_snapshot(&mut store, collection).await.unwrap();
             assert!(current.open(secret, &bob).is_err());
 
             let added =
@@ -851,10 +822,7 @@ mod tests {
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
             drop(current);
 
-            let after =
-                maintain_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            let after = maintain_and_snapshot(&mut store, collection).await.unwrap();
             assert_eq!(after.open(secret, &bob).unwrap(), b"value");
         });
     }
@@ -901,10 +869,29 @@ mod tests {
                 .unwrap();
             // The final proof contains the signed prefix granting Bob READ too.
             store.insert_proof(proof).unwrap();
-            let current =
-                ensure_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(100.0))
-                    .await
-                    .unwrap();
+            drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
+            let instant = Epoch::from_unix_seconds(100.0);
+            let current = snapshot(store.snapshot_at(instant).unwrap(), collection).unwrap();
+            let expired_instant = Epoch::from_unix_seconds(200.0);
+            let expired_same_content =
+                snapshot(store.snapshot_at(expired_instant).unwrap(), collection).unwrap();
+            assert!(expired_same_content
+                .store_snapshot()
+                .changes_since(current.store_snapshot())
+                .is_empty());
+            assert_eq!(current.instant(), instant);
+            assert_eq!(expired_same_content.instant(), expired_instant);
+            assert_eq!(
+                maintain_recipient_envelopes(
+                    &mut store,
+                    &alice,
+                    &expired_same_content,
+                    collection,
+                    &alice,
+                )
+                .unwrap(),
+                0
+            );
             assert_eq!(
                 maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
                     .unwrap(),
@@ -917,10 +904,9 @@ mod tests {
             store
                 .commit(collection.source(), &alice, sealed.fragment)
                 .unwrap();
+            drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
             let expired =
-                ensure_and_snapshot(&mut store, collection, Epoch::from_unix_seconds(200.0))
-                    .await
-                    .unwrap();
+                snapshot(store.snapshot_at(expired_instant).unwrap(), collection).unwrap();
             assert_eq!(
                 maintain_recipient_envelopes(&mut store, &alice, &expired, collection, &alice)
                     .unwrap(),

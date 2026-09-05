@@ -23,7 +23,7 @@ use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, Union
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -66,7 +66,6 @@ pub struct WrapRow {
 /// One immutable observation of the configured Secrets collection.
 pub struct SecretsSnapshot<R> {
     store_snapshot: R,
-    instant: Epoch,
     collection: CollectionHandle,
     support: Support,
     facts: Option<SecretsFacts>,
@@ -75,14 +74,12 @@ pub struct SecretsSnapshot<R> {
 impl<R> SecretsSnapshot<R> {
     pub(crate) fn new(
         store_snapshot: R,
-        instant: Epoch,
         collection: CollectionHandle,
         support: Support,
         facts: Option<SecretsFacts>,
     ) -> Self {
         Self {
             store_snapshot,
-            instant,
             collection,
             support,
             facts,
@@ -94,8 +91,11 @@ impl<R> SecretsSnapshot<R> {
     }
 
     /// Authorization instant of this immutable observation.
-    pub const fn instant(&self) -> Epoch {
-        self.instant
+    pub fn instant(&self) -> Epoch
+    where
+        R: StoreSnapshot,
+    {
+        self.store_snapshot.instant()
     }
 
     pub const fn collection(&self) -> CollectionHandle {

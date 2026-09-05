@@ -263,21 +263,31 @@ impl WikiStorage<'_> {
                         .with_context(|| format!("register maintained {label} fact collection"))?;
                     auxiliaries.push((source, facts, label));
                 }
+                drop(
+                    pile.ensure(wiki_source)
+                        .await
+                        .context("ensure Wiki source collection")?,
+                );
+                for (source, _, label) in &auxiliaries {
+                    drop(
+                        pile.ensure(*source)
+                            .await
+                            .with_context(|| format!("ensure {label} source collection"))?,
+                    );
+                }
                 let shared_control = pile
                     .snapshot()
                     .context("freeze Wiki and auxiliary source snapshot")?;
-                let instant = clock::now()?;
 
-                let wiki_support = pile
-                    .acquire_admitted_support_at(wiki_source, &shared_control, instant)
-                    .await
-                    .context("acquire admitted Wiki source support")?;
+                let wiki_support = wiki_source
+                    .admitted(&shared_control)
+                    .context("admit Wiki source support")?;
                 let mut auxiliary_supports = Vec::with_capacity(auxiliaries.len());
                 for (source, _, label) in &auxiliaries {
                     auxiliary_supports.push(
-                        pile.acquire_admitted_support_at(*source, &shared_control, instant)
-                            .await
-                            .with_context(|| format!("acquire admitted {label} source support"))?,
+                        source
+                            .admitted(&shared_control)
+                            .with_context(|| format!("admit {label} source support"))?,
                     );
                 }
                 drop(shared_control);

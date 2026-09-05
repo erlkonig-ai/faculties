@@ -38,7 +38,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::relations::{self, Head, ProfileInput};
 use faculties::schemas::linkedin;
@@ -222,21 +221,12 @@ impl RelationsStorage<'_> {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Relations fact collection")?;
-            let before = pile
-                .snapshot()
-                .context("freeze Relations pre-maintenance snapshot")?;
-            let instant = clock::now()?;
-            drop(
-                maintained
-                    .maintain_at(&mut pile, &before, instant)
-                    .await
-                    .context("maintain Relations fact collection")?,
-            );
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze maintained Relations snapshot")?;
+            let store_snapshot = maintained
+                .maintain(&mut pile)
+                .await
+                .context("maintain Relations fact collection")?;
             let observed = store_snapshot
-                .collection_at(maintained.rank9(), instant)
+                .collection(maintained.rank9())
                 .context("observe Relations Rank9 projection")?;
             let facts = observed
                 .view::<FactArchive>()
@@ -293,8 +283,7 @@ impl RelationsStorage<'_> {
         let result = (|| {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
-            let instant = clock::now()?;
-            let cover = collection.admitted_at(&store_snapshot, instant)?;
+            let cover = collection.admitted(&store_snapshot)?;
             Ok(cover
                 .commits(&store_snapshot)?
                 .iter()

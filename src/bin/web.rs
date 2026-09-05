@@ -295,17 +295,31 @@ impl WebStorage<'_> {
             let headspace = FactCollection::new(&mut pile, source)
                 .context("register maintained Headspace fact collection")?;
 
-            // One frozen source watermark decides which Headspace support this
-            // command may observe. Maintenance can append physical views, but
-            // cannot move that semantic boundary.
+            let secrets_collection =
+                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
+            for (label, source) in [
+                ("Headspace", headspace.source()),
+                ("Secrets", secrets_collection.source()),
+            ] {
+                drop(
+                    pile.ensure(source)
+                        .await
+                        .with_context(|| format!("ensure {label} source collection"))?,
+                );
+            }
+            // Both roots are ready before this common observation selects
+            // the exact support carried through each derived representation.
             let before = pile
                 .snapshot()
-                .context("freeze Headspace source snapshot")?;
-            let instant = clock::now()?;
-            let support = pile
-                .acquire_admitted_support_at(headspace.source(), &before, instant)
-                .await
-                .context("acquire admitted Headspace collection support")?;
+                .context("freeze shared Web credential support snapshot")?;
+            let support = headspace
+                .source()
+                .admitted(&before)
+                .context("admit Headspace collection support")?;
+            let secrets_support = secrets_collection
+                .source()
+                .admitted(&before)
+                .context("admit Secrets collection support")?;
             drop(before);
             drop(
                 headspace
@@ -314,12 +328,13 @@ impl WebStorage<'_> {
                     .context("maintain Headspace fact collection")?,
             );
 
-            let secrets_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
+            let store_snapshot = secrets_collection
+                .ensure_exact(&mut pile, &secrets_support)
+                .await
+                .context("ensure configured Secrets collection")?;
             let secrets =
-                secret_storage::ensure_and_snapshot(&mut pile, secrets_collection, instant)
-                    .await
-                    .context("ensure configured Secrets collection")?;
+                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
+                    .context("attach exact Secrets collection")?;
 
             // Secrets discovery owns a later immutable pile snapshot. Attach
             // the exact maintained Headspace support through that same world,
@@ -947,12 +962,9 @@ mod tests {
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let collection = FactCollection::new(&mut pile, source).unwrap();
-        let before = pile.snapshot().unwrap();
-        let instant = clock::now().unwrap();
-        let store_snapshot =
-            pollster::block_on(collection.maintain_at(&mut pile, &before, instant)).unwrap();
+        let store_snapshot = pollster::block_on(collection.maintain(&mut pile)).unwrap();
         let facts = store_snapshot
-            .collection_at(collection.rank9(), instant)
+            .collection(collection.rank9())
             .unwrap()
             .view::<FactArchive>()
             .unwrap();

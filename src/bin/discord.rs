@@ -155,16 +155,11 @@ impl DiscordSession<'_> {
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
-        let before = self
-            .pile
-            .snapshot()
-            .context("freeze Discord post-commit source snapshot")?;
-        let instant = faculties::clock::now()?;
-        self.reader = pollster::block_on(self.maintained.maintain_at(self.pile, &before, instant))
+        self.reader = pollster::block_on(self.maintained.maintain(self.pile))
             .context("maintain Discord fact collection after commit")?;
         self.facts = self
             .reader
-            .collection_at(self.maintained.rank9(), instant)
+            .collection(self.maintained.rank9())
             .context("observe maintained Discord fact collection after commit")?
             .view::<FactArchive>()
             .context("read maintained Discord fact collection after commit")?;
@@ -197,9 +192,8 @@ impl DiscordStorage<'_> {
             let snapshot = pile
                 .snapshot()
                 .context("freeze Discord WRITE-admission preflight")?;
-            let instant = faculties::clock::now()?;
             if !collection
-                .writer_is_admitted_at(&snapshot, signer.verifying_key(), instant)
+                .writer_is_admitted(&snapshot, signer.verifying_key())
                 .context("check Discord collection WRITE admission")?
             {
                 bail!("durable signer is not admitted to WRITE the Discord collection");
@@ -219,15 +213,10 @@ impl DiscordStorage<'_> {
             let collection = self.open_collection(&mut pile, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Discord fact collection")?;
-            let before = pile
-                .snapshot()
-                .context("freeze Discord pre-maintenance snapshot")?;
-            let instant = faculties::clock::now()?;
-            let store_snapshot =
-                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
-                    .context("maintain Discord fact collection")?;
+            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
+                .context("maintain Discord fact collection")?;
             let facts = store_snapshot
-                .collection_at(maintained.rank9(), instant)
+                .collection(maintained.rank9())
                 .context("observe maintained Discord fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Discord fact collection")?;

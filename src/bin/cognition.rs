@@ -13,7 +13,6 @@ use faculties::collection_names::open_configured;
 use faculties::schemas::cognition::DEFAULT_SCOPE_ID;
 use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
 use triblespace::core::collection::CollectionSnapshotExt;
-use triblespace::core::repo::SnapshotSource;
 
 #[derive(Parser)]
 #[command(
@@ -45,21 +44,10 @@ fn check(cli: &Cli) -> Result<()> {
     let collection = FactCollection::new(&mut pile, source)
         .context("register maintained Cognition fact collection")?;
     let result = (|| {
-        let instant = faculties::clock::now()?;
-        let before = pile
-            .snapshot()
-            .context("freeze Cognition source snapshot")?;
-        drop(
-            pollster::block_on(collection.maintain_at(&mut pile, &before, instant))
-                .context("maintain Cognition fact collection")?,
-        );
-        drop(before);
-
-        let snapshot = pile
-            .snapshot()
-            .context("freeze maintained Cognition snapshot")?;
+        let snapshot = pollster::block_on(collection.maintain(&mut pile))
+            .context("maintain Cognition fact collection")?;
         let facts = snapshot
-            .collection_at(collection.rank9(), instant)
+            .collection(collection.rank9())
             .context("observe Cognition Rank9 collection")?
             .view::<FactArchive>()
             .context("read Cognition Rank9 collection")?;

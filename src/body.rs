@@ -544,13 +544,14 @@ pub async fn materialize_indexed_collection(
         FactCollection::new(pile, source).context("register maintained Body fact collection")?;
     let target = intent_register_collection(pile, signer.verifying_key())?;
 
-    let before = pile.snapshot().context("freeze Body source snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let support = pile
-        .acquire_admitted_support_at(source, &before, instant)
+    let source_snapshot = pile
+        .ensure(source)
         .await
-        .context("acquire admitted Body support")?;
-    drop(before);
+        .context("ensure Body source collection")?;
+    let support = source
+        .admitted(&source_snapshot)
+        .context("admit ensured Body source support")?;
+    drop(source_snapshot);
 
     drop(
         collection

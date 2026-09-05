@@ -2838,15 +2838,11 @@ mod tests {
         .unwrap();
         assert_ne!(exact, later);
 
-        let instant = triblespace::core::clock::epoch_now();
-        let collection = crate::storage::open_secrets_collection_read(
-            &mut pile,
-            signer.verifying_key(),
-            instant,
-        )
-        .unwrap();
+        let collection =
+            crate::storage::open_secrets_collection_read(&mut pile, signer.verifying_key())
+                .unwrap();
         let secrets = pollster::block_on(crate::secrets::storage::ensure_and_snapshot(
-            &mut pile, collection, instant,
+            &mut pile, collection,
         ))
         .unwrap();
         assert_eq!(secrets.open(exact, &signer).unwrap(), b"exact");
