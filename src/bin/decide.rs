@@ -134,13 +134,10 @@ impl DecideStorage<'_> {
             let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Decide fact collection")?;
-            let before = pile.snapshot().context("freeze Decide source snapshot")?;
-            let instant = clock::now()?;
-            let store_snapshot =
-                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
-                    .context("maintain Decide fact collection")?;
+            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
+                .context("maintain Decide fact collection")?;
             let facts = store_snapshot
-                .collection_at(maintained.rank9(), instant)
+                .collection(maintained.rank9())
                 .context("observe maintained Decide fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Decide fact collection")?;

@@ -1553,19 +1553,13 @@ mod tests {
                 .len(),
             1
         );
-        let before = pile.snapshot().unwrap();
-        let instant = crate::clock::now().unwrap();
-        drop(pollster::block_on(messages.maintain_at(&mut pile, &before, instant)).unwrap());
-        let store_snapshot = pile.snapshot().unwrap();
-        let observed = store_snapshot
-            .collection_at(messages.rank9(), instant)
-            .unwrap();
+        let store_snapshot = pollster::block_on(messages.maintain(&mut pile)).unwrap();
+        let observed = store_snapshot.collection(messages.rank9()).unwrap();
         let message_facts = observed.view::<FactArchive>().unwrap();
         assert_eq!(load_message_rows(&message_facts).unwrap()[0].id, message_id);
         drop(message_facts);
         drop(observed);
         drop(store_snapshot);
-        drop(before);
         pile.close().unwrap();
     }
 

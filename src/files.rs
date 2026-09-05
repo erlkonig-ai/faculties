@@ -981,8 +981,7 @@ pub fn materialize_collection(
         signer.verifying_key(),
     )?;
     let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Files collection")?;
     Ok((facts, store_snapshot))
 }
@@ -1535,9 +1534,8 @@ mod tests {
             .commit(collection, &signer, file)
             .expect("commit canonical file");
         let reader = store.snapshot().expect("freeze files store snapshot");
-        let instant = triblespace::core::clock::epoch_now();
-        let (catalog, _) = crate::storage::read_fact_collection(collection, &reader, instant)
-            .expect("materialize files");
+        let (catalog, _) =
+            crate::storage::read_fact_collection(collection, &reader).expect("materialize files");
         let content_handle = find!(
             content: ContentHandle,
             pattern!(&catalog, [{ file_id @ file::content: ?content }])

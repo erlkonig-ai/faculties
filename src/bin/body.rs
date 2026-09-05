@@ -443,12 +443,10 @@ impl BodyStorage<'_> {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(pile, source)
                 .context("register maintained Body fact collection")?;
-            let before = pile.snapshot().context("freeze Body source snapshot")?;
-            let instant = triblespace::core::clock::epoch_now();
-            let store_snapshot = pollster::block_on(collection.maintain_at(pile, &before, instant))
+            let store_snapshot = pollster::block_on(collection.maintain(pile))
                 .context("maintain Body fact collection")?;
             let facts = store_snapshot
-                .collection_at(collection.rank9(), instant)
+                .collection(collection.rank9())
                 .context("observe maintained Body fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Body fact collection")?;

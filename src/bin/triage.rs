@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::clock;
 use faculties::memory::{self as memory_model};
 use faculties::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
@@ -36,7 +35,7 @@ use faculties::triage::{
 };
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::collection::{CollectionSnapshotExt, Support};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -174,25 +173,40 @@ impl TriageSnapshot {
             registered.push((scope, label, facts));
         }
 
-        // One immutable watermark chooses every source's resident support.
-        let before = pile
-            .snapshot()
-            .context("freeze pre-maintenance Triage snapshot")?;
-        let instant = clock::now()?;
-        let supports = registered
-            .iter()
-            .map(|(_, label, facts)| {
-                before
-                    .collection_at(facts.source(), instant)
-                    .with_context(|| format!("observe resident {label} collection"))
-                    .map(|snapshot| snapshot.support().clone())
-            })
-            .collect::<Result<Vec<Support>>>()?;
-        drop(before);
+        let secrets_collection = open_secrets_collection_read(&mut pile, signer.verifying_key())?;
+        let (supports, secrets) = pollster::block_on(async {
+            for (_, label, facts) in &registered {
+                drop(
+                    pile.ensure(facts.source())
+                        .await
+                        .with_context(|| format!("ensure {label} source collection"))?,
+                );
+            }
+            drop(
+                pile.ensure(secrets_collection.source())
+                    .await
+                    .context("ensure Secrets source collection")?,
+            );
+            // All roots are ready before this common observation selects
+            // the exact supports carried through every later derivation.
+            let before = pile
+                .snapshot()
+                .context("freeze shared Triage support snapshot")?;
+            let mut supports = Vec::<Support>::with_capacity(registered.len());
+            for (_, label, facts) in &registered {
+                supports.push(
+                    facts
+                        .source()
+                        .admitted(&before)
+                        .with_context(|| format!("admit {label} collection support"))?,
+                );
+            }
+            let secrets_support = secrets_collection
+                .source()
+                .admitted(&before)
+                .context("admit Secrets collection support")?;
+            drop(before);
 
-        let secrets_collection =
-            open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)?;
-        let secrets = pollster::block_on(async {
             for ((_, label, facts), support) in registered.iter().zip(&supports) {
                 drop(
                     facts
@@ -201,9 +215,14 @@ impl TriageSnapshot {
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
             }
-            secret_storage::ensure_and_snapshot(&mut pile, [secrets_collection], instant)
+            let store_snapshot = secrets_collection
+                .ensure_exact(&mut pile, &secrets_support)
                 .await
-                .context("ensure configured Secrets collection")
+                .context("ensure configured Secrets collection")?;
+            let secrets =
+                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
+                    .context("attach exact Secrets collection")?;
+            Ok::<_, anyhow::Error>((supports, secrets))
         })?;
 
         // Secrets attachment already owns the one later immutable snapshot.
@@ -1196,6 +1215,7 @@ mod tests {
     use faculties::schemas::triage::{exec, KIND_EXEC_REQUEST_ID};
     use faculties::storage::initialize_signer;
     use triblespace::core::metadata;
+    use triblespace::core::repo::StoreSnapshot;
     use triblespace::macros::entity;
 
     fn test_id(byte: u8) -> Id {
@@ -1445,6 +1465,10 @@ mod tests {
         );
         let snapshot = fixture.snapshot();
         snapshot.cognition().unwrap();
+        assert_eq!(
+            snapshot.store_snapshot.instant(),
+            snapshot.secrets.instant()
+        );
         snapshot.close(Ok(())).unwrap();
         let maintained = std::fs::metadata(&fixture.pile).unwrap().len();
 

@@ -28,7 +28,7 @@ use faculties::memory_cover::{chunk_embedding_handle, l2_normalize};
 use faculties::{clock, cognition as cognition_model, comb as comb_model, memory as memory_model};
 use hifitime::Epoch;
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -111,12 +111,12 @@ struct LoadedProvenance {
 impl MemoryStorage<'_> {
     fn attach_collection(
         collection: FactCollection,
+        support: &Support,
         store_snapshot: &PileSnapshot,
-        instant: Epoch,
         label: &str,
     ) -> Result<CollectionView> {
         let facts = store_snapshot
-            .collection_at(collection.rank9(), instant)
+            .collection_exact(collection.rank9(), support)
             .with_context(|| format!("observe maintained {label} collection"))?
             .view::<FactArchive>()
             .with_context(|| format!("attach maintained {label} collection"))?;
@@ -140,10 +140,10 @@ impl MemoryStorage<'_> {
 
     fn load_memory_from_snapshot(
         collection: FactCollection,
+        support: &Support,
         store_snapshot: &PileSnapshot,
-        instant: Epoch,
     ) -> Result<LoadedMemory> {
-        let memory = Self::attach_collection(collection, store_snapshot, instant, "Memory")?;
+        let memory = Self::attach_collection(collection, support, store_snapshot, "Memory")?;
         Ok(LoadedMemory { memory })
     }
 
@@ -155,19 +155,19 @@ impl MemoryStorage<'_> {
             let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             let collection = FactCollection::new(&mut pile, source)
                 .context("register maintained Memory collection")?;
-            let instant = clock::now()?;
-            let before = pile.snapshot().context("freeze Memory source snapshot")?;
+            let control = pile.ensure(source).await.context("ensure Memory source")?;
+            let support = control.collection(source)?.support().clone();
             drop(
                 collection
-                    .maintain_at(&mut pile, &before, instant)
+                    .maintain_exact(&mut pile, &support)
                     .await
                     .context("maintain Memory collection")?,
             );
-            drop(before);
+            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory snapshot")?;
-            Self::load_memory_from_snapshot(collection, &store_snapshot, instant)
+            Self::load_memory_from_snapshot(collection, &support, &store_snapshot)
         });
         Self::finish_pile(pile, result)
     }
@@ -192,40 +192,55 @@ impl MemoryStorage<'_> {
             } else {
                 None
             };
-            let instant = clock::now()?;
-            let before = pile
+            drop(pile.ensure(memory_source).await?);
+            if let Some(collection) = embeddings_collection {
+                drop(pile.ensure(collection.source()).await?);
+            }
+            let control = pile
                 .snapshot()
                 .context("freeze Memory/Embeddings source snapshot")?;
+            let memory_support = control.collection(memory_source)?.support().clone();
+            let embeddings_support = match embeddings_collection {
+                Some(collection) => {
+                    Some(control.collection(collection.source())?.support().clone())
+                }
+                None => None,
+            };
             drop(
                 memory_collection
-                    .maintain_at(&mut pile, &before, instant)
+                    .maintain_exact(&mut pile, &memory_support)
                     .await
                     .context("maintain Memory collection")?,
             );
-            if let Some(collection) = embeddings_collection {
+            if let (Some(collection), Some(support)) =
+                (embeddings_collection, embeddings_support.as_ref())
+            {
                 drop(
                     collection
-                        .maintain_at(&mut pile, &before, instant)
+                        .maintain_exact(&mut pile, support)
                         .await
                         .context("maintain shared Embeddings collection")?,
                 );
             }
-            drop(before);
+            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Embeddings snapshot")?;
-            let memory =
-                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
-            let embeddings = embeddings_collection
-                .map(|collection| {
-                    Self::attach_collection(
-                        collection,
-                        &store_snapshot,
-                        instant,
-                        "shared Embeddings",
-                    )
-                })
-                .transpose()?;
+            let memory = Self::load_memory_from_snapshot(
+                memory_collection,
+                &memory_support,
+                &store_snapshot,
+            )?;
+            let embeddings = match (embeddings_collection, embeddings_support.as_ref()) {
+                (Some(collection), Some(support)) => Some(Self::attach_collection(
+                    collection,
+                    support,
+                    &store_snapshot,
+                    "shared Embeddings",
+                )?),
+                (None, None) => None,
+                _ => unreachable!("Embeddings collection and support are created together"),
+            };
             Ok(LoadedContext { memory, embeddings })
         });
         Self::finish_pile(pile, result)
@@ -244,29 +259,36 @@ impl MemoryStorage<'_> {
                 open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             let comb_collection = FactCollection::new(&mut pile, comb_source)
                 .context("register maintained Comb collection")?;
-            let instant = clock::now()?;
-            let before = pile
+            drop(pile.ensure(memory_source).await?);
+            drop(pile.ensure(comb_source).await?);
+            let control = pile
                 .snapshot()
                 .context("freeze Memory/Comb source snapshot")?;
+            let memory_support = control.collection(memory_source)?.support().clone();
+            let comb_support = control.collection(comb_source)?.support().clone();
             drop(
                 memory_collection
-                    .maintain_at(&mut pile, &before, instant)
+                    .maintain_exact(&mut pile, &memory_support)
                     .await
                     .context("maintain Memory collection")?,
             );
             drop(
                 comb_collection
-                    .maintain_at(&mut pile, &before, instant)
+                    .maintain_exact(&mut pile, &comb_support)
                     .await
                     .context("maintain Comb collection")?,
             );
-            drop(before);
+            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Comb snapshot")?;
-            let memory =
-                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
-            let comb = Self::attach_collection(comb_collection, &store_snapshot, instant, "Comb")?;
+            let memory = Self::load_memory_from_snapshot(
+                memory_collection,
+                &memory_support,
+                &store_snapshot,
+            )?;
+            let comb =
+                Self::attach_collection(comb_collection, &comb_support, &store_snapshot, "Comb")?;
             Ok(LoadedComb { memory, comb })
         });
         Self::finish_pile(pile, result)
@@ -296,40 +318,48 @@ impl MemoryStorage<'_> {
                 .context("register maintained Cognition collection")?;
             let archive_collection = FactCollection::new(&mut pile, archive_source)
                 .context("register maintained Archive collection")?;
-            let instant = clock::now()?;
-            let before = pile
+            for source in [memory_source, cognition_source, archive_source] {
+                drop(pile.ensure(source).await?);
+            }
+            let control = pile
                 .snapshot()
                 .context("freeze Memory/Cognition/Archive source snapshot")?;
-            for (collection, label) in [
-                (memory_collection, "Memory"),
-                (cognition_collection, "Cognition"),
-                (archive_collection, "Archive"),
+            let memory_support = control.collection(memory_source)?.support().clone();
+            let cognition_support = control.collection(cognition_source)?.support().clone();
+            let archive_support = control.collection(archive_source)?.support().clone();
+            for (collection, support, label) in [
+                (memory_collection, &memory_support, "Memory"),
+                (cognition_collection, &cognition_support, "Cognition"),
+                (archive_collection, &archive_support, "Archive"),
             ] {
                 drop(
                     collection
-                        .maintain_at(&mut pile, &before, instant)
+                        .maintain_exact(&mut pile, support)
                         .await
                         .with_context(|| format!("maintain {label} collection"))?,
                 );
             }
-            drop(before);
+            drop(control);
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze maintained Memory/Cognition/Archive snapshot")?;
-            let memory =
-                Self::load_memory_from_snapshot(memory_collection, &store_snapshot, instant)?;
+            let memory = Self::load_memory_from_snapshot(
+                memory_collection,
+                &memory_support,
+                &store_snapshot,
+            )?;
             Ok(LoadedProvenance {
                 memory,
                 cognition: Self::attach_collection(
                     cognition_collection,
+                    &cognition_support,
                     &store_snapshot,
-                    instant,
                     "Cognition",
                 )?,
                 archive: Self::attach_collection(
                     archive_collection,
+                    &archive_support,
                     &store_snapshot,
-                    instant,
                     "Archive",
                 )?,
             })

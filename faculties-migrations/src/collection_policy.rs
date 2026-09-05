@@ -17,11 +17,9 @@
 //! DERIVE records are cache exhaust tied to the old descriptor and are rebuilt
 //! lazily.
 //!
-//! Secrets is intentionally not transformed here. Its access envelopes,
-//! sealed frames, and capability proofs bind an exact vault descriptor handle.
-//! The separate `secrets_reader_envelopes` migration opens that cryptographic
-//! boundary explicitly and moves the retained fact union into the configured
-//! direct-reader Secrets collection.
+//! Secrets is intentionally not transformed here. Historical vault ciphertext
+//! remains inert; current Mail and Teams credentials are resupplied through
+//! the direct-reader Secrets model instead of extending runtime compatibility.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

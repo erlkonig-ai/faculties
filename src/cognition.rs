@@ -522,13 +522,9 @@ mod tests {
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let collection = FactCollection::new(&mut pile, source).unwrap();
-        let instant = crate::clock::now().unwrap();
-        let before = pile.snapshot().unwrap();
-        drop(pollster::block_on(collection.maintain_at(&mut pile, &before, instant)).unwrap());
-        drop(before);
-        let snapshot = pile.snapshot().unwrap();
+        let snapshot = pollster::block_on(collection.maintain(&mut pile)).unwrap();
         let facts = snapshot
-            .collection_at(collection.rank9(), instant)
+            .collection(collection.rank9())
             .unwrap()
             .view::<FactArchive>()
             .unwrap();

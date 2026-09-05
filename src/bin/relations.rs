@@ -1123,19 +1123,10 @@ fn main() -> Result<()> {
         let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         let facts = FactCollection::new(&mut pile, collection)
             .context("register maintained Relations fact collection")?;
-        let before = pile
-            .snapshot()
-            .context("freeze Relations pre-maintenance snapshot")?;
-        let instant = clock::now()?;
-        drop(
-            pollster::block_on(facts.maintain_at(&mut pile, &before, instant))
-                .context("maintain Relations fact collection")?,
-        );
-        let reader = pile
-            .snapshot()
-            .context("freeze maintained Relations snapshot")?;
+        let reader = pollster::block_on(facts.maintain(&mut pile))
+            .context("maintain Relations fact collection")?;
         let observed = reader
-            .collection_at(facts.rank9(), instant)
+            .collection(facts.rank9())
             .context("observe Relations Rank9 projection")?;
         let view = observed
             .view::<FactArchive>()
@@ -1293,11 +1284,8 @@ mod tests {
         store.commit(collection, &signer, left).unwrap();
         store.commit(collection, &signer, right).unwrap();
 
-        let before = store.snapshot().unwrap();
-        let instant = clock::now().unwrap();
-        drop(pollster::block_on(facts.maintain_at(&mut store, &before, instant)).unwrap());
-        let reader = store.snapshot().unwrap();
-        let observed = reader.collection_at(facts.rank9(), instant).unwrap();
+        let reader = pollster::block_on(facts.maintain(&mut store)).unwrap();
+        let observed = reader.collection(facts.rank9()).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
         match relations::profile_head(&view, person).unwrap() {
             Head::Forked(heads) => assert_eq!(heads.len(), 2),
@@ -1306,7 +1294,6 @@ mod tests {
         drop(view);
         drop(observed);
         drop(reader);
-        drop(before);
         store.close().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }

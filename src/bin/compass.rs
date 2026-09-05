@@ -267,29 +267,54 @@ impl CompassStorage<'_> {
                 None
             };
 
-            let instant = clock::now()?;
-            let before = pile
-                .snapshot()
-                .context("freeze shared Compass/Relations source snapshot")?;
-            pollster::block_on(async {
+            let (compass_support, relation_support) = pollster::block_on(async {
                 drop(
-                    compass_facts
-                        .maintain_at(pile, &before, instant)
+                    pile.ensure(compass_facts.source())
                         .await
-                        .context("maintain Compass fact collection")?,
+                        .context("ensure Compass source collection")?,
                 );
                 if let Some(relation_facts) = relation_facts {
                     drop(
+                        pile.ensure(relation_facts.source())
+                            .await
+                            .context("ensure Relations source collection for Compass persona")?,
+                    );
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Compass/Relations source snapshot")?;
+                let compass_support = compass_facts
+                    .source()
+                    .admitted(&before)
+                    .context("admit Compass support")?;
+                let relation_support = match relation_facts {
+                    Some(relation_facts) => Some(
                         relation_facts
-                            .maintain_at(pile, &before, instant)
+                            .source()
+                            .admitted(&before)
+                            .context("admit Relations support for Compass persona")?,
+                    ),
+                    None => None,
+                };
+                drop(before);
+                drop(
+                    compass_facts
+                        .maintain_exact(pile, &compass_support)
+                        .await
+                        .context("maintain Compass fact collection")?,
+                );
+                if let (Some(relation_facts), Some(relation_support)) =
+                    (relation_facts, relation_support.as_ref())
+                {
+                    drop(
+                        relation_facts
+                            .maintain_exact(pile, relation_support)
                             .await
                             .context("maintain Relations fact collection for Compass persona")?,
                     );
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<_, anyhow::Error>((compass_support, relation_support))
             })?;
-            drop(before);
-
             // Attach every view through one immutable post-maintenance store
             // boundary, so validation and persona resolution cannot mix
             // collection watermarks.
@@ -297,13 +322,15 @@ impl CompassStorage<'_> {
                 .snapshot()
                 .context("freeze maintained Compass/Relations snapshot")?;
             let facts = reader
-                .collection_at(compass_facts.rank9(), instant)
+                .collection_exact(compass_facts.rank9(), &compass_support)
                 .context("observe Compass fact collection")?
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
-            let by = if let (Some(persona), Some(relation_facts)) = (persona, relation_facts) {
+            let by = if let (Some(persona), Some(relation_facts), Some(relation_support)) =
+                (persona, relation_facts, relation_support.as_ref())
+            {
                 let relations = reader
-                    .collection_at(relation_facts.rank9(), instant)
+                    .collection_exact(relation_facts.rank9(), relation_support)
                     .context("observe Relations fact collection for Compass persona")?
                     .view::<FactArchive>()
                     .context("read Relations fact collection for Compass persona")?;

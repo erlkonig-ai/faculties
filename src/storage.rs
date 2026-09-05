@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use hifitime::Epoch;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -76,13 +75,11 @@ where
 ///
 /// Exact shared descriptors must admit `subject` under their READ policy
 /// before a caller may attach or decrypt the collection. An unset override
-/// still registers the ordinary signer-private `secrets` descriptor. The
-/// caller-supplied instant is reused by companion collection reads in the same
-/// logical operation.
+/// still registers the ordinary signer-private `secrets` descriptor. Admission
+/// uses the actual descriptor snapshot's frozen authorization instant.
 pub fn open_secrets_collection_read<S>(
     store: &mut S,
     subject: VerifyingKey,
-    instant: Epoch,
 ) -> Result<crate::secrets::storage::SecretsCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
@@ -92,7 +89,6 @@ where
         store,
         crate::secrets::DEFAULT_SCOPE_ID,
         subject,
-        instant,
     )
     .context("open configured Secrets source collection for READ")?;
     crate::secrets::storage::SecretsCollection::from_source(store, source)
@@ -106,8 +102,8 @@ where
 /// Succinct archives, to Rank9-accelerated Succinct archives. Keeping those
 /// handles together prevents every Faculty from growing its own lifecycle
 /// facade while leaving the actual write/read boundary explicit:
-/// [`Self::maintain_at`] may append derivations, and callers subsequently use
-/// [`CollectionSnapshotExt::collection_at`] on one immutable store snapshot.
+/// [`Self::maintain`] may append derivations, and callers subsequently use
+/// [`CollectionSnapshotExt::collection`] on one immutable store snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FactCollection {
     source: Collection<SimpleArchive>,
@@ -161,27 +157,26 @@ impl FactCollection {
         self.rank9
     }
 
-    /// Maintain both derivation hops for source support resident in `before`.
+    /// Ensure the root and maintain both derivation hops for its admitted support.
     ///
-    /// The one pre-work snapshot is the semantic watermark. Admitted commits
-    /// whose payloads are not resident there are deliberately absent, while a
-    /// later returned snapshot truthfully includes all compatible concurrent
-    /// work visible after maintenance. The same foundational support crosses
-    /// both mapping edges; a downstream edge never constructs its source.
-    pub async fn maintain_at<S>(
-        self,
-        store: &mut S,
-        before: &S::Snapshot,
-        instant: Epoch,
-    ) -> Result<S::Snapshot>
+    /// Root acquisition finishes before one snapshot selects support. That
+    /// exact support crosses both mapping edges; later records and proofs
+    /// cannot widen it, and a downstream edge never constructs its source.
+    /// For a batch with one common observation, ensure every root first, take
+    /// one snapshot, select all supports, and call [`Self::maintain_exact`].
+    pub async fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let support = before
-            .collection_at(self.source, instant)
-            .context("observe resident fact collection")?
-            .support()
-            .clone();
+        let ready = store
+            .ensure(self.source)
+            .await
+            .context("ensure fact collection source")?;
+        let support = self
+            .source
+            .admitted(&ready)
+            .context("admit ensured fact collection support")?;
+        drop(ready);
         self.maintain_exact(store, &support).await
     }
 
@@ -305,18 +300,17 @@ where
 }
 
 /// Read one authorized SimpleArchive union through a caller-supplied coherent
-/// store snapshot and authorization instant, returning the foundational
+/// store snapshot at its frozen authorization instant, returning the foundational
 /// support used for maintained indexes.
 pub fn read_fact_collection<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
-    instant: Epoch,
 ) -> Result<(TribleSet, Support)>
 where
     S: StoreRead,
 {
     let support = collection
-        .admitted_at(snapshot, instant)
+        .admitted(snapshot)
         .context("discover authorized collection support")?;
     let facts = snapshot
         .collection_exact(collection, &support)
@@ -324,27 +318,6 @@ where
         .view::<TribleSet>()
         .context("read authorized collection facts")?;
     Ok((facts, support))
-}
-
-/// Read one authorized SimpleArchive union and retain the exact provenance
-/// claims selected by the same snapshot-and-instant admission decision.
-pub fn read_fact_collection_with_commits<S>(
-    collection: Collection<SimpleArchive>,
-    snapshot: &S,
-    instant: Epoch,
-) -> Result<(TribleSet, Support, Vec<CollectionCommit>)>
-where
-    S: StoreRead,
-{
-    let (support, commits) = collection
-        .admitted_with_commits_at(snapshot, instant)
-        .context("discover authorized collection support and commits")?;
-    let facts = snapshot
-        .collection_exact(collection, &support)
-        .context("attach authorized collection support")?
-        .view::<TribleSet>()
-        .context("read authorized collection facts")?;
-    Ok((facts, support, commits))
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.
@@ -652,11 +625,8 @@ mod tests {
         let expected = fragment.facts().clone();
         store.commit(source, &signer, fragment).unwrap();
 
-        let instant = triblespace::core::clock::epoch_now();
-        let before = store.snapshot().unwrap();
-        let after =
-            pollster::block_on(maintained.maintain_at(&mut store, &before, instant)).unwrap();
-        let observed = after.collection_at(maintained.rank9(), instant).unwrap();
+        let after = pollster::block_on(maintained.maintain(&mut store)).unwrap();
+        let observed = after.collection(maintained.rank9()).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
         let actual: TribleSet = view.iter().collect();
 

@@ -583,14 +583,10 @@ impl VoiceStorage<'_> {
                 open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
             let maintained = FactCollection::new(&mut pile, collection)
                 .context("register maintained Voice fact collection")?;
-            let before = pile.snapshot().context("freeze Voice source snapshot")?;
-            let instant = clock::now()?;
-            let store_snapshot =
-                pollster::block_on(maintained.maintain_at(&mut pile, &before, instant))
-                    .context("maintain Voice fact collection")?;
-            drop(before);
+            let store_snapshot = pollster::block_on(maintained.maintain(&mut pile))
+                .context("maintain Voice fact collection")?;
             let facts = store_snapshot
-                .collection_at(maintained.rank9(), instant)
+                .collection(maintained.rank9())
                 .context("observe maintained Voice fact collection")?
                 .view::<FactArchive>()
                 .context("read maintained Voice fact collection")?;

@@ -1905,22 +1905,39 @@ impl PostureStorage<'_> {
                         .with_context(|| format!("register maintained Posture {label} collection"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let before = pile
-                .snapshot()
-                .context("freeze shared Posture source snapshot")?;
-            let instant = now_epoch()?;
-            pollster::block_on(async {
-                for ((_, label), collection) in scopes.iter().zip(&maintained) {
-                    drop(
-                        collection
-                            .maintain_at(&mut pile, &before, instant)
-                            .await
-                            .with_context(|| format!("maintain Posture {label} collection"))?,
-                    );
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
-            drop(before);
+            let supports =
+                pollster::block_on(async {
+                    for ((_, label), collection) in scopes.iter().zip(&maintained) {
+                        drop(pile.ensure(collection.source()).await.with_context(|| {
+                            format!("ensure Posture {label} source collection")
+                        })?);
+                    }
+                    let before = pile
+                        .snapshot()
+                        .context("freeze shared Posture source snapshot")?;
+                    let supports = scopes
+                        .iter()
+                        .zip(&maintained)
+                        .map(|((_, label), collection)| {
+                            collection
+                                .source()
+                                .admitted(&before)
+                                .with_context(|| format!("admit Posture {label} source support"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    drop(before);
+                    for (((_, label), collection), support) in
+                        scopes.iter().zip(&maintained).zip(&supports)
+                    {
+                        drop(
+                            collection
+                                .maintain_exact(&mut pile, support)
+                                .await
+                                .with_context(|| format!("maintain Posture {label} collection"))?,
+                        );
+                    }
+                    Ok::<_, anyhow::Error>(supports)
+                })?;
 
             // Every logical view is attached through this one immutable
             // post-maintenance watermark.
@@ -1930,9 +1947,10 @@ impl PostureStorage<'_> {
             scopes
                 .iter()
                 .zip(maintained)
-                .map(|((_, label), collection)| {
+                .zip(supports)
+                .map(|(((_, label), collection), support)| {
                     let facts = reader
-                        .collection_at(collection.rank9(), instant)
+                        .collection_exact(collection.rank9(), &support)
                         .with_context(|| format!("observe maintained Posture {label} collection"))?
                         .view::<FactArchive>()
                         .with_context(|| format!("read maintained Posture {label} collection"))?;
@@ -1982,13 +2000,11 @@ impl PostureStorage<'_> {
             let store_snapshot = pile
                 .snapshot()
                 .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
-            let instant = clock::now()?;
-            let (_, _, commits) = faculties::storage::read_fact_collection_with_commits(
-                collection,
-                &store_snapshot,
-                instant,
-            )
-            .with_context(|| format!("snapshot admitted Posture {label} collection"))?;
+            let commits = collection
+                .admitted(&store_snapshot)
+                .with_context(|| format!("admit Posture {label} collection"))?
+                .commits(&store_snapshot)
+                .with_context(|| format!("read admitted Posture {label} commits"))?;
             Ok(commits
                 .iter()
                 .copied()

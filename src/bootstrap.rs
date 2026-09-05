@@ -641,8 +641,7 @@ mod tests {
         )
         .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         let bytes_before = std::fs::metadata(&imported.pile).unwrap().len();
         let second = pollster::block_on(import(&imported.pile, Some(&imported.key))).unwrap();
@@ -656,8 +655,7 @@ mod tests {
         )
         .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let cover_after = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.wiki_commit, second.wiki_commit);

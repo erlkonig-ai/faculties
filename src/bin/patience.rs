@@ -258,9 +258,7 @@ mod tests {
             faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let reader = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let (facts, _) =
-            faculties::storage::read_fact_collection(collection, &reader, instant).unwrap();
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &reader).unwrap();
         assert_eq!(facts, expected.into_facts());
         cognition::validate_catalog(&reader, &facts).unwrap();
 

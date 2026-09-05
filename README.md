@@ -189,6 +189,15 @@ concatenation, all backed by the same content-addressed blob store. Ordinary
 runtime never probes historical Repository branches; the shipped migration is
 an explicit re-seat between native collection-policy descriptor epochs.
 
+Reads use maintained Succinct/Rank9 collections through immutable store
+snapshots. The snapshot freezes both the stored prefix and its authorization
+instant; reading it never fetches or derives missing data. A live store's
+`ensure` fetches root dependencies, while `maintain_exact` carries one selected
+support through each derived collection. Multi-collection readers select those
+supports together and attach their query views to one final snapshot. Archive
+uses this same generic collection snapshot rather than a separate decoded
+catalog or COMMIT-list facade.
+
 By default, a named faculty collection is rooted at the pile's durable signer.
 An operator can instead select an already-resident exact descriptor for one
 name with `TRIBLESPACE_COLLECTION_<NAME>` (64 hexadecimal digits, optionally

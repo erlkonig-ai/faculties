@@ -49,7 +49,7 @@ use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{
-    next_authorization_change_at, Collection, CollectionSnapshot, CollectionSnapshotExt,
+    next_authorization_change, Collection, CollectionSnapshot, CollectionSnapshotExt,
     CollectionStoreExt, Support,
 };
 use triblespace::core::metadata;
@@ -257,15 +257,10 @@ impl OrientSource {
         Ok(Self { facts, label })
     }
 
-    async fn maintain_at(
-        &self,
-        pile: &mut Pile,
-        snapshot: &PileSnapshot,
-        instant: Epoch,
-    ) -> Result<Support> {
+    async fn maintain(&self, pile: &mut Pile, snapshot: &PileSnapshot) -> Result<Support> {
         let support = snapshot
-            .collection_at(self.facts.source(), instant)
-            .map_err(|error| anyhow!("observe resident {} collection: {error}", self.label))?
+            .collection(self.facts.source())
+            .map_err(|error| anyhow!("observe admitted {} support: {error}", self.label))?
             .support()
             .clone();
         drop(
@@ -301,6 +296,30 @@ struct OrientSources {
 }
 
 impl OrientSources {
+    /// Fetch direct source dependencies before choosing a common observation.
+    async fn ensure(&self, pile: &mut Pile) -> Result<()> {
+        for source in [
+            Some(&self.messages),
+            Some(&self.mail),
+            Some(&self.teams),
+            Some(&self.compass),
+            Some(&self.relations),
+            Some(&self.status),
+            self.habits.as_ref(),
+            Some(&self.presentations),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            drop(
+                pile.ensure(source.facts.source())
+                    .await
+                    .with_context(|| format!("ensure {} source collection", source.label))?,
+            );
+        }
+        Ok(())
+    }
+
     fn open(pile: &mut Pile, signer: &SigningKey, include_habits: bool) -> Result<Self> {
         let authority = signer.verifying_key();
         Ok(Self {
@@ -395,36 +414,26 @@ impl OrientObservation {
     }
 }
 
-/// Maintain the resident support visible in one immutable source snapshot.
+/// Maintain the resident support admitted by one immutable control snapshot.
 ///
-/// Missing source blobs are simply outside that snapshot's collection value;
-/// a later append creates a later snapshot and another maintenance chance.
-async fn maintain_sources_at(
+/// Source acquisition precedes this observation. Later records, proofs, and
+/// blobs cannot enter any support selected by this batch.
+async fn maintain_sources(
     pile: &mut Pile,
     snapshot: &PileSnapshot,
     sources: &OrientSources,
-    instant: Epoch,
 ) -> Result<OrientSupports> {
-    let messages = sources
-        .messages
-        .maintain_at(pile, snapshot, instant)
-        .await?;
-    let mail = sources.mail.maintain_at(pile, snapshot, instant).await?;
-    let teams = sources.teams.maintain_at(pile, snapshot, instant).await?;
-    let compass = sources.compass.maintain_at(pile, snapshot, instant).await?;
-    let relations = sources
-        .relations
-        .maintain_at(pile, snapshot, instant)
-        .await?;
-    let status = sources.status.maintain_at(pile, snapshot, instant).await?;
+    let messages = sources.messages.maintain(pile, snapshot).await?;
+    let mail = sources.mail.maintain(pile, snapshot).await?;
+    let teams = sources.teams.maintain(pile, snapshot).await?;
+    let compass = sources.compass.maintain(pile, snapshot).await?;
+    let relations = sources.relations.maintain(pile, snapshot).await?;
+    let status = sources.status.maintain(pile, snapshot).await?;
     let habits = match sources.habits.as_ref() {
-        Some(source) => Some(source.maintain_at(pile, snapshot, instant).await?),
+        Some(source) => Some(source.maintain(pile, snapshot).await?),
         None => None,
     };
-    let presentations = sources
-        .presentations
-        .maintain_at(pile, snapshot, instant)
-        .await?;
+    let presentations = sources.presentations.maintain(pile, snapshot).await?;
     drop(
         pile.maintain_exact(sources.compass_status, &compass)
             .await
@@ -444,13 +453,12 @@ async fn maintain_sources_at(
 
 /// Read every target collection as it actually exists at one immutable store
 /// boundary and one authorization instant. This function performs no writes.
-fn observe_sources_at(
+fn observe_sources(
     snapshot: PileSnapshot,
     sources: &OrientSources,
     supports: &OrientSupports,
-    instant: Epoch,
 ) -> Result<OrientObservation> {
-    let next_authorization_change = next_authorization_change_at(&snapshot, instant)
+    let next_authorization_change = next_authorization_change(&snapshot)
         .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
     let messages = sources
         .messages
@@ -499,28 +507,29 @@ fn observe_sources_at(
 /// Maintain from one frozen source boundary, then observe only the target
 /// state resident in the later boundary. `source_snapshot` remains the
 /// caller's polling watermark; it is not part of the semantic observation.
-async fn maintain_and_observe_sources_at(
+/// Preserve its authorization instant too: if maintenance crosses a validity
+/// boundary, the next poll must still see that boundary and refresh admission.
+async fn maintain_and_observe_snapshot(
     pile: &mut Pile,
     source_snapshot: &PileSnapshot,
     sources: &OrientSources,
-    instant: Epoch,
 ) -> Result<OrientObservation> {
-    let supports = maintain_sources_at(pile, source_snapshot, sources, instant).await?;
+    let supports = maintain_sources(pile, source_snapshot, sources).await?;
     let snapshot = pile
-        .snapshot()
+        .snapshot_at(source_snapshot.instant())
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
-    observe_sources_at(snapshot, sources, &supports, instant)
+    observe_sources(snapshot, sources, &supports)
 }
 
 async fn maintain_and_observe_sources(
     pile: &mut Pile,
     sources: &OrientSources,
-    instant: Epoch,
 ) -> Result<OrientObservation> {
+    sources.ensure(pile).await?;
     let source_snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_sources_at(pile, &source_snapshot, sources, instant).await
+    maintain_and_observe_snapshot(pile, &source_snapshot, sources).await
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2141,8 +2150,7 @@ async fn cmd_baseline(pile_path: &Path, key: Option<&Path>, persona: Option<&str
     let mut pile = open_pile_strict(pile_path)?;
     let result = async {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let instant = clock::now()?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let query = observation.query();
         let persona = resolve_native_persona(&query, input)?;
         let view = load_attention_view(&query, persona)?;
@@ -2170,8 +2178,8 @@ async fn cmd_show(
     let mut pile = open_pile_strict(pile_path)?;
     let result = async {
         let sources = OrientSources::open(&mut pile, &signer, true)?;
-        let instant = clock::now()?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
+        let instant = observation.snapshot.instant();
         let query = observation.query();
         let persona_id = persona
             .map(|input| resolve_native_persona(&query, input))
@@ -2540,8 +2548,7 @@ async fn cmd_poll(
     let mut pile = open_pile_strict(pile_path)?;
     let result = async {
         let sources = OrientSources::open(&mut pile, &signer, false)?;
-        let instant = clock::now()?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources, instant).await?;
+        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let query = observation.query();
         let persona_id = match resolve_native_persona(&query, input) {
             Ok(persona) => persona,
@@ -2624,11 +2631,15 @@ async fn load_wait_frame(
     pile: &mut Pile,
     sources: &OrientSources,
     snapshot: PileSnapshot,
-    instant: Epoch,
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    let observation = maintain_and_observe_sources_at(pile, &snapshot, sources, instant).await?;
+    // Fetching may change residency, but this attempt keeps its caller's
+    // watermark. The next poll observes those additions (and any concurrent
+    // records); maintenance never consumes an unobserved source frontier.
+    sources.ensure(pile).await?;
+    let instant = snapshot.instant();
+    let observation = maintain_and_observe_snapshot(pile, &snapshot, sources).await?;
     let query = observation.query();
     let persona = match resolve_native_persona(&query, persona_input) {
         Ok(persona) => persona,
@@ -2676,11 +2687,10 @@ async fn load_wait_frame(
     }))
 }
 
-fn retained_habit_support_is_admitted_at(
+fn retained_habit_support_is_admitted(
     observation: &OrientObservation,
     sources: &OrientSources,
     snapshot: &PileSnapshot,
-    instant: Epoch,
 ) -> Result<bool> {
     let (Some(source), Some(facts)) = (sources.habits.as_ref(), observation.facts.habits.as_ref())
     else {
@@ -2689,7 +2699,7 @@ fn retained_habit_support_is_admitted_at(
     let admitted = source
         .facts
         .source()
-        .admitted_at(snapshot, instant)
+        .admitted(snapshot)
         .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
     facts
         .support()
@@ -2739,12 +2749,10 @@ async fn cmd_wait(
         let first_snapshot = pile
             .snapshot()
             .map_err(|error| anyhow!("freeze initial Orient wait snapshot: {error}"))?;
-        let first_instant = clock::now()?;
         let mut attempt = load_wait_frame(
             &mut pile,
             &sources,
             first_snapshot,
-            first_instant,
             pile_path,
             persona_input,
         )
@@ -2777,19 +2785,15 @@ async fn cmd_wait(
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
             let changed = !sampled.changes_since(&observed_snapshot).is_empty();
-            let instant = clock::now()?;
-            if !changed && !authorization_change_elapsed(next_authorization_change, instant) {
+            let instant = sampled.instant();
+            if !changed
+                && instant >= observed_snapshot.instant()
+                && !authorization_change_elapsed(next_authorization_change, instant)
+            {
                 continue;
             }
-            attempt = load_wait_frame(
-                &mut pile,
-                &sources,
-                sampled,
-                instant,
-                pile_path,
-                persona_input,
-            )
-            .await?;
+            attempt =
+                load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
             observed_snapshot = attempt.watermark_snapshot().clone();
             next_authorization_change = attempt.next_authorization_change();
         };
@@ -2842,10 +2846,10 @@ async fn cmd_wait(
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
             let storage_changed = !sampled.changes_since(&observed_snapshot).is_empty();
-            let now = clock::now()?;
+            let now = sampled.instant();
             let now_secs = epoch_seconds(now);
-            let authorization_changed =
-                authorization_change_elapsed(next_authorization_change, now);
+            let authorization_changed = now < observed_snapshot.instant()
+                || authorization_change_elapsed(next_authorization_change, now);
             let cooldown_elapsed = habit_seen
                 .next_cooldown_at
                 .is_some_and(|deadline| now_secs >= deadline);
@@ -2860,8 +2864,7 @@ async fn cmd_wait(
 
             if storage_changed || authorization_changed {
                 let attempt =
-                    load_wait_frame(&mut pile, &sources, sampled, now, pile_path, persona_input)
-                        .await?;
+                    load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
                 observed_snapshot = attempt.watermark_snapshot().clone();
                 next_authorization_change = attempt.next_authorization_change();
                 match attempt {
@@ -2904,11 +2907,10 @@ async fn cmd_wait(
                             // A global capability boundary is only a reload
                             // trigger. It invalidates the retained Habit view
                             // only when that view's own support lost admission.
-                            current_habit_context_valid &= retained_habit_support_is_admitted_at(
+                            current_habit_context_valid &= retained_habit_support_is_admitted(
                                 &current,
                                 &sources,
                                 &pending.watermark,
-                                now,
                             )?;
                         }
                     }
@@ -3018,18 +3020,17 @@ async fn cmd_wake(
             .context("register maintained Wiki collection")?;
         let wiki_observed = wiki_model::observed_collection(&mut storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
-        let instant = clock::now()?;
+        sources.ensure(&mut storage).await?;
+        drop(storage.ensure(memory_source).await?);
+        drop(storage.ensure(wiki_source).await?);
         let source_snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake source snapshot: {error}"))?;
-        let wiki_support = source_snapshot
-            .collection_at(wiki_source, instant)
-            .context("observe resident Wiki source collection")?
-            .support()
-            .clone();
+        let memory_support = source_snapshot.collection(memory_source)?.support().clone();
+        let wiki_support = source_snapshot.collection(wiki_source)?.support().clone();
         drop(
             memory_collection
-                .maintain_at(&mut storage, &source_snapshot, instant)
+                .maintain_exact(&mut storage, &memory_support)
                 .await
                 .context("maintain Memory collection")?,
         );
@@ -3046,12 +3047,11 @@ async fn cmd_wake(
                 .context("maintain Wiki supersession index")?,
         );
         let observation =
-            maintain_and_observe_sources_at(&mut storage, &source_snapshot, &sources, instant)
-                .await?;
+            maintain_and_observe_snapshot(&mut storage, &source_snapshot, &sources).await?;
         drop(source_snapshot);
         let memory_facts = observation
             .snapshot
-            .collection_at(memory_collection.rank9(), instant)
+            .collection_exact(memory_collection.rank9(), &memory_support)
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;
@@ -3257,9 +3257,7 @@ mod tests {
         )
         .unwrap();
         let snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let (facts, _) =
-            faculties::storage::read_fact_collection(collection, &snapshot, instant).unwrap();
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &snapshot).unwrap();
         presented_events(&facts, persona)
     }
 
@@ -3291,10 +3289,9 @@ mod tests {
         let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
         pile.commit(sources.relations.facts.source(), &fixture.signer, person)
             .unwrap();
-        let watermark = pile.snapshot().unwrap();
-        let instant = clock::now().unwrap();
+        let watermark = pile.snapshot_at(Epoch::from_tai_seconds(42.0)).unwrap();
         let expected_support = watermark
-            .collection_at(sources.messages.facts.source(), instant)
+            .collection(sources.messages.facts.source())
             .unwrap()
             .support()
             .clone();
@@ -3310,20 +3307,11 @@ mod tests {
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        let future = pile.snapshot().unwrap();
-        drop(
-            sources
-                .messages
-                .facts
-                .maintain_at(&mut pile, &future, instant)
-                .await
-                .unwrap(),
-        );
+        drop(sources.messages.facts.maintain(&mut pile).await.unwrap());
         let attempt = load_wait_frame(
             &mut pile,
             &sources,
             watermark.clone(),
-            instant,
             &fixture.path,
             "test-persona",
         )
@@ -3336,8 +3324,9 @@ mod tests {
         let resident_after = frame
             .observation
             .snapshot
-            .collection_at(message_collection, instant)
+            .collection(message_collection)
             .unwrap();
+        assert_eq!(frame.observation.snapshot.instant(), watermark.instant());
         assert_eq!(
             frame.observation.facts.messages.support(),
             &expected_support,
@@ -3423,13 +3412,11 @@ mod tests {
         let mut pile = open_pile_strict(&fixture.path).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true).unwrap();
         let watermark = pile.snapshot().unwrap();
-        let instant = clock::now().unwrap();
 
         let attempt = load_wait_frame(
             &mut pile,
             &sources,
             watermark.clone(),
-            instant,
             &fixture.path,
             "not-yet-resident",
         )

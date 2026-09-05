@@ -1605,8 +1605,7 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
+    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
     validate_catalog(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
@@ -1615,7 +1614,7 @@ pub fn materialize_collection(
 /// Capture one durable Wiki snapshot with shard-preserving facts and its exact
 /// maintained supersession index.
 ///
-/// One pre-maintenance snapshot chooses the foundational support. Both fact
+/// The ensured root's snapshot chooses the foundational support. Both fact
 /// derivation hops and the supersession projection are maintained for exactly
 /// that support, then attached through one later immutable snapshot. Normal
 /// reads therefore never flatten the collection or validate a closed-world
@@ -1625,13 +1624,14 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     let facts = FactCollection::new(pile, collection)
         .context("register maintained Wiki fact collection")?;
     let target = observed_collection(pile, signer.verifying_key())?;
-    let before = pile.snapshot().context("freeze Wiki source snapshot")?;
-    let instant = crate::clock::now()?;
-    let support = before
-        .collection_at(collection, instant)
-        .context("observe resident Wiki source collection")?
-        .support()
-        .clone();
+    let source_snapshot = pile
+        .ensure(collection)
+        .await
+        .context("ensure Wiki source collection")?;
+    let support = collection
+        .admitted(&source_snapshot)
+        .context("admit ensured Wiki source support")?;
+    drop(source_snapshot);
     drop(
         facts
             .maintain_exact(pile, &support)
@@ -1671,8 +1671,7 @@ pub async fn materialize_indexed_collection(
 ) -> Result<WikiSnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot, instant)
+    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
     let target = observed_collection(pile, signer.verifying_key())?;
     let maintained = pile
@@ -1888,12 +1887,12 @@ mod tests {
         let collection =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let instant = store_snapshot.instant();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         let snapshot =
             pollster::block_on(materialize_indexed_collection(&mut pile, &signer)).unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let cover_after_index = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let store_snapshot = pile.snapshot_at(instant).unwrap();
+        let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
         assert_eq!(resolve(snapshot.observed(), [root]), BTreeSet::from([root]));
 

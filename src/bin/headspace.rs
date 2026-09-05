@@ -192,31 +192,46 @@ impl Storage<'_> {
         let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
         let collection = FactCollection::new(pile, source)
             .context("register maintained Headspace fact collection")?;
-        // One frozen source watermark decides the exact Headspace support.
-        // Maintenance and Secrets discovery may append physical views, but
-        // cannot move that semantic boundary.
-        let before = pile
-            .snapshot()
-            .context("freeze Headspace source snapshot")?;
-        let instant = clock::now()?;
-        let secrets_collection =
-            open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
-        let support = before
-            .collection_at(collection.source(), instant)
-            .context("observe resident Headspace collection")?
-            .support()
-            .clone();
-        drop(before);
-        let secrets = pollster::block_on(async {
+        let secrets_collection = open_secrets_collection_read(pile, self.signer.verifying_key())?;
+        let (support, secrets) = pollster::block_on(async {
+            for (label, source) in [
+                ("Headspace", collection.source()),
+                ("Secrets", secrets_collection.source()),
+            ] {
+                drop(
+                    pile.ensure(source)
+                        .await
+                        .with_context(|| format!("ensure {label} source collection"))?,
+                );
+            }
+            // Both roots are ready before this common observation selects
+            // support. Neither later derivation can widen that boundary.
+            let before = pile
+                .snapshot()
+                .context("freeze shared Headspace support snapshot")?;
+            let support = collection
+                .source()
+                .admitted(&before)
+                .context("admit Headspace collection support")?;
+            let secrets_support = secrets_collection
+                .source()
+                .admitted(&before)
+                .context("admit Secrets collection support")?;
+            drop(before);
             drop(
                 collection
                     .maintain_exact(pile, &support)
                     .await
                     .context("maintain Headspace fact collection")?,
             );
-            secret_storage::ensure_and_snapshot(pile, [secrets_collection], instant)
+            let store_snapshot = secrets_collection
+                .ensure_exact(pile, &secrets_support)
                 .await
-                .context("ensure configured Secrets collection")
+                .context("ensure configured Secrets collection")?;
+            let secrets =
+                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
+                    .context("attach exact Secrets collection")?;
+            Ok::<_, anyhow::Error>((support, secrets))
         })?;
         // Attach Headspace through the same final immutable physical snapshot
         // that backs every Secrets lookup in this view.
@@ -1019,6 +1034,7 @@ mod tests {
         assert!(secrets_reader
             .changes_since(&views.headspace.reader)
             .is_empty());
+        assert_eq!(views.headspace.reader.instant(), secrets_reader.instant());
         storage.close().unwrap();
     }
 
@@ -1114,7 +1130,7 @@ mod tests {
         ))
         .unwrap();
         let (storage, repaired) = views(&pile, &key);
-        assert_eq!(repaired.secrets.collections().len(), 1);
+        assert_eq!(repaired.secrets.collection(), collection.handle());
         assert!(repaired.secrets.contains(version));
         let config_resolution =
             headspace::current_config(&repaired.headspace.reader, &repaired.headspace.facts)
@@ -1143,7 +1159,7 @@ mod tests {
         ))
         .unwrap();
         let (storage, replay) = views(&pile, &key);
-        assert_eq!(replay.secrets.collections().len(), 1);
+        assert_eq!(replay.secrets.collection(), collection.handle());
         let config_resolution =
             headspace::current_config(&replay.headspace.reader, &replay.headspace.facts).unwrap();
         let config = settled_config(&config_resolution).unwrap().unwrap();

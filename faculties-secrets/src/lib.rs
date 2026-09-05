@@ -23,7 +23,7 @@ use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, Union
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -63,21 +63,39 @@ pub struct WrapRow {
     pub sealed_dek: BytesHandle,
 }
 
-/// One explicitly configured collection observed through its maintained view.
-#[derive(Clone)]
-pub struct SecretsView {
+/// One immutable observation of the configured Secrets collection.
+pub struct SecretsSnapshot<R> {
+    store_snapshot: R,
     collection: CollectionHandle,
     support: Support,
-    facts: SecretsFacts,
+    facts: Option<SecretsFacts>,
 }
 
-impl SecretsView {
-    pub(crate) fn new(collection: CollectionHandle, support: Support, facts: SecretsFacts) -> Self {
+impl<R> SecretsSnapshot<R> {
+    pub(crate) fn new(
+        store_snapshot: R,
+        collection: CollectionHandle,
+        support: Support,
+        facts: Option<SecretsFacts>,
+    ) -> Self {
         Self {
+            store_snapshot,
             collection,
             support,
             facts,
         }
+    }
+
+    pub fn store_snapshot(&self) -> &R {
+        &self.store_snapshot
+    }
+
+    /// Authorization instant of this immutable observation.
+    pub fn instant(&self) -> Epoch
+    where
+        R: StoreSnapshot,
+    {
+        self.store_snapshot.instant()
     }
 
     pub const fn collection(&self) -> CollectionHandle {
@@ -88,61 +106,12 @@ impl SecretsView {
         &self.support
     }
 
-    pub fn facts(&self) -> &SecretsFacts {
-        &self.facts
-    }
-}
-
-/// Storage-agnostic aggregate over explicitly configured Secrets collections.
-///
-/// Collection discovery is deliberately outside this type. A caller supplies
-/// the policy boundaries it intends to inspect; no ambient inbox or global
-/// collection registry is introduced merely to find ciphertext.
-pub struct SecretsSnapshot<R> {
-    store_snapshot: R,
-    instant: Epoch,
-    collections: Vec<SecretsView>,
-    facts: Option<SecretsFacts>,
-}
-
-impl<R> SecretsSnapshot<R> {
-    pub(crate) fn new(store_snapshot: R, instant: Epoch, collections: Vec<SecretsView>) -> Self {
-        let facts = collections
-            .iter()
-            .map(|view| view.facts.clone())
-            .reduce(|left, right| left.union(&right));
-        Self {
-            store_snapshot,
-            instant,
-            collections,
-            facts,
-        }
-    }
-
-    pub fn store_snapshot(&self) -> &R {
-        &self.store_snapshot
-    }
-
-    /// Authorization instant shared by every collection view in this snapshot.
-    pub const fn instant(&self) -> Epoch {
-        self.instant
-    }
-
-    pub fn collections(&self) -> &[SecretsView] {
-        &self.collections
-    }
-
-    /// Logical union of all explicitly configured collection views.
-    ///
-    /// This is a shallow union of mmap/Bytes-backed Succinct shards, not a
-    /// temporary TribleSet or eagerly reconstructed catalog. Facts for one
-    /// entity may therefore conjoin across policy boundaries in the ordinary
-    /// open-world TribleSpace model.
+    /// Queryable facts physically realized for this exact support.
     pub fn facts(&self) -> Option<&SecretsFacts> {
         self.facts.as_ref()
     }
 
-    /// Whether one opaque immutable secret id occurs in any configured view.
+    /// Whether one opaque immutable secret id occurs in this collection.
     pub fn contains(&self, secret: Id) -> bool {
         self.facts
             .as_ref()
@@ -648,35 +617,12 @@ where
     P: TriblePattern,
     I: IntoIterator<Item = VerifyingKey>,
 {
-    add_recipient_envelopes_for_target(reader, facts, facts, secret, holder, recipients)
-}
-
-/// Build missing envelopes for `target_facts`, recovering the existing DEK
-/// from a possibly wider aggregate `recovery_facts` view.
-///
-/// This is the collection-boundary primitive: cross-collection facts may help
-/// recover a split historical version, while an envelope only counts as
-/// already published when it is resident in the explicit target collection.
-pub fn add_recipient_envelopes_for_target<R, P, Q, I>(
-    reader: &R,
-    recovery_facts: &P,
-    target_facts: &Q,
-    secret: Id,
-    holder: &SigningKey,
-    recipients: I,
-) -> Result<RecipientEnvelopes>
-where
-    R: BlobStoreGet,
-    P: TriblePattern,
-    Q: TriblePattern,
-    I: IntoIterator<Item = VerifyingKey>,
-{
-    if secret_rows_for(recovery_facts, secret).is_empty() {
+    if secret_rows_for(facts, secret).is_empty() {
         bail!("secret {secret} not found");
     }
-    let dek = recover_dek_from_facts(reader, recovery_facts, secret, holder)?
+    let dek = recover_dek_from_facts(reader, facts, secret, holder)?
         .ok_or_else(|| anyhow!("holder has no wrap on secret {secret}"))?;
-    let existing = resident_wrap_recipients(reader, target_facts, secret);
+    let existing = resident_wrap_recipients(reader, facts, secret);
     let recipients = deduplicated_recipients(recipients);
     let mut fragment = Fragment::empty();
     let mut added = Vec::new();

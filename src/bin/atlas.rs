@@ -4,7 +4,6 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use faculties::atlas;
-use faculties::clock;
 use faculties::collection_names::open_configured;
 use faculties::out::Out;
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
@@ -14,7 +13,7 @@ use triblespace::core::collection::CollectionSnapshotExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::prelude::{find, pattern, Id, SnapshotSource};
+use triblespace::prelude::{find, pattern, Id};
 
 const SHARED: &[Param] = &[
     Param::caller("pile", "Path to the pile file to use")
@@ -75,16 +74,10 @@ impl AtlasContext {
         )?;
         let collection = FactCollection::new(&mut self.pile, source)
             .context("register maintained Atlas fact collection")?;
-        let before = self
-            .pile
-            .snapshot()
-            .context("freeze Atlas source snapshot")?;
-        let instant = clock::now()?;
-        let store_snapshot =
-            pollster::block_on(collection.maintain_at(&mut self.pile, &before, instant))
-                .context("maintain Atlas fact collection")?;
+        let store_snapshot = pollster::block_on(collection.maintain(&mut self.pile))
+            .context("maintain Atlas fact collection")?;
         let facts = store_snapshot
-            .collection_at(collection.rank9(), instant)
+            .collection(collection.rank9())
             .context("observe maintained Atlas fact collection")?
             .view::<FactArchive>()
             .context("read maintained Atlas fact collection")?;

@@ -19,9 +19,7 @@ use faculties::wiki::{
 #[cfg(test)]
 use hifitime::Epoch;
 use triblespace::core::collection::observed_union::ObservedIndex;
-use triblespace::core::collection::{
-    CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
-};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -265,25 +263,34 @@ impl WikiStorage<'_> {
                         .with_context(|| format!("register maintained {label} fact collection"))?;
                     auxiliaries.push((source, facts, label));
                 }
-                let before = pile
+                drop(
+                    pile.ensure(wiki_source)
+                        .await
+                        .context("ensure Wiki source collection")?,
+                );
+                for (source, _, label) in &auxiliaries {
+                    drop(
+                        pile.ensure(*source)
+                            .await
+                            .with_context(|| format!("ensure {label} source collection"))?,
+                    );
+                }
+                let shared_control = pile
                     .snapshot()
                     .context("freeze Wiki and auxiliary source snapshot")?;
-                let instant = clock::now()?;
 
-                let wiki_support = before
-                    .collection_at(wiki_source, instant)
-                    .context("observe resident Wiki source collection")?
-                    .support()
-                    .clone();
-                let auxiliary_supports = auxiliaries
-                    .iter()
-                    .map(|(source, _, label)| {
-                        before
-                            .collection_at(*source, instant)
-                            .with_context(|| format!("observe resident {label} source collection"))
-                            .map(|snapshot| snapshot.support().clone())
-                    })
-                    .collect::<Result<Vec<Support>>>()?;
+                let wiki_support = wiki_source
+                    .admitted(&shared_control)
+                    .context("admit Wiki source support")?;
+                let mut auxiliary_supports = Vec::with_capacity(auxiliaries.len());
+                for (source, _, label) in &auxiliaries {
+                    auxiliary_supports.push(
+                        source
+                            .admitted(&shared_control)
+                            .with_context(|| format!("admit {label} source support"))?,
+                    );
+                }
+                drop(shared_control);
 
                 drop(
                     wiki_facts

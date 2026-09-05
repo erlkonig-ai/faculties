@@ -192,7 +192,6 @@ impl Storage<'_> {
             let pile = pile
                 .as_mut()
                 .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-            let instant = clock::now()?;
             let mail_collection =
                 open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
             let files_collection =
@@ -202,7 +201,7 @@ impl Storage<'_> {
             let relations_collection =
                 open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
             let secrets_collection =
-                open_secrets_collection_read(pile, self.signer.verifying_key(), instant)?;
+                open_secrets_collection_read(pile, self.signer.verifying_key())?;
             let mail = FactCollection::new(pile, mail_collection)
                 .context("register maintained Mail fact collection")?;
             let files = FactCollection::new(pile, files_collection)
@@ -211,62 +210,90 @@ impl Storage<'_> {
                 .context("register maintained Decide fact collection")?;
             let relations = FactCollection::new(pile, relations_collection)
                 .context("register maintained Relations fact collection")?;
-            let before = pile
-                .snapshot()
-                .context("freeze shared Mail pre-maintenance snapshot")?;
-            // One source watermark fixes every ordinary fact collection this
-            // command may observe. Maintenance may append physical views, but
-            // cannot move that semantic boundary independently per scope.
-            let mail_support = before
-                .collection_at(mail.source(), instant)
-                .context("observe resident Mail collection")?
-                .support()
-                .clone();
-            let files_support = before
-                .collection_at(files.source(), instant)
-                .context("observe resident Files collection")?
-                .support()
-                .clone();
-            let decide_support = before
-                .collection_at(decide.source(), instant)
-                .context("observe resident Decide collection")?
-                .support()
-                .clone();
-            let relations_support = before
-                .collection_at(relations.source(), instant)
-                .context("observe resident Relations collection")?
-                .support()
-                .clone();
-            drop(before);
-            let secrets = pollster::block_on(async {
-                drop(
-                    mail.maintain_exact(pile, &mail_support)
-                        .await
-                        .context("maintain Mail fact collection")?,
-                );
-                drop(
-                    files
-                        .maintain_exact(pile, &files_support)
-                        .await
-                        .context("maintain Files fact collection")?,
-                );
-                drop(
-                    decide
-                        .maintain_exact(pile, &decide_support)
-                        .await
-                        .context("maintain Decide fact collection")?,
-                );
-                drop(
-                    relations
-                        .maintain_exact(pile, &relations_support)
-                        .await
-                        .context("maintain Relations fact collection")?,
-                );
+            // Ensure every root before one common snapshot fixes all support,
+            // including Secrets. Later maintenance cannot widen any scope.
+            let (mail_support, files_support, decide_support, relations_support, secrets) =
+                pollster::block_on(async {
+                    for (label, source) in [
+                        ("Mail", mail.source()),
+                        ("Files", files.source()),
+                        ("Decide", decide.source()),
+                        ("Relations", relations.source()),
+                        ("Secrets", secrets_collection.source()),
+                    ] {
+                        drop(
+                            pile.ensure(source)
+                                .await
+                                .with_context(|| format!("ensure {label} source collection"))?,
+                        );
+                    }
+                    let before = pile
+                        .snapshot()
+                        .context("freeze shared Mail support snapshot")?;
+                    let mail_support = mail
+                        .source()
+                        .admitted(&before)
+                        .context("admit Mail collection support")?;
+                    let files_support = files
+                        .source()
+                        .admitted(&before)
+                        .context("admit Files collection support")?;
+                    let decide_support = decide
+                        .source()
+                        .admitted(&before)
+                        .context("admit Decide collection support")?;
+                    let relations_support = relations
+                        .source()
+                        .admitted(&before)
+                        .context("admit Relations collection support")?;
+                    let secrets_support = secrets_collection
+                        .source()
+                        .admitted(&before)
+                        .context("admit Secrets collection support")?;
+                    drop(before);
 
-                secret_storage::ensure_and_snapshot(&mut *pile, [secrets_collection], instant)
-                    .await
-                    .context("ensure configured Secrets collection")
-            })?;
+                    drop(
+                        mail.maintain_exact(pile, &mail_support)
+                            .await
+                            .context("maintain Mail fact collection")?,
+                    );
+                    drop(
+                        files
+                            .maintain_exact(pile, &files_support)
+                            .await
+                            .context("maintain Files fact collection")?,
+                    );
+                    drop(
+                        decide
+                            .maintain_exact(pile, &decide_support)
+                            .await
+                            .context("maintain Decide fact collection")?,
+                    );
+                    drop(
+                        relations
+                            .maintain_exact(pile, &relations_support)
+                            .await
+                            .context("maintain Relations fact collection")?,
+                    );
+
+                    let store_snapshot = secrets_collection
+                        .ensure_exact(pile, &secrets_support)
+                        .await
+                        .context("ensure configured Secrets collection")?;
+                    let secrets = secret_storage::snapshot_exact(
+                        store_snapshot,
+                        secrets_collection,
+                        secrets_support,
+                    )
+                    .context("attach exact Secrets collection")?;
+                    Ok::<_, anyhow::Error>((
+                        mail_support,
+                        files_support,
+                        decide_support,
+                        relations_support,
+                        secrets,
+                    ))
+                })?;
             // Secrets attachment owns the final immutable pile snapshot. Attach
             // every exact maintained support through that same world so Mail
             // facts, file payloads, decisions, relations, and credentials can
@@ -1326,6 +1353,7 @@ mod tests {
         ] {
             assert!(reader.changes_since(secrets_snapshot).is_empty());
             assert!(secrets_snapshot.changes_since(reader).is_empty());
+            assert_eq!(reader.instant(), secrets_snapshot.instant());
         }
     }
 

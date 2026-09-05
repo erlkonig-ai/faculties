@@ -8,9 +8,10 @@
 //! signer. Repository branches, mutable heads, and compatibility fallbacks do
 //! not participate in this boundary. The interactive viewer loads all sources;
 //! focused capture binaries request only their source dependency
-//! closure. Loading may maintain deterministic derived views for the exact
-//! resident source support observed before work begins; those unsigned
-//! artifacts are cache exhaust, not authoritative writes. Most sources are
+//! closure. Loading ensures each root before one common snapshot selects the
+//! exact admitted supports carried through deterministic derived views;
+//! those unsigned artifacts are cache exhaust, not
+//! authoritative writes. Most sources are
 //! fixed descriptor-handle collections. Secrets uses the same explicit
 //! collection configuration and is attached only when the pile signer is
 //! admitted to READ it.
@@ -164,13 +165,7 @@ impl DatasetRevision {
     fn from_secrets(snapshot: &SecretsSnapshot<PileSnapshot>) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.secrets-revision.v3");
-        for collection in snapshot.collections() {
-            Self::hash_collection_support(
-                &mut hasher,
-                collection.collection(),
-                collection.support(),
-            );
-        }
+        Self::hash_collection_support(&mut hasher, snapshot.collection(), snapshot.support());
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -666,19 +661,50 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             })
             .transpose()?;
 
-        // All source supports come from one immutable pre-work watermark.
+        let secrets_collection = sources
+            .contains(&SourceKey::Secrets)
+            .then(|| {
+                open_secrets_collection_read(&mut pile, signer.verifying_key())
+                    .map_err(|error| format!("open configured Secrets collection: {error:#}"))
+            })
+            .transpose()?;
+
+        for (_, label, collection) in &collections {
+            drop(
+                pile.ensure(collection.source())
+                    .await
+                    .map_err(|error| format!("ensure {label} source collection: {error:#}"))?,
+            );
+        }
+        if let Some(collection) = secrets_collection {
+            drop(
+                pile.ensure(collection.source())
+                    .await
+                    .map_err(|error| format!("ensure Secrets source collection: {error:#}"))?,
+            );
+        }
+
+        // Root acquisition is finished. All ordinary, indexed, and Secrets
+        // views select support from one immutable records/proofs/time boundary.
         let before = pile
             .snapshot()
-            .map_err(|error| format!("freeze pre-maintenance viewer snapshot: {error}"))?;
-        let instant = triblespace::core::clock::epoch_now();
+            .map_err(|error| format!("freeze shared viewer support snapshot: {error}"))?;
         for (scope, label, collection) in collections {
-            let support = before
-                .collection_at(collection.source(), instant)
-                .map_err(|error| format!("observe resident {label} collection: {error:#}"))?
-                .support()
-                .clone();
+            let support = collection
+                .source()
+                .admitted(&before)
+                .map_err(|error| format!("admit {label} collection support: {error:#}"))?;
             by_scope.insert(scope, (collection, support));
         }
+        let secrets_support = secrets_collection
+            .map(|collection| {
+                collection
+                    .source()
+                    .admitted(&before)
+                    .map(|support| (collection, support))
+                    .map_err(|error| format!("admit Secrets collection support: {error:#}"))
+            })
+            .transpose()?;
         drop(before);
 
         for (scope, (collection, support)) in &by_scope {
@@ -715,16 +741,14 @@ async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<Loade
             );
         }
 
-        let secrets = if sources.contains(&SourceKey::Secrets) {
-            let collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key(), instant)
-                    .map_err(|error| format!("open configured Secrets collection: {error:#}"))?;
-            Some(
-                secret_storage::ensure_and_snapshot(&mut pile, [collection], instant)
-                    .await
-                    .map(LoadedSecrets::new)
-                    .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?,
-            )
+        let secrets = if let Some((collection, support)) = secrets_support {
+            let store_snapshot = collection
+                .ensure_exact(&mut pile, &support)
+                .await
+                .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?;
+            let snapshot = secret_storage::snapshot_exact(store_snapshot, collection, support)
+                .map_err(|error| format!("attach exact Secrets collection: {error:#}"))?;
+            Some(LoadedSecrets::new(snapshot))
         } else {
             None
         };
@@ -864,7 +888,7 @@ mod tests {
     use anybytes::View;
     use hifitime::Epoch;
     use triblespace::core::metadata;
-    use triblespace::core::repo::BlobStoreGet;
+    use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
@@ -992,6 +1016,13 @@ mod tests {
         let triage = context.dataset(SourceKey::Triage).unwrap();
         assert_eq!(reason.revision, triage.revision);
         assert!(reason.facts.iter().eq(triage.facts.iter()));
+        let secrets = context.secrets().unwrap();
+        let secrets_reader = secrets.snapshot.store_snapshot();
+        for reader in [reason.reader, triage.reader] {
+            assert_eq!(reader.instant(), secrets_reader.instant());
+            assert!(reader.changes_since(secrets_reader).is_empty());
+            assert!(secrets_reader.changes_since(reader).is_empty());
+        }
     }
 
     #[test]
@@ -1074,8 +1105,7 @@ mod tests {
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let cover_before = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let cover_before = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
 
         let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
@@ -1095,8 +1125,7 @@ mod tests {
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = triblespace::core::clock::epoch_now();
-        let cover_after = collection.admitted_at(&store_snapshot, instant).unwrap();
+        let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(cover_after, cover_before);
     }
