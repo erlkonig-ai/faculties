@@ -153,11 +153,6 @@ enum Command {
     /// Run recorded clips through the SAME segmenter and embed path — the
     /// hardware-free gate for everything below the capture seam.
     Once(OnceArgs),
-    /// The Inkling ear: listen on Soma (or run clips) and write one dMel
-    /// record per utterance on stdout in the framed-stream convention, for
-    /// drive's `--hear`. No Gemma, no embeddings, no files -- the mind's own
-    /// front end, eighty levels per 50 ms, which its session turns into rows.
-    Stream(StreamArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -234,27 +229,6 @@ struct ListenArgs {
 }
 
 #[derive(Args, Debug)]
-struct StreamArgs {
-    /// Base URL of the running Soma that owns the microphone.
-    #[arg(long, env = "SOMA_URL", default_value = "http://localhost:8000")]
-    soma: String,
-    /// Comma-separated clips to run INSTEAD of the microphone, through the
-    /// same segmenter: the silent gate. The stream ends when they do.
-    #[arg(long, value_delimiter = ',')]
-    wav: Vec<PathBuf>,
-    /// Half-duplex pause file, as for `listen`.
-    #[arg(long, env = "VOICE_PAUSE_FILE")]
-    pause_file: Option<PathBuf>,
-    /// Drop segments shorter than this many seconds.
-    #[arg(long, default_value_t = 0.6)]
-    min_dur_s: f64,
-    /// Grace after our own speech ends during which an overlapping utterance
-    /// is still treated as self-echo, ms.
-    #[arg(long, default_value_t = turntaking::DEFAULT_BARGE_GRACE_MS)]
-    barge_grace_ms: u64,
-}
-
-#[derive(Args, Debug)]
 struct OnceArgs {
     #[command(flatten)]
     shared: Shared,
@@ -268,7 +242,6 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Listen(args)) => cmd_listen(args),
         Some(Command::Once(args)) => cmd_once(args),
-        Some(Command::Stream(args)) => cmd_stream(args),
         None => {
             Cli::command().print_help().ok();
             println!();
@@ -718,110 +691,6 @@ fn cmd_listen(args: ListenArgs) -> Result<()> {
             }
         }
     }
-}
-
-/// The Inkling ear. One framed record per kept utterance: the dMel levels,
-/// `frames * 80` bytes, extent `frames`. Everything else this program says
-/// goes to stderr, because stdout IS the stream.
-#[cfg(feature = "hear")]
-fn cmd_stream(args: StreamArgs) -> Result<()> {
-    use mary::models::inkling::dmel::DmelFrontEnd;
-    use mary::models::inkling::resident::DMEL_BINS;
-
-    let front = DmelFrontEnd::new();
-    let filter = SpeechFilter {
-        min_chars: 0,
-        min_dur_s: args.min_dur_s,
-        barge_grace_ms: args.barge_grace_ms,
-    };
-    let mut out = framed_stream::FramedWriter::open(
-        std::io::stdout().lock(),
-        framed_stream::INKLING_DMEL,
-        framed_stream::UNIT_FRAMES,
-    )
-    .context("open the dMel stream on stdout")?;
-    let mut emit = |segment: &Segment, spoke: Option<SpeechWindow>| -> Result<bool> {
-        let utc_ms = now_ms()?;
-        let dur_s = segment.dur_s();
-        // The audio-only filter: a blip or our own echo never becomes a record.
-        if let Some(reason) = turntaking::audio_drop_reason(dur_s, utc_ms, &filter, spoke) {
-            eprintln!("[heard ] ({dur_s:.2}s) → DROPPED: {reason}");
-            return Ok(false);
-        }
-        let wave = to_hear_rate(&segment.samples, segment.rate)?;
-        let levels = front.levels(&wave);
-        let frames = levels.len() / DMEL_BINS;
-        out.record(&levels, frames as u64)
-            .context("write a dMel record")?;
-        eprintln!("[heard ] ({dur_s:.2}s) → {frames} dMel frame(s)");
-        Ok(true)
-    };
-
-    if !args.wav.is_empty() {
-        for path in &args.wav {
-            let wave = load_16k(path)?;
-            let mut segmenter = Segmenter::new(HEAR_RATE, VadConfig::default());
-            let mut segments: Vec<Segment> = Vec::new();
-            segmenter.push(&wave, &mut |s| segments.push(s));
-            segmenter.flush(&mut |s| segments.push(s));
-            eprintln!("{}: {} utterance(s)", path.display(), segments.len());
-            for segment in &segments {
-                emit(segment, None)?;
-            }
-        }
-        out.finish(framed_stream::EndStatus::Complete)
-            .context("finish the dMel stream")?;
-        return Ok(());
-    }
-
-    if let Some(path) = &args.pause_file {
-        if turntaking::clear_stale(path) {
-            eprintln!("cleared stale pause file {}", path.display());
-        }
-    }
-    let mut capture = soma_client::SomaCapture::open(&args.soma)
-        .with_context(|| format!("open Soma capture at {}", args.soma))?;
-    eprintln!(
-        "hear stream: soma={} {} Hz; dMel at {} Hz, {} bins per 50 ms",
-        args.soma,
-        soma_client::SAMPLE_RATE,
-        HEAR_RATE,
-        DMEL_BINS
-    );
-    let mut segmenter = Segmenter::new(CAPTURE_RATE, VadConfig::default());
-    let mut spoke: Option<SpeechWindow> = None;
-    let mut pause_since: Option<u64> = None;
-    loop {
-        let frame = capture.next_frame()?;
-        let held = args
-            .pause_file
-            .as_deref()
-            .map(turntaking::paused)
-            .unwrap_or(false);
-        if held {
-            if pause_since.is_none() {
-                pause_since = Some(now_ms()?);
-            }
-            segmenter.pause_skip(frame.samples.len() as u64);
-            continue;
-        }
-        if let Some(start_ms) = pause_since.take() {
-            spoke = Some(SpeechWindow {
-                start_ms,
-                end_ms: now_ms()?,
-            });
-        }
-        let mut segments: Vec<Segment> = Vec::new();
-        segmenter.push(&frame.samples, &mut |s| segments.push(s));
-        for segment in &segments {
-            emit(segment, spoke)?;
-        }
-    }
-}
-
-#[cfg(not(feature = "hear"))]
-fn cmd_stream(_args: StreamArgs) -> Result<()> {
-    bail!("hear was built without the `hear` feature")
 }
 
 /// One segment → maybe one embedding record. `Ok(true)` = handed over.
