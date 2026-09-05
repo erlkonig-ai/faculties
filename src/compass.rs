@@ -16,6 +16,7 @@ use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
@@ -90,7 +91,7 @@ where
         .context("freeze Compass source policy snapshot")?;
     let policy = source
         .policy(&snapshot)
-        .map_err(|error| anyhow!("read Compass source collection policy: {error}"))?;
+        .context("read Compass source collection policy")?;
     let target = store.derive::<LwwRegisterBlob>(
         source,
         (board::status_of.id(), metadata::created_at.id()),
@@ -977,9 +978,7 @@ pub fn priority_ranks(
 }
 
 pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
-    let value: View<str> = reader
-        .get(handle)
-        .map_err(|error| anyhow!("load Compass text: {error:?}"))?;
+    let value: View<str> = reader.get(handle).context("load Compass text")?;
     Ok(value.to_string())
 }
 
@@ -1059,10 +1058,13 @@ pub fn materialize_collection(
 
 /// Capture Compass facts and attach the maintained status LWW index for that
 /// exact source cover, constructing missing derived artifacts if necessary.
-pub async fn materialize_indexed_collection(
-    pile: &mut Pile,
+pub async fn materialize_indexed_collection<S>(
+    pile: &mut S,
     signer: &SigningKey,
-) -> Result<CompassSnapshot> {
+) -> Result<CompassSnapshot>
+where
+    S: Store<Snapshot = PileSnapshot> + AsyncBlobStoreAcquire + Send,
+{
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let facts =
         FactCollection::new(pile, source).context("register maintained Compass fact collection")?;
@@ -1074,6 +1076,7 @@ pub async fn materialize_indexed_collection(
     let support = source
         .admitted(&source_snapshot)
         .context("admit ensured Compass source support")?;
+    let instant = source_snapshot.instant();
     drop(source_snapshot);
     drop(
         facts
@@ -1081,20 +1084,24 @@ pub async fn materialize_indexed_collection(
             .await
             .context("maintain Compass fact collection")?,
     );
+    drop(
+        pile.maintain_exact(status_target, &support)
+            .await
+            .context("maintain Compass status register")?,
+    );
     let store_snapshot = pile
-        .maintain_exact(status_target, &support)
-        .await
-        .map_err(|error| anyhow!("maintain Compass status register: {error}"))?;
+        .snapshot_at(instant)
+        .context("freeze maintained Compass snapshot at its source instant")?;
     let fact_archive = store_snapshot
         .collection_exact(facts.rank9(), &support)
-        .map_err(|error| anyhow!("observe Compass fact collection: {error}"))?
+        .context("observe Compass fact collection")?
         .view::<FactArchive>()
-        .map_err(|error| anyhow!("read Compass fact collection: {error}"))?;
+        .context("read Compass fact collection")?;
     let status = store_snapshot
         .collection_exact(status_target, &support)
-        .map_err(|error| anyhow!("observe Compass status register: {error}"))?
+        .context("observe Compass status register")?
         .view::<LwwIndex>()
-        .map_err(|error| anyhow!("read Compass status register: {error}"))?;
+        .context("read Compass status register")?;
     Ok(CompassSnapshot {
         facts: fact_archive,
         store_snapshot,
@@ -1108,14 +1115,18 @@ pub async fn materialize_indexed_collection(
 /// Once this returns, the authoritative commit is durable; cache maintenance
 /// must never turn that success into an error which tempts a caller to retry
 /// the semantic action.
-pub fn commit_collection(
-    pile: &mut Pile,
+pub fn commit_collection<S>(
+    pile: &mut S,
     signer: &SigningKey,
     fragment: Fragment,
-) -> Result<CollectionCommit> {
+) -> Result<CollectionCommit>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet,
+{
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
-        .map_err(|error| anyhow!("commit Compass collection fragment: {error}"))
+        .context("commit Compass collection fragment")
 }
 
 #[cfg(test)]

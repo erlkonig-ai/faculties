@@ -44,10 +44,10 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 7ddf1cc55fed21f3341c2885884a2399486ac533
-git -C mary checkout 38c911cae75d1659219909d99fd0e8d35ada78eb
+git -C triblespace-rs checkout 97f85d5203930c8b7f0e07f749c5a3a37c1ef44e
+git -C mary checkout ffc6fbf6647dab60da81d298067c09302a2517f4
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
-git -C cubecl-fork checkout 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
+git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
 cd faculties
 cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
@@ -76,6 +76,44 @@ compass add "ship the demo" --status doing
 wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
+
+### Reading cold blobs from peers
+
+`message`, `orient`, `wiki`, `compass`, and ordinary `files` commands use a live
+store for foreground acquisition. If an explicitly requested descriptor, fact
+fragment, or selected payload is absent locally, they discover a provider
+through the blob DHT and cache its bytes. Files similarity and embedding
+commands retain their resident-only model/input paths for now.
+Configure one or more bootstrap routes as comma-separated Iroh endpoint
+tickets or endpoint IDs:
+
+```sh
+export TRIBLESPACE_PEERS='<bootstrap endpoint ticket or ID>'
+message list assistant
+```
+
+These routes introduce the DHT; they are not a list of blob providers to probe
+serially. A compatible running provider must hold and advertise the requested
+bytes. With no bootstrap route, a fresh foreground process cannot discover
+that application-level DHT merely from an Iroh relay address.
+
+Local reads, writes, and snapshots start no network host. The first cold read
+starts an ephemeral transport identity, separate from the pile signer and any
+running replication daemon. The foreground client subscribes to no collection
+gossip and advertises no providers. Exact blob handles remain the read
+capability; acquisition neither authors a `WANT` nor follows every reference
+inside a blob. `WANT` remains explicit durable delegation to another process.
+
+Snapshot queries stay frozen: fetching a selected attachment may make its
+bytes available, but cannot add concurrently arriving facts to that command's
+answer. Output and publication occur outside acquisition retries. An
+unavailable provider is not interpreted as empty text or an acknowledgement;
+Orient wait keeps the news pending for a later poll.
+
+This is an incremental command port, not permission to switch every deployment
+to records-only repair: commands still using plain `Pile` require their
+payloads to be resident. Keep those deployments' existing replication policy
+until all readers they use have acquired a live boundary.
 
 ### For agent onboarding: the portable bootstrap
 

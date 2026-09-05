@@ -1130,14 +1130,6 @@ where
     // The pool is part of the same status line: a reader who sees a cover come
     // in under budget needs to know the shortfall is the quantized pool doing
     // its job, not a cover that failed to fill.
-    eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode}); floor {} + refinement pool {}",
-        cover.len(),
-        used,
-        budget_chars,
-        floor_used,
-        refinement_pool(budget_chars, floor_used),
-    );
     for &i in &cover {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
@@ -1158,6 +1150,16 @@ where
             writeln!(out, "[image memory @ {}]", chunk_span_str(space, id))?;
         }
     }
+    // Only report a completed cover. A live caller may acquire a missing
+    // selected summary and retry this resident-only computation.
+    eprintln!(
+        "memory context — {} chunk(s), ~{} of {} characters ({mode}); floor {} + refinement pool {}",
+        cover.len(),
+        used,
+        budget_chars,
+        floor_used,
+        refinement_pool(budget_chars, floor_used),
+    );
     Ok(out)
 }
 

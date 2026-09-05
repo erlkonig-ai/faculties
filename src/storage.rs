@@ -7,9 +7,10 @@
 //!   resolve one durable signing key per pile. Ordinary commands load; only an
 //!   explicit initialization mints. No faculty falls back to an ephemeral
 //!   identity.
-//! - **Opening.** [`open_pile_strict`] refreshes eagerly and reports a
-//!   malformed suffix as evidence through [`pile_read_error`] rather than
-//!   silently truncating it.
+//! - **Opening.** [`open_store`] supplies lazy exact-handle acquisition;
+//!   [`open_pile_strict`] is the local-only boundary used by migrations and
+//!   not-yet-ported callers. Both report a malformed suffix as evidence through
+//!   [`pile_read_error`] rather than silently truncating it.
 //! - **Read models.** [`FactCollection`] names the canonical maintained
 //!   SimpleArchive → Succinct → Rank9 descriptor chain without hiding either
 //!   maintenance writes or immutable snapshot attachment.
@@ -41,13 +42,118 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::Store;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, CapabilityProofRead, SnapshotSource, StoreRead,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StoreRead,
+    StoreSnapshot,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
 
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
+
+/// A live faculty store. Its snapshots are still resident-only `PileSnapshot`s.
+/// The network host starts only when an explicitly requested blob is missing.
+pub type FacultyStore = triblespace_net::peer::Peer<Pile>;
+
+/// Enter the async I/O boundary of a foreground command.
+pub fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create faculty I/O runtime")
+}
+
+/// Run a pure read, acquiring only the exact blobs that it asks for.
+///
+/// Capture the command's already-frozen facts/support in `read`. The argument
+/// is its blob reader: acquisition may replace this reader with a later
+/// resident snapshot, at the original authorization instant. It must not be
+/// used to choose a newer collection frontier. Report output and publish facts
+/// only after this function succeeds, since the read may run more than once.
+pub async fn read<S, T>(
+    store: &mut S,
+    snapshot: &S::Snapshot,
+    mut read: impl FnMut(&S::Snapshot) -> Result<T>,
+) -> Result<T>
+where
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreList,
+{
+    let mut reader = snapshot.clone();
+    loop {
+        let error = match read(&reader) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(missing) = error
+            .chain()
+            .find_map(|error| error.downcast_ref::<MissingBlob>())
+        else {
+            return Err(error);
+        };
+        // A closure still consulting an older snapshot must fail, not acquire
+        // the same already-resident bytes forever. Only an actual miss from
+        // the supplied blob reader can advance this operation.
+        if reader.contains_blob(missing.handle)? {
+            return Err(error);
+        }
+        if store.acquire(missing.handle).await?.is_none() {
+            return Err(error);
+        }
+        reader = store.snapshot_at(snapshot.instant())?;
+    }
+}
+
+/// Open a pile with lazy, exact-handle network acquisition.
+///
+/// `TRIBLESPACE_PEERS` supplies comma-separated bootstrap endpoint tickets or
+/// endpoint ids, not blob providers to probe in order. The DHT finds providers.
+/// This foreground client joins no collection gossip topics and announces no
+/// providers. Its ephemeral transport identity is deliberately separate from
+/// both the durable author and any already-running replication daemon.
+pub fn open_store(path: &Path) -> Result<FacultyStore> {
+    use iroh_base::{EndpointAddr, EndpointId};
+    use iroh_tickets::endpoint::EndpointTicket;
+    use rand_core::RngCore;
+    use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+
+    let routes = std::env::var("TRIBLESPACE_PEERS").or_else(|error| match error {
+        std::env::VarError::NotPresent => Ok(String::new()),
+        error => Err(error),
+    })?;
+    let peers = routes
+        .split(',')
+        .map(str::trim)
+        .filter(|route| !route.is_empty())
+        .map(|route| {
+            if let Ok(ticket) = route.parse::<EndpointTicket>() {
+                return Ok(EndpointAddr::from(ticket));
+            }
+            route
+                .parse::<EndpointId>()
+                .map(EndpointAddr::from)
+                .with_context(|| format!("invalid TRIBLESPACE_PEERS endpoint {route:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut secret = [0; 32];
+    rand_core::OsRng
+        .try_fill_bytes(&mut secret)
+        .context("generate foreground transport identity")?;
+    let key = SigningKey::from_bytes(&secret);
+    use zeroize::Zeroize;
+    secret.zeroize();
+    Ok(FacultyStore::lazy(
+        open_pile_strict(path)?,
+        key,
+        PeerConfig {
+            peers,
+            qos: ReconcileQos {
+                direction: ReconcileDirection::ReadOnly,
+            },
+            provider_publication_budget: Some(0),
+        },
+    ))
+}
 
 /// Open the explicitly configured Secrets policy boundary for publication.
 ///
@@ -507,6 +613,79 @@ mod tests {
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn live_read_fetches_only_demanded_bytes_and_preserves_its_observation() {
+        use anybytes::Bytes;
+        use triblespace::core::blob::encodings::UnknownBlob;
+        use triblespace::core::repo::{BlobStorePut, WantRead};
+
+        struct Supply {
+            pile: Pile,
+            payload: Bytes,
+            requested: Vec<Inline<Handle<UnknownBlob>>>,
+        }
+        impl SnapshotSource for Supply {
+            type Snapshot = triblespace::core::repo::pile::PileSnapshot;
+            type SnapshotError = <Pile as SnapshotSource>::SnapshotError;
+
+            fn snapshot_at(
+                &mut self,
+                instant: hifitime::Epoch,
+            ) -> Result<Self::Snapshot, Self::SnapshotError> {
+                self.pile.snapshot_at(instant)
+            }
+        }
+        impl AsyncBlobStoreAcquire for Supply {
+            type AcquireError = std::io::Error;
+
+            async fn acquire(
+                &mut self,
+                handle: Inline<Handle<UnknownBlob>>,
+            ) -> Result<Option<Bytes>, Self::AcquireError> {
+                self.requested.push(handle);
+                let stored = self
+                    .pile
+                    .put::<UnknownBlob, _>(self.payload.clone())
+                    .unwrap();
+                assert_eq!(stored, handle);
+                Ok(Some(self.payload.clone()))
+            }
+        }
+
+        let files = TestFiles::new();
+        let payload: Bytes = Vec::from("selected body").into();
+        let mut source = MemoryRepo::default();
+        let handle = source.put::<UnknownBlob, _>(payload.clone()).unwrap();
+        let mut store = Supply {
+            pile: open_pile_strict(&files.pile).unwrap(),
+            payload,
+            requested: Vec::new(),
+        };
+        let before = store
+            .snapshot_at(hifitime::Epoch::from_tai_seconds(42.0))
+            .unwrap();
+        let value = pollster::block_on(read(&mut store, &before, |reader| {
+            assert_eq!(reader.instant(), before.instant());
+            let bytes = reader.get::<Bytes, UnknownBlob>(handle)?;
+            Ok(bytes)
+        }))
+        .unwrap();
+        assert_eq!(&*value, b"selected body");
+        assert_eq!(store.requested, [handle]);
+        assert!(!before.contains_blob(handle).unwrap());
+        assert!(store.snapshot().unwrap().wants().unwrap().next().is_none());
+        let resident = store.snapshot().unwrap();
+        let result = pollster::block_on(read(&mut store, &resident, |_| {
+            // Accidentally capturing the old reader cannot spin forever.
+            Ok(before.get::<Bytes, UnknownBlob>(handle)?)
+        }));
+        assert!(result.is_err());
+        assert_eq!(store.requested, [handle]);
+        drop(resident);
+        drop(before);
+        store.pile.close().unwrap();
     }
 
     #[test]

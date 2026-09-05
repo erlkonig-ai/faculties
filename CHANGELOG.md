@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Foreground Message, Orient, Wiki, Compass, and ordinary Files reads can
+  acquire cold blobs.** The shared
+  live store reuses `Peer<Pile>` and starts its network host only on a missing
+  exact-handle read. `TRIBLESPACE_PEERS` provides DHT bootstrap routes; transport
+  identity is separate from the durable signer. Selected-text preparation can
+  acquire missing bytes without changing frozen facts/support or authorization
+  time, repeating publication/output, or creating implicit `WANT` records.
+  Exact Relations IDs no longer fetch unrelated labels. Sparse-data regressions
+  cover delayed bodies, labels, MIME metadata, absent descriptors, unchanged
+  snapshots, and delayed presentation. File extraction prepares the selected
+  bytes before touching its destination; Wiki and Compass prepare their selected
+  payloads before rendering or publishing. Files similarity/embedding work and
+  other plain-Pile callers remain resident-only during the port, so this cohort
+  does not yet permit a deployment-wide switch to records-only replication.
+
 - **Secrets uses collection authority directly instead of maintaining a
   parallel vault-authority system.** One ordinary source collection is one
   actual policy boundary. Each immutable secret version has a fresh random DEK

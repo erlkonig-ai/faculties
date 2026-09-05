@@ -163,6 +163,10 @@ rand_core = "0.6.4"
 triblespace = { version = "0.47", path = "../triblespace-rs" }
 triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-paths" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
+triblespace-net = { path = "../triblespace-rs/triblespace-net" }
+iroh-base = "1.0"
+iroh-tickets = "1.0"
+tokio = { version = "1", features = ["rt", "time", "net"] }
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).

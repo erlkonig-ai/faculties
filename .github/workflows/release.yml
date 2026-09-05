@@ -45,14 +45,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: triblespace/triblespace-rs
-          ref: 624f9fc23a484a989389eca0af0f652aba840ead
+          ref: 97f85d5203930c8b7f0e07f749c5a3a37c1ef44e
           path: triblespace-rs
 
       - name: Check out Mary cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: b7c09009f6bd921f12ecfedeb32e4a4ff94861e2
+          ref: ffc6fbf6647dab60da81d298067c09302a2517f4
           path: mary
 
       - name: Check out Soma cohort
@@ -66,7 +66,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/cubecl
-          ref: 75635270eed8cfacd1cd0f171f2f6b45a5e65b9c
+          ref: 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
           path: cubecl-fork
 
       - name: Install rust toolchain

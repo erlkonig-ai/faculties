@@ -1478,22 +1478,29 @@ where
     let mut forked = BTreeSet::new();
     let mut retired = BTreeSet::new();
     for person in anchors {
+        if exact_id && !id_matches.contains(&person) {
+            continue;
+        }
         let profile_state = profile_head(facts, person)?;
-        let label_matches = match &profile_state {
-            Head::Unique(id) => profile_matches(reader, &profile_snapshot(facts, *id)?, &key)?,
-            Head::Forked(heads) => {
-                let mut matches = false;
-                for head in heads {
-                    let snapshot = profile_snapshot(facts, *head)?;
-                    if profile_matches(reader, &snapshot, &key)? {
-                        matches = true;
-                        break;
+        if matches!(profile_state, Head::Missing) {
+            bail!("person {person:x} has no profile snapshot");
+        }
+        let label_matches = id_matches.contains(&person)
+            || match &profile_state {
+                Head::Unique(id) => profile_matches(reader, &profile_snapshot(facts, *id)?, &key)?,
+                Head::Forked(heads) => {
+                    let mut matches = false;
+                    for head in heads {
+                        let snapshot = profile_snapshot(facts, *head)?;
+                        if profile_matches(reader, &snapshot, &key)? {
+                            matches = true;
+                            break;
+                        }
                     }
+                    matches
                 }
-                matches
-            }
-            Head::Missing => bail!("person {person:x} has no profile snapshot"),
-        };
+                Head::Missing => bail!("person {person:x} has no profile snapshot"),
+            };
         if !id_matches.contains(&person) && (exact_id || !label_matches) {
             continue;
         }
@@ -1541,25 +1548,29 @@ where
     let mut settled = BTreeSet::new();
     let mut forked = BTreeSet::new();
     for group_id in anchors {
+        if exact_id && !id_matches.contains(&group_id) {
+            continue;
+        }
         let state = group_head(facts, group_id)?;
-        let label_matches = match &state {
-            Head::Unique(id) => {
-                let snapshot = group_snapshot(facts, *id)?;
-                lookup_key(&load_text_from(reader, snapshot.name)?) == key
-            }
-            Head::Forked(heads) => {
-                let mut matches = false;
-                for head in heads {
-                    let snapshot = group_snapshot(facts, *head)?;
-                    if lookup_key(&load_text_from(reader, snapshot.name)?) == key {
-                        matches = true;
-                        break;
-                    }
+        let label_matches = id_matches.contains(&group_id)
+            || match &state {
+                Head::Unique(id) => {
+                    let snapshot = group_snapshot(facts, *id)?;
+                    lookup_key(&load_text_from(reader, snapshot.name)?) == key
                 }
-                matches
-            }
-            Head::Missing => bail!("group {group_id:x} has no snapshot"),
-        };
+                Head::Forked(heads) => {
+                    let mut matches = false;
+                    for head in heads {
+                        let snapshot = group_snapshot(facts, *head)?;
+                        if lookup_key(&load_text_from(reader, snapshot.name)?) == key {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    matches
+                }
+                Head::Missing => bail!("group {group_id:x} has no snapshot"),
+            };
         if !id_matches.contains(&group_id) && (exact_id || !label_matches) {
             continue;
         }
@@ -1570,7 +1581,7 @@ where
             Head::Forked(_) => {
                 forked.insert(group_id);
             }
-            Head::Missing => unreachable!("handled above"),
+            Head::Missing => bail!("group {group_id:x} has no snapshot"),
         }
     }
     Ok(selector_outcome(settled, forked, BTreeSet::new()))
@@ -2211,6 +2222,31 @@ mod tests {
             resolve_person(&view.reader, &view.facts, "countess", false).unwrap(),
             SelectorOutcome::Ambiguous(vec![ada.min(third), ada.max(third)])
         );
+    }
+
+    #[test]
+    fn exact_ids_do_not_require_unrelated_or_selected_label_blobs() {
+        let fixture = Fixture::new();
+        let resident = fixture.view().reader;
+        let ada = genid().id;
+        let other = genid().id;
+        let group = genid().id;
+        publish_person(&fixture, ada, "Ada");
+        publish_person(&fixture, other, "Other");
+        let (fragment, _) = group_create_fragment(group, "crew").unwrap();
+        fixture.publish(fragment);
+        let facts = fixture.facts.borrow();
+
+        assert_eq!(
+            resolve_person(&resident, &*facts, &format!("{ada:x}"), false).unwrap(),
+            SelectorOutcome::Unique(ada),
+        );
+        assert_eq!(
+            resolve_group(&resident, &*facts, &format!("{group:x}")).unwrap(),
+            SelectorOutcome::Unique(group),
+        );
+        // Name selection still needs the names; an opaque ID is not a label.
+        assert!(resolve_person(&resident, &*facts, "Ada", false).is_err());
     }
 
     /// Fork one person's profile track into two un-superseded heads that both

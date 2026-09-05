@@ -1,21 +1,25 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use faculties::collection_names::open_configured;
+use faculties::collection_names::{configured_handle, open_configured, open_exact_in};
 use faculties::schemas::compass::{
     board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive, FactCollection};
+use faculties::storage::{
+    self, load_signer, open_store, runtime, FactArchive, FactCollection, FacultyStore,
+};
 use faculties::{clock, compass, relations};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::StorageClose;
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
@@ -218,11 +222,26 @@ struct CompassStorage<'a> {
 impl CompassStorage<'_> {
     fn with_pile<T>(
         &self,
-        f: impl FnOnce(&mut Pile, &ed25519_dalek::SigningKey) -> Result<T>,
+        f: impl FnOnce(
+            &mut FacultyStore,
+            &ed25519_dalek::SigningKey,
+            &tokio::runtime::Runtime,
+        ) -> Result<T>,
     ) -> Result<T> {
         let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = f(&mut pile, &signer);
+        let runtime = runtime()?;
+        let mut pile = open_store(self.pile)?;
+        let result = (|| {
+            if let Some(handle) = configured_handle(COMPASS_SCOPE_ID)? {
+                let reader = pile
+                    .snapshot()
+                    .context("freeze configured Compass descriptor")?;
+                runtime.block_on(storage::read(&mut pile, &reader, |reader| {
+                    open_exact_in(reader, COMPASS_SCOPE_ID, handle)
+                }))?;
+            }
+            f(&mut pile, &signer, &runtime)
+        })();
         let close = pile.close();
         match (result, close) {
             (Ok(value), Ok(())) => Ok(value),
@@ -234,30 +253,47 @@ impl CompassStorage<'_> {
         }
     }
 
+    /// Prepare a pure read against fixed facts/status and an acquiring blob
+    /// reader. Printing and other effects belong after this returns.
     fn with_view<T>(
         &self,
-        f: impl FnOnce(&FactArchive, &PileSnapshot, &LwwIndex) -> Result<T>,
+        mut f: impl FnMut(&FactArchive, &PileSnapshot, &LwwIndex) -> Result<T>,
     ) -> Result<T> {
-        self.with_pile(|pile, signer| {
-            let view = pollster::block_on(compass::materialize_indexed_collection(pile, signer))?;
-            f(view.facts(), view.store_snapshot(), view.status_register())
+        self.with_pile(|pile, signer, runtime| {
+            runtime.block_on(async {
+                let view = compass::materialize_indexed_collection(pile, signer).await?;
+                storage::read(pile, view.store_snapshot(), |reader| {
+                    f(view.facts(), reader, view.status_register())
+                })
+                .await
+            })
         })
     }
 
-    /// Build and publish one complete user action against one known-prefix
-    /// view. `None` is a genuine no-op and writes no collection record.
-    fn update<T>(
+    /// Prepare reads against one frozen view, then author and publish once.
+    /// The author runs outside retries, so event clocks and publication cannot
+    /// be repeated by a missing attachment. `None` is a genuine no-op.
+    fn update<P, T>(
         &self,
         persona: Option<&str>,
-        f: impl FnOnce(&FactArchive, &PileSnapshot, Option<Id>) -> Result<(Option<Fragment>, T)>,
+        mut prepare: impl FnMut(&FactArchive, &PileSnapshot, Option<Id>) -> Result<P>,
+        author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_pile(|pile, signer| {
+        self.with_pile(|pile, signer, runtime| {
             // Register every descriptor before fixing the one shared source
             // boundary used by this action.
             let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
             let compass_facts = FactCollection::new(pile, compass_source)
                 .context("register maintained Compass fact collection")?;
             let relation_facts = if persona.is_some() {
+                if let Some(handle) = configured_handle(RELATIONS_SCOPE_ID)? {
+                    let reader = pile
+                        .snapshot()
+                        .context("freeze configured Relations descriptor for Compass")?;
+                    runtime.block_on(storage::read(pile, &reader, |reader| {
+                        open_exact_in(reader, RELATIONS_SCOPE_ID, handle)
+                    }))?;
+                }
                 let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
                 Some(
                     FactCollection::new(pile, source)
@@ -267,7 +303,7 @@ impl CompassStorage<'_> {
                 None
             };
 
-            let (compass_support, relation_support) = pollster::block_on(async {
+            let (compass_support, relation_support, instant) = runtime.block_on(async {
                 drop(
                     pile.ensure(compass_facts.source())
                         .await
@@ -296,6 +332,7 @@ impl CompassStorage<'_> {
                     ),
                     None => None,
                 };
+                let instant = before.instant();
                 drop(before);
                 drop(
                     compass_facts
@@ -313,13 +350,13 @@ impl CompassStorage<'_> {
                             .context("maintain Relations fact collection for Compass persona")?,
                     );
                 }
-                Ok::<_, anyhow::Error>((compass_support, relation_support))
+                Ok::<_, anyhow::Error>((compass_support, relation_support, instant))
             })?;
             // Attach every view through one immutable post-maintenance store
             // boundary, so validation and persona resolution cannot mix
             // collection watermarks.
             let reader = pile
-                .snapshot()
+                .snapshot_at(instant)
                 .context("freeze maintained Compass/Relations snapshot")?;
             let facts = reader
                 .collection_exact(compass_facts.rank9(), &compass_support)
@@ -334,11 +371,18 @@ impl CompassStorage<'_> {
                     .context("observe Relations fact collection for Compass persona")?
                     .view::<FactArchive>()
                     .context("read Relations fact collection for Compass persona")?;
-                Some(resolve_persona_id(&relations, &reader, persona)?)
+                Some(
+                    runtime.block_on(storage::read(pile, &reader, |blob_reader| {
+                        resolve_persona_id(&relations, blob_reader, persona)
+                    }))?,
+                )
             } else {
                 None
             };
-            let (fragment, value) = f(&facts, &reader, by)?;
+            let prepared = runtime.block_on(storage::read(pile, &reader, |blob_reader| {
+                prepare(&facts, blob_reader, by)
+            }))?;
+            let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
                 compass::commit_collection(pile, signer, fragment)?;
             }
@@ -347,11 +391,12 @@ impl CompassStorage<'_> {
     }
 }
 
-fn task_title<P: TriblePattern>(reader: &PileSnapshot, space: &P, task_id: Id) -> String {
+fn task_title<P: TriblePattern>(reader: &PileSnapshot, space: &P, task_id: Id) -> Result<String> {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
-        .and_then(|h| read_text(reader, h).ok())
-        .unwrap_or_default()
+        .map(|handle| read_text(reader, handle))
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn task_tags<P: TriblePattern>(space: &P, task_id: Id) -> Vec<String> {
@@ -473,16 +518,20 @@ fn note_tags<P: TriblePattern>(space: &P, note_id: Id) -> Vec<String> {
     tags
 }
 
-fn note_references<P: TriblePattern>(reader: &PileSnapshot, space: &P, note_id: Id) -> Vec<String> {
+fn note_references<P: TriblePattern>(
+    reader: &PileSnapshot,
+    space: &P,
+    note_id: Id,
+) -> Result<Vec<String>> {
     let mut references: Vec<String> = find!(
         handle: TextHandle,
         pattern!(space, [{ note_id @ board::reference: ?handle }])
     )
-    .filter_map(|handle| read_text(reader, handle).ok())
-    .collect();
+    .map(|handle| read_text(reader, handle))
+    .collect::<Result<_>>()?;
     references.sort();
     references.dedup();
-    references
+    Ok(references)
 }
 
 fn note_supersedes<P: TriblePattern>(space: &P, note_id: Id) -> Vec<Id> {
@@ -503,7 +552,7 @@ fn render_board<P: TriblePattern>(
     status_filter: &[String],
     tag_filter: &[String],
     show_done: bool,
-) {
+) -> Result<String> {
     let goal_ids = all_goal_ids(space);
     let priority_ranks = compass::priority_ranks(
         goal_ids.iter().copied(),
@@ -530,7 +579,7 @@ fn render_board<P: TriblePattern>(
             continue;
         }
 
-        let title = task_title(reader, space, task_id);
+        let title = task_title(reader, space, task_id)?;
         let created_at = task_created_at(space, task_id);
         let notes = note_count(space, task_id);
         let parent = task_parent(space, task_id);
@@ -565,28 +614,30 @@ fn render_board<P: TriblePattern>(
     ordered_statuses.extend(extras);
 
     if ordered_statuses.is_empty() {
-        println!("No goals yet.");
-        return;
+        return Ok("No goals yet.\n".to_owned());
     }
 
+    let mut output = String::new();
     for status in ordered_statuses {
         let rows = columns.remove(&status).unwrap_or_default();
-        println!();
-        println!("== {} ({}) ==", status.to_uppercase(), rows.len());
+        writeln!(output)?;
+        writeln!(output, "== {} ({}) ==", status.to_uppercase(), rows.len())?;
         let ordered = order_rows(rows, &priority_ranks);
         for (row, depth) in ordered {
             let indent = "  ".repeat(depth);
-            println!(
+            writeln!(
+                output,
                 "{}- [{}] {}{}{}",
                 indent,
                 row.id_hex,
                 row.title,
                 row.tag_suffix(),
                 row.note_suffix()
-            );
+            )?;
         }
     }
-    println!();
+    writeln!(output)?;
+    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -739,27 +790,33 @@ fn cmd_add(
 ) -> Result<()> {
     let status = compass::canonical_status(status)?;
     let tags = compass::canonical_tags(tags)?;
-    let (task_ref, note_ref) = storage.update(persona, |space, _reader, by_id| {
-        let parent_id = match parent.as_deref() {
-            Some(parent) => Some(resolve_task_id(parent, space)?),
-            None => None,
-        };
-        let now = clock::point_now()?;
-        let mut change = compass::kind_catalog_fragment();
-        let (goal, task_ref) = compass::goal_fragment(title, tags, parent_id, now)?;
-        change += goal;
-        change += compass::status_fragment(task_ref, status, by_id, now)?;
+    let (task_ref, note_ref) = storage.update(
+        persona,
+        |space, _reader, by_id| {
+            let parent_id = parent
+                .as_deref()
+                .map(|parent| resolve_task_id(parent, space))
+                .transpose()?;
+            Ok((parent_id, by_id))
+        },
+        |(parent_id, by_id)| {
+            let now = clock::point_now()?;
+            let mut change = compass::kind_catalog_fragment();
+            let (goal, task_ref) = compass::goal_fragment(title, tags, parent_id, now)?;
+            change += goal;
+            change += compass::status_fragment(task_ref, status, by_id, now)?;
 
-        let mut note_ref = None;
-        if let Some(note) = note {
-            let references = extract_reference_values(&note);
-            let (record, note_id) =
-                compass::note_fragment(task_ref, note, vec![], references, vec![], by_id, now)?;
-            change += record;
-            note_ref = Some(note_id);
-        }
-        Ok((Some(change), (task_ref, note_ref)))
-    })?;
+            let mut note_ref = None;
+            if let Some(note) = note {
+                let references = extract_reference_values(&note);
+                let (record, note_id) =
+                    compass::note_fragment(task_ref, note, vec![], references, vec![], by_id, now)?;
+                change += record;
+                note_ref = Some(note_id);
+            }
+            Ok((Some(change), (task_ref, note_ref)))
+        },
+    )?;
     println!("Added goal {:x}", task_ref);
     if let Some(note_ref) = note_ref {
         println!("Added note {:x} to goal {:x}", note_ref, task_ref);
@@ -778,7 +835,7 @@ fn cmd_list(
         validate_short("status", status)?;
     }
 
-    storage.with_view(|space, reader, status_register| {
+    let output = storage.with_view(|space, reader, status_register| {
         render_board(
             reader,
             space,
@@ -786,9 +843,10 @@ fn cmd_list(
             &status_filter,
             &tag_filter,
             show_done,
-        );
-        Ok(())
-    })
+        )
+    })?;
+    print!("{output}");
+    Ok(())
 }
 
 fn cmd_move(
@@ -799,12 +857,15 @@ fn cmd_move(
 ) -> Result<()> {
     let status = compass::canonical_status(status)?;
     let rendered_status = status.clone();
-    let resolved = storage.update(persona, |space, _reader, by_id| {
-        let task_id = resolve_task_id(&id, space)?;
-        let mut change = compass::kind_catalog_fragment();
-        change += compass::status_fragment(task_id, status, by_id, clock::point_now()?)?;
-        Ok((Some(change), task_id))
-    })?;
+    let resolved = storage.update(
+        persona,
+        |space, _reader, by_id| Ok((resolve_task_id(&id, space)?, by_id)),
+        |(task_id, by_id)| {
+            let mut change = compass::kind_catalog_fragment();
+            change += compass::status_fragment(task_id, status, by_id, clock::point_now()?)?;
+            Ok((Some(change), task_id))
+        },
+    )?;
     println!("Moved goal {:x} to {}", resolved, rendered_status);
     Ok(())
 }
@@ -829,171 +890,197 @@ fn cmd_note(
     references.sort();
     references.dedup();
 
-    let (task_id, note_id) = storage.update(persona, |space, _reader, by_id| {
-        let task_id = resolve_task_id(&id, space)?;
-        let superseded_ids: Vec<Id> = supersedes
-            .iter()
-            .map(|input| resolve_note_id(input, space))
-            .collect::<Result<_>>()?;
-        let now = clock::point_now()?;
-        let mut change = compass::kind_catalog_fragment();
-        let (record, note_id) =
-            compass::note_fragment(task_id, note, tags, references, superseded_ids, by_id, now)?;
-        change += record;
-        Ok((Some(change), (task_id, note_id)))
-    })?;
+    let (task_id, note_id) = storage.update(
+        persona,
+        |space, _reader, by_id| {
+            let task_id = resolve_task_id(&id, space)?;
+            let superseded_ids: Vec<Id> = supersedes
+                .iter()
+                .map(|input| resolve_note_id(input, space))
+                .collect::<Result<_>>()?;
+            Ok((task_id, superseded_ids, by_id))
+        },
+        |(task_id, superseded_ids, by_id)| {
+            let now = clock::point_now()?;
+            let mut change = compass::kind_catalog_fragment();
+            let (record, note_id) = compass::note_fragment(
+                task_id,
+                note,
+                tags,
+                references,
+                superseded_ids,
+                by_id,
+                now,
+            )?;
+            change += record;
+            Ok((Some(change), (task_id, note_id)))
+        },
+    )?;
     println!("Added note {:x} to goal {:x}", note_id, task_id);
     Ok(())
 }
 
-fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
-    storage.with_view(|space, reader, status_register| {
-        let task_id = resolve_task_id(&id, space)?;
+fn render_goal<P: TriblePattern>(
+    reader: &PileSnapshot,
+    space: &P,
+    status_register: &LwwIndex,
+    task_id: Id,
+) -> Result<String> {
+    let mut output = String::new();
+    let title = task_title(reader, space, task_id)?;
+    if title.is_empty() {
+        bail!("goal missing");
+    }
 
-        let title = task_title(reader, space, task_id);
-        if title.is_empty() {
-            bail!("goal missing");
+    writeln!(output, "Goal {:x}", task_id)?;
+    writeln!(output, "Title: {}", title)?;
+    if let Some(created) = task_created_at(space, task_id) {
+        writeln!(output, "Created: {}", format_interval(created))?;
+    }
+
+    if let Some((status, at)) = task_latest_status(space, status_register, task_id) {
+        writeln!(output, "Status: {} (since {})", status, format_interval(at))?;
+    }
+
+    let tags = task_tags(space, task_id);
+    if !tags.is_empty() {
+        writeln!(output, "Tags: {}", tags.join(", "))?;
+    }
+
+    if let Some(parent_id) = task_parent(space, task_id) {
+        let parent_hex = fmt_id(parent_id);
+        let parent_title = task_title(reader, space, parent_id)?;
+        if parent_title.is_empty() {
+            writeln!(output, "Parent: {parent_hex}")?;
+        } else {
+            writeln!(output, "Parent: {parent_title} ({parent_hex})")?;
         }
+    }
 
-        println!("Goal {:x}", task_id);
-        println!("Title: {}", title);
-        if let Some(created) = task_created_at(space, task_id) {
-            println!("Created: {}", format_interval(created));
-        }
-
-        if let Some((status, at)) = task_latest_status(space, status_register, task_id) {
-            println!("Status: {} (since {})", status, format_interval(at));
-        }
-
-        let tags = task_tags(space, task_id);
-        if !tags.is_empty() {
-            println!("Tags: {}", tags.join(", "));
-        }
-
-        if let Some(parent_id) = task_parent(space, task_id) {
-            let parent_hex = fmt_id(parent_id);
-            let parent_title = task_title(reader, space, parent_id);
-            if parent_title.is_empty() {
-                println!("Parent: {parent_hex}");
-            } else {
-                println!("Parent: {parent_title} ({parent_hex})");
-            }
-        }
-
-        // Status history for this task.
-        let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
-            (event: Id, status: String, at: IntervalValue),
-            pattern!(space, [{
-                ?event @
-                metadata::tag: &KIND_STATUS_ID,
-                board::status_of: &task_id,
-                board::status: ?status,
-                metadata::created_at: ?at,
-            }])
+    // Status history for this task.
+    let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
+        (event: Id, status: String, at: IntervalValue),
+        pattern!(space, [{
+            ?event @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &task_id,
+            board::status: ?status,
+            metadata::created_at: ?at,
+        }])
+    )
+    .map(|(event, status, at)| {
+        (
+            interval_key(at),
+            event,
+            format_interval(at),
+            status,
+            event_actor(space, event),
         )
-        .map(|(event, status, at)| {
-            (
-                interval_key(at),
-                event,
-                format_interval(at),
-                status,
-                event_actor(space, event),
-            )
-        })
-        .collect();
-        if !history.is_empty() {
-            history.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            println!();
-            println!("Status history:");
-            for (_, _, at, status, by) in &history {
-                match by {
-                    Some(by) => println!("- {at} {status} by {by:x}"),
-                    None => println!("- {at} {status}"),
-                }
-            }
-        }
-
-        // Notes for this task.
-        let mut notes: Vec<NoteRow> = find!(
-            (note_id: Id, note_handle: TextHandle, at: IntervalValue),
-            pattern!(space, [{
-                ?note_id @
-                metadata::tag: &KIND_NOTE_ID,
-                board::task: &task_id,
-                board::note: ?note_handle,
-                metadata::created_at: ?at,
-            }])
-        )
-        .filter_map(|(note_id, handle, at)| {
-            read_text(reader, handle).ok().map(|text| NoteRow {
-                id: note_id,
-                text,
-                sort_key: interval_key(at),
-                at: format_interval(at),
-                by: event_actor(space, note_id),
-                tags: note_tags(space, note_id),
-                references: note_references(reader, space, note_id),
-                supersedes: note_supersedes(space, note_id),
-            })
-        })
-        .collect();
-        if !notes.is_empty() {
-            notes.sort_by(|a, b| (a.sort_key, a.id).cmp(&(b.sort_key, b.id)));
-            println!();
-            println!("Notes:");
-            for note in &notes {
-                match note.by {
-                    Some(by) => println!("- [{}] {} by {by:x}", fmt_id(note.id), note.at),
-                    None => println!("- [{}] {}", fmt_id(note.id), note.at),
-                }
-                if note.text.is_empty() {
-                    println!("  (empty)");
-                } else {
-                    for line in note.text.lines() {
-                        println!("  {line}");
-                    }
-                }
-                if !note.tags.is_empty() {
-                    println!(
-                        "  tags: {}",
-                        note.tags
-                            .iter()
-                            .map(|tag| format!("#{tag}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                }
-                if !note.references.is_empty() {
-                    println!("  refs: {}", note.references.join(", "));
-                }
-                if !note.supersedes.is_empty() {
-                    println!(
-                        "  supersedes: {}",
-                        note.supersedes
-                            .iter()
-                            .map(|id| fmt_id(*id))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-            }
-
-            let mut all_refs = Vec::new();
-            for note in &notes {
-                all_refs.extend(extract_references(&note.text));
-            }
-            all_refs.sort();
-            all_refs.dedup();
-            if !all_refs.is_empty() {
-                println!();
-                println!("References:");
-                for (faculty, hex) in &all_refs {
-                    println!("  ⇢ {faculty}:{hex}");
-                }
-            }
-        }
-        Ok(())
     })
+    .collect();
+    if !history.is_empty() {
+        history.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        writeln!(output)?;
+        writeln!(output, "Status history:")?;
+        for (_, _, at, status, by) in &history {
+            match by {
+                Some(by) => writeln!(output, "- {at} {status} by {by:x}")?,
+                None => writeln!(output, "- {at} {status}")?,
+            }
+        }
+    }
+
+    // Notes for this task.
+    let mut notes: Vec<NoteRow> = find!(
+        (note_id: Id, note_handle: TextHandle, at: IntervalValue),
+        pattern!(space, [{
+            ?note_id @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &task_id,
+            board::note: ?note_handle,
+            metadata::created_at: ?at,
+        }])
+    )
+    .map(|(note_id, handle, at)| {
+        Ok(NoteRow {
+            id: note_id,
+            text: read_text(reader, handle)?,
+            sort_key: interval_key(at),
+            at: format_interval(at),
+            by: event_actor(space, note_id),
+            tags: note_tags(space, note_id),
+            references: note_references(reader, space, note_id)?,
+            supersedes: note_supersedes(space, note_id),
+        })
+    })
+    .collect::<Result<_>>()?;
+    if !notes.is_empty() {
+        notes.sort_by(|a, b| (a.sort_key, a.id).cmp(&(b.sort_key, b.id)));
+        writeln!(output)?;
+        writeln!(output, "Notes:")?;
+        for note in &notes {
+            match note.by {
+                Some(by) => writeln!(output, "- [{}] {} by {by:x}", fmt_id(note.id), note.at)?,
+                None => writeln!(output, "- [{}] {}", fmt_id(note.id), note.at)?,
+            }
+            if note.text.is_empty() {
+                writeln!(output, "  (empty)")?;
+            } else {
+                for line in note.text.lines() {
+                    writeln!(output, "  {line}")?;
+                }
+            }
+            if !note.tags.is_empty() {
+                writeln!(
+                    output,
+                    "  tags: {}",
+                    note.tags
+                        .iter()
+                        .map(|tag| format!("#{tag}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )?;
+            }
+            if !note.references.is_empty() {
+                writeln!(output, "  refs: {}", note.references.join(", "))?;
+            }
+            if !note.supersedes.is_empty() {
+                writeln!(
+                    output,
+                    "  supersedes: {}",
+                    note.supersedes
+                        .iter()
+                        .map(|id| fmt_id(*id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+            }
+        }
+
+        let mut all_refs = Vec::new();
+        for note in &notes {
+            all_refs.extend(extract_references(&note.text));
+        }
+        all_refs.sort();
+        all_refs.dedup();
+        if !all_refs.is_empty() {
+            writeln!(output)?;
+            writeln!(output, "References:")?;
+            for (faculty, hex) in &all_refs {
+                writeln!(output, "  ⇢ {faculty}:{hex}")?;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn cmd_show(storage: CompassStorage<'_>, id: String) -> Result<()> {
+    let output = storage.with_view(|space, reader, status_register| {
+        let task_id = resolve_task_id(&id, space)?;
+        render_goal(reader, space, status_register, task_id)
+    })?;
+    print!("{output}");
+    Ok(())
 }
 
 fn cmd_prioritize(
@@ -1001,36 +1088,42 @@ fn cmd_prioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    let (higher_title, lower_title) = storage.update(None, |space, reader, _| {
-        let higher_id = resolve_task_id(&higher_input, space)?;
-        let lower_id = resolve_task_id(&lower_input, space)?;
+    let (higher_title, lower_title) = storage.update(
+        None,
+        |space, reader, _| {
+            let higher_id = resolve_task_id(&higher_input, space)?;
+            let lower_id = resolve_task_id(&lower_input, space)?;
 
-        if higher_id == lower_id {
-            bail!("cannot prioritize a goal over itself");
-        }
-
-        // Build full edge set (explicit + implicit child→parent)
-        let edges = compass::goal_priority_edges(space);
-
-        if compass::would_create_priority_cycle(&edges, higher_id, lower_id) {
-            let paths = parent_paths(space)?;
-            if is_ancestor(&paths, higher_id, lower_id) || is_ancestor(&paths, lower_id, higher_id)
-            {
-                bail!("children are implicitly prioritized over their parents");
+            if higher_id == lower_id {
+                bail!("cannot prioritize a goal over itself");
             }
-            bail!("would create a priority cycle");
-        }
 
-        let mut change = compass::kind_catalog_fragment();
-        change += compass::priority_fragment(higher_id, lower_id, true, clock::point_now()?);
-        Ok((
-            Some(change),
-            (
-                task_title(reader, space, higher_id),
-                task_title(reader, space, lower_id),
-            ),
-        ))
-    })?;
+            // Build full edge set (explicit + implicit child→parent)
+            let edges = compass::goal_priority_edges(space);
+
+            if compass::would_create_priority_cycle(&edges, higher_id, lower_id) {
+                let paths = parent_paths(space)?;
+                if is_ancestor(&paths, higher_id, lower_id)
+                    || is_ancestor(&paths, lower_id, higher_id)
+                {
+                    bail!("children are implicitly prioritized over their parents");
+                }
+                bail!("would create a priority cycle");
+            }
+
+            Ok((
+                higher_id,
+                lower_id,
+                task_title(reader, space, higher_id)?,
+                task_title(reader, space, lower_id)?,
+            ))
+        },
+        |(higher_id, lower_id, higher_title, lower_title)| {
+            let mut change = compass::kind_catalog_fragment();
+            change += compass::priority_fragment(higher_id, lower_id, true, clock::point_now()?);
+            Ok((Some(change), (higher_title, lower_title)))
+        },
+    )?;
     println!(
         "{} > {}",
         if higher_title.is_empty() {
@@ -1052,25 +1145,30 @@ fn cmd_deprioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    let (higher_title, lower_title) = storage.update(None, |space, reader, _| {
-        let higher_id = resolve_task_id(&higher_input, space)?;
-        let lower_id = resolve_task_id(&lower_input, space)?;
+    let (higher_title, lower_title) = storage.update(
+        None,
+        |space, reader, _| {
+            let higher_id = resolve_task_id(&higher_input, space)?;
+            let lower_id = resolve_task_id(&lower_input, space)?;
 
-        let edges = compass::active_priority_edges(space);
-        if !edges.contains(&(higher_id, lower_id)) {
-            bail!("no active priority relationship between these goals");
-        }
+            let edges = compass::active_priority_edges(space);
+            if !edges.contains(&(higher_id, lower_id)) {
+                bail!("no active priority relationship between these goals");
+            }
 
-        let mut change = compass::kind_catalog_fragment();
-        change += compass::priority_fragment(higher_id, lower_id, false, clock::point_now()?);
-        Ok((
-            Some(change),
-            (
-                task_title(reader, space, higher_id),
-                task_title(reader, space, lower_id),
-            ),
-        ))
-    })?;
+            Ok((
+                higher_id,
+                lower_id,
+                task_title(reader, space, higher_id)?,
+                task_title(reader, space, lower_id)?,
+            ))
+        },
+        |(higher_id, lower_id, higher_title, lower_title)| {
+            let mut change = compass::kind_catalog_fragment();
+            change += compass::priority_fragment(higher_id, lower_id, false, clock::point_now()?);
+            Ok((Some(change), (higher_title, lower_title)))
+        },
+    )?;
     println!(
         "Removed: {} > {}",
         if higher_title.is_empty() {
@@ -1088,11 +1186,10 @@ fn cmd_deprioritize(
 }
 
 fn cmd_resolve(storage: CompassStorage<'_>, prefix: String) -> Result<()> {
-    storage.with_view(|space, _reader, _status_register| {
-        let id = resolve_task_id(&prefix, space)?;
-        println!("{:x}", id);
-        Ok(())
-    })
+    let id =
+        storage.with_view(|space, _reader, _status_register| resolve_task_id(&prefix, space))?;
+    println!("{id:x}");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1161,8 +1258,399 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anybytes::Bytes;
+    use ed25519_dalek::SigningKey;
     use faculties::storage::initialize_signer;
+    use std::convert::Infallible;
+    use std::future::{ready, Future};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::blob::MemoryBlobStoreSnapshot;
+    use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+    use triblespace::core::repo::pile::ReadError;
+    use triblespace::core::repo::MissingBlob;
+
+    type BlobHandle = Inline<inlineencodings::Handle<UnknownBlob>>;
+
+    /// A real resident-only pile with an exact-handle remote byte fixture.
+    struct AcquiringPile {
+        pile: Pile,
+        remote: MemoryBlobStoreSnapshot,
+        requested: Vec<BlobHandle>,
+        arriving: Option<(Collection<SimpleArchive>, SigningKey, Fragment)>,
+        _file: tempfile::NamedTempFile,
+    }
+
+    impl AcquiringPile {
+        fn new(mut remote: MemoryBlobStore) -> Self {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            Self {
+                pile: Pile::open(file.path()).unwrap(),
+                remote: remote.snapshot().unwrap(),
+                requested: Vec::new(),
+                arriving: None,
+                _file: file,
+            }
+        }
+    }
+
+    impl SnapshotSource for AcquiringPile {
+        type Snapshot = PileSnapshot;
+        type SnapshotError = ReadError;
+
+        fn snapshot_at(&mut self, instant: Epoch) -> Result<PileSnapshot, ReadError> {
+            self.pile.snapshot_at(instant)
+        }
+    }
+
+    impl AsyncBlobStoreAcquire for AcquiringPile {
+        type AcquireError = Infallible;
+
+        fn acquire(
+            &mut self,
+            handle: BlobHandle,
+        ) -> impl Future<Output = Result<Option<Bytes>, Infallible>> + Send {
+            let resident = self.pile.snapshot().unwrap();
+            if resident.contains_blob(handle).unwrap() {
+                return ready(Ok(Some(resident.get(handle).unwrap())));
+            }
+            self.requested.push(handle);
+            if let Some((collection, signer, fragment)) = self.arriving.take() {
+                self.pile.commit(collection, &signer, fragment).unwrap();
+            }
+            if !self.remote.contains_blob(handle).unwrap() {
+                return ready(Ok(None));
+            }
+            let bytes: Bytes = self.remote.get(handle).unwrap();
+            let cached: BlobHandle = self.pile.put(bytes.clone()).unwrap();
+            assert_eq!(cached, handle);
+            ready(Ok(Some(bytes)))
+        }
+    }
+
+    fn sparse_view(
+        mut fragment: Fragment,
+    ) -> (
+        AcquiringPile,
+        compass::CompassSnapshot,
+        Collection<SimpleArchive>,
+        SigningKey,
+    ) {
+        let mut store = AcquiringPile::new(fragment.blobs().clone());
+        fragment.blobs_mut().keep([]);
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let source = faculties::collection_names::open(
+            &mut store.pile,
+            COMPASS_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        store.pile.commit(source, &signer, fragment).unwrap();
+        let view = pollster::block_on(compass::materialize_indexed_collection(
+            &mut store.pile,
+            &signer,
+        ))
+        .unwrap();
+        (store, view, source, signer)
+    }
+
+    #[test]
+    fn configured_descriptor_read_acquires_descriptor_and_name_only() {
+        let mut remote = MemoryRepo::default();
+        let signer = SigningKey::from_bytes(&[8; 32]);
+        let source = faculties::collection_names::open(
+            &mut remote,
+            COMPASS_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let descriptor: TribleSet = remote.snapshot().unwrap().get(source.handle()).unwrap();
+        let name = triblespace::core::collection::descriptor::name(&descriptor)
+            .unwrap()
+            .unwrap();
+        let mut store = AcquiringPile::new(remote.blobs);
+        let before = store.snapshot().unwrap();
+
+        let opened = pollster::block_on(storage::read(&mut store, &before, |reader| {
+            open_exact_in(reader, COMPASS_SCOPE_ID, source.handle())
+        }))
+        .unwrap();
+
+        assert_eq!(opened, source);
+        assert_eq!(
+            store.requested,
+            vec![source.handle().transmute(), name.transmute()]
+        );
+        assert!(!before.contains_blob(source.handle()).unwrap());
+        assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_title_and_reference_keep_the_typed_missing_blob_error() {
+        let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+            .try_to_inline()
+            .unwrap();
+        let (mut fragment, goal) =
+            compass::goal_fragment("selected goal", vec![], None, at).unwrap();
+        let (note, note_id) = compass::note_fragment(
+            goal,
+            "selected note",
+            vec![],
+            vec!["git:DEADBEEF".to_owned()],
+            vec![],
+            None,
+            at,
+        )
+        .unwrap();
+        fragment += note;
+        let title = find!(handle: TextHandle, pattern!(fragment.facts(), [{ goal @ board::title: ?handle }]))
+            .next().unwrap();
+        let reference = find!(handle: TextHandle, pattern!(fragment.facts(), [{ note_id @ board::reference: ?handle }]))
+            .next().unwrap();
+        let (_, view, _, _) = sparse_view(fragment);
+
+        let missing_title = task_title(view.store_snapshot(), view.facts(), goal).unwrap_err();
+        let missing_reference =
+            note_references(view.store_snapshot(), view.facts(), note_id).unwrap_err();
+        for (error, expected) in [(missing_title, title), (missing_reference, reference)] {
+            assert_eq!(
+                error
+                    .chain()
+                    .find_map(|source| source.downcast_ref::<MissingBlob>())
+                    .unwrap()
+                    .handle,
+                expected.transmute()
+            );
+        }
+        // An absent title fact retains its existing open-world meaning.
+        assert_eq!(
+            task_title(view.store_snapshot(), &TribleSet::new(), goal).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn board_fetches_only_titles_surviving_status_and_tag_filters() {
+        let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+            .try_to_inline()
+            .unwrap();
+        let (mut fragment, selected) =
+            compass::goal_fragment("selected goal", vec!["shown".to_owned()], None, at).unwrap();
+        fragment += compass::status_fragment(selected, "doing", None, at).unwrap();
+        let (hidden, _) =
+            compass::goal_fragment("other tag goal", vec!["other".to_owned()], None, at).unwrap();
+        fragment += hidden;
+        let (done, done_id) =
+            compass::goal_fragment("done goal", vec!["shown".to_owned()], None, at).unwrap();
+        fragment += done;
+        fragment += compass::status_fragment(done_id, "done", None, at).unwrap();
+        fragment += compass::note_fragment(
+            selected,
+            "note not needed by list",
+            vec![],
+            vec!["git:DEADBEEF".to_owned()],
+            vec![],
+            None,
+            at,
+        )
+        .unwrap()
+        .0;
+        let title = find!(handle: TextHandle, pattern!(fragment.facts(), [{ selected @ board::title: ?handle }]))
+            .next().unwrap();
+        let (mut store, view, _, _) = sparse_view(fragment);
+
+        let output =
+            pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
+                render_board(
+                    reader,
+                    view.facts(),
+                    view.status_register(),
+                    &[],
+                    &["shown".to_owned()],
+                    false,
+                )
+            }))
+            .unwrap();
+
+        assert!(output.contains("selected goal"));
+        assert!(output.contains("DOING (1)"));
+        assert!(!output.contains("other tag goal"));
+        assert!(!output.contains("done goal"));
+        assert_eq!(store.requested, vec![title.transmute()]);
+        assert!(!view.store_snapshot().contains_blob(title).unwrap());
+        assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn show_fetches_selected_goal_parent_note_and_reference_only() {
+        let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+            .try_to_inline()
+            .unwrap();
+        let (mut fragment, parent) =
+            compass::goal_fragment("parent goal", vec![], None, at).unwrap();
+        let (child, goal) =
+            compass::goal_fragment("selected goal", vec![], Some(parent), at).unwrap();
+        fragment += child;
+        let (note, note_id) = compass::note_fragment(
+            goal,
+            "selected note",
+            vec!["review".to_owned()],
+            vec!["git:DEADBEEF".to_owned()],
+            vec![],
+            None,
+            at,
+        )
+        .unwrap();
+        fragment += note;
+        let (unrelated, unrelated_goal) =
+            compass::goal_fragment("unrelated goal", vec![], None, at).unwrap();
+        fragment += unrelated;
+        fragment += compass::note_fragment(
+            unrelated_goal,
+            "unrelated note",
+            vec![],
+            vec![],
+            vec![],
+            None,
+            at,
+        )
+        .unwrap()
+        .0;
+        let mut expected: Vec<BlobHandle> = find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ goal @ board::title: ?handle }]))
+        .map(|handle| handle.transmute())
+        .collect();
+        expected.extend(
+            find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ parent @ board::title: ?handle }]))
+            .map(|handle| handle.transmute()),
+        );
+        expected.extend(
+            find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ note_id @ board::note: ?handle }]))
+            .map(|handle| handle.transmute()),
+        );
+        expected.extend(
+            find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ note_id @ board::reference: ?handle }]))
+            .map(|handle| handle.transmute()),
+        );
+        let (mut store, view, _, _) = sparse_view(fragment);
+
+        let output =
+            pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
+                render_goal(reader, view.facts(), view.status_register(), goal)
+            }))
+            .unwrap();
+
+        assert!(output.contains("Title: selected goal"));
+        assert!(output.contains("Parent: parent goal"));
+        assert!(output.contains("selected note"));
+        assert!(output.contains("refs: git:DEADBEEF"));
+        assert!(!output.contains("unrelated"));
+        assert_eq!(store.requested, expected);
+        assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unavailable_note_or_reference_fails_the_whole_prepared_show() {
+        let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+            .try_to_inline()
+            .unwrap();
+        let (mut fragment, goal) =
+            compass::goal_fragment("selected goal", vec![], None, at).unwrap();
+        let (note, note_id) = compass::note_fragment(
+            goal,
+            "selected note",
+            vec![],
+            vec!["git:DEADBEEF".to_owned()],
+            vec![],
+            None,
+            at,
+        )
+        .unwrap();
+        fragment += note;
+        let title = find!(handle: TextHandle, pattern!(fragment.facts(), [{ goal @ board::title: ?handle }]))
+            .next().unwrap();
+        let body = find!(handle: TextHandle, pattern!(fragment.facts(), [{ note_id @ board::note: ?handle }]))
+            .next().unwrap();
+        let reference = find!(handle: TextHandle, pattern!(fragment.facts(), [{ note_id @ board::reference: ?handle }]))
+            .next().unwrap();
+
+        for missing in [body, reference] {
+            let (mut store, view, _, _) = sparse_view(fragment.clone());
+            let mut remote = fragment.blobs().clone();
+            remote.keep(
+                [title, body, reference]
+                    .into_iter()
+                    .filter(|handle| *handle != missing)
+                    .map(|handle| handle.transmute()),
+            );
+            store.remote = remote.snapshot().unwrap();
+            let error =
+                pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
+                    render_goal(reader, view.facts(), view.status_register(), goal)
+                }))
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .chain()
+                    .find_map(|source| source.downcast_ref::<MissingBlob>())
+                    .unwrap()
+                    .handle,
+                missing.transmute()
+            );
+            assert_eq!(store.requested.last(), Some(&missing.transmute()));
+        }
+    }
+
+    #[test]
+    fn render_retry_keeps_frozen_facts_status_support_and_instant() {
+        let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+            .try_to_inline()
+            .unwrap();
+        let later: IntervalValue = (Epoch::from_tai_seconds(1.0), Epoch::from_tai_seconds(1.0))
+            .try_to_inline()
+            .unwrap();
+        let (mut fragment, goal) =
+            compass::goal_fragment("original goal", vec![], None, at).unwrap();
+        fragment += compass::status_fragment(goal, "todo", None, at).unwrap();
+        let (mut store, view, source, signer) = sparse_view(fragment);
+        let original_support = source.admitted(view.store_snapshot()).unwrap();
+        let (mut arrival, arrived_goal) =
+            compass::goal_fragment("later goal", vec![], None, later).unwrap();
+        arrival += compass::status_fragment(goal, "done", None, later).unwrap();
+        store.arriving = Some((source, signer, arrival));
+
+        let output =
+            pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
+                assert_eq!(reader.instant(), view.store_snapshot().instant());
+                render_board(
+                    reader,
+                    view.facts(),
+                    view.status_register(),
+                    &[],
+                    &[],
+                    false,
+                )
+            }))
+            .unwrap();
+
+        assert!(output.contains("original goal"));
+        assert!(output.contains("TODO (1)"));
+        assert!(!output.contains("later goal"));
+        assert!(!compass::goal_ids(view.facts()).contains(&arrived_goal));
+        assert_eq!(
+            source.admitted(view.store_snapshot()).unwrap(),
+            original_support
+        );
+        assert_eq!(original_support.len(), 1);
+        assert_eq!(store.requested.len(), 1);
+        let after = store.snapshot().unwrap();
+        assert_eq!(source.admitted(&after).unwrap().len(), 2);
+        assert_eq!(after.wants().unwrap().count(), 0);
+    }
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
@@ -1261,7 +1749,7 @@ mod tests {
         let mut fragment = entity! { &unrelated @ metadata::created_at: first };
         fragment += entity! { &unrelated @ metadata::created_at: second };
         storage
-            .with_pile(|pile, signer| {
+            .with_pile(|pile, signer, _runtime| {
                 compass::commit_collection(pile, signer, fragment)?;
                 Ok(())
             })
