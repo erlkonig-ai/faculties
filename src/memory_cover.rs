@@ -574,66 +574,87 @@ impl CoverOpts {
 /// instant-stamped memory has no interior an instant could fall into.
 const MOMENT_NS: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
 
-const DAY_NS: i128 = 86_400 * 1_000_000_000;
+/// The grid unit: 2^14 seconds, about four and a half hours -- the order of
+/// the resident's working quarter, and nothing the calendar knows.
+pub const TILE_UNIT_NS: i128 = (1i128 << 14) * 1_000_000_000;
 
 /// Tiles grow by this factor per level, and a level holds at most this many
 /// complete tiles before they merge into one tile of the next level.
 pub const TILE_BASE: i128 = 4;
 
-/// The most memories per tile a reader may ask for, and the far end of the
-/// search when it asks for none.
+/// The most memories per tile a reader may ask for.
 pub const DETAIL_CAP: usize = 4096;
 
-/// One tile of the cover: a block of whole TAI days on an absolute grid.
-/// `open` is today, the day `now` falls in, still being written; it wants leaf
-/// grain. A closed tile of `days` days wants a grain of `days / detail`.
+/// The details the cut steps through: about a half-doubling apart, so a
+/// search visits two dozen cuts and a step down is a step, not a crawl.
+const DETAIL_LADDER: [usize; 24] = [
+    1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 91, 128, 181, 256, 362, 512, 724, 1024, 1448, 2048,
+    2896, 4096,
+];
+
+/// One tile of the cover: a block of whole grid units on an absolute grid.
+/// `open` is the tile `now` falls in, still being written; it wants leaf
+/// grain. A closed tile of `units` units wants a grain of its width over the
+/// detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tile {
     pub start: i128,
     pub end: i128,
-    pub days: i128,
+    pub units: i128,
     pub open: bool,
+}
+
+impl Tile {
+    /// The tile's width, humanized: hours under two days, days above.
+    pub fn width(&self) -> String {
+        let hours = (self.units * TILE_UNIT_NS) as f64 / 3.6e12;
+        if hours < 48.0 {
+            format!("{hours:.1}h")
+        } else {
+            format!("{:.1}d", hours / 24.0)
+        }
+    }
 }
 
 /// The tiling for a pile whose earliest memory starts at `earliest` and whose
 /// latest ends at `now` (TAI keys): a pure function of the pile.
 ///
-/// It is the base-`TILE_BASE` counter of the day `now` falls in. Level 0 is
-/// today, open. Level `l` holds the complete tiles of `TILE_BASE^l` days that
-/// lie before the current block at that level and inside the current block of
-/// the level above: the digit of the counter, zero to `TILE_BASE - 1` tiles.
-/// So when today closes it becomes a one-day tile; when a level fills, its
-/// tiles merge into one tile of the next level and are re-rendered at that
-/// level's grain. Between merges the cover changes only by appends in today,
-/// a merge rewrites a suffix, and a merge into a deep level is rare in
-/// proportion to its depth. That is what lets a resident reuse the prefix of
-/// her cover across recomputes.
+/// It is the base-`TILE_BASE` counter of the unit `now` falls in. Level 0 is
+/// that unit, open. Level `l` holds the complete tiles of `TILE_BASE^l` units
+/// that lie before the current block at that level and inside the current
+/// block of the level above: the digit of the counter, zero to
+/// `TILE_BASE - 1` tiles. So when the open unit closes it becomes a one-unit
+/// tile; when a level fills, its tiles merge into one tile of the next level
+/// and are re-rendered at that level's grain. Between merges the cover changes
+/// only by appends in the open tile, a merge rewrites a suffix, and a merge
+/// into a deep level is rare in proportion to its depth. That is what lets a
+/// resident reuse the prefix of her cover across recomputes.
 pub fn tiles(earliest: i128, now: i128) -> Vec<Tile> {
-    let first = earliest.div_euclid(DAY_NS);
-    let today = now.div_euclid(DAY_NS);
+    let first = earliest.div_euclid(TILE_UNIT_NS);
+    let current = now.div_euclid(TILE_UNIT_NS);
     let mut out = vec![Tile {
-        start: today * DAY_NS,
-        end: (today + 1) * DAY_NS,
-        days: 1,
+        start: current * TILE_UNIT_NS,
+        end: (current + 1) * TILE_UNIT_NS,
+        units: 1,
         open: true,
     }];
     let mut size = 1i128;
     loop {
         // The current block at this level already reaches the first memory:
         // nothing lies to its left.
-        let block = today - today.rem_euclid(size);
+        let block = current - current.rem_euclid(size);
         if block <= first {
             break;
         }
         let up = size * TILE_BASE;
-        let block_up = today - today.rem_euclid(up);
+        let block_up = current - current.rem_euclid(up);
         let left = block_up.max(first - first.rem_euclid(size));
         let mut t = left;
         while t < block {
             out.push(Tile {
-                start: t * DAY_NS,
-                end: (t + size) * DAY_NS,
-                days: size,
+                start: t * TILE_UNIT_NS,
+                end: (t + size) * TILE_UNIT_NS,
+                units: size,
                 open: false,
             });
             t += size;
@@ -659,7 +680,7 @@ fn want(tile: &Tile, detail: usize) -> Want {
     } else if tile.open {
         Want::Narrowest
     } else {
-        Want::Width((tile.days * DAY_NS / detail as i128).max(MOMENT_NS))
+        Want::Width((tile.units * TILE_UNIT_NS / detail as i128).max(MOMENT_NS))
     }
 }
 
@@ -789,14 +810,15 @@ pub fn tile_report(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) ->
         .collect()
 }
 
-/// A cut that fits. `detail` is what the reader asked for, `asked`; the cut
-/// steps down from there until it fits, because a complete cover that fits
-/// must always be produced. `fits` is false only when even the floor (the
-/// widest memory at every point) overflows, in which case `cover` is that
-/// floor and `used` its cost, so the caller can name the shortfall. With no
-/// detail asked, the finest detail that fits is searched for: doubling from
-/// one, then bisecting; a reader that wants a stable cover states the detail
-/// this prints.
+/// A cut that fits. `detail` is what the reader asked for, `asked`; if that
+/// overflows, the cut steps down the detail ladder until a complete cover
+/// fits, because one must always be produced. `fits` is false only when even
+/// the floor (the widest memory at every point) overflows, in which case
+/// `cover` is that floor and `used` its cost, so the caller can name the
+/// shortfall. With no detail asked, every rung of the ladder is tried from
+/// the finest down and the first that fits wins (cost is not monotone in
+/// detail, so a search that stops at the first overflow could miss a finer
+/// fit); a reader that wants a stable cover states the detail this prints.
 pub struct TiledCut {
     pub detail: usize,
     pub asked: Option<usize>,
@@ -839,7 +861,12 @@ pub fn fit_tiled(
     };
     match asked {
         Some(wanted) => {
-            for detail in (1..=wanted.min(DETAIL_CAP)).rev() {
+            let wanted = wanted.min(DETAIL_CAP);
+            let cut = render(wanted)?;
+            if cut.1 <= budget {
+                return Ok(done(wanted, cut));
+            }
+            for &detail in DETAIL_LADDER.iter().rev().filter(|&&d| d < wanted) {
                 let cut = render(detail)?;
                 if cut.1 <= budget {
                     return Ok(done(detail, cut));
@@ -848,53 +875,32 @@ pub fn fit_tiled(
             Ok(done(0, (floor_cover, floor)))
         }
         None => {
-            let mut best = (0usize, (floor_cover, floor));
-            let mut detail = 1usize;
-            let mut over = None;
-            while detail <= DETAIL_CAP {
+            for &detail in DETAIL_LADDER.iter().rev() {
                 let cut = render(detail)?;
                 if cut.1 <= budget {
-                    best = (detail, cut);
-                    detail *= 2;
-                } else {
-                    over = Some(detail);
-                    break;
+                    return Ok(done(detail, cut));
                 }
             }
-            if let Some(mut hi) = over {
-                let mut lo = best.0;
-                while hi - lo > 1 {
-                    let mid = (lo + hi) / 2;
-                    let cut = render(mid)?;
-                    if cut.1 <= budget {
-                        lo = mid;
-                        best = (mid, cut);
-                    } else {
-                        hi = mid;
-                    }
-                }
-            }
-            Ok(done(best.0, best.1))
+            Ok(done(0, (floor_cover, floor)))
         }
     }
 }
 
-/// The tiles in one line, newest last: `today, 3x1d, 2x4d, 1x16d`.
+/// The tiles in one line, newest first: `now, 3x4.6h, 2x18.2h, 1x3.0d`.
 pub fn describe_tiles(tiles: &[Tile]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut runs: Vec<(i128, usize)> = Vec::new();
+    let mut parts = vec!["now".to_string()];
+    let mut runs: Vec<(i128, String, usize)> = Vec::new();
     for tile in tiles.iter().rev() {
         if tile.open {
             continue;
         }
         match runs.last_mut() {
-            Some((days, count)) if *days == tile.days => *count += 1,
-            _ => runs.push((tile.days, 1)),
+            Some((units, _, count)) if *units == tile.units => *count += 1,
+            _ => runs.push((tile.units, tile.width(), 1)),
         }
     }
-    parts.push("today".to_string());
-    for (days, count) in runs {
-        parts.push(format!("{count}x{days}d"));
+    for (_, width, count) in runs {
+        parts.push(format!("{count}x{width}"));
     }
     parts.join(", ")
 }
@@ -1501,34 +1507,38 @@ mod headroom_tests {
             .collect()
     }
 
-    fn at(day: i128, hour: i128) -> i128 {
-        day * DAY_NS + hour * 3_600_000_000_000
+    fn unit(n: i128) -> i128 {
+        n * TILE_UNIT_NS
     }
 
     fn minutes(m: i128) -> i128 {
         m * 60_000_000_000
     }
 
-    fn tile_days(tiles: &[Tile]) -> Vec<(i128, i128)> {
-        tiles.iter().map(|t| (t.start / DAY_NS, t.days)).collect()
+    fn tile_units(tiles: &[Tile]) -> Vec<(i128, i128)> {
+        tiles
+            .iter()
+            .map(|t| (t.start / TILE_UNIT_NS, t.units))
+            .collect()
     }
 
-    /// The tiling is the base-4 counter of today: one open day, then the
-    /// complete tiles of each level before the current block at that level.
+    /// The tiling is the base-4 counter of the unit now falls in: one open
+    /// unit, then the complete tiles of each level before the current block
+    /// at that level.
     #[test]
-    fn the_tiling_is_the_counter_of_today() {
+    fn the_tiling_is_the_counter_of_now() {
         // 85 = 1*64 + 1*16 + 1*4 + 1: one tile at every level.
-        let t = tiles(at(0, 0), at(85, 12));
+        let t = tiles(unit(0), unit(85) + minutes(30));
         assert_eq!(
-            tile_days(&t),
+            tile_units(&t),
             vec![(0, 64), (64, 16), (80, 4), (84, 1), (85, 1)]
         );
         assert!(t.last().unwrap().open);
-        assert_eq!(describe_tiles(&t), "today, 1x1d, 1x4d, 1x16d, 1x64d");
-        // 87 = 1*64 + 1*16 + 1*4 + 3: three day tiles.
-        let t = tiles(at(0, 0), at(87, 0));
+        assert_eq!(describe_tiles(&t), "now, 1x4.6h, 1x18.2h, 1x3.0d, 1x12.1d");
+        // 87 = 1*64 + 1*16 + 1*4 + 3: three unit tiles.
+        let t = tiles(unit(0), unit(87));
         assert_eq!(
-            tile_days(&t),
+            tile_units(&t),
             vec![
                 (0, 64),
                 (64, 16),
@@ -1539,32 +1549,35 @@ mod headroom_tests {
                 (87, 1)
             ]
         );
-        // 88 = 1*64 + 1*16 + 2*4: the three days merged into a 4-day tile.
-        let t = tiles(at(0, 0), at(88, 0));
+        // 88 = 1*64 + 1*16 + 2*4: the three units merged into a 4-unit tile.
+        let t = tiles(unit(0), unit(88));
         assert_eq!(
-            tile_days(&t),
+            tile_units(&t),
             vec![(0, 64), (64, 16), (80, 4), (84, 4), (88, 1)]
         );
-        // A life that began two days ago has no tiles left of the first memory.
-        let t = tiles(at(83, 0), at(85, 12));
-        assert_eq!(tile_days(&t), vec![(80, 4), (84, 1), (85, 1)]);
-        // A life that began today is one open tile.
-        assert_eq!(tile_days(&tiles(at(85, 1), at(85, 12))), vec![(85, 1)]);
+        // A life that began two units ago has no tiles left of the first memory.
+        let t = tiles(unit(83), unit(85) + minutes(30));
+        assert_eq!(tile_units(&t), vec![(80, 4), (84, 1), (85, 1)]);
+        // A life that began in this unit is one open tile.
+        assert_eq!(
+            tile_units(&tiles(unit(85) + minutes(1), unit(85) + minutes(30))),
+            vec![(85, 1)]
+        );
     }
 
-    /// Today wants leaf grain: every memory in it, nested, overlapping, and
-    /// the instant beside its container.
+    /// The open tile wants leaf grain: every memory in it, nested, overlapping,
+    /// and the instant beside its container.
     #[test]
-    fn today_wants_every_memory() {
+    fn the_open_tile_wants_every_memory() {
         let id = ids(5);
         let spans = vec![
-            (at(85, 0), at(85, 6), id[0]),
-            (at(85, 1), at(85, 1) + minutes(15), id[1]),
-            (at(85, 2), at(85, 2), id[2]),
-            (at(85, 5), at(85, 9), id[3]),
-            (at(85, 9), at(85, 9) + minutes(1), id[4]),
+            (unit(85), unit(85) + minutes(60), id[0]),
+            (unit(85) + minutes(10), unit(85) + minutes(25), id[1]),
+            (unit(85) + minutes(20), unit(85) + minutes(20), id[2]),
+            (unit(85) + minutes(50), unit(85) + minutes(90), id[3]),
+            (unit(85) + minutes(90), unit(85) + minutes(91), id[4]),
         ];
-        let t = tiles(at(85, 0), at(85, 12));
+        let t = tiles(unit(85), unit(85) + minutes(120));
         assert_eq!(select_tiled(&spans, &t, 1), vec![0, 1, 2, 3, 4]);
         assert_eq!(select_tiled(&spans, &t, 4096), vec![0, 1, 2, 3, 4]);
         // The floor is the widest at every point: the two arcs, and the last
@@ -1576,48 +1589,51 @@ mod headroom_tests {
     /// memory closest to that, as a ratio.
     #[test]
     fn a_closed_tile_wants_its_grain() {
-        let id = ids(16);
-        let mut spans = vec![(at(84, 0), at(85, 0), id[0])];
-        for q in 0..6 {
-            spans.push((at(84, 4 * q), at(84, 4 * q + 4), id[1 + q as usize]));
+        let id = ids(14);
+        let quarter = TILE_UNIT_NS / 4;
+        let entry = TILE_UNIT_NS / 64;
+        let mut spans = vec![(unit(84), unit(85), id[0])];
+        for q in 0..4 {
+            spans.push((
+                unit(84) + q * quarter,
+                unit(84) + (q + 1) * quarter,
+                id[1 + q as usize],
+            ));
         }
         for e in 0..8 {
-            let s = at(84, 0) + minutes(15 * e);
-            spans.push((s, s + minutes(15), id[7 + e as usize]));
+            let s = unit(84) + e * entry;
+            spans.push((s, s + entry, id[5 + e as usize]));
         }
-        spans.push((at(85, 3), at(85, 3) + minutes(10), id[15]));
-        let t = tiles(at(84, 0), at(85, 12));
-        // One per tile: the day arc, and today's entry.
-        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 15]);
-        // Six per tile: the four-hour arcs.
-        assert_eq!(select_tiled(&spans, &t, 6), vec![1, 2, 3, 4, 5, 6, 15]);
-        // Ninety-six per tile: the entries where they exist, and where none
-        // does, the four-hour arcs (closer to fifteen minutes than the day).
+        spans.push((unit(85) + minutes(30), unit(85) + minutes(40), id[13]));
+        let t = tiles(unit(84), unit(85) + minutes(60));
+        // One per tile: the unit arc, and the open tile's entry.
+        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 13]);
+        // Four per tile: the quarter arcs.
+        assert_eq!(select_tiled(&spans, &t, 4), vec![1, 2, 3, 4, 13]);
+        // Sixty-four per tile: the entries where they exist, and where none
+        // does, the quarter arcs (closer to a sixty-fourth than the unit).
         assert_eq!(
-            select_tiled(&spans, &t, 96),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            select_tiled(&spans, &t, 64),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
     }
 
     /// Closest as a ratio, from either side: a point covered by an entry and a
-    /// life root, wanting a day, shows the entry; add an arc between and it
-    /// shows the arc.
+    /// life root, wanting a unit, shows the entry; add an arc between and it
+    /// shows the arc. Ties go to the narrower.
     #[test]
     fn closest_by_ratio_takes_the_entry_over_the_root() {
         let id = ids(3);
-        let root = (at(0, 0), at(400, 0), id[0]);
-        let entry = (at(82, 10), at(82, 10) + minutes(15), id[1]);
-        let t = tiles(at(0, 0), at(85, 12));
+        let root = (unit(0), unit(400), id[0]);
+        let entry = (unit(81) + minutes(10), unit(81) + minutes(27), id[1]);
+        let t = tiles(unit(0), unit(85) + minutes(30));
         assert_eq!(select_tiled(&[root, entry], &t, 4), vec![0, 1]);
-        let arc = (at(82, 8), at(82, 11), id[2]);
+        let arc = (unit(81), unit(81) + TILE_UNIT_NS / 2, id[2]);
         assert_eq!(select_tiled(&[root, entry, arc], &t, 4), vec![0, 2]);
-        // Ties go to the narrower: a two-hour and an eight-hour memory over a
-        // point wanting four hours.
-        let t = tiles(at(84, 0), at(85, 12));
-        let two = (at(84, 6), at(84, 8), id[1]);
-        let eight = (at(84, 0), at(84, 8), id[2]);
-        assert_eq!(select_tiled(&[two, eight], &t, 6), vec![0, 1]);
-        assert_eq!(select_tiled(&[eight, two], &t, 6), vec![0, 1]);
+        let half = (unit(81), unit(81) + TILE_UNIT_NS / 2, id[1]);
+        let double = (unit(80), unit(82), id[2]);
+        assert_eq!(select_tiled(&[half, double], &t, 4), vec![0, 1]);
+        assert_eq!(select_tiled(&[double, half], &t, 4), vec![0, 1]);
     }
 
     /// The floor is the widest memory at every point, and an overhang that
@@ -1625,59 +1641,60 @@ mod headroom_tests {
     #[test]
     fn the_floor_is_the_widest_at_every_point() {
         let id = ids(3);
-        let t = tiles(at(0, 0), at(150, 0));
+        let t = tiles(unit(0), unit(150));
         let spans = vec![
-            (at(0, 0), at(100, 0), id[0]),
-            (at(10, 0), at(20, 0), id[1]),
-            (at(30, 0), at(40, 0), id[2]),
+            (unit(0), unit(100), id[0]),
+            (unit(10), unit(20), id[1]),
+            (unit(30), unit(40), id[2]),
         ];
         assert_eq!(select_tiled(&spans, &t, 0), vec![0]);
-        let spans = vec![
-            (at(0, 0), at(100, 0), id[0]),
-            (at(90, 0), at(150, 0), id[1]),
-        ];
+        let spans = vec![(unit(0), unit(100), id[0]), (unit(90), unit(150), id[1])];
         assert_eq!(select_tiled(&spans, &t, 0), vec![0, 1]);
     }
 
-    /// The reader asks for a detail; the cut steps down until a complete cover
-    /// fits, and only the floor overflowing is a failure. With no detail asked,
-    /// the finest that fits is found.
+    /// The reader asks for a detail; the cut steps down the ladder until a
+    /// complete cover fits, and only the floor overflowing is a failure. With
+    /// no detail asked, the finest rung that fits is found.
     #[test]
     fn the_cut_steps_down_and_never_strands() {
-        let id = ids(30);
-        let mut spans = vec![(at(84, 0), at(85, 0), id[0])];
-        for e in 0..24 {
-            spans.push((at(84, e), at(84, e + 1), id[1 + e as usize]));
+        let id = ids(34);
+        let sub = TILE_UNIT_NS / 32;
+        let mut spans = vec![(unit(84), unit(85), id[0])];
+        for e in 0..32 {
+            spans.push((
+                unit(84) + e * sub,
+                unit(84) + (e + 1) * sub,
+                id[1 + e as usize],
+            ));
         }
-        spans.push((at(85, 1), at(85, 1) + minutes(5), id[25]));
-        let t = tiles(at(84, 0), at(85, 12));
+        spans.push((unit(85) + minutes(10), unit(85) + minutes(15), id[33]));
+        let t = tiles(unit(84), unit(85) + minutes(30));
         let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
-        // Asked twenty-four (every hour, 250): only the day arc fits 200.
-        let cut = fit_tiled(&spans, &t, &mut cost, 200, Some(24)).unwrap();
+        // Asked thirty-two (every sub-arc, 330): only the unit arc fits 200.
+        let cut = fit_tiled(&spans, &t, &mut cost, 200, Some(32)).unwrap();
         assert!(cut.fits);
-        assert_eq!(cut.asked, Some(24));
-        assert!(cut.detail < 24);
-        assert_eq!(cut.cover, vec![0, 25]);
-        // Asked twenty-four with room: every hour.
-        let cut = fit_tiled(&spans, &t, &mut cost, 300, Some(24)).unwrap();
-        assert_eq!(cut.detail, 24);
-        assert_eq!(cut.cover.len(), 25);
+        assert_eq!(cut.asked, Some(32));
+        assert!(cut.detail < 32);
+        assert_eq!(cut.cover, vec![0, 33]);
+        // Asked thirty-two with room: every sub-arc, at the detail asked.
+        let cut = fit_tiled(&spans, &t, &mut cost, 400, Some(32)).unwrap();
+        assert_eq!(cut.detail, 32);
+        assert_eq!(cut.cover.len(), 33);
         // Below the floor: not fitting, and the floor is what comes back.
-        let cut = fit_tiled(&spans, &t, &mut cost, 50, Some(24)).unwrap();
+        let cut = fit_tiled(&spans, &t, &mut cost, 50, Some(32)).unwrap();
         assert!(!cut.fits);
         assert_eq!(cut.detail, 0);
-        assert_eq!(cut.cover, vec![0, 25]);
-        // Nothing asked: the search finds the hours when they fit.
-        let cut = fit_tiled(&spans, &t, &mut cost, 300, None).unwrap();
+        assert_eq!(cut.cover, vec![0, 33]);
+        // Nothing asked: the finest rung, since it fits.
+        let cut = fit_tiled(&spans, &t, &mut cost, 400, None).unwrap();
         assert_eq!(cut.asked, None);
-        assert!(cut.detail >= 24, "{}", cut.detail);
-        assert_eq!(cut.cover.len(), 25);
+        assert_eq!(cut.detail, DETAIL_CAP);
+        assert_eq!(cut.cover.len(), 33);
     }
 
-    /// Consecutive covers differ only in a suffix: a write in today changes
-    /// nothing before today; a midnight closes today into a day tile and
-    /// changes nothing before it; a merge rewrites the merged tiles and
-    /// nothing before them.
+    /// Consecutive covers differ only in a suffix: a write in the open tile
+    /// changes nothing before it; the unit closing changes nothing before it;
+    /// a merge rewrites the merged tiles and nothing before them.
     #[test]
     fn consecutive_covers_differ_only_in_a_suffix() {
         let mut spans = Vec::new();
@@ -1687,34 +1704,38 @@ mod headroom_tests {
             next += 1;
             id
         };
-        for d in 0..86 {
-            spans.push((at(d, 0), at(d + 1, 0), mint()));
-            for h in [3, 9, 15, 21] {
-                spans.push((at(d, h), at(d, h + 1), mint()));
+        let quarter = TILE_UNIT_NS / 4;
+        for u in 0..86 {
+            spans.push((unit(u), unit(u + 1), mint()));
+            for q in 0..4 {
+                spans.push((unit(u) + q * quarter, unit(u) + (q + 1) * quarter, mint()));
             }
         }
         let shown_before = |spans: &[(i128, i128, Id)], now: i128, limit: i128| -> Vec<Id> {
-            let t = tiles(at(0, 0), now);
+            let t = tiles(unit(0), now);
             select_tiled(spans, &t, 6)
                 .into_iter()
                 .filter(|&i| spans[i].1 <= limit)
                 .map(|i| spans[i].2)
                 .collect()
         };
-        let a = shown_before(&spans, at(85, 12), at(85, 0));
-        // A write in today.
-        spans.push((at(85, 13), at(85, 13) + minutes(15), mint()));
-        assert_eq!(shown_before(&spans, at(85, 14), at(85, 0)), a);
-        // Midnight: day 85 closes; nothing before it moves.
-        spans.push((at(86, 1), at(86, 1) + minutes(15), mint()));
-        assert_eq!(shown_before(&spans, at(86, 2), at(85, 0)), a);
-        // Day 88: days 84 to 87 merge into one tile; nothing before 84 moves,
+        let a = shown_before(&spans, unit(85) + minutes(30), unit(85));
+        // A write in the open tile.
+        spans.push((unit(85) + minutes(40), unit(85) + minutes(55), mint()));
+        assert_eq!(shown_before(&spans, unit(85) + minutes(60), unit(85)), a);
+        // The unit closes: nothing before it moves.
+        spans.push((unit(86) + minutes(5), unit(86) + minutes(20), mint()));
+        assert_eq!(shown_before(&spans, unit(86) + minutes(30), unit(85)), a);
+        // Unit 88: units 84 to 87 merge into one tile; nothing before 84 moves,
         // and the merged stretch is rendered coarser.
-        let before_84 = shown_before(&spans, at(86, 2), at(84, 0));
-        spans.push((at(88, 1), at(88, 1) + minutes(15), mint()));
-        assert_eq!(shown_before(&spans, at(88, 2), at(84, 0)), before_84);
-        let merged_fine = shown_before(&spans, at(87, 23), at(88, 0)).len();
-        let merged_coarse = shown_before(&spans, at(88, 2), at(88, 0)).len();
+        let before_84 = shown_before(&spans, unit(86) + minutes(30), unit(84));
+        spans.push((unit(88) + minutes(5), unit(88) + minutes(20), mint()));
+        assert_eq!(
+            shown_before(&spans, unit(88) + minutes(30), unit(84)),
+            before_84
+        );
+        let merged_fine = shown_before(&spans, unit(87) + minutes(30), unit(88)).len();
+        let merged_coarse = shown_before(&spans, unit(88) + minutes(30), unit(88)).len();
         assert!(
             merged_coarse < merged_fine,
             "{merged_coarse} < {merged_fine}"
@@ -1725,17 +1746,18 @@ mod headroom_tests {
     #[test]
     fn the_report_names_the_missing_arc() {
         let id = ids(9);
+        let entry = TILE_UNIT_NS / 64;
         let mut spans = Vec::new();
         for e in 0..8 {
-            let s = at(84, e);
-            spans.push((s, s + minutes(15), id[e as usize]));
+            let s = unit(84) + e * entry;
+            spans.push((s, s + entry, id[e as usize]));
         }
-        let t = tiles(at(84, 0), at(85, 12));
+        let t = tiles(unit(84), unit(85) + minutes(30));
         let report = tile_report(&spans, &t, 1);
         assert_eq!(report[0].picked, 8);
-        assert!(report[0].worst_ratio > 90.0, "{}", report[0].worst_ratio);
-        assert_eq!(report[1].want_ns, None, "today wants leaf grain");
-        spans.push((at(84, 0), at(85, 0), id[8]));
+        assert!(report[0].worst_ratio > 60.0, "{}", report[0].worst_ratio);
+        assert_eq!(report[1].want_ns, None, "the open tile wants leaf grain");
+        spans.push((unit(84), unit(85), id[8]));
         let report = tile_report(&spans, &t, 1);
         assert_eq!(report[0].picked, 1);
         assert_eq!(report[0].worst_ratio, 1.0);
