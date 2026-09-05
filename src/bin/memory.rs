@@ -61,7 +61,6 @@ use triblespace::prelude::*;
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
-             memory supersede <newer-id> <older-id> — a later RENDERING of a span replaces an earlier one in the cover's structure (both stay readable by id); only a strictly wider newer span takes effect\n  \
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
@@ -808,9 +807,6 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "create") {
         return cmd_create(storage, &cli.ids[1..]);
     }
-    if cli.ids.first().is_some_and(|value| value == "supersede") {
-        return cmd_supersede(storage, &cli.ids[1..]);
-    }
     if cli.ids.first().is_some_and(|value| value == "image") {
         return cmd_image(storage, &cli.ids[1..]);
     }
@@ -988,39 +984,6 @@ fn cmd_create(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     )?;
     println!("range: {}", format_time_range(range.0, range.1));
     println!("id: {chunk_id:x}");
-    Ok(())
-}
-
-/// `memory supersede <newer-id> <older-id>` -- a later RENDERING of a span
-/// replaces an earlier one in the cover's temporal structure. The older text
-/// stays in the journal and answers by id. The cover honours the edge only
-/// when the newer span is strictly wider than the older's; an equal-span
-/// retelling coexists as an alternate recollection, as every episode does.
-fn cmd_supersede(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
-    if args.len() != 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        bail!(
-            "usage: memory supersede <newer-id> <older-id>\n\
-             \n\
-             Record that <newer-id> is a later rendering of the time <older-id>\n\
-             renders: a whole-life root written again with a longer tail, an arc\n\
-             summarized again. Both stay in the journal and answer by id; the\n\
-             context cover keeps only the newer in its structure, and only when\n\
-             the newer span is strictly wider. Episodes are never superseded: a\n\
-             later memory of the same time is another memory."
-        );
-    }
-    let loaded = storage.load()?;
-    let newer = resolve_chunk_id(&loaded, &args[0])?;
-    let older = resolve_chunk_id(&loaded, &args[1])?;
-    if newer == older {
-        bail!("a memory cannot supersede itself");
-    }
-    let space = &loaded.memory.facts;
-    let newer_span = chunk_span_str(space, newer);
-    let older_span = chunk_span_str(space, older);
-    storage.publish_memory(memory_model::supersede_fragment(newer, older))?;
-    println!("{newer:x} ({newer_span})");
-    println!("  supersedes {older:x} ({older_span})");
     Ok(())
 }
 
@@ -2385,45 +2348,6 @@ fn cmd_meta(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             incoming
                 .iter()
                 .map(|id| format!("{id:x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    // Rendering edges, both ways: what this chunk stands in for, and what
-    // stands in for it. The cover honours an edge only when the newer span is
-    // strictly wider (see `memory supersede`); the spans are printed so that
-    // is visible here.
-    let span_of = |id: Id| match (chunk_start_at(space, id), chunk_end_at(space, id)) {
-        (Some(s), Some(e)) => format!(
-            "{} ({:x})",
-            format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)),
-            id
-        ),
-        _ => format!("{id:x}"),
-    };
-    let supersedes: Vec<Id> =
-        find!(o: Id, pattern!(space, [{ chunk_id @ metadata::supersedes: ?o }])).collect();
-    if !supersedes.is_empty() {
-        println!(
-            "supersedes: {}",
-            supersedes
-                .iter()
-                .map(|id| span_of(*id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let superseded_by: Vec<Id> = find!(
-        n: Id,
-        pattern!(space, [{ ?n @ metadata::tag: &faculties::schemas::memory::KIND_CHUNK_ID, metadata::supersedes: chunk_id }])
-    )
-    .collect();
-    if !superseded_by.is_empty() {
-        println!(
-            "superseded_by: {}",
-            superseded_by
-                .iter()
-                .map(|id| span_of(*id))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
