@@ -2,11 +2,11 @@
 //!
 //! A secret version owns one fresh random data-encryption key (DEK). Its body
 //! is encrypted once and the DEK is sealed independently to every subject
-//! admitted for `READ(collection)` when the version is published. Granting a
-//! reader later adds another wrap; it never rewrites the body or changes the
-//! secret id. Collection capability proofs remain the authority. A wrap is
-//! only cryptographic delivery for an already-admitted reader, not a second
-//! authorization system.
+//! admitted for the distinct Secrets key-delivery capability on the source
+//! collection when the version is published. Collection READ permits encrypted
+//! evidence replication, not DEK delivery. Later key-delivery grants add wraps;
+//! they never rewrite bodies or secret ids. Generic capability proofs remain
+//! the authority. A delivered wrap opens by possession, without expiry checks.
 
 use std::collections::BTreeSet;
 
@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 pub mod schema;
 pub mod storage;
 
-pub use self::schema::DEFAULT_SCOPE_ID;
+pub use self::schema::{key_delivery_capability, key_delivery_definition, DEFAULT_SCOPE_ID};
 
 use self::schema::{
     secret_body, wrap_dek, wrap_recipient_key, wrap_secret, KIND_SECRET, KIND_WRAP,
@@ -122,8 +122,8 @@ impl<R> SecretsSnapshot<R> {
 impl<R: BlobStoreGet> SecretsSnapshot<R> {
     /// Open one global secret id with the caller's ordinary signing key.
     ///
-    /// This performs no clock or capability check. Admission already selected
-    /// the collection view; possession of the matching private key is what
+    /// This performs no clock or capability check. Signed WRITE admission
+    /// already selected the collection view; possession of the private key
     /// opens its additive DEK envelope. Every independently decryptable
     /// occurrence must agree on plaintext.
     pub fn open(&self, secret: Id, signing_key: &SigningKey) -> Result<Vec<u8>> {
@@ -433,7 +433,7 @@ pub struct SealedVersion {
 }
 
 /// Encrypt one immutable version with a fresh DEK and seal that DEK to every
-/// distinct admitted reader.
+/// distinct caller-selected key recipient.
 pub fn seal_version<I>(
     name: &str,
     plaintext: &[u8],
@@ -445,7 +445,7 @@ where
 {
     let recipients = deduplicated_recipients(recipients);
     if recipients.is_empty() {
-        bail!("a secret requires at least one finite admitted reader");
+        bail!("a secret requires at least one finite key-delivery recipient");
     }
 
     let dek = Key::gen();

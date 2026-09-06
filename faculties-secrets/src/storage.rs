@@ -2,8 +2,14 @@
 //!
 //! This module deliberately has no vault registry or access inbox. Callers
 //! configure the collection descriptors they use. Authorization evidence is
-//! interpreted by TribleSpace; Secrets consumes only the finite admitted
-//! `READ(collection)` audience needed to deliver per-version DEKs.
+//! interpreted by TribleSpace; Secrets consumes the finite audience of its
+//! distinct key-delivery capability on the source collection. Collection READ
+//! governs encrypted-evidence replication, never key delivery.
+//!
+//! Adding this binding changes the immutable descriptor handle. Historical
+//! descriptors are not silently matched by name or treated as key-delivery
+//! grants. An explicit additive descriptor/recommit transition can preserve
+//! existing secret ids, ciphertext, and wraps; this module does not migrate them.
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -11,17 +17,21 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
+use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
-    collection_read_audience, Collection, CollectionHandle, CollectionPolicy,
+    collection_capability_audience, descriptor, Collection, CollectionHandle, CollectionPolicy,
     CollectionReadAudience, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
+use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreRead, StoreSnapshot};
+use triblespace::core::trible::TribleSet;
 use triblespace::macros::{find, pattern};
 
 use super::{
-    add_recipient_envelopes_from_facts, seal_version, IntervalValue, SecretsFacts, SecretsSnapshot,
+    add_recipient_envelopes_from_facts, key_delivery_capability, seal_version, IntervalValue,
+    SecretsFacts, SecretsSnapshot,
 };
 
 /// One logical Secrets policy boundary and its ordinary maintained encodings.
@@ -37,31 +47,27 @@ pub struct SecretsCollection {
 }
 
 impl SecretsCollection {
-    /// Register one source collection and its maintained query encodings.
+    /// Register a source with an explicit key-delivery policy and its query encodings.
+    ///
+    /// Supply `policy.with_capability(key_delivery_definition(), delivery_policy)`.
+    /// Neither custom nor default policy acquires key-delivery authority from READ.
     pub fn register<S>(store: &mut S, name: &str, policy: CollectionPolicy) -> Result<Self>
     where
-        S: CollectionStoreExt,
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: BlobStoreGet,
     {
         let source = store
-            .collection(name, policy.clone())
+            .collection(name, policy)
             .map_err(|error| anyhow!("register Secrets source collection: {error}"))?;
-        let succinct = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .map_err(|error| anyhow!("register Succinct Secrets collection: {error}"))?;
-        let rank9 = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .map_err(|error| anyhow!("register Rank9 Secrets collection: {error}"))?;
-        Ok(Self {
-            source,
-            succinct,
-            rank9,
-        })
+        Self::from_source(store, source)
     }
 
     /// Attach the canonical maintained encodings above one existing source.
     ///
     /// The source descriptor remains the policy boundary and identity. The
-    /// two derived descriptors inherit that exact immutable policy.
+    /// two derived descriptors inherit that exact immutable policy. A supported
+    /// explicit key-delivery binding is required; historical READ-only policy
+    /// descriptors do not receive a fallback or an implicit transition.
     pub fn from_source<S>(store: &mut S, source: Collection<SimpleArchive>) -> Result<Self>
     where
         S: CollectionStoreExt + SnapshotSource,
@@ -70,6 +76,21 @@ impl SecretsCollection {
         let snapshot = store
             .snapshot()
             .context("freeze Secrets source descriptor snapshot")?;
+        let descriptor: Blob<SimpleArchive> = snapshot
+            .get(source.handle())
+            .context("read Secrets key-delivery policy descriptor")?;
+        let facts = TribleSet::try_from_blob(descriptor)
+            .context("decode Secrets key-delivery policy descriptor")?;
+        if descriptor::admission_policies(
+            &facts,
+            key_delivery_capability(),
+            Some(SimpleArchive::id()),
+        )
+        .next()
+        .is_none()
+        {
+            bail!("Secrets source descriptor has no supported key-delivery policy binding; an explicit descriptor transition is required");
+        }
         let policy = source
             .policy(&snapshot)
             .context("read Secrets source collection policy")?;
@@ -295,24 +316,28 @@ where
     snapshot_exact(store_snapshot, collection, support)
 }
 
-fn admitted_readers<R>(snapshot: &R, collection: SecretsCollection) -> Result<Vec<VerifyingKey>>
+fn key_delivery_recipients<R>(
+    snapshot: &R,
+    collection: SecretsCollection,
+) -> Result<Vec<VerifyingKey>>
 where
     R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
 {
-    let audience = collection_read_audience(snapshot, collection.handle())
-        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
-    finite_readers(audience)
+    let audience =
+        collection_capability_audience(snapshot, collection.handle(), key_delivery_capability())
+            .map_err(|error| anyhow!("resolve Secrets key-delivery audience: {error}"))?;
+    finite_recipients(audience)
 }
 
-fn finite_readers(audience: CollectionReadAudience) -> Result<Vec<VerifyingKey>> {
+fn finite_recipients(audience: CollectionReadAudience) -> Result<Vec<VerifyingKey>> {
     match audience {
         CollectionReadAudience::Open => {
-            bail!("cannot seal a finite DEK envelope set for an open-read collection")
+            bail!("cannot seal a finite DEK envelope set for an open key-delivery policy")
         }
-        CollectionReadAudience::Restricted(readers) if readers.is_empty() => {
-            bail!("Secrets collection has no admitted readers")
+        CollectionReadAudience::Restricted(recipients) if recipients.is_empty() => {
+            bail!("Secrets collection has no admitted key-delivery recipients")
         }
-        CollectionReadAudience::Restricted(readers) => Ok(readers),
+        CollectionReadAudience::Restricted(recipients) => Ok(recipients),
     }
 }
 
@@ -335,7 +360,7 @@ where
     let snapshot = store
         .snapshot()
         .context("freeze Secrets audience before publication")?;
-    let recipients = admitted_readers(&snapshot, collection)?;
+    let recipients = key_delivery_recipients(&snapshot, collection)?;
     drop(snapshot);
     let sealed = seal_version(name, plaintext, recipients, created_at)?;
     let secret = sealed.secret;
@@ -347,8 +372,8 @@ where
 
 /// Add missing envelopes across every secret in one policy boundary.
 ///
-/// The supplied snapshot fixes both the secrets and self-contained READ proofs
-/// to inspect. Concurrent grants and secrets wait for the next additive
+/// The supplied snapshot fixes both the secrets and self-contained key-delivery
+/// proofs to inspect. Concurrent grants and secrets wait for the next additive
 /// maintenance call.
 pub fn maintain_recipient_envelopes<S, R>(
     store: &mut S,
@@ -367,9 +392,7 @@ where
     let Some(facts) = secrets.facts() else {
         return Ok(0);
     };
-    let audience = collection_read_audience(secrets.store_snapshot(), collection.handle())
-        .map_err(|error| anyhow!("resolve admitted Secrets readers: {error}"))?;
-    let recipients = finite_readers(audience)?;
+    let recipients = key_delivery_recipients(secrets.store_snapshot(), collection)?;
     let secret_ids = find!(
         id: triblespace::core::id::Id,
         pattern!(facts, [{
@@ -410,13 +433,12 @@ mod tests {
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob};
     use triblespace::core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-        CapabilityValidity,
+        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
     };
     use triblespace::core::collection::{
-        grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionCommit,
-        CollectionData, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
-        ACTION_READ, ACTION_WRITE,
+        grant_collection_capability, grant_collection_read, grant_collection_write,
+        write_capability, AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy,
+        CollectionRead, CollectionRecord, CollectionStore,
     };
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::{Inline, InlineEncoding};
@@ -435,6 +457,10 @@ mod tests {
 
     fn direct_policy(key: VerifyingKey) -> CollectionPolicy {
         CollectionPolicy::new(AdmissionPolicy::direct(key), AdmissionPolicy::direct(key))
+            .with_capability(
+                super::super::key_delivery_definition(),
+                AdmissionPolicy::direct(key),
+            )
     }
 
     #[derive(Default)]
@@ -580,8 +606,14 @@ mod tests {
                 direct_policy(alice.verifying_key()),
             )
             .unwrap();
-            grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
-                .unwrap();
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                key_delivery_capability(),
+                &alice,
+                bob.verifying_key(),
+            )
+            .unwrap();
 
             let secret = add_secret(
                 &mut store,
@@ -609,6 +641,167 @@ mod tests {
     }
 
     #[test]
+    fn replication_and_key_delivery_are_independent_at_seal_and_maintenance() {
+        pollster::block_on(async {
+            let owner = SigningKey::generate(&mut OsRng);
+            let delivery_root = SigningKey::generate(&mut OsRng);
+            let replica = SigningKey::generate(&mut OsRng);
+            let recipient = SigningKey::generate(&mut OsRng);
+            let mut store = MemoryRepo::default();
+            let collection = SecretsCollection::register(
+                &mut store,
+                "separate-authorities",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(owner.verifying_key()),
+                    AdmissionPolicy::direct(owner.verifying_key()),
+                )
+                .with_capability(
+                    super::super::key_delivery_definition(),
+                    AdmissionPolicy::direct(delivery_root.verifying_key()),
+                ),
+            )
+            .unwrap();
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                key_delivery_capability(),
+                &delivery_root,
+                owner.verifying_key(),
+            )
+            .unwrap();
+            grant_collection_read(
+                &mut store,
+                collection.handle(),
+                &owner,
+                replica.verifying_key(),
+            )
+            .unwrap();
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                key_delivery_capability(),
+                &delivery_root,
+                recipient.verifying_key(),
+            )
+            .unwrap();
+            let secret = add_secret(
+                &mut store,
+                &owner,
+                collection,
+                "token",
+                b"separate authority",
+                at(1),
+            )
+            .unwrap();
+            let before = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            assert!(collection
+                .source()
+                .reader_is_admitted(before.store_snapshot(), replica.verifying_key(),)
+                .unwrap());
+            assert!(!collection
+                .source()
+                .reader_is_admitted(before.store_snapshot(), recipient.verifying_key(),)
+                .unwrap());
+            assert!(before.open(secret, &replica).is_err());
+            assert_eq!(
+                before.open(secret, &recipient).unwrap(),
+                b"separate authority"
+            );
+            assert_eq!(
+                maintain_recipient_envelopes(&mut store, &owner, &before, collection, &owner,)
+                    .unwrap(),
+                0
+            );
+            let body = super::super::secret_rows_for(before.facts().unwrap(), secret)[0].body;
+
+            assert!(
+                grant_collection_capability(
+                    &mut store,
+                    collection.handle(),
+                    key_delivery_capability(),
+                    &owner,
+                    replica.verifying_key(),
+                )
+                .is_err(),
+                "replication policy roots cannot issue key-delivery grants"
+            );
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                key_delivery_capability(),
+                &delivery_root,
+                replica.verifying_key(),
+            )
+            .unwrap();
+            assert_eq!(
+                maintain_recipient_envelopes(&mut store, &owner, &before, collection, &owner,)
+                    .unwrap(),
+                0,
+                "the selected proof frontier stays frozen"
+            );
+            let current = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            assert_eq!(
+                maintain_recipient_envelopes(&mut store, &owner, &current, collection, &owner,)
+                    .unwrap(),
+                1
+            );
+            let after = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            assert_eq!(after.open(secret, &replica).unwrap(), b"separate authority");
+            assert_eq!(
+                super::super::secret_rows_for(after.facts().unwrap(), secret)[0].body,
+                body
+            );
+            assert!(before.open(secret, &replica).is_err());
+        });
+    }
+
+    #[test]
+    fn historical_descriptor_without_key_delivery_has_no_read_fallback() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let mut store = MemoryRepo::default();
+        let historical = store
+            .collection(
+                "historical-secrets",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(owner.verifying_key()),
+                    AdmissionPolicy::direct(owner.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let error = SecretsCollection::from_source(&mut store, historical).unwrap_err();
+        assert!(format!("{error:#}").contains("no supported key-delivery policy binding"));
+        assert_eq!(store.snapshot().unwrap().records().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn open_replication_can_have_owner_only_key_delivery() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let mut store = MemoryRepo::default();
+        let collection = SecretsCollection::register(
+            &mut store,
+            "open-replication",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(owner.verifying_key()),
+            )
+            .with_capability(
+                super::super::key_delivery_definition(),
+                AdmissionPolicy::direct(owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+        assert!(add_secret(
+            &mut store,
+            &owner,
+            collection,
+            "token",
+            b"private key",
+            at(2)
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn open_audience_is_rejected_before_publication() {
         let alice = SigningKey::generate(&mut OsRng);
         let mut store = MemoryRepo::default();
@@ -618,12 +811,16 @@ mod tests {
             CollectionPolicy::new(
                 AdmissionPolicy::Open,
                 AdmissionPolicy::direct(alice.verifying_key()),
+            )
+            .with_capability(
+                super::super::key_delivery_definition(),
+                AdmissionPolicy::Open,
             ),
         )
         .unwrap();
         let error =
             add_secret(&mut store, &alice, collection, "token", b"value", at(2)).unwrap_err();
-        assert!(format!("{error:#}").contains("open-read"));
+        assert!(format!("{error:#}").contains("open key-delivery"));
     }
 
     #[test]
@@ -688,7 +885,7 @@ mod tests {
             let left_proof = CapabilityProof::issue_root(
                 &authority,
                 CapabilityResource::from(collection.handle()),
-                Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+                Capability::new(write_capability(), CapabilityMode::Invoke),
                 None,
                 left_writer.verifying_key(),
             );
@@ -720,7 +917,7 @@ mod tests {
             let right_proof = CapabilityProof::issue_root(
                 &authority,
                 CapabilityResource::from(collection.handle()),
-                Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+                Capability::new(write_capability(), CapabilityMode::Invoke),
                 None,
                 right_writer.verifying_key(),
             );
@@ -742,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_admitted_reader_gets_an_additive_wrap() {
+    fn newly_admitted_key_recipient_gets_an_additive_wrap() {
         pollster::block_on(async {
             let alice = SigningKey::generate(&mut OsRng);
             let bob = SigningKey::generate(&mut OsRng);
@@ -761,8 +958,14 @@ mod tests {
             assert!(before.open(first, &bob).is_err());
             assert!(before.open(second, &bob).is_err());
 
-            grant_collection_read(&mut store, collection.handle(), &alice, bob.verifying_key())
-                .unwrap();
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                key_delivery_capability(),
+                &alice,
+                bob.verifying_key(),
+            )
+            .unwrap();
             // A later proof cannot change the audience of an existing snapshot.
             assert_eq!(
                 maintain_recipient_envelopes(&mut store, &alice, &before, collection, &alice)
@@ -805,7 +1008,7 @@ mod tests {
             let proof = CapabilityProof::issue_root(
                 &alice,
                 CapabilityResource::from(collection.handle()),
-                Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+                Capability::new(key_delivery_capability(), CapabilityMode::Invoke),
                 None,
                 bob.verifying_key(),
             );
@@ -828,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_readers_expire_for_delivery_not_for_existing_envelopes() {
+    fn delegated_key_recipients_expire_for_delivery_not_for_existing_envelopes() {
         pollster::block_on(async {
             let alice = SigningKey::generate(&mut OsRng);
             let bob = SigningKey::generate(&mut OsRng);
@@ -846,10 +1049,7 @@ mod tests {
             let root = CapabilityProof::issue_root(
                 &alice,
                 CapabilityResource::from(collection.handle()),
-                Capability::new(
-                    CapabilityAction::new(ACTION_READ),
-                    CapabilityMode::InvokeAndDelegate,
-                ),
+                Capability::new(key_delivery_capability(), CapabilityMode::InvokeAndDelegate),
                 Some(
                     CapabilityValidity::new(
                         Epoch::from_unix_seconds(0.0),
@@ -862,12 +1062,12 @@ mod tests {
             let proof = root
                 .extend(
                     &bob,
-                    Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+                    Capability::new(key_delivery_capability(), CapabilityMode::Invoke),
                     None,
                     carol.verifying_key(),
                 )
                 .unwrap();
-            // The final proof contains the signed prefix granting Bob READ too.
+            // The final proof contains Bob's signed key-delivery prefix too.
             store.insert_proof(proof).unwrap();
             drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
             let instant = Epoch::from_unix_seconds(100.0);
@@ -898,12 +1098,15 @@ mod tests {
                 2
             );
 
-            let sealed =
-                seal_version("new", b"not delivered", [alice.verifying_key()], at(200)).unwrap();
-            let new_secret = sealed.secret;
-            store
-                .commit(collection.source(), &alice, sealed.fragment)
-                .unwrap();
+            let new_secret = add_secret(
+                &mut store,
+                &alice,
+                collection,
+                "new",
+                b"not delivered",
+                at(200),
+            )
+            .unwrap();
             drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
             let expired =
                 snapshot(store.snapshot_at(expired_instant).unwrap(), collection).unwrap();

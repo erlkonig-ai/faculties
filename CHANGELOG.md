@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Secrets key delivery has its own capability definition and explicit policy
+  binding on the source collection. Replication READ never selects DEK
+  recipients; both initial sealing and additive envelope maintenance query the
+  key-delivery audience. Expiry stops new delivery, not opening resident wraps.
+  Default private descriptors explicitly bind delivery to their owner; custom
+  descriptors must provide a supported binding. This changes descriptor handles:
+  historical sources need an explicit additive descriptor/recommit transition,
+  not an equal-name bridge or a READ fallback. Existing secret IDs, ciphertext,
+  and wrap records are unchanged; no live transition is performed here.
+  Key-delivery action ID minted with installed `trible genid` on 2026-09-06:
+  `4E350A11267E4E0DA8F547610594D148`.
+
 - Orient and Body intent reads now select resident fact and register targets
   from one final store snapshot. Remove Orient's separate source-support vector
   and ordinary exact-support attachment; lagging positive latest/status joins
@@ -46,7 +58,7 @@ All notable changes to this project will be documented in this file.
 - **Secrets uses collection authority directly instead of maintaining a
   parallel vault-authority system.** One ordinary source collection is one
   actual policy boundary. Each immutable secret version has a fresh random DEK
-  sealed additively to the finite subjects admitted for `READ(collection)` in
+  sealed additively to the finite subjects admitted for key delivery in
   one frozen store snapshot. Later grants add only missing wraps across the
   collection; ciphertext and opaque secret ids do not change. Vault custody
   keys and epochs, the `secrets-access` inbox, Secrets-specific READ claims,

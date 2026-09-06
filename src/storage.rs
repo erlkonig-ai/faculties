@@ -152,8 +152,9 @@ pub fn open_store(path: &Path) -> Result<FacultyStore> {
 /// Open the explicitly configured Secrets policy boundary for publication.
 ///
 /// `TRIBLESPACE_COLLECTION_SECRETS` selects an exact shared source descriptor;
-/// otherwise the usual signer-private `secrets` descriptor is registered.
-/// This validates descriptor identity but deliberately performs no admission
+/// otherwise a signer-private `secrets` descriptor is registered with an
+/// explicit, separate key-delivery policy under that owner.
+/// This selects the exact descriptor but deliberately performs no admission
 /// check: local publication is unconditional, and WRITE admission is applied
 /// when collection snapshots admit commits.
 pub fn open_secrets_collection<S>(
@@ -164,35 +165,44 @@ where
     S: CollectionStoreExt + SnapshotSource,
     S::Snapshot: BlobStoreGet,
 {
-    let source =
-        crate::collection_names::open_configured(store, crate::secrets::DEFAULT_SCOPE_ID, subject)
-            .context("open configured Secrets source collection")?;
+    let scope = crate::secrets::DEFAULT_SCOPE_ID;
+    let Some(handle) = crate::collection_names::configured_handle(scope)? else {
+        return crate::secrets::storage::SecretsCollection::register(
+            store,
+            crate::collection_names::require_name(scope),
+            crate::collection_names::private_policy(subject).with_capability(
+                crate::secrets::key_delivery_definition(),
+                triblespace::core::collection::AdmissionPolicy::direct(subject),
+            ),
+        )
+        .context("register signer-private Secrets descriptor with key-delivery policy");
+    };
+    let snapshot = store
+        .snapshot()
+        .context("freeze configured Secrets descriptor")?;
+    let source = crate::collection_names::open_exact_in(&snapshot, scope, handle)
+        .context("open configured Secrets source collection")?;
+    drop(snapshot);
     crate::secrets::storage::SecretsCollection::from_source(store, source)
         .context("register maintained Secrets collection descriptors")
 }
 
-/// Open the explicitly configured Secrets policy boundary for disclosure.
+/// Open the explicitly configured Secrets policy boundary for local reads.
 ///
-/// Exact shared descriptors must admit `subject` under their READ policy
-/// before a caller may attach or decrypt the collection. An unset override
-/// still registers the ordinary signer-private `secrets` descriptor. Admission
-/// uses the actual descriptor snapshot's frozen authorization instant.
+/// Collection READ controls encrypted-evidence replication, not opening an
+/// already-delivered local wrap. This retains exact descriptor/type/name
+/// selection and ordinary signed WRITE admission of the facts, but adds no
+/// READ or key-delivery expiry check to decryption by possession. An unset
+/// override registers an explicit signer-private key-delivery policy.
 pub fn open_secrets_collection_read<S>(
     store: &mut S,
     subject: VerifyingKey,
 ) -> Result<crate::secrets::storage::SecretsCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    S::Snapshot: BlobStoreGet,
 {
-    let source = crate::collection_names::open_configured_read(
-        store,
-        crate::secrets::DEFAULT_SCOPE_ID,
-        subject,
-    )
-    .context("open configured Secrets source collection for READ")?;
-    crate::secrets::storage::SecretsCollection::from_source(store, source)
-        .context("register maintained Secrets collection descriptors")
+    open_secrets_collection(store, subject)
 }
 
 /// Canonical records currently known for one scoped target collection.

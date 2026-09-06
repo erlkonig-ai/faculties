@@ -1,5 +1,6 @@
 //! Stable wire schema for immutable encrypted secret versions and recipient wraps.
 
+use triblespace::core::capability::{capability_action, CapabilityHandle};
 use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
 
@@ -9,6 +10,33 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-09-03:
 /// `0A33FEA863F9A2F460F98B8F6EE7F0A3`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("0A33FEA863F9A2F460F98B8F6EE7F0A3");
+
+/// Semantic action of the Secrets key-delivery capability definition.
+///
+/// Minted with installed `/Users/jp/.cargo/bin/trible genid` on 2026-09-06:
+/// `4E350A11267E4E0DA8F547610594D148`.
+pub const ACTION_KEY_DELIVERY: Id = id_hex!("4E350A11267E4E0DA8F547610594D148");
+
+/// Stable definition of permission to deliver Secrets data-encryption keys.
+///
+/// The canonical SimpleArchive of these facts is the capability identity.
+/// Collection READ only permits replication of encrypted evidence; it does not
+/// imply this capability. Changing these definition facts changes its handle.
+pub fn key_delivery_definition() -> Fragment {
+    entity! {
+        capability_action: ACTION_KEY_DELIVERY,
+        triblespace::core::metadata::name: "secrets.key-delivery".to_owned(),
+        triblespace::core::metadata::description:
+            "Deliver data-encryption keys for Secrets versions by sealing additive envelopes to authorized recipients. Existing envelopes remain usable by possession after authority expires.".to_owned(),
+    }
+}
+
+/// Exact content handle signed into Secrets key-delivery proof edges.
+pub fn key_delivery_capability() -> CapabilityHandle {
+    let definition: Blob<blobencodings::SimpleArchive> =
+        key_delivery_definition().facts().clone().to_blob();
+    definition.get_handle()
+}
 
 // These records retain their already-published wire meaning across the
 // custody-vault removal. Old vault headers and access envelopes remain inert
@@ -35,6 +63,17 @@ attributes! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_delivery_definition_is_stable_and_distinct_from_replication() {
+        let capability = key_delivery_capability();
+        assert_eq!(capability, key_delivery_capability());
+        assert_ne!(capability, triblespace::core::collection::read_capability());
+        assert_ne!(
+            capability,
+            triblespace::core::collection::write_capability()
+        );
+    }
 
     #[test]
     fn retained_wire_ids_are_stable() {

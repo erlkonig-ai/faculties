@@ -1,9 +1,10 @@
 //! `secrets` — immutable encrypted versions in one configured collection.
 //!
-//! The collection descriptor owns READ/WRITE policy. This faculty neither
-//! discovers vaults nor issues a second kind of grant: generic capability
-//! tooling changes admission, and `maintain` delivers existing DEKs to newly
-//! admitted finite readers.
+//! The collection descriptor owns separate replication, WRITE, and key-delivery
+//! policies. This faculty neither discovers vaults nor issues a second kind of
+//! grant: generic capability tooling changes admission, and `maintain` delivers
+//! existing DEKs to newly admitted finite key-delivery recipients. Local
+//! decryption uses wrap possession.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -54,7 +55,7 @@ enum Command {
     },
     /// List complete immutable versions in the configured collection.
     List,
-    /// Deliver existing DEKs to every reader currently admitted by policy.
+    /// Deliver existing DEKs to currently authorized key-delivery recipients.
     Maintain,
 }
 
