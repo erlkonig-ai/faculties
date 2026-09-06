@@ -1006,8 +1006,8 @@ where
 /// Reference implementation that derives the supersession order directly.
 ///
 /// Migrations, detached fact-set validation, and tests use this as an oracle.
-/// Durable application reads use [`materialize_indexed_collection`] so the
-/// exact collection cover and its maintained order stay attached.
+/// Ordinary application reads use [`query_snapshot`] and query resident facts
+/// and the maintained positive supersession relation directly.
 pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
     let order = ObservationOrder::new(space, metadata::supersedes.id());
     load_catalog_with_order(space, &order)
@@ -1059,7 +1059,7 @@ pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Resu
 /// Strictly validate a detached Wiki snapshot with the reference resolver.
 ///
 /// This is the migration/import and test-oracle boundary. Durable application
-/// reads should use [`materialize_indexed_collection`].
+/// reads should use [`query_snapshot`].
 pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<WikiCatalog> {
     let catalog = load_catalog(facts)?;
     validate_payloads(reader, &catalog)?;
@@ -1591,7 +1591,7 @@ impl FrontierModel {
 ///
 /// This deliberately resolves the supersession order from the complete fact
 /// set. Durable application readers should use
-/// [`materialize_indexed_collection`] instead.
+/// [`query_snapshot`] instead.
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,

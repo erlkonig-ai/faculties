@@ -17,10 +17,10 @@ feature).
 
 ## Editing a faculty
 
-* Keep binaries as thin orchestration shells. Reusable domain construction,
-  validation, and read models belong in `src/lib.rs`; UI projections belong in
-  `src/widgets/`. Read both the binary and its library module before changing
-  either boundary.
+* Share schemas and reusable capabilities in the library; query with `find!`
+  at the point of use. A thin binary does not justify loading a collection into
+  a second catalog of Rust structs. UI projections belong in `src/widgets/`.
+  Read both the binary and its library module before changing either boundary.
 * Schemas (attribute IDs, shared kinds) live under
   [`src/schemas/`](src/schemas/) and are imported via
   `use faculties::schemas::<faculty>::*;`. New attribute IDs go
@@ -110,13 +110,20 @@ reconciliation.
   self-contained `Fragment`; a compound operation may publish to several fixed
   collections. Construct all dependent fragments before the first
   `Collection::commit`, and make an interrupted operation safely replayable.
-  Strictly validate untrusted reads and migration inputs; do not rescan the
-  entire current union before ordinary writes unless the domain has a real
-  cross-fragment compatibility invariant. Never introduce a mutable head,
-  branch selector, or CAS loop.
+  Validate bytes and signatures at their trust boundary. Domain queries select
+  the rows they understand: extra facts, unknown encodings, and opaque entity
+  ids must not turn an open-world union into an invalid database. Do not load
+  and validate the entire current union before ordinary reads or writes.
+  Never introduce a mutable head, branch selector, or CAS loop.
 * **No shadow datamodels.** If state belongs in the pile, query the
   pile on demand via `pattern!` / `find!`. Don't pre-materialise
   into structs/maps.
+* **Read resident targets.** Maintain explicit mapping hops, take one final
+  store snapshot, and query its target collection views. A positive join with
+  a maintained latest/status relation does not require equal support. Reserve
+  the exact-support APIs for an explicitly requested support; do not carry a
+  source-support vector through ordinary readers. Once views are selected,
+  fetching their missing payloads must not silently replace those views.
 * **`PILE` env var, not flags.** Faculties default to `PILE` from
   the environment; `--pile` is the override, not the primary path.
 * **Atomic COMMITs.** Each individual collection publication produces one

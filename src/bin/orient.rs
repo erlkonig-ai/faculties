@@ -293,32 +293,27 @@ impl OrientSource {
         })
     }
 
-    async fn maintain(&self, pile: &mut FacultyStore, snapshot: &PileSnapshot) -> Result<Support> {
-        let support = snapshot
-            .collection(self.source)
-            .map_err(|error| anyhow!("observe admitted {} support: {error}", self.label))?
-            .support()
-            .clone();
+    async fn maintain(&self, pile: &mut FacultyStore) -> Result<()> {
         drop(
-            pile.maintain_exact(self.succinct, &support)
+            pile.maintain(self.succinct)
                 .await
                 .with_context(|| format!("maintain {} Succinct collection", self.label))?,
         );
         drop(
-            pile.maintain_exact(self.rank9, &support)
+            pile.maintain(self.rank9)
                 .await
                 .with_context(|| format!("maintain {} Rank9 collection", self.label))?,
         );
-        Ok(support)
+        Ok(())
     }
 
-    fn attach_exact(&self, snapshot: &PileSnapshot, support: &Support) -> Result<OrientFact> {
+    fn observe(&self, snapshot: &PileSnapshot) -> Result<OrientFact> {
         let collection = snapshot
-            .collection_exact(self.rank9, support)
-            .with_context(|| format!("observe exact {} Rank9 projection", self.label))?;
+            .collection(self.rank9)
+            .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
         let view = collection
             .view::<FactArchive>()
-            .with_context(|| format!("read exact {} Rank9 projection", self.label))?;
+            .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
         Ok(OrientFact { collection, view })
     }
 }
@@ -416,22 +411,6 @@ struct OrientFacts {
     presentations: OrientFact,
 }
 
-/// Foundational supports selected at one immutable source watermark.
-///
-/// These coordinates are the denotational boundary of an Orient observation.
-/// A later store snapshot may contain more authored commits or independently
-/// maintained target nodes, but attachment must remain exact to this vector.
-struct OrientSupports {
-    messages: Support,
-    mail: Support,
-    teams: Support,
-    compass: Support,
-    relations: Support,
-    status: Support,
-    habits: Option<Support>,
-    presentations: Support,
-}
-
 /// One coherent semantic observation. Each source stays in its own resident
 /// target collection and Rank9 query view; shared vocabulary never turns those
 /// authority boundaries into an accidental global fact union.
@@ -462,76 +441,53 @@ impl OrientObservation {
     }
 }
 
-/// Maintain the resident support admitted by one immutable control snapshot.
-///
-/// Source acquisition precedes this observation. Later records, proofs, and
-/// blobs cannot enter any support selected by this batch.
-async fn maintain_sources(
-    pile: &mut FacultyStore,
-    snapshot: &PileSnapshot,
-    sources: &OrientSources,
-) -> Result<OrientSupports> {
-    let messages = sources.messages.maintain(pile, snapshot).await?;
-    let mail = sources.mail.maintain(pile, snapshot).await?;
-    let teams = sources.teams.maintain(pile, snapshot).await?;
-    let compass = sources.compass.maintain(pile, snapshot).await?;
-    let relations = sources.relations.maintain(pile, snapshot).await?;
-    let status = sources.status.maintain(pile, snapshot).await?;
-    let habits = match sources.habits.as_ref() {
-        Some(source) => Some(source.maintain(pile, snapshot).await?),
-        None => None,
-    };
-    let presentations = sources.presentations.maintain(pile, snapshot).await?;
+/// Advance each explicit mapping hop from its currently resident source.
+/// Readers select their target views only after this optional cache work.
+async fn maintain_sources(pile: &mut FacultyStore, sources: &OrientSources) -> Result<()> {
+    for source in [
+        Some(&sources.messages),
+        Some(&sources.mail),
+        Some(&sources.teams),
+        Some(&sources.compass),
+        Some(&sources.relations),
+        Some(&sources.status),
+        sources.habits.as_ref(),
+        Some(&sources.presentations),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        source.maintain(pile).await?;
+    }
     drop(
-        pile.maintain_exact(sources.compass_status, &compass)
+        pile.maintain(sources.compass_status)
             .await
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
-    Ok(OrientSupports {
-        messages,
-        mail,
-        teams,
-        compass,
-        relations,
-        status,
-        habits,
-        presentations,
-    })
+    Ok(())
 }
 
 /// Read every target collection as it actually exists at one immutable store
 /// boundary and one authorization instant. This function performs no writes.
-fn observe_sources(
-    snapshot: PileSnapshot,
-    sources: &OrientSources,
-    supports: &OrientSupports,
-) -> Result<OrientObservation> {
+fn observe_sources(snapshot: PileSnapshot, sources: &OrientSources) -> Result<OrientObservation> {
     let next_authorization_change = next_authorization_change(&snapshot)
         .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
-    let messages = sources
-        .messages
-        .attach_exact(&snapshot, &supports.messages)?;
-    let mail = sources.mail.attach_exact(&snapshot, &supports.mail)?;
-    let teams = sources.teams.attach_exact(&snapshot, &supports.teams)?;
-    // Orient explicitly preserves its whole source watermark across later
-    // maintenance. The positive status relation shares that chosen boundary;
-    // ordinary joins do not themselves require equal support.
-    let compass = sources.compass.attach_exact(&snapshot, &supports.compass)?;
-    let relations = sources
-        .relations
-        .attach_exact(&snapshot, &supports.relations)?;
-    let status = sources.status.attach_exact(&snapshot, &supports.status)?;
+    let messages = sources.messages.observe(&snapshot)?;
+    let mail = sources.mail.observe(&snapshot)?;
+    let teams = sources.teams.observe(&snapshot)?;
+    let compass = sources.compass.observe(&snapshot)?;
+    let relations = sources.relations.observe(&snapshot)?;
+    let status = sources.status.observe(&snapshot)?;
     let habits = sources
         .habits
         .as_ref()
-        .zip(supports.habits.as_ref())
-        .map(|(source, support)| source.attach_exact(&snapshot, support))
+        .map(|source| source.observe(&snapshot))
         .transpose()?;
-    let presentations = sources
-        .presentations
-        .attach_exact(&snapshot, &supports.presentations)?;
+    let presentations = sources.presentations.observe(&snapshot)?;
+    // Positive known-winner membership is an ordinary relation: it does not
+    // require the fact and register collections to have identical support.
     let compass_status = snapshot
-        .collection_exact(sources.compass_status, &supports.compass)
+        .collection(sources.compass_status)
         .map_err(|error| anyhow!("observe Compass status register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Compass status register: {error}"))?;
@@ -552,21 +508,21 @@ fn observe_sources(
     })
 }
 
-/// Maintain from one frozen source boundary, then observe only the target
-/// state resident in the later boundary. `source_snapshot` remains the
-/// caller's polling watermark; it is not part of the semantic observation.
+/// Maintain each hop, then observe the targets resident at one later boundary.
+/// `watermark` remains the caller's change-detection baseline, not a support
+/// vector imposed on the target collections.
 /// Preserve its authorization instant too: if maintenance crosses a validity
 /// boundary, the next poll must still see that boundary and refresh admission.
 async fn maintain_and_observe_snapshot(
     pile: &mut FacultyStore,
-    source_snapshot: &PileSnapshot,
+    watermark: &PileSnapshot,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
-    let supports = maintain_sources(pile, source_snapshot, sources).await?;
+    maintain_sources(pile, sources).await?;
     let snapshot = pile
-        .snapshot_at(source_snapshot.instant())
+        .snapshot_at(watermark.instant())
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
-    observe_sources(snapshot, sources, &supports)
+    observe_sources(snapshot, sources)
 }
 
 async fn maintain_and_observe_sources(
@@ -574,10 +530,10 @@ async fn maintain_and_observe_sources(
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
     sources.ensure(pile).await?;
-    let source_snapshot = pile
+    let watermark = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_snapshot(pile, &source_snapshot, sources).await
+    maintain_and_observe_snapshot(pile, &watermark, sources).await
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2673,9 +2629,9 @@ async fn load_wait_frame(
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    // The caller ensures sources before choosing this watermark. Later
-    // maintenance and selected-payload acquisition may change residency, but
-    // neither can advance the source frontier consumed by this attempt.
+    // The caller chooses the polling baseline before maintenance. The later
+    // observation selects resident targets once; subsequent payload retries
+    // keep those views fixed without replacing this change-detection baseline.
     let instant = snapshot.instant();
     let mut observation = maintain_and_observe_snapshot(pile, &snapshot, sources).await?;
     let (persona, reader) = match read(pile, &observation.snapshot, |reader| {
@@ -2719,7 +2675,7 @@ async fn load_wait_frame(
         Err(error) => return Err(error),
     };
     // Retain acquired bytes for later timer-driven Habit evaluation. The
-    // original fact/support vector and polling watermark remain untouched.
+    // selected target views and polling watermark remain untouched.
     observation.snapshot = reader;
     let habits = observe_habits(habits, pile_path, epoch_seconds(instant))?;
     Ok(WaitFrameLoad::Ready(WaitFrame {
@@ -2834,7 +2790,7 @@ async fn cmd_wait(
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
             // Provider availability can change without an appended record.
-            // Retry this pending view, still selecting only the sampled facts.
+            // Retry maintenance and choose a new resident target observation.
             attempt =
                 load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
             observed_snapshot = attempt.watermark_snapshot().clone();
@@ -3039,7 +2995,7 @@ fn render_tags(tags: &[String]) -> String {
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
 /// goals. Semantically read-only: it publishes no authoritative collection
-/// commits, though exact derived indexes may be maintained as cache exhaust.
+/// commits, though derived indexes may be maintained as cache exhaust.
 async fn cmd_wake(
     pile_path: &Path,
     key: Option<&Path>,
@@ -3053,74 +3009,47 @@ async fn cmd_wake(
     let signer = load_signer(pile_path, key)?;
     let mut storage = open_store(pile_path)?;
     let result = async {
-        // Register every descriptor before freezing the one source watermark.
+        // Register every descriptor before choosing the authorization instant.
         // Maintenance may append derived lattice nodes; all reads attach only
         // after that work, from one later immutable pile snapshot.
         let sources = OrientSources::open(&mut storage, &signer, false).await?;
         let memory_collection =
             OrientSource::open(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory").await?;
-        let memory_source = memory_collection.source;
         let wiki_collection =
             OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki").await?;
-        let wiki_source = wiki_collection.source;
         let wiki_latest = wiki_model::latest_collection(&mut storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
         sources.ensure(&mut storage).await?;
-        drop(storage.ensure(memory_source).await?);
-        drop(storage.ensure(wiki_source).await?);
-        let source_snapshot = storage
+        drop(storage.ensure(memory_collection.source).await?);
+        drop(storage.ensure(wiki_collection.source).await?);
+        let watermark = storage
             .snapshot()
-            .map_err(|error| anyhow!("freeze shared wake source snapshot: {error}"))?;
-        let memory_support = source_snapshot.collection(memory_source)?.support().clone();
-        let wiki_support = source_snapshot.collection(wiki_source)?.support().clone();
+            .map_err(|error| anyhow!("freeze shared wake authorization instant: {error}"))?;
+        memory_collection.maintain(&mut storage).await?;
+        wiki_collection.maintain(&mut storage).await?;
         drop(
             storage
-                .maintain_exact(memory_collection.succinct, &memory_support)
-                .await
-                .context("maintain Memory Succinct collection")?,
-        );
-        drop(
-            storage
-                .maintain_exact(memory_collection.rank9, &memory_support)
-                .await
-                .context("maintain Memory Rank9 collection")?,
-        );
-        drop(
-            storage
-                .maintain_exact(wiki_collection.succinct, &wiki_support)
-                .await
-                .context("maintain Wiki Succinct collection")?,
-        );
-        drop(
-            storage
-                .maintain_exact(wiki_collection.rank9, &wiki_support)
-                .await
-                .context("maintain Wiki Rank9 collection")?,
-        );
-        drop(
-            storage
-                .maintain_exact(wiki_latest, &wiki_support)
+                .maintain(wiki_latest)
                 .await
                 .context("maintain Wiki supersession index")?,
         );
-        let observation =
-            maintain_and_observe_snapshot(&mut storage, &source_snapshot, &sources).await?;
-        drop(source_snapshot);
+        let observation = maintain_and_observe_snapshot(&mut storage, &watermark, &sources).await?;
+        drop(watermark);
         let memory_facts = observation
             .snapshot
-            .collection_exact(memory_collection.rank9, &memory_support)
+            .collection(memory_collection.rank9)
             .context("observe maintained Memory collection")?
             .view::<FactArchive>()
             .context("attach maintained Memory collection")?;
         let wiki_facts = observation
             .snapshot
-            .collection_exact(wiki_collection.rank9, &wiki_support)
+            .collection(wiki_collection.rank9)
             .context("observe maintained Wiki collection")?
             .view::<FactArchive>()
             .context("attach maintained Wiki collection")?;
         let wiki_order = observation
             .snapshot
-            .collection_exact(wiki_latest, &wiki_support)
+            .collection(wiki_latest)
             .context("observe maintained Wiki supersession index")?
             .view::<triblespace::core::collection::latest::LatestIndex>()
             .context("attach maintained Wiki supersession index")?;
@@ -3351,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn status_query_joins_only_known_winners_when_facts_advance() {
+    fn resident_fact_and_status_views_do_not_require_equal_support() {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store(&fixture.path).unwrap();
@@ -3394,46 +3323,44 @@ mod tests {
             let unseen_id = unseen.root().unwrap();
             pile.commit(sources.compass.source, &fixture.signer, next + unseen)
                 .unwrap();
-            let snapshot = pile.snapshot().unwrap();
-            let facts = snapshot
-                .collection(sources.compass.source)
-                .unwrap()
-                .view::<TribleSet>()
-                .unwrap();
-            let facts = archive(&facts);
-            {
-                let mut query = observation.query(&snapshot);
-                query.compass = &facts;
-                assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
-                assert_eq!(latest_goal_status(&query, unseen_goal), None);
-            }
+            drop(pile.maintain(sources.compass.succinct).await.unwrap());
+            let snapshot = pile.maintain(sources.compass.rank9).await.unwrap();
+            let lagging = observe_sources(snapshot, &sources).unwrap();
+            let status_support = lagging.snapshot.collection(sources.compass_status).unwrap();
+            assert_ne!(lagging.facts.compass.support(), status_support.support());
+            let query = lagging.query(&lagging.snapshot);
+            assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
+            assert_eq!(latest_goal_status(&query, unseen_goal), None);
 
             let ready = pile.maintain(sources.compass_status).await.unwrap();
-            let advanced = ready
-                .collection(sources.compass_status)
-                .unwrap()
-                .view::<LwwIndex>()
-                .unwrap();
-            {
-                let mut query = observation.query(&snapshot);
-                query.compass = &facts;
-                query.compass_status = &advanced;
-                assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
-                assert_eq!(
-                    latest_goal_status(&query, unseen_goal).unwrap().0,
-                    unseen_id
-                );
-            }
+            let advanced = observe_sources(ready, &sources).unwrap();
+            let query = advanced.query(&advanced.snapshot);
+            assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
+            assert_eq!(
+                latest_goal_status(&query, unseen_goal).unwrap().0,
+                unseen_id
+            );
+            let frozen = lagging.query(&lagging.snapshot);
+            assert_eq!(latest_goal_status(&frozen, goal).unwrap().0, initial_id);
+            assert_eq!(latest_goal_status(&frozen, unseen_goal), None);
+            assert_eq!(
+                latest_goal_status(&observation.query(&observation.snapshot), goal)
+                    .unwrap()
+                    .0,
+                initial_id,
+            );
             pile.close().unwrap();
         });
     }
 
     #[test]
-    fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark() {
-        pollster::block_on(wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async())
+    fn wait_selects_resident_targets_and_preserves_polling_watermark() {
+        pollster::block_on(wait_selects_resident_targets_and_preserves_polling_watermark_async())
     }
 
-    async fn wait_maintenance_is_bounded_by_and_preserves_its_input_watermark_async() {
+    async fn wait_selects_resident_targets_and_preserves_polling_watermark_async() {
+        use triblespace::core::repo::WantRead;
+
         let fixture = TestPile::new();
         let mut pile = open_store(&fixture.path).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true)
@@ -3456,8 +3383,8 @@ mod tests {
 
         // This commit arrives after the wait watermark was frozen. Another
         // maintainer also realizes that newer support before this reader runs.
-        // The observation must still attach the exact support selected at its
-        // own source watermark, rather than re-selecting from the later target.
+        // The read must select that resident target progress while keeping the
+        // original watermark solely as its polling and authorization baseline.
         let message_collection = sources.messages.source;
         pile.commit(
             message_collection,
@@ -3484,19 +3411,21 @@ mod tests {
         let resident_after = frame
             .observation
             .snapshot
-            .collection(message_collection)
+            .collection(sources.messages.rank9)
             .unwrap();
         assert_eq!(frame.observation.snapshot.instant(), watermark.instant());
-        assert_eq!(
+        assert_ne!(
             frame.observation.facts.messages.support(),
             &expected_support,
-            "maintenance must derive only the source support resident at its input watermark",
+            "a source watermark must not exclude already-resident target progress",
         );
-        assert_ne!(
-            resident_after.support(), &expected_support,
-            "the later observation must contain the racing source commit without pretending its target was already derived",
+        assert_eq!(
+            frame.observation.facts.messages.support(),
+            resident_after.support(),
+            "the selected view must be the resident target at the observation snapshot",
         );
-        assert_eq!(frame.observation.facts.messages.view().iter().count(), 0);
+        assert_eq!(frame.observation.facts.messages.view().iter().count(), 1);
+        assert!(frame.observation.snapshot.wants().unwrap().next().is_none());
         assert!(
             frame.watermark.changes_since(&watermark).is_empty()
                 && watermark.changes_since(&frame.watermark).is_empty(),
@@ -3575,6 +3504,8 @@ mod tests {
         struct Supply {
             store: FacultyStore,
             source: Collection<blobencodings::SimpleArchive>,
+            succinct: Collection<SuccinctArchiveBlob>,
+            rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
             signer: SigningKey,
             handle: Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>,
             bytes: Bytes,
@@ -3611,8 +3542,9 @@ mod tests {
                     .put::<blobencodings::UnknownBlob, _>(self.bytes.clone())
                     .unwrap();
                 assert_eq!(cached, handle);
-                // Acquiring bytes races with an unrelated authoritative append.
-                // The render must not select this newer support.
+                // Acquiring bytes races with an unrelated authoritative append
+                // and its maintenance. The render must retain its chosen view
+                // even though a newer target is now resident in the reader.
                 self.store
                     .commit(
                         self.source,
@@ -3620,6 +3552,8 @@ mod tests {
                         entity! { metadata::tag: &KIND_MESSAGE_ID },
                     )
                     .unwrap();
+                drop(self.store.maintain(self.succinct).await.unwrap());
+                drop(self.store.maintain(self.rank9).await.unwrap());
                 Ok(Some(self.bytes.clone()))
             }
         }
@@ -3686,6 +3620,8 @@ mod tests {
             let mut supply = Supply {
                 store: pile,
                 source: sources.messages.source,
+                succinct: sources.messages.succinct,
+                rank9: sources.messages.rank9,
                 signer: fixture.signer.clone(),
                 handle,
                 bytes,
@@ -3716,10 +3652,7 @@ mod tests {
             assert!(!observation.snapshot.contains_blob(handle).unwrap());
             assert!(!reader.contains_blob(unrelated).unwrap());
             assert_eq!(observation.facts.messages.support(), &support);
-            assert_ne!(
-                reader.collection(supply.source).unwrap().support(),
-                &support
-            );
+            assert_ne!(reader.collection(supply.rank9).unwrap().support(), &support);
             assert!(reader.wants().unwrap().next().is_none());
             let News::Report { text, events } = &news else {
                 panic!("the acquired body must make the selected message readable")

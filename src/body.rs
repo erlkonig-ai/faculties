@@ -61,9 +61,9 @@ pub struct BodyCatalog {
 
 /// One coherent Body fact view plus its maintained intent register.
 ///
-/// Facts, exact support, and the attachment reader come from one immutable
-/// post-maintenance store snapshot. The index is attached for exactly the same
-/// support; it is cache exhaust, never additional authority.
+/// Facts, known intent winners, and the attachment reader come from one
+/// immutable post-maintenance store snapshot. Each target contributes its
+/// resident view; their supports need not be identical.
 pub struct BodySnapshot {
     facts: FactArchive,
     store_snapshot: PileSnapshot,
@@ -71,12 +71,12 @@ pub struct BodySnapshot {
 }
 
 impl BodySnapshot {
-    /// Materialized facts admitted by this exact source cover.
+    /// Shard-preserving facts from the resident target collection.
     pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
-    /// Store snapshot captured while validating this exact source view.
+    /// Store snapshot shared by the selected fact and intent views.
     pub fn store_snapshot(&self) -> &PileSnapshot {
         &self.store_snapshot
     }
@@ -536,8 +536,8 @@ pub fn latest_intent<P: TriblePattern>(
     .min_by_key(|row| (row.created_at, row.text)))
 }
 
-/// Capture Body facts and attach the maintained intent LWW index for that
-/// exact source cover, constructing missing derived artifacts if necessary.
+/// Maintain Body's explicit mapping hops, then attach resident facts and
+/// known intent winners from one immutable store observation.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -562,22 +562,21 @@ pub async fn materialize_indexed_collection(
         .maintain(rank9)
         .await
         .context("maintain Body fact collection")?;
-    let support = ready.collection(rank9)?.support().clone();
     let instant = ready.instant();
     drop(ready);
     drop(
-        pile.maintain_exact(target, &support)
+        pile.maintain(target)
             .await
             .map_err(|error| anyhow!("maintain Body intent register: {error}"))?,
     );
     let store_snapshot = pile.snapshot_at(instant)?;
     let facts = store_snapshot
-        .collection_exact(rank9, &support)
+        .collection(rank9)
         .context("observe maintained Body fact collection")?
         .view::<FactArchive>()
         .context("read maintained Body fact collection")?;
     let intents = store_snapshot
-        .collection_exact(target, &support)
+        .collection(target)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
         .view::<LwwIndex>()
         .map_err(|error| anyhow!("read Body intent register: {error}"))?;
@@ -620,6 +619,104 @@ mod tests {
             pose,
         });
         fragment
+    }
+
+    #[test]
+    fn resident_intent_views_allow_lag_without_changing_frozen_snapshots() {
+        use triblespace::core::repo::{BlobStorePut, WantRead};
+
+        pollster::block_on(async {
+            std::env::remove_var(crate::collection_names::override_env_name(DEFAULT_SCOPE_ID));
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("body.pile");
+            std::fs::File::create(&path).unwrap();
+            let signer = SigningKey::from_bytes(&[32; 32]);
+            let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+            let source =
+                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            let target = intent_register_collection(&mut pile, signer.verifying_key()).unwrap();
+            let first = intent_record(&IntentRow {
+                id: KIND_INTENT,
+                created_at: at(1.0),
+                text: pile
+                    .put::<blobencodings::UTF8String, _>("first".to_owned())
+                    .unwrap(),
+            });
+            let first_id = first.root().unwrap();
+            pile.commit(source, &signer, first).unwrap();
+            let before = materialize_indexed_collection(&mut pile, &signer)
+                .await
+                .unwrap();
+
+            let second = intent_record(&IntentRow {
+                id: KIND_INTENT,
+                created_at: at(2.0),
+                text: pile
+                    .put::<blobencodings::UTF8String, _>("second".to_owned())
+                    .unwrap(),
+            });
+            let second_id = second.root().unwrap();
+            pile.commit(source, &signer, second).unwrap();
+            drop(pile.maintain(succinct).await.unwrap());
+            let snapshot = pile.maintain(rank9).await.unwrap();
+            let fact_collection = snapshot.collection(rank9).unwrap();
+            let intent_collection = snapshot.collection(target).unwrap();
+            assert_ne!(fact_collection.support(), intent_collection.support());
+            let facts = fact_collection.view::<FactArchive>().unwrap();
+            let lagging = intent_collection.view::<LwwIndex>().unwrap();
+            assert_eq!(
+                latest_intent(&facts, &lagging).unwrap().unwrap().id,
+                first_id
+            );
+
+            let snapshot = pile.maintain(target).await.unwrap();
+            let advanced = snapshot
+                .collection(target)
+                .unwrap()
+                .view::<LwwIndex>()
+                .unwrap();
+            assert_eq!(latest_intent(before.facts(), &advanced).unwrap(), None);
+            assert_eq!(
+                latest_intent(&facts, &advanced).unwrap().unwrap().id,
+                second_id
+            );
+            assert_eq!(
+                latest_intent(&facts, &lagging).unwrap().unwrap().id,
+                first_id
+            );
+
+            let admitted_before = source.admitted(&snapshot).unwrap();
+            let after = materialize_indexed_collection(&mut pile, &signer)
+                .await
+                .unwrap();
+            assert_eq!(
+                latest_intent(after.facts(), after.intent_register())
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                second_id,
+            );
+            assert_eq!(
+                latest_intent(before.facts(), before.intent_register())
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                first_id,
+            );
+            assert_eq!(
+                source.admitted(after.store_snapshot()).unwrap(),
+                admitted_before
+            );
+            assert!(after.store_snapshot().wants().unwrap().next().is_none());
+            pile.close().unwrap();
+        });
     }
 
     #[test]

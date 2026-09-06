@@ -4,11 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient and Body intent reads now select resident fact and register targets
+  from one final store snapshot. Remove Orient's separate source-support vector
+  and ordinary exact-support attachment; lagging positive latest/status joins
+  remain useful without equal supports. Wait retains its polling watermark and
+  authorization instant, and payload acquisition preserves the already-selected
+  views even if a concurrent writer maintains newer targets. No data migration
+  or implicit `WANT` is introduced.
+
 - Wiki frontiers now join the maintained positive `LatestIndex` relation;
   Compass and Orient status queries likewise join known LWW winners. Facts
   ahead of a derived relation cannot expose unseen current states. Ordinary
   Wiki, Compass, and widget readers maintain facts and indexes independently,
-  while explicit migration and Orient watermark requests retain exact support.
+  while explicit migration requests retain exact support.
   Widget cache identities include each relation's support so index-only progress
   refreshes projections. The latest descriptor uses the new core `(H, D)`
   encoding; old observed-only artifacts are not reinterpreted.
@@ -17,7 +25,7 @@ All notable changes to this project will be documented in this file.
   and Rank9 collections explicitly, retaining the same descriptor policies and
   identities. Ordinary fact readers advance each mapping with `maintain` and
   read the resulting snapshot instead of preselecting a foundation-wide support.
-  Exact support remains explicit for paired indexes and retained observations;
+  Exact support remains available for explicitly selected observations;
   no schema or pile migration is needed.
 
 - **Foreground Message, Orient, Wiki, Compass, and ordinary Files reads can
@@ -52,12 +60,11 @@ All notable changes to this project will be documented in this file.
 - **Orient reads maintained Succinct collection snapshots directly.** Messages,
   Mail, Teams, Compass, Relations, Status, Habits, and Orient presentations
   remain separately queryable instead of being copied into one temporary
-  `TribleSet` or retained in a Rust catalog. Maintenance freezes one pile
-  snapshot and advances the raw and Rank9 mappings over only the foundational
-  support resident there; observation then attaches each target collection to
-  one later immutable pile snapshot and reads exactly the support represented
-  by each resident target cover; Compass facts and status share one exact
-  resident support. Durable acknowledgement is the relational
+  `TribleSet` or retained in a Rust catalog. Maintenance advances the raw and
+  Rank9 mappings from their resident sources; observation then attaches each
+  target collection to one final immutable pile snapshot. Compass facts and
+  status join through positive known-winner membership. Durable acknowledgement
+  is the relational
   `Presented(persona, event)` set, and output is flushed before presentation is
   recorded. Wait keeps its last readable view while required view input is
   unavailable and retains the exact pre-maintenance pile snapshot as its polling
@@ -73,8 +80,7 @@ All notable changes to this project will be documented in this file.
   scan.
 
 - **Orient validates the data it observes, not every historical row.** `show`,
-  `wait`, and `poll` select resident target covers in one immutable snapshot
-  (with Compass facts and status attached to one exact shared support), and
+  `wait`, and `poll` select resident target covers in one immutable snapshot, and
   typed query paths decode only selected payloads. A historical
   row outside those typed views therefore cannot poison every future
   observation merely by remaining in the append-only history.
