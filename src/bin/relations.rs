@@ -9,23 +9,24 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::clock;
-use faculties::collection_names::open_configured;
+use faculties::collection_names::{configured_handle, open_configured, open_exact_in};
 use faculties::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
-use faculties::storage::{load_signer, open_pile_strict, FactArchive};
+use faculties::storage::{load_signer, open_store, runtime, FactArchive, FacultyStore};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::async_store::Blocking;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -267,16 +268,21 @@ enum IdentityCommand {
     List,
 }
 
+type RelationsReader = Blocking<<FacultyStore as SnapshotSource>::Snapshot>;
+
 struct RelationsStorage<'a> {
-    pile: &'a mut Pile,
+    pile: &'a mut FacultyStore,
     signer: &'a SigningKey,
     collection: Collection<SimpleArchive>,
     facts: &'a FactArchive,
-    reader: &'a PileSnapshot,
+    reader: &'a RelationsReader,
 }
 
 impl RelationsStorage<'_> {
-    fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
+    fn with_view<T>(
+        &self,
+        f: impl FnOnce(&FactArchive, &RelationsReader) -> Result<T>,
+    ) -> Result<T> {
         f(self.facts, self.reader)
     }
 
@@ -284,7 +290,7 @@ impl RelationsStorage<'_> {
     /// collection record.
     fn update<T>(
         &mut self,
-        f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<(Option<Fragment>, T)>,
+        f: impl FnOnce(&FactArchive, &RelationsReader) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         let (fragment, result) = f(self.facts, self.reader)?;
         if let Some(fragment) = fragment {
@@ -309,7 +315,7 @@ fn now_observation() -> Result<relations::ObservedAt> {
 }
 
 fn resolve_person_anchor(
-    reader: &PileSnapshot,
+    reader: &RelationsReader,
     facts: &FactArchive,
     selector: &str,
     include_retired: bool,
@@ -327,7 +333,11 @@ fn resolve_person_anchor(
     }
 }
 
-fn resolve_group_anchor(reader: &PileSnapshot, facts: &FactArchive, selector: &str) -> Result<Id> {
+fn resolve_group_anchor(
+    reader: &RelationsReader,
+    facts: &FactArchive,
+    selector: &str,
+) -> Result<Id> {
     match relations::resolve_group(reader, facts, selector)? {
         SelectorOutcome::Unique(id) => Ok(id),
         SelectorOutcome::Forked {
@@ -937,7 +947,7 @@ fn cmd_group_reconcile(
 }
 
 fn print_group_snapshot(
-    reader: &PileSnapshot,
+    reader: &RelationsReader,
     facts: &FactArchive,
     snapshot: GroupSnapshot,
 ) -> Result<()> {
@@ -1122,33 +1132,44 @@ fn main() -> Result<()> {
     };
 
     let signer = load_signer(&cli.pile, cli.key.as_deref())?;
-    let mut pile = open_pile_strict(&cli.pile)?;
+    let runtime = Arc::new(runtime()?);
+    let mut pile = open_store(&cli.pile)?;
     let result = (|| {
-        let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        let collection = if let Some(handle) = configured_handle(DEFAULT_SCOPE_ID)? {
+            let reader = Blocking::with_runtime(pile.snapshot()?, Arc::clone(&runtime));
+            open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)?
+        } else {
+            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?
+        };
         let descriptor_snapshot = pile.snapshot()?;
         let policy = collection.policy(&descriptor_snapshot)?;
         drop(descriptor_snapshot);
         let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
         let facts_rank9 =
             pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
-        let reader = pollster::block_on(async {
-            drop(pile.ensure(collection).await?);
-            drop(pile.maintain(facts_succinct).await?);
-            pile.maintain(facts_rank9).await
-        })
-        .context("maintain Relations fact collection")?;
+        let reader = runtime
+            .block_on(async {
+                drop(pile.ensure(collection).await?);
+                drop(pile.maintain(facts_succinct).await?);
+                pile.maintain(facts_rank9).await
+            })
+            .context("maintain Relations fact collection")?;
         let observed = reader
             .collection(facts_rank9)
             .context("observe Relations Rank9 projection")?;
         let view = observed
             .view::<FactArchive>()
             .context("read Relations Rank9 projection")?;
+        // Only exact payload gets may acquire here. Facts, records, proofs,
+        // and their interpretation instant remain those of this observation.
+        // Dispatch stays outside block_on: Blocking owns the one CLI boundary.
+        let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(&runtime));
         let mut storage = RelationsStorage {
             pile: &mut pile,
             signer: &signer,
             collection,
             facts: &view,
-            reader: &reader,
+            reader: &payload_reader,
         };
 
         match command {
@@ -1214,8 +1235,13 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{initialize_signer, open_pile_strict};
     use std::fs;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::blob::Bytes;
+    use triblespace::core::collection::{
+        CollectionRead, CollectionRecord, CollectionRecordSelector,
+    };
 
     fn profile(label: &str) -> ProfileInput {
         ProfileInput {
@@ -1321,5 +1347,114 @@ mod tests {
         drop(reader);
         store.close().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_payload_reads_keep_relations_facts_frozen_and_publish_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("relations.pile");
+        let key = directory.path().join("relations.key");
+        fs::File::create(&path).unwrap();
+        let signer = initialize_signer(&path, Some(&key)).unwrap();
+        let runtime = Arc::new(runtime().unwrap());
+        let mut pile = open_store(&path).unwrap();
+        let collection =
+            faculties::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let policy = collection.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+
+        let person = genid().id;
+        let (fragment, initial_profile, _) =
+            relations::person_fragment(person, profile("Ada")).unwrap();
+        let (facts, mut payloads) = fragment.into_facts_and_blobs();
+        let label = relations::profile_snapshot(&facts, initial_profile)
+            .unwrap()
+            .label;
+        // The source archive is present, but its text attachments are cold.
+        let initial = pile.commit(collection, &signer, facts.into()).unwrap();
+        let frozen = runtime
+            .block_on(async {
+                drop(pile.ensure(collection).await?);
+                drop(pile.maintain(succinct).await?);
+                pile.maintain(rank9).await
+            })
+            .unwrap();
+        let instant = frozen.instant();
+        assert!(!frozen.contains_blob(label).unwrap());
+        let observed = frozen.collection(rank9).unwrap();
+        let view = observed.view::<FactArchive>().unwrap();
+        let reader = Blocking::with_runtime(frozen.clone(), Arc::clone(&runtime));
+
+        // Model bytes arriving in shared backing after the semantic snapshot.
+        // Exact get may use them; it must not adopt the later person's facts.
+        let payloads = payloads.snapshot().unwrap();
+        for blob in payloads.blobs() {
+            let blob = blob.unwrap();
+            let bytes: Bytes = payloads.get(blob.handle).unwrap();
+            pile.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        let later_person = genid().id;
+        let (later, _, _) = relations::person_fragment(later_person, profile("Ada")).unwrap();
+        pile.commit(collection, &signer, later).unwrap();
+
+        let mut storage = RelationsStorage {
+            pile: &mut pile,
+            signer: &signer,
+            collection,
+            facts: &view,
+            reader: &reader,
+        };
+        storage
+            .with_view(|facts, reader| {
+                assert_eq!(resolve_person_anchor(reader, facts, "Ada", false)?, person);
+                assert_eq!(
+                    resolve_person_anchor(reader, facts, "old alias", false)?,
+                    person
+                );
+                assert_eq!(relations::person_anchors(facts), BTreeSet::from([person]));
+                let current = relations::current_profile(facts, person)?;
+                assert_eq!(relations::profile_input(reader, &current)?, profile("Ada"));
+                Ok(())
+            })
+            .unwrap();
+        let successor = storage
+            .update(|facts, reader| {
+                let current = relations::current_profile(facts, person)?;
+                let mut input = relations::profile_input(reader, &current)?;
+                input.note = Some("one snapshot-backed publication".to_owned());
+                let fragment = relations::profile_fragment(person, input, &[current.id])?;
+                let successor = fragment.root().unwrap();
+                Ok((Some(fragment), successor))
+            })
+            .unwrap();
+        assert_ne!(successor, initial_profile);
+        drop(storage);
+
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
+        assert_eq!(frozen.instant(), instant);
+        assert!(!frozen.contains_blob(label).unwrap());
+        assert_eq!(
+            frozen.select_records(&selectors).unwrap(),
+            vec![CollectionRecord::Commit(initial)],
+        );
+        assert_eq!(
+            relations::profile_head(&view, person).unwrap(),
+            Head::Unique(initial_profile)
+        );
+        let after = pile.snapshot().unwrap();
+        assert_eq!(after.select_records(&selectors).unwrap().len(), 3);
+        assert_eq!(after.wants().unwrap().count(), 0);
+        drop(after);
+        drop(reader);
+        drop(view);
+        drop(observed);
+        drop(frozen);
+        pile.close().unwrap();
     }
 }
