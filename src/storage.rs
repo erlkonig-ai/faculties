@@ -45,9 +45,13 @@ use triblespace::core::trible::{Fragment, TribleSet};
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
 
-/// A live faculty store. Its snapshots are still resident-only `PileSnapshot`s.
+/// A live faculty store. Its snapshots freeze collection records, proofs, and
+/// residency observations while permitting shared async exact-blob reads.
 /// The network host starts only when an explicitly requested blob is missing.
 pub type FacultyStore = triblespace_net::peer::Peer<Pile>;
+
+/// The live store's frozen observation with an async exact-blob reader.
+pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 
 /// Enter the async I/O boundary of a foreground command.
 pub fn runtime() -> Result<tokio::runtime::Runtime> {

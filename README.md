@@ -44,7 +44,7 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 35ec1817a1f1f62251e19ad5e8eaeb5214760d0c
+git -C triblespace-rs checkout b6848a3320ab4cecb77da0dc7a8dd22e5d653b27
 git -C mary checkout ffc6fbf6647dab60da81d298067c09302a2517f4
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
@@ -79,11 +79,16 @@ viewer               # picks up PILE from the environment
 
 ### Reading cold blobs from peers
 
-`message`, `orient`, `wiki`, `compass`, and ordinary `files` commands use a live
-store for foreground acquisition. If an explicitly requested descriptor, fact
-fragment, or selected payload is absent locally, they discover a provider
+`relations`, `message`, `orient`, `wiki`, `compass`, and ordinary `files` commands
+use a live store for foreground acquisition. If an explicitly requested
+descriptor, fact fragment, or selected payload is absent locally, they discover a provider
 through the blob DHT and cache its bytes. Files similarity and embedding
 commands retain their resident-only model/input paths for now.
+Live snapshots expose async exact-blob reads: fetching a selected handle caches
+its bytes without advancing the snapshot's records, authorization instant, or
+selected collection covers. Relations uses this reader directly; the other
+ported commands still use the shared payload-retry adapter. Neither path emits
+an implicit `WANT`.
 Configure one or more bootstrap routes as comma-separated Iroh endpoint
 tickets or endpoint IDs:
 

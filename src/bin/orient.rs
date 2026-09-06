@@ -36,6 +36,7 @@ use faculties::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use faculties::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use faculties::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use faculties::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use faculties::storage::FacultySnapshot;
 use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
 use faculties::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
@@ -57,7 +58,6 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, MissingBlob, StorageClose, StoreSnapshot,
 };
@@ -307,7 +307,7 @@ impl OrientSource {
         Ok(())
     }
 
-    fn observe(&self, snapshot: &PileSnapshot) -> Result<OrientFact> {
+    fn observe(&self, snapshot: &FacultySnapshot) -> Result<OrientFact> {
         let collection = snapshot
             .collection(self.rank9)
             .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
@@ -386,7 +386,7 @@ impl OrientSources {
 }
 
 struct OrientFact {
-    collection: CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    collection: CollectionSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     view: FactArchive,
 }
 
@@ -418,14 +418,14 @@ struct OrientObservation {
     /// Resident payload reader at the observation's frozen authorization
     /// instant. Exact acquisition may advance its blob residency without
     /// changing any selected fact view, support, or authorization boundary.
-    snapshot: PileSnapshot,
+    snapshot: FacultySnapshot,
     facts: OrientFacts,
     compass_status: LwwIndex,
     next_authorization_change: Option<Epoch>,
 }
 
 impl OrientObservation {
-    fn query<'a>(&'a self, snapshot: &'a PileSnapshot) -> OrientQuery<'a> {
+    fn query<'a>(&'a self, snapshot: &'a FacultySnapshot) -> OrientQuery<'a> {
         OrientQuery {
             messages: self.facts.messages.view(),
             mail: self.facts.mail.view(),
@@ -469,7 +469,10 @@ async fn maintain_sources(pile: &mut FacultyStore, sources: &OrientSources) -> R
 
 /// Read every target collection as it actually exists at one immutable store
 /// boundary and one authorization instant. This function performs no writes.
-fn observe_sources(snapshot: PileSnapshot, sources: &OrientSources) -> Result<OrientObservation> {
+fn observe_sources(
+    snapshot: FacultySnapshot,
+    sources: &OrientSources,
+) -> Result<OrientObservation> {
     let next_authorization_change = next_authorization_change(&snapshot)
         .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
     let messages = sources.messages.observe(&snapshot)?;
@@ -515,7 +518,7 @@ fn observe_sources(snapshot: PileSnapshot, sources: &OrientSources) -> Result<Or
 /// boundary, the next poll must still see that boundary and refresh admission.
 async fn maintain_and_observe_snapshot(
     pile: &mut FacultyStore,
-    watermark: &PileSnapshot,
+    watermark: &FacultySnapshot,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
     maintain_sources(pile, sources).await?;
@@ -550,7 +553,7 @@ struct OrientQuery<'a> {
     habits: Option<&'a FactArchive>,
     presentations: &'a FactArchive,
     compass_status: &'a LwwIndex,
-    snapshot: &'a PileSnapshot,
+    snapshot: &'a FacultySnapshot,
 }
 
 fn is_payload_pending(error: &anyhow::Error) -> bool {
@@ -560,7 +563,7 @@ fn is_payload_pending(error: &anyhow::Error) -> bool {
 }
 
 fn read_utf8(
-    snapshot: &PileSnapshot,
+    snapshot: &FacultySnapshot,
     handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
     label: &str,
 ) -> Result<String> {
@@ -571,14 +574,13 @@ fn read_utf8(
     {
         return Err(MissingBlob { handle: unknown }.into());
     }
-    let value: View<str> = snapshot
-        .get(handle)
+    let value: View<str> = BlobStoreGet::get(snapshot, handle)
         .with_context(|| format!("read {label} payload {}", hex::encode(handle.raw)))?;
     Ok(value.to_string())
 }
 
 fn read_bytes(
-    snapshot: &PileSnapshot,
+    snapshot: &FacultySnapshot,
     handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
     label: &str,
 ) -> Result<Vec<u8>> {
@@ -589,8 +591,7 @@ fn read_bytes(
     {
         return Err(MissingBlob { handle: unknown }.into());
     }
-    let value: Bytes = snapshot
-        .get(handle)
+    let value: Bytes = BlobStoreGet::get(snapshot, handle)
         .with_context(|| format!("read {label} payload {}", hex::encode(handle.raw)))?;
     Ok(value.to_vec())
 }
@@ -1522,7 +1523,7 @@ struct HabitObservation {
 /// Prepare only the selected Habit evaluation inputs. No scripts run here:
 /// a missing payload can safely retry this read against the same frozen facts.
 fn prepare_habits(
-    snapshot: &PileSnapshot,
+    snapshot: &FacultySnapshot,
     facts: &FactArchive,
 ) -> Result<(Vec<habits::HabitRow>, HabitObservation)> {
     let mut rows = Vec::new();
@@ -1932,7 +1933,7 @@ fn group_attention_name_handles<P: TriblePattern>(
 }
 
 fn group_attention_keys<P: TriblePattern>(
-    reader: &PileSnapshot,
+    reader: &FacultySnapshot,
     facts: &P,
     persona: Id,
 ) -> Result<HashSet<String>> {
@@ -2566,7 +2567,7 @@ struct WaitOutcome {
 }
 
 struct WaitFrame {
-    watermark: PileSnapshot,
+    watermark: FacultySnapshot,
     observation: OrientObservation,
     persona: Id,
     habits: HabitObservation,
@@ -2574,7 +2575,7 @@ struct WaitFrame {
 }
 
 struct PendingWaitFrame {
-    watermark: PileSnapshot,
+    watermark: FacultySnapshot,
     next_authorization_change: Option<Epoch>,
     reason: PendingWaitReason,
 }
@@ -2589,7 +2590,7 @@ enum PendingWaitReason {
 
 impl PendingWaitFrame {
     fn awaiting_view(
-        watermark: PileSnapshot,
+        watermark: FacultySnapshot,
         observation: &OrientObservation,
         reason: PendingWaitReason,
     ) -> Self {
@@ -2607,7 +2608,7 @@ enum WaitFrameLoad {
 }
 
 impl WaitFrameLoad {
-    fn watermark_snapshot(&self) -> &PileSnapshot {
+    fn watermark_snapshot(&self) -> &FacultySnapshot {
         match self {
             Self::Pending(pending) => &pending.watermark,
             Self::Ready(frame) => &frame.watermark,
@@ -2625,7 +2626,7 @@ impl WaitFrameLoad {
 async fn load_wait_frame(
     pile: &mut FacultyStore,
     sources: &OrientSources,
-    snapshot: PileSnapshot,
+    snapshot: FacultySnapshot,
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
@@ -2690,7 +2691,7 @@ async fn load_wait_frame(
 fn retained_habit_support_is_admitted(
     observation: &OrientObservation,
     sources: &OrientSources,
-    snapshot: &PileSnapshot,
+    snapshot: &FacultySnapshot,
 ) -> Result<bool> {
     let (Some(source), Some(facts)) = (sources.habits.as_ref(), observation.facts.habits.as_ref())
     else {
@@ -3514,7 +3515,7 @@ mod tests {
         }
 
         impl SnapshotSource for Supply {
-            type Snapshot = PileSnapshot;
+            type Snapshot = FacultySnapshot;
             type SnapshotError = <FacultyStore as SnapshotSource>::SnapshotError;
 
             fn snapshot_at(

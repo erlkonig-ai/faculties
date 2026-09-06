@@ -27,7 +27,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::repo::async_store::Blocking;
-use triblespace::core::repo::SnapshotSource;
+use triblespace::core::repo::{SnapshotSource, StorageClose};
 use triblespace::prelude::*;
 
 #[derive(Parser)]

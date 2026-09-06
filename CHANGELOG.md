@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Live Faculty snapshots now support shared async exact-blob reads without
+  requiring a mutable store at each payload read. Records, authorization time,
+  selected covers, and passive residency observations remain frozen while
+  explicitly requested bytes may be fetched and cached. Relations uses this
+  snapshot reader for cold persona labels and aliases, including publication
+  paths, without rerunning the operation or emitting `WANT`. Other live callers
+  retain their payload-retry adapter while adopting the new snapshot type.
+  No schema changes, entity re-identification, or pile migration are required.
+
 - Add `migrations resource-capabilities` for the exact direct READ/WRITE-policy
   roots from core `35ec1817`. Plan and publish separately by author, with an
   optional explicit authority root, exact descriptor handles, and report-only
