@@ -40,20 +40,20 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 /// Facts, positive status membership, and blob reader are captured at one
 /// immutable store observation without requiring equal support. Maintained
 /// artifacts are cache exhaust, never additional semantic authority.
-pub struct CompassSnapshot {
+pub struct CompassSnapshot<R = PileSnapshot> {
     facts: FactArchive,
-    store_snapshot: PileSnapshot,
+    store_snapshot: R,
     status: LwwIndex,
 }
 
-impl CompassSnapshot {
+impl<R> CompassSnapshot<R> {
     /// Shard-preserving facts admitted by this exact snapshot.
     pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
     /// Store snapshot captured while validating this exact collection view.
-    pub fn store_snapshot(&self) -> &PileSnapshot {
+    pub fn store_snapshot(&self) -> &R {
         &self.store_snapshot
     }
 
@@ -63,7 +63,7 @@ impl CompassSnapshot {
     }
 
     /// Consume the coherent snapshot into facts, store snapshot, and status index.
-    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwIndex) {
+    pub fn into_parts(self) -> (FactArchive, R, LwwIndex) {
         (self.facts, self.store_snapshot, self.status)
     }
 }
@@ -1064,9 +1064,9 @@ pub fn materialize_collection(
 pub async fn materialize_indexed_collection<S>(
     pile: &mut S,
     signer: &SigningKey,
-) -> Result<CompassSnapshot>
+) -> Result<CompassSnapshot<S::Snapshot>>
 where
-    S: Store<Snapshot = PileSnapshot> + AsyncBlobStoreAcquire + Send,
+    S: Store + AsyncBlobStoreAcquire + Send,
 {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let policy = source.policy(&pile.snapshot()?)?;

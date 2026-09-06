@@ -8,7 +8,9 @@ use faculties::schemas::embeddings;
 use faculties::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
+use faculties::storage::{
+    load_signer, open_store, read, runtime, FactArchive, FacultySnapshot, FacultyStore,
+};
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
@@ -27,7 +29,7 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 #[cfg(test)]
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource, StorageClose};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource, StorageClose};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
@@ -415,7 +417,7 @@ fn with_files_view<T>(
         Collection<SimpleArchive>,
         &SigningKey,
         &FactArchive,
-        &PileSnapshot,
+        &FacultySnapshot,
         &tokio::runtime::Runtime,
     ) -> Result<T>,
 ) -> Result<T> {
@@ -1099,13 +1101,14 @@ fn cmd_get<P, S>(
     store: &mut S,
     runtime: &tokio::runtime::Runtime,
     space: &P,
-    reader: &PileSnapshot,
+    reader: &S::Snapshot,
     id: &str,
     output: Option<&str>,
 ) -> Result<()>
 where
     P: TriblePattern,
-    S: SnapshotSource<Snapshot = PileSnapshot> + AsyncBlobStoreAcquire,
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
 {
     let eid = file_capability::resolve_selector(space, id)?;
 
@@ -1231,7 +1234,7 @@ fn cmd_tag<P: TriblePattern>(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     space: &P,
-    reader: &PileSnapshot,
+    reader: &FacultySnapshot,
     id: &str,
     tag_name: &str,
 ) -> Result<()> {
