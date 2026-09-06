@@ -16,6 +16,21 @@ All notable changes to this project will be documented in this file.
   Key-delivery action ID minted with installed `trible genid` on 2026-09-06:
   `4E350A11267E4E0DA8F547610594D148`.
 
+- **Memory context is now density-shaped recollection, not a tiled exact
+  cover.** A continuous logarithmic-age gradient maps the reader's available
+  character space across lived time. Each candidate's charged length defines
+  one ideal temporal slot on that map, and the greedy walk chooses the memory
+  whose actual start and end best match it. Gaps, overlap, wobbling temporal
+  centres, and omitted detail are valid active recall while the pile remains
+  lossless; broad old arcs emerge from the gradient and available support
+  rather than a special coverage rule. The sampler's greedy SPACE order is
+  rendered unchanged: there is no chronological repair that relocates a chosen
+  memory and hides where the journal lacks appropriately dense support. Remove
+  tile/detail controls and `memory levels`; `memory churn` now replays
+  the sampler by journal observation time and reports any unselected stretch
+  longer than one quarter of the available life. Budgets charge the exact
+  rendered range/body framing as well as optional per-chunk consumer overhead.
+
 - Orient and Body intent reads now select resident fact and register targets
   from one final store snapshot. Remove Orient's separate source-support vector
   and ordinary exact-support attachment; lagging positive latest/status joins

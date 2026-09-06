@@ -2,12 +2,12 @@
 //! IN-PROCESS by more than one caller.
 //!
 //! `memory context` (in `src/bin/memory.rs`) and `orient wake` (in
-//! `src/bin/orient.rs`) both need the antichain cover over ALL of a persona's
-//! memories — coarse → fine, fit to a character budget — rendered to a string.
+//! `src/bin/orient.rs`) both need the same density-shaped recollection of a
+//! persona's memories, fit to a character budget and rendered to a string.
 //! Keeping the render (and the chunk accessors it needs) here means the two
-//! callers can never drift: the cover semantics — antichain completeness, the
-//! character budget, the `--about`/`--filter`/`--remove` composition — live in
-//! exactly one place. Context never gets to rewrite the temporal structure:
+//! callers can never drift: the recollection semantics, character budget, and
+//! `--about`/`--filter`/`--remove` composition live in exactly one place.
+//! Context never gets to rewrite the temporal structure:
 //! `--about` may choose one recollection among entries with the exact same
 //! temporal coverage, but cannot change which spans the cover refines.
 //!
@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 
 #[cfg(feature = "local-embed")]
 use anyhow::anyhow;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use hifitime::Epoch;
 
 use triblespace::core::metadata;
@@ -255,14 +255,10 @@ pub fn collect_chunk_spans<P: TriblePattern>(space: &P) -> Vec<(i128, i128, Id)>
     spans
 }
 
-/// Budget weight charged for a wordless image memory in the context cover —
-/// it renders as a one-line `[image memory @ <span>]` marker, so a small fixed
-/// character cost (vs a text summary's measured length).
-pub const IMAGE_CHUNK_CHAR_COST: usize = 64;
-
-/// Character-cost of a chunk (its budget weight), loaded lazily and cached by
-/// span index. Cost is the summary's exact character count, so the budget and
-/// the per-chunk weights are in the same, unambiguous CHARACTER units.
+/// Exact rendered character-cost of a chunk, loaded lazily and cached by span
+/// index. This includes the leading blank line, range label, body, and their
+/// newlines; `budget_chars` therefore bounds the returned string rather than
+/// merely its summaries.
 pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     ws: &B,
     space: &P,
@@ -273,16 +269,25 @@ pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     if let Some(c) = cache[i] {
         return Ok(c);
     }
-    let c = match chunk_summary_handle(space, spans[i].2) {
+    let (start, end, id) = spans[i];
+    let range = format_time_range(key_to_epoch(start), key_to_epoch(end));
+    // Leading blank line plus the range and its newline.
+    let framing = 1usize
+        .saturating_add(range.chars().count())
+        .saturating_add(1);
+    let body = match chunk_summary_handle(space, id) {
         Some(handle) => {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            summary.chars().count()
+            Some(summary.trim_end().chars().count())
         }
-        // A wordless image memory renders as a small `[image memory @ <span>]`
-        // marker in the cover — a fixed handful of characters, not zero.
-        None if chunk_image_handle(space, spans[i].2).is_some() => IMAGE_CHUNK_CHAR_COST,
-        None => 0,
+        None if chunk_image_handle(space, id).is_some() => {
+            Some(format!("[image memory @ {range}]").chars().count())
+        }
+        None => None,
     };
+    let c = body.map_or(framing, |chars| {
+        framing.saturating_add(chars).saturating_add(1)
+    });
     cache[i] = Some(c);
     Ok(c)
 }
@@ -524,14 +529,10 @@ pub struct CoverOpts {
     pub remove: Option<String>,
     /// Cosine cutoff for `--filter`/`--remove` eligibility.
     pub sim_threshold: f32,
-    /// Memories per tile, stated by the reader with its window. `None` searches
-    /// for the finest detail that fits the budget; a reader that wants the same
-    /// cover tomorrow states the detail that search printed.
-    pub detail: Option<usize>,
 }
 
 impl CoverOpts {
-    /// The plain recency-first cover: no about/filter/remove, default threshold.
+    /// Plain density-shaped recollection: no semantic gating or substitution.
     pub fn plain(budget_chars: usize) -> Self {
         CoverOpts {
             budget_chars,
@@ -540,420 +541,227 @@ impl CoverOpts {
             filter: None,
             remove: None,
             sim_threshold: DEFAULT_SIM_THRESHOLD,
-            detail: None,
         }
     }
 }
 
-/// Render the context-cover text from maintained Memory and shared Embeddings
-/// views, using `reader` for their attachment blobs. The result is the
-/// antichain cover over all temporal memory positions, coarse → fine, fit to
-/// `opts.budget_chars` characters.
-///
-/// Completeness is invariant — every temporal position remains represented.
-/// Exact-span recollections are interchangeable at one position, not additive
-/// structural nodes. If even the coarsest cover (all roots) overflows the
-/// budget, this ERRORS with instructions for raising a coarser apex rather than
-/// silently losing the past.
-/// Containment forest over chunk spans: each chunk's tightest strict container,
-/// the children that induces, and the roots with no container at all.
-///
-// ---------------------------------------------------------------------------
-// the field: coarseness by age
-// ---------------------------------------------------------------------------
-//
-// Memories have a coarseness -- their width -- and the cover is coarser
-// further back in time. That is the whole rule (JP, 2026-09-05). There is
-// no parent and no child: two memories over the same minutes are two
-// memories, and an arc over a day is a wider memory than an entry in it.
-// The tree this replaced was a rendering shortcut that grew semantics: it
-// walked a containment forest and never split a chunk with one child, so
-// six whole-life roots nested by their tails hid every leaf before June.
-
-/// A memory lasts at least a moment for the purpose of covering time: an
-/// instant-stamped memory has no interior an instant could fall into.
+/// A point memory lasts one journal moment when its endpoints are compared
+/// with an ideal slot; otherwise its temporal density would be exactly zero.
 const MOMENT_NS: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
 
-/// The grid unit: 2^14 seconds, about four and a half hours -- the order of
-/// the resident's working quarter, and nothing the calendar knows.
-pub const TILE_UNIT_NS: i128 = (1i128 << 14) * 1_000_000_000;
+// ---------------------------------------------------------------------------
+// density-shaped recollection
+// ---------------------------------------------------------------------------
 
-/// Tiles grow by this factor per level, and a level holds at most this many
-/// complete tiles before they merge into one tile of the next level.
-pub const TILE_BASE: i128 = 4;
-
-/// The most memories per tile a reader may ask for.
-pub const DETAIL_CAP: usize = 4096;
-
-/// The details the cut steps through: about a half-doubling apart, so a
-/// search visits two dozen cuts and a step down is a step, not a crawl.
-const DETAIL_LADDER: [usize; 24] = [
-    1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 91, 128, 181, 256, 362, 512, 724, 1024, 1448, 2048,
-    2896, 4096,
-];
-
-/// One tile of the cover: a block of whole grid units on an absolute grid.
-/// `open` is the tile `now` falls in, still being written; it wants leaf
-/// grain. A closed tile of `units` units wants a grain of its width over the
-/// detail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tile {
-    pub start: i128,
-    pub end: i128,
-    pub units: i128,
-    pub open: bool,
+/// The ideal temporal point and grain at one character position in a reader's
+/// memory space. Times are offsets from the beginning of the remembered life,
+/// avoiding precision loss from converting absolute TAI nanoseconds to `f64`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DensitySample {
+    pub time_ns: f64,
+    pub time_per_char_ns: f64,
 }
 
-impl Tile {
-    /// The tile's width, humanized: hours under two days, days above.
-    pub fn width(&self) -> String {
-        let hours = (self.units * TILE_UNIT_NS) as f64 / 3.6e12;
-        if hours < 48.0 {
-            format!("{hours:.1}h")
-        } else {
-            format!("{:.1}d", hours / 24.0)
-        }
-    }
-}
-
-/// The tiling for a pile whose earliest memory starts at `earliest` and whose
-/// latest ends at `now` (TAI keys): a pure function of the pile.
+/// A continuous map from a fixed character space onto an arbitrarily long
+/// remembered life.
 ///
-/// It is the base-`TILE_BASE` counter of the unit `now` falls in. Level 0 is
-/// that unit, open. Level `l` holds the complete tiles of `TILE_BASE^l` units
-/// that lie before the current block at that level and inside the current
-/// block of the level above: the digit of the counter, zero to
-/// `TILE_BASE - 1` tiles. So when the open unit closes it becomes a one-unit
-/// tile; when a level fills, its tiles merge into one tile of the next level
-/// and are re-rendered at that level's grain. Between merges the cover changes
-/// only by appends in the open tile, a merge rewrites a suffix, and a merge
-/// into a deep level is rare in proportion to its depth. That is what lets a
-/// resident reuse the prefix of her cover across recomputes.
-pub fn tiles(earliest: i128, now: i128) -> Vec<Tile> {
-    let first = earliest.div_euclid(TILE_UNIT_NS);
-    let current = now.div_euclid(TILE_UNIT_NS);
-    let mut out = vec![Tile {
-        start: current * TILE_UNIT_NS,
-        end: (current + 1) * TILE_UNIT_NS,
-        units: 1,
-        open: true,
-    }];
-    let mut size = 1i128;
-    loop {
-        // The current block at this level already reaches the first memory:
-        // nothing lies to its left.
-        let block = current - current.rem_euclid(size);
-        if block <= first {
-            break;
+/// Characters are uniform in `ln(moment + age)`, where age is measured back
+/// from the newest memory. Consequently the wanted temporal density grows
+/// exponentially into the past. The existing three-second memory moment is
+/// the only scale anchor; there is no calendar cell, tile width, level, or
+/// fitted detail. Integrating [`DensityGradient::sample`] from zero to `space`
+/// yields exactly `life_ns`.
+#[derive(Clone, Copy, Debug)]
+pub struct DensityGradient {
+    life_ns: f64,
+    space: usize,
+    rate: f64,
+}
+
+impl DensityGradient {
+    pub fn new(life_ns: i128, space: usize) -> Self {
+        let life_ns = life_ns.max(MOMENT_NS) as f64;
+        let space = space.max(1);
+        let moment = MOMENT_NS as f64;
+        let rate = (life_ns / moment).ln_1p() / space as f64;
+        Self {
+            life_ns,
+            space,
+            rate,
         }
-        let up = size * TILE_BASE;
-        let block_up = current - current.rem_euclid(up);
-        let left = block_up.max(first - first.rem_euclid(size));
-        let mut t = left;
-        while t < block {
-            out.push(Tile {
-                start: t * TILE_UNIT_NS,
-                end: (t + size) * TILE_UNIT_NS,
-                units: size,
-                open: false,
-            });
-            t += size;
-        }
-        size = up;
     }
-    out.sort_by_key(|t| t.start);
-    out
-}
 
-/// An alternative tiling, for measuring beside the counter: every level
-/// renders the `k` most recent complete blocks of its size, aligned to the
-/// grid, except where a finer level already renders; the open unit renders
-/// at leaf grain. Older levels appear as the life grows. The number of tiles
-/// is then about `k` per level at every phase of the grid, where the
-/// counter's swings between one and three, and a level's window slides by
-/// one block at every boundary of its size, re-rendering from that block on.
-pub fn tiles_sliding(earliest: i128, now: i128, k: i128) -> Vec<Tile> {
-    let k = k.max(1);
-    let first = earliest.div_euclid(TILE_UNIT_NS);
-    let current = now.div_euclid(TILE_UNIT_NS);
-    let mut out = vec![Tile {
-        start: current * TILE_UNIT_NS,
-        end: (current + 1) * TILE_UNIT_NS,
-        units: 1,
-        open: true,
-    }];
-    let mut size = 1i128;
-    let mut covered_from = current;
-    loop {
-        let boundary = current - current.rem_euclid(size);
-        let start = boundary - k * size;
-        let first_aligned = first - first.rem_euclid(size);
-        let from = start.max(first_aligned);
-        let mut t = from;
-        while t < covered_from {
-            out.push(Tile {
-                start: t * TILE_UNIT_NS,
-                end: (t + size).min(covered_from) * TILE_UNIT_NS,
-                units: size,
-                open: false,
-            });
-            t += size;
-        }
-        if start <= first {
-            break;
-        }
-        covered_from = from;
-        size *= TILE_BASE;
-    }
-    out.sort_by_key(|t| t.start);
-    out
-}
-
-/// The grain a tile wants at `detail` memories per tile. `detail == 0` wants
-/// the widest memory everywhere: the completeness floor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Want {
-    Widest,
-    Narrowest,
-    Width(i128),
-}
-
-fn want(tile: &Tile, detail: usize) -> Want {
-    if detail == 0 {
-        Want::Widest
-    } else if tile.open {
-        Want::Narrowest
-    } else {
-        Want::Width((tile.units * TILE_UNIT_NS / detail as i128).max(MOMENT_NS))
-    }
-}
-
-/// Of the active memories, keyed `(width, index)`, the one whose width is
-/// closest to the want as a ratio; ties go to the narrower.
-fn closest(active: &BTreeSet<(i128, usize)>, want: Want) -> usize {
-    match want {
-        Want::Widest => active.iter().next_back().unwrap().1,
-        Want::Narrowest => active.iter().next().unwrap().1,
-        Want::Width(w) => {
-            let narrower = active.range(..(w + 1, 0)).next_back();
-            let wider = active.range((w + 1, 0)..).next();
-            match (narrower, wider) {
-                (Some(&(nw, ni)), Some(&(ww, wi))) => {
-                    // w / nw <= ww / w  <=>  w * w <= nw * ww
-                    if w * w <= nw * ww {
-                        ni
-                    } else {
-                        wi
-                    }
-                }
-                (Some(&(_, i)), None) | (None, Some(&(_, i))) => i,
-                (None, None) => unreachable!("closest of an empty set"),
-            }
+    pub fn sample(&self, cursor: usize) -> DensitySample {
+        let cursor = cursor.min(self.space) as f64;
+        let behind = self.space as f64 - cursor;
+        let exponent = self.rate * behind;
+        let moment = MOMENT_NS as f64;
+        let age = moment * exponent.exp_m1();
+        DensitySample {
+            time_ns: (self.life_ns - age).clamp(0.0, self.life_ns),
+            time_per_char_ns: moment * self.rate * exponent.exp(),
         }
     }
 }
 
-/// Sweep the tiled field left to right and report every elementary interval:
-/// `(tile index, from, to, picked span index)`. At every point, of the
-/// memories covering it, the one whose width is closest to the grain the
-/// point's tile wants. Instants are a moment wide, so a moment inside an entry
-/// is picked beside it, and overlapping memories are each picked where they
-/// are closest.
-fn sweep(
-    spans: &[(i128, i128, Id)],
-    tiles: &[Tile],
-    detail: usize,
-    mut visit: impl FnMut(usize, i128, i128, usize),
-) {
-    let n = spans.len();
-    if n == 0 {
-        return;
-    }
-    let width = |i: usize| (spans[i].1 - spans[i].0).max(MOMENT_NS);
-    // (coordinate, kind, index): ends leave before starts arrive at one
-    // coordinate (0 sorts before 1), and a tile boundary (2) only breaks the
-    // sweep so the want can change there.
-    let mut events: Vec<(i128, u8, usize)> = Vec::with_capacity(2 * n + tiles.len());
-    for i in 0..n {
-        events.push((spans[i].0, 1, i));
-        events.push((spans[i].0 + width(i), 0, i));
-    }
-    for (t, tile) in tiles.iter().enumerate() {
-        events.push((tile.start, 2, t));
-    }
-    events.sort_unstable();
-    let mut active: BTreeSet<(i128, usize)> = BTreeSet::new();
-    let mut tile_at = 0usize;
-    let mut at = 0;
-    while at < events.len() {
-        let coordinate = events[at].0;
-        while at < events.len() && events[at].0 == coordinate {
-            let (_, kind, i) = events[at];
-            match kind {
-                0 => {
-                    active.remove(&(width(i), i));
-                }
-                1 => {
-                    active.insert((width(i), i));
-                }
-                _ => tile_at = tile_at.max(i),
-            }
-            at += 1;
-        }
-        if at < events.len() && !active.is_empty() {
-            let pick = closest(&active, want(&tiles[tile_at], detail));
-            visit(tile_at, coordinate, events[at].0, pick);
-        }
-    }
-}
-
-/// One cut through the tiled field at `detail` memories per tile: a memory is
-/// in the cover wherever it was the closest to what its tile wants. `detail`
-/// zero is the widest memory at every point, the completeness floor.
-pub fn select_tiled(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) -> Vec<usize> {
-    let mut shown = vec![false; spans.len()];
-    sweep(spans, tiles, detail, |_, _, _, pick| shown[pick] = true);
-    (0..spans.len()).filter(|&i| shown[i]).collect()
-}
-
-/// How well the pile serves one tile at a detail: what the tile wanted, how
-/// many memories were picked in it, and the worst ratio between a picked
-/// width and the want over the tile. A ratio far from one is a missing arc
-/// (or, for today, nothing: today wants everything).
-#[derive(Clone, Debug, PartialEq)]
-pub struct TileReport {
-    pub tile: Tile,
-    pub want_ns: Option<i128>,
-    pub picked: usize,
-    pub worst_ratio: f64,
-}
-
-pub fn tile_report(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) -> Vec<TileReport> {
-    let mut picked: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); tiles.len()];
-    let mut worst: Vec<f64> = vec![1.0; tiles.len()];
-    let width = |i: usize| (spans[i].1 - spans[i].0).max(MOMENT_NS);
-    sweep(spans, tiles, detail, |t, _, _, pick| {
-        picked[t].insert(pick);
-        if let Want::Width(w) = want(&tiles[t], detail) {
-            let ratio = (width(pick) as f64 / w as f64).max(w as f64 / width(pick) as f64);
-            worst[t] = worst[t].max(ratio);
-        }
-    });
-    tiles
-        .iter()
-        .enumerate()
-        .map(|(t, tile)| TileReport {
-            tile: *tile,
-            want_ns: match want(tile, detail) {
-                Want::Width(w) => Some(w),
-                _ => None,
-            },
-            picked: picked[t].len(),
-            worst_ratio: worst[t],
-        })
-        .collect()
-}
-
-/// A cut that fits.
-///
-/// `detail` is memories per tile. With none asked it is the finest rung of
-/// the ladder at which a complete cover fits the budget, chosen anew at every
-/// render, so the cover is as full as the pile allows. When the tiling's
-/// counter carries, or the pile grows, across a rung, the whole cover renders
-/// anew: on the live pile that was six times in the month to 2026-09-06 at
-/// the wake's budget, against the merges, which rewrite only the young end.
-/// An asked detail pins it, for measuring, and steps down the ladder until a
-/// complete cover fits, because one must always be produced. `fits` is false
-/// only when even the floor (the widest memory at every point) overflows, in
-/// which case `cover` is that floor and `used` its cost, so the caller can
-/// name the shortfall.
-pub struct TiledCut {
-    pub detail: usize,
-    pub asked: Option<usize>,
+/// The lossy recollection selected for one reader. `cover` is in greedy SPACE
+/// cursor order. Temporal centres may wobble when ranges overlap or support is
+/// sparse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecollectionCut {
     pub cover: Vec<usize>,
     pub used: usize,
-    pub fits: bool,
 }
 
-pub fn fit_tiled(
-    spans: &[(i128, i128, Id)],
-    tiles: &[Tile],
-    cost: &mut dyn FnMut(usize) -> Result<usize>,
-    budget: usize,
-    asked: Option<usize>,
-) -> Result<TiledCut> {
-    let mut render = |detail: usize| -> Result<(Vec<usize>, usize)> {
-        let cover = select_tiled(spans, tiles, detail);
-        let mut used = 0usize;
-        for &i in &cover {
-            used = used.saturating_add(cost(i)?);
-        }
-        Ok((cover, used))
-    };
-    let (floor_cover, floor) = render(0)?;
-    if floor > budget {
-        return Ok(TiledCut {
-            detail: 0,
-            asked,
-            cover: floor_cover,
-            used: floor,
-            fits: false,
-        });
-    }
-    let done = |detail, (cover, used)| TiledCut {
-        detail,
-        asked,
-        cover,
-        used,
-        fits: true,
-    };
-    if let Some(wanted) = asked {
-        let wanted = wanted.min(DETAIL_CAP);
-        let cut = render(wanted)?;
-        if cut.1 <= budget {
-            return Ok(done(wanted, cut));
-        }
-    }
-    let top = asked.map(|a| a.min(DETAIL_CAP)).unwrap_or(usize::MAX);
-    for &detail in DETAIL_LADDER.iter().rev().filter(|&&d| d < top) {
-        let cut = render(detail)?;
-        if cut.1 <= budget {
-            return Ok(done(detail, cut));
-        }
-    }
-    Ok(done(0, (floor_cover, floor)))
-}
-
-/// The tiles in one line, newest first: `now, 3x4.6h, 2x18.2h, 1x3.0d`.
-pub fn describe_tiles(tiles: &[Tile]) -> String {
-    let mut parts = vec!["now".to_string()];
-    let mut runs: Vec<(i128, String, usize)> = Vec::new();
-    for tile in tiles.iter().rev() {
-        if tile.open {
-            continue;
-        }
-        match runs.last_mut() {
-            Some((units, _, count)) if *units == tile.units => *count += 1,
-            _ => runs.push((tile.units, tile.width(), 1)),
-        }
-    }
-    for (_, width, count) in runs {
-        parts.push(format!("{count}x{width}"));
-    }
-    parts.join(", ")
-}
-
-/// Collapse memories which are interchangeable to the temporal cover into one
-/// structural position.
+/// Greedily approximate the continuous density gradient with the memories the
+/// journal actually contains.
 ///
-/// The current cover has one axis: chronological, non-lens memories. Its forest
-/// is computed solely from `(start, end)`, so exact equality of those two keys is
-/// the strongest possible notion of structural equivalence: substituting one
-/// member for another cannot alter containment, ancestry, recency, or width.
-/// Content, intrinsic id, and rendered size deliberately do not participate.
+/// A candidate's charged size turns the cursor into one ideal temporal slot:
+/// `[gradient(cursor), gradient(cursor + cost)]`. The closest memory is the one
+/// whose actual start and end best match those two endpoints. Centre and
+/// density are therefore not separately weighted objectives: they are the
+/// midpoint and width of the same interval comparison, including the
+/// gradient's curvature across a long memory. Local overshoot is deliberate:
+/// the cursor remains on the ideal field, so subsequent memories may fall
+/// inside or leave gaps around an earlier range. This is recollection, not an
+/// interval partition.
+///
+/// Each exact-span structural class may appear once. The first best candidate
+/// which cannot fit ends the recollection, exactly as a physical
+/// reader whose remaining space is smaller than the next memory. Intrinsic id
+/// is the final tie-break, making the projection independent of input order.
+pub fn select_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    budget: usize,
+) -> RecollectionCut {
+    assert_eq!(spans.len(), costs.len());
+    assert_eq!(spans.len(), eligible.len());
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|span| span.0).min(),
+        spans.iter().map(|span| span.1).max(),
+    ) else {
+        return RecollectionCut {
+            cover: Vec::new(),
+            used: 0,
+        };
+    };
+    if budget == 0 {
+        return RecollectionCut {
+            cover: Vec::new(),
+            used: 0,
+        };
+    }
+
+    let gradient = DensityGradient::new(latest.saturating_sub(earliest), budget);
+    let mut selected = vec![false; spans.len()];
+    let mut cover = Vec::new();
+    let mut used = 0usize;
+
+    while used < budget {
+        let ideal_start = gradient.sample(used).time_ns;
+        let mut best: Option<(f64, Id, usize)> = None;
+        for (i, &(start, end, id)) in spans.iter().enumerate() {
+            let cost = costs[i];
+            if selected[i] || !eligible[i] || cost == 0 {
+                continue;
+            }
+            let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
+            let actual_start = start.saturating_sub(earliest) as f64;
+            let actual_end = actual_start + width;
+            let ideal_end = gradient.sample(used.saturating_add(cost)).time_ns;
+            let start_error = actual_start - ideal_start;
+            let end_error = actual_end - ideal_end;
+            let score = start_error.mul_add(start_error, end_error * end_error);
+            let candidate = (score, id, i);
+            if best.as_ref().is_none_or(|current| {
+                candidate
+                    .0
+                    .total_cmp(&current.0)
+                    .then(candidate.1.cmp(&current.1))
+                    .is_lt()
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let Some((_, _, pick)) = best else {
+            break;
+        };
+        let next = used.saturating_add(costs[pick]);
+        if next > budget {
+            break;
+        }
+        selected[pick] = true;
+        cover.push(pick);
+        used = next;
+    }
+
+    RecollectionCut { cover, used }
+}
+
+/// Gaps longer than one quarter of the currently available life which no
+/// selected memory overlaps.
+///
+/// This is an instrument, never an admission rule: recollection remains the
+/// pure greedy projection above. A reported silent era points to missing
+/// coarse support for the comb to improve. Overlapping selected memories are
+/// unioned before gaps are measured.
+pub fn silent_life_quarters(spans: &[(i128, i128, Id)], cover: &[usize]) -> Vec<(i128, i128)> {
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|span| span.0).min(),
+        spans.iter().map(|span| span.1).max(),
+    ) else {
+        return Vec::new();
+    };
+    let life = latest.saturating_sub(earliest);
+    if life <= 0 {
+        return Vec::new();
+    }
+
+    let mut selected: Vec<(i128, i128)> = cover
+        .iter()
+        .map(|&i| {
+            let span = spans
+                .get(i)
+                .unwrap_or_else(|| panic!("cover index {i} is outside {} spans", spans.len()));
+            (span.0.max(earliest), span.1.min(latest))
+        })
+        .filter(|(start, end)| end > start)
+        .collect();
+    selected.sort_unstable();
+
+    let threshold = life / 4;
+    let mut silent = Vec::new();
+    let mut cursor = earliest;
+    for (start, end) in selected {
+        if start > cursor && start.saturating_sub(cursor) > threshold {
+            silent.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+        if cursor >= latest {
+            break;
+        }
+    }
+    if latest.saturating_sub(cursor) > threshold {
+        silent.push((cursor, latest));
+    }
+    silent
+}
+
+/// Collapse memories which are interchangeable to the temporal sampler into
+/// one structural position.
+///
+/// Recollection has one axis: chronological, non-lens memories. Exact equality
+/// of `(start, end)` is therefore the strongest possible structural
+/// equivalence. Every member is later assigned the class's conservative
+/// maximum rendered charge, so substituting its prose cannot alter the ideal
+/// slot or its contribution to a silent-stretch diagnostic. Content, intrinsic
+/// id, and an individual member's rendered size deliberately do not split the
+/// class.
 ///
 /// The structural id is the least member id. It exists only as a stable final
-/// tie-break for the refinement algorithm; the id of the recollection eventually
+/// tie-break for the sampler; the id of the recollection eventually
 /// rendered is selected separately.
 fn recollection_classes(
     raw_spans: &[(i128, i128, Id)],
@@ -1009,6 +817,53 @@ fn recollection_class_cost<B: BlobStoreGet, P: TriblePattern>(
     Ok(cost)
 }
 
+/// The first journal observation of each exact-span structural class.
+///
+/// A range says what period a memory recalls; `created_at` says when that
+/// recollection became available. Historical replay must use the latter or a
+/// summary written today about an old month appears before it existed. Legacy
+/// memories without an observation fall back to their range end, and the count
+/// is returned so the approximation remains visible.
+fn recollection_class_observations<P: TriblePattern>(
+    space: &P,
+    raw_spans: &[(i128, i128, Id)],
+    classes: &[Vec<usize>],
+) -> (Vec<i128>, usize) {
+    let mut first_by_id: HashMap<Id, i128> = HashMap::new();
+    for (id, observed) in find!(
+        (id: Id, observed: Inline<NsTAIInterval>),
+        pattern!(space, [{ ?id @ metadata::created_at: ?observed }])
+    ) {
+        let observed = interval_key(observed);
+        first_by_id
+            .entry(id)
+            .and_modify(|first| *first = (*first).min(observed))
+            .or_insert(observed);
+    }
+
+    let mut missing = 0usize;
+    let observations = classes
+        .iter()
+        .map(|members| {
+            let mut observed = None;
+            for &raw in members {
+                if let Some(at) = first_by_id.get(&raw_spans[raw].2).copied() {
+                    observed = Some(observed.map_or(at, |first: i128| first.min(at)));
+                }
+            }
+            observed.unwrap_or_else(|| {
+                missing += 1;
+                members
+                    .iter()
+                    .map(|&raw| raw_spans[raw].1)
+                    .min()
+                    .unwrap_or(0)
+            })
+        })
+        .collect();
+    (observations, missing)
+}
+
 /// Pick one recollection for a structural position. Eligibility is decided
 /// before contextual ranking, so `--about` cannot accidentally hide a span by
 /// choosing a filtered-out alternative when an eligible one exists. Scores tie
@@ -1042,121 +897,28 @@ fn select_recollection(
         .expect("a recollection class is never empty")
 }
 
-/// How close the coarsest possible cover is to the budget.
-///
-/// `render_cover` refuses when the roots alone overflow, which is correct but
-/// only observable once it has already happened — and it happens to EVERY reader
-/// at once, because the roots grow silently as top-level chunks accumulate
-/// without a coarser parent. On 2026-08-09 the whole wake ritual returned nothing
-/// at 805,092 characters against an 800,000 budget: it had crossed by 0.6% and
-/// nothing had ever reported the approach. This makes the approach readable while
-/// the cover still works.
-#[derive(Clone, Copy, Debug)]
-pub struct CoverHeadroom {
-    /// Top-level temporal positions with no coarser parent. These are the
-    /// coarsest cover.
-    pub roots: usize,
-    /// Characters the coarsest cover needs, conservatively charging the largest
-    /// recollection at each exact-span position.
-    pub used: usize,
-    /// Characters allowed.
-    pub budget: usize,
-}
-
-impl CoverHeadroom {
-    /// Characters to spare, saturating at zero once the cover is impossible.
-    pub fn spare(&self) -> usize {
-        self.budget.saturating_sub(self.used)
-    }
-
-    /// True once no in-budget cover exists — i.e. `render_cover` now fails.
-    pub fn exhausted(&self) -> bool {
-        self.used > self.budget
-    }
-
-    /// Fraction of the budget still free, 0.0 when exhausted.
-    pub fn spare_fraction(&self) -> f64 {
-        if self.budget == 0 {
-            return 0.0;
-        }
-        self.spare() as f64 / self.budget as f64
-    }
-}
-
-/// Compute [`CoverHeadroom`] without rendering a cover.
-pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
-    space: &P,
-    ws: &B,
-    budget_chars: usize,
-) -> Result<CoverHeadroom> {
-    let raw_spans = collect_chunk_spans(space);
-    let (spans, classes) = recollection_classes(&raw_spans);
-    let coarsest = match (
-        spans.iter().map(|s| s.0).min(),
-        spans.iter().map(|s| s.1).max(),
-    ) {
-        (Some(earliest), Some(latest)) => select_tiled(&spans, &tiles(earliest, latest), 0),
-        _ => Vec::new(),
-    };
-    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
-    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
-    let mut used = 0usize;
-    for &i in &coarsest {
-        used = used.saturating_add(recollection_class_cost(
-            ws,
-            space,
-            &raw_spans,
-            &mut raw_costs,
-            &classes,
-            &mut class_costs,
-            i,
-        )?);
-    }
-    Ok(CoverHeadroom {
-        roots: coarsest.len(),
-        used,
-        budget: budget_chars,
-    })
-}
-
-/// One step of a replay: the cover the pile would have rendered when its
-/// latest memory ended at `now`, and how much of the previous step's cover
-/// survived as a byte-for-byte prefix.
+/// One step of a historical replay, using when memories actually joined the
+/// journal rather than pretending a later-written summary always existed.
 #[derive(Clone, Debug)]
 pub struct ReplayRow {
-    /// The latest memory end at this step (TAI key): the `now` of the tiling.
-    pub now: i128,
-    pub tiles: usize,
-    pub detail: usize,
+    pub observed_now: i128,
+    pub semantic_now: i128,
     pub chunks: usize,
-    /// Characters the cover used.
     pub used: usize,
-    /// Characters of the previous step's cover that this cover begins with,
-    /// unchanged and in the same order: what a cache would keep.
+    pub silent_life_quarters: Vec<(i128, i128)>,
     pub kept: usize,
-    /// Characters the previous step's cover used (0 on the first step).
     pub prev_used: usize,
-    pub fits: bool,
-    /// The tiling, newest first, as `describe_tiles` prints it.
-    pub layout: String,
-    /// The span of the first chunk in the cover: where a re-render began if
-    /// nothing was kept.
     pub first: Option<(i128, i128)>,
-    /// The span of the first chunk that differs from the previous cover.
     pub changed_at: Option<(i128, i128)>,
+    pub unobserved_classes: usize,
 }
 
-/// Replay the cover over the pile's own past: pretend the newest memory ends
-/// at each of `steps` points, one `step_units` grid units apart, walking from
-/// the oldest point to the present, and at each point render the cover the
-/// pile would have rendered then (memories ending after the point are not yet
-/// there). Fit the detail to the budget at every step -- or hold `asked` --
-/// and report how much of each cover survives into the next.
-///
-/// A memory counts as present once its range has ended, not once it was
-/// written, so arcs the comb wrote later over earlier days are present from
-/// the start. That hides the comb's own re-renders on purpose: this measures
-/// the churn of the tiling and the fit, nothing else.
+/// One replay sampling quantum: about 4.55 hours, historically the resident's
+/// working-quarter cadence. This is measurement cadence only, never a boundary
+/// in the recollection algorithm.
+pub const REPLAY_QUANTUM_NS: i128 = (1i128 << 14) * 1_000_000_000;
+
+/// Replay density-shaped recollection over the pile's observation history.
 pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
     space: &P,
     ws: &B,
@@ -1164,64 +926,53 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
     chunk_overhead: usize,
     steps: usize,
     step_units: i128,
-    asked: Option<usize>,
-    sliding: Option<i128>,
 ) -> Result<Vec<ReplayRow>> {
     let raw_spans = collect_chunk_spans(space);
     let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed_at, unobserved_classes) =
+        recollection_class_observations(space, &raw_spans, &classes);
     let mut rows = Vec::new();
-    let (Some(earliest), Some(latest)) = (
-        spans.iter().map(|s| s.0).min(),
-        spans.iter().map(|s| s.1).max(),
-    ) else {
+    let Some(latest_observation) = observed_at.iter().copied().max() else {
         return Ok(rows);
     };
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
     let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
-    let mut cost_of = |i: usize| -> Result<usize> {
-        Ok(recollection_class_cost(
-            ws,
-            space,
-            &raw_spans,
-            &mut raw_costs,
-            &classes,
-            &mut class_costs,
-            i,
-        )?
-        .saturating_add(chunk_overhead))
-    };
-    let step_ns = step_units.max(1) * TILE_UNIT_NS;
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(
+            recollection_class_cost(
+                ws,
+                space,
+                &raw_spans,
+                &mut raw_costs,
+                &classes,
+                &mut class_costs,
+                i,
+            )?
+            .saturating_add(chunk_overhead),
+        );
+    }
+    let step_ns = step_units.max(1) * REPLAY_QUANTUM_NS;
     let mut previous: Vec<usize> = Vec::new();
     let mut prev_used = 0usize;
     for k in (0..=steps).rev() {
-        let point = latest - (k as i128) * step_ns;
-        // The pile as it stood: every memory whose range had ended by `point`.
+        let point = latest_observation - (k as i128) * step_ns;
         let mut map: Vec<usize> = Vec::new();
         let mut sub: Vec<(i128, i128, Id)> = Vec::new();
+        let mut sub_costs = Vec::new();
         for (i, s) in spans.iter().enumerate() {
-            if s.1 <= point {
+            if observed_at[i] <= point {
                 map.push(i);
                 sub.push(*s);
+                sub_costs.push(costs[i]);
             }
         }
-        let Some(now) = sub.iter().map(|s| s.1).max() else {
+        let Some(semantic_now) = sub.iter().map(|s| s.1).max() else {
             continue;
         };
-        let first = sub.iter().map(|s| s.0).min().unwrap_or(earliest);
-        let tiles = match sliding {
-            Some(k) => tiles_sliding(first, now, k),
-            None => tiles(first, now),
-        };
-        let mut cost_sub = |j: usize| -> Result<usize> { cost_of(map[j]) };
-        let cut = fit_tiled(&sub, &tiles, &mut cost_sub, budget_chars, asked)?;
-        // The emission order: time order, wider first at a tie.
-        let mut cover: Vec<usize> = cut.cover.iter().map(|&j| map[j]).collect();
-        cover.sort_by(|&a, &b| {
-            spans[a]
-                .0
-                .cmp(&spans[b].0)
-                .then(spans[b].1.cmp(&spans[a].1))
-        });
+        let cut = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget_chars);
+        let silent_life_quarters = silent_life_quarters(&sub, &cut.cover);
+        let cover: Vec<usize> = cut.cover.iter().map(|&j| map[j]).collect();
         let mut kept = 0usize;
         let mut changed_at = None;
         for (n, (a, b)) in cover.iter().zip(previous.iter()).enumerate() {
@@ -1229,23 +980,25 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
                 changed_at = Some((spans[*a].0, spans[*a].1));
                 break;
             }
-            kept = kept.saturating_add(cost_of(*a)?);
+            kept = kept.saturating_add(costs[*a]);
             if n + 1 == previous.len() && cover.len() > previous.len() {
                 changed_at = Some((spans[cover[n + 1]].0, spans[cover[n + 1]].1));
             }
         }
+        if changed_at.is_none() && previous.is_empty() {
+            changed_at = cover.first().map(|&i| (spans[i].0, spans[i].1));
+        }
         rows.push(ReplayRow {
-            now,
-            tiles: tiles.len(),
-            detail: cut.detail,
+            observed_now: point,
+            semantic_now,
             chunks: cover.len(),
             used: cut.used,
+            silent_life_quarters,
             kept,
             prev_used,
-            fits: cut.fits,
-            layout: describe_tiles(&tiles),
             first: cover.first().map(|&i| (spans[i].0, spans[i].1)),
             changed_at,
+            unobserved_classes,
         });
         previous = cover;
         prev_used = cut.used;
@@ -1289,14 +1042,6 @@ where
         return Ok(String::new());
     }
     let n = spans.len();
-
-    // Only the emission needs containment, to indent a shown memory under the
-    // shown memories around it. Nothing else does.
-    let strict_contains = |a: usize, b: usize| -> bool {
-        spans[a].0 <= spans[b].0
-            && spans[a].1 >= spans[b].1
-            && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
-    };
 
     // Eligibility gates. `--filter` keeps only chunks whose positive
     // similarity to its query is ABOVE the threshold; `--remove` drops chunks
@@ -1371,8 +1116,8 @@ where
         .collect();
 
     // Contextual similarity is deliberately *not* a structural score. It may
-    // select one member of an exact-span class, but never changes the forest or
-    // split order. This is the crucial boundary between situated recollection
+    // select one member of an exact-span class, but never changes the sampled
+    // spans. This is the crucial boundary between situated recollection
     // and a context-dependent autobiography.
     let about_scores = if classes.iter().any(|class| class.len() > 1) {
         about
@@ -1390,72 +1135,37 @@ where
         })
         .collect();
 
-    // The cut. Cost is the recollection's exact character count plus the
-    // consumer overhead, once per shown chunk.
+    // The recollection. Cost is the exact-span class's conservative character
+    // count plus consumer overhead, once per selected memory.
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
     let mut class_costs: Vec<Option<usize>> = vec![None; n];
-    let mut cost_of = |i: usize| -> Result<usize> {
-        Ok(recollection_class_cost(
-            reader,
-            space,
-            &raw_spans,
-            &mut raw_costs,
-            &classes,
-            &mut class_costs,
-            i,
-        )?
-        .saturating_add(chunk_overhead))
-    };
-    let earliest = spans.iter().map(|s| s.0).min().unwrap();
-    let latest = spans.iter().map(|s| s.1).max().unwrap();
-    let tiles = tiles(earliest, latest);
-    let cut = fit_tiled(&spans, &tiles, &mut cost_of, budget_chars, opts.detail)?;
-    if !cut.fits {
-        // Completeness is invariant -- never drop a temporal position to fit.
-        // Even the floor, the widest memory at every point, overflows: the
-        // memories at the edge have no arc over them yet. Say where.
-        bail!(
-            "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
-             {} memories are the widest thing over some stretch of time, so no in-budget cover can contain everything.\n\
-             Comb the uncovered stretch into arcs BESIDE what exists -- day or week arcs over it (`memory levels` and `memory check` show where) -- never a new root from {} over the whole extent to {}: a root nested inside a root is a second rendering of the same time, and the journal keeps both.\n\
-             (A well-maintained hierarchy keeps arcs over every span; the apex is the one you already have.)",
-            cut.used,
-            cut.cover.len(),
-            fmt_epoch(key_to_epoch(earliest)),
-            fmt_epoch(key_to_epoch(latest)),
+    let mut costs = Vec::with_capacity(n);
+    for i in 0..n {
+        costs.push(
+            recollection_class_cost(
+                reader,
+                space,
+                &raw_spans,
+                &mut raw_costs,
+                &classes,
+                &mut class_costs,
+                i,
+            )?
+            .saturating_add(chunk_overhead),
         );
     }
-    let detail = cut.detail;
-    let asked = cut.asked;
-    let mut cover = cut.cover;
-    let mut used = cut.used;
+    let cut = select_recollection_cut(&spans, &costs, &class_eligible, budget_chars);
+    let used = cut.used;
+    let cover = cut.cover;
 
-    // Enforce eligibility at the chunk level the cover selected: a removed /
-    // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
-    // surviving coarse ANCESTOR's summary is pre-written text and passes
-    // through unchanged, so it may still *mention* removed material in its
-    // prose — we drop selected nodes, we do not rewrite ancestor summaries.
-    if filter_elig.is_some() || remove_elig.is_some() {
-        cover.retain(|&i| class_eligible[i]);
-        // Recompute the conservative character tally over what survived.
-        used = 0;
-        for &i in &cover {
-            used = used.saturating_add(cost_of(i)?);
-        }
-    }
-
-    // Emit coarse → fine: time order, indented by containment depth, each
-    // chunk's span header followed by its summary content.
-    cover.sort_by(|&a, &b| {
-        spans[a]
-            .0
-            .cmp(&spans[b].0)
-            .then(spans[b].1.cmp(&spans[a].1))
-    });
+    // The selected SPACE order is the emitted order. Reordering by lived time
+    // would move memories away from the ideal slots which chose them and hide
+    // where the journal lacks appropriately dense support. Ranges may therefore
+    // overlap, leave gaps, or wobble backwards in lived time.
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("recollections about \"{q}\" within equal spans"),
-            None => "coarser further back".to_string(),
+            None => "density-shaped recollection".to_string(),
         }];
         if let Some(q) = filter_q {
             parts.push(format!("filtered to \"{q}\""));
@@ -1463,61 +1173,49 @@ where
         if let Some(q) = remove_q {
             parts.push(format!("excluding \"{q}\""));
         }
-        format!("coarse → fine; {}", parts.join("; "))
+        format!("greedy SPACE order; {}", parts.join("; "))
     };
     // The status header goes to STDERR, not into the returned cover buffer: the
     // time-ranges are the drill key the wake ritual ingests, and this line's
     // volatile counts (chunk/char totals) would perturb the otherwise
     // prefix-stable cover on every call. Keep it visible to a human on stderr,
     // out of the stored/ingested cover text.
-    // The pool is part of the same status line: a reader who sees a cover come
-    // in under budget needs to know the shortfall is the quantized pool doing
-    // its job, not a cover that failed to fill.
     for &i in &cover {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
-        let depth = cover
-            .iter()
-            .filter(|&&j| j != i && strict_contains(j, i))
-            .count();
-        let indent = "  ".repeat(depth);
         writeln!(out)?;
         // Ranges are the drill key (`memory <from>..<to>`); the opaque hex id is
         // boot-theatre noise in the wake, so it stays out of the cover line.
         writeln!(
             out,
-            "{indent}{}",
+            "{}",
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
         )?;
         if let Some(handle) = chunk_summary_handle(space, id) {
             let summary: View<str> = reader.get(handle).context("read chunk summary")?;
             writeln!(out, "{}", summary.trim_end())?;
         } else if chunk_image_handle(space, id).is_some() {
-            writeln!(out, "[image memory @ {}]", chunk_span_str(space, id))?;
+            let range = format_time_range(key_to_epoch(s), key_to_epoch(e));
+            writeln!(out, "[image memory @ {range}]")?;
         }
     }
-    // Only report a completed cover. A live caller may acquire a missing
-    // selected summary and retry this resident-only computation. The status
-    // line goes to STDERR so its volatile counts never enter the cover text.
+    let fill = if budget_chars == 0 {
+        0.0
+    } else {
+        100.0 * used as f64 / budget_chars as f64
+    };
     eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode}); detail {} per tile{}; tiles: {}; floor {} chunk(s)",
+        "memory context — {} of {} eligible memories recalled, ~{} of {} characters ({fill:.1}% full; {mode})",
         cover.len(),
+        class_eligible.iter().filter(|&&yes| yes).count(),
         used,
         budget_chars,
-        detail,
-        match asked {
-            Some(wanted) if wanted != detail => format!(" (asked {wanted}, stepped down to fit)"),
-            Some(_) => " (asked)".to_string(),
-            None => " (the finest that fits)".to_string(),
-        },
-        describe_tiles(&tiles),
-        select_tiled(&spans, &tiles, 0).len(),
     );
     Ok(out)
 }
 
 #[cfg(test)]
-mod headroom_tests {
+mod recollection_tests {
     use super::*;
     use triblespace::macros::id_hex;
 
@@ -1613,43 +1311,6 @@ mod headroom_tests {
         );
     }
 
-    #[test]
-    fn headroom_arithmetic() {
-        let ok = CoverHeadroom {
-            roots: 2,
-            used: 700_000,
-            budget: 800_000,
-        };
-        assert!(!ok.exhausted());
-        assert_eq!(ok.spare(), 100_000);
-        assert!((ok.spare_fraction() - 0.125).abs() < 1e-9);
-
-        // the real numbers from the 2026-08-09 outage
-        let dead = CoverHeadroom {
-            roots: 722,
-            used: 805_092,
-            budget: 800_000,
-        };
-        assert!(
-            dead.exhausted(),
-            "this is the state in which wake returns nothing"
-        );
-        assert_eq!(dead.spare(), 0, "spare saturates rather than underflowing");
-        assert_eq!(dead.spare_fraction(), 0.0);
-
-        // and the state that should have warned, well before it died
-        let thin = CoverHeadroom {
-            roots: 700,
-            used: 799_000,
-            budget: 800_000,
-        };
-        assert!(!thin.exhausted());
-        assert!(
-            thin.spare_fraction() < 0.15,
-            "warning threshold would fire here"
-        );
-    }
-
     #[cfg(feature = "local-embed")]
     #[test]
     fn competing_shared_embedding_observations_are_arbitrated_deterministically() {
@@ -1679,259 +1340,196 @@ mod headroom_tests {
             .collect()
     }
 
-    fn unit(n: i128) -> i128 {
-        n * TILE_UNIT_NS
-    }
-
-    fn minutes(m: i128) -> i128 {
-        m * 60_000_000_000
-    }
-
-    fn tile_units(tiles: &[Tile]) -> Vec<(i128, i128)> {
-        tiles
-            .iter()
-            .map(|t| (t.start / TILE_UNIT_NS, t.units))
-            .collect()
-    }
-
-    /// The tiling is the base-4 counter of the unit now falls in: one open
-    /// unit, then the complete tiles of each level before the current block
-    /// at that level.
     #[test]
-    fn the_tiling_is_the_counter_of_now() {
-        // 85 = 1*64 + 1*16 + 1*4 + 1: one tile at every level.
-        let t = tiles(unit(0), unit(85) + minutes(30));
-        assert_eq!(
-            tile_units(&t),
-            vec![(0, 64), (64, 16), (80, 4), (84, 1), (85, 1)]
-        );
-        assert!(t.last().unwrap().open);
-        assert_eq!(describe_tiles(&t), "now, 1x4.6h, 1x18.2h, 1x3.0d, 1x12.1d");
-        // 87 = 1*64 + 1*16 + 1*4 + 3: three unit tiles.
-        let t = tiles(unit(0), unit(87));
-        assert_eq!(
-            tile_units(&t),
-            vec![
-                (0, 64),
-                (64, 16),
-                (80, 4),
-                (84, 1),
-                (85, 1),
-                (86, 1),
-                (87, 1)
-            ]
-        );
-        // 88 = 1*64 + 1*16 + 2*4: the three units merged into a 4-unit tile.
-        let t = tiles(unit(0), unit(88));
-        assert_eq!(
-            tile_units(&t),
-            vec![(0, 64), (64, 16), (80, 4), (84, 4), (88, 1)]
-        );
-        // A life that began two units ago has no tiles left of the first memory.
-        let t = tiles(unit(83), unit(85) + minutes(30));
-        assert_eq!(tile_units(&t), vec![(80, 4), (84, 1), (85, 1)]);
-        // A life that began in this unit is one open tile.
-        assert_eq!(
-            tile_units(&tiles(unit(85) + minutes(1), unit(85) + minutes(30))),
-            vec![(85, 1)]
+    fn gradient_integrates_the_life_and_gets_finer_toward_now() {
+        let life = 1023 * MOMENT_NS;
+        let space = 10_000;
+        let gradient = DensityGradient::new(life, space);
+        let old = gradient.sample(0);
+        let young = gradient.sample(space);
+
+        assert!(old.time_ns.abs() < life as f64 * 1e-12);
+        assert!((young.time_ns - life as f64).abs() < life as f64 * 1e-12);
+        assert!(old.time_per_char_ns > young.time_per_char_ns);
+
+        // Trapezoidal integration is enough to catch a density which does not
+        // actually map the whole reader space onto the whole remembered life.
+        let mut integral = 0.0;
+        for cursor in 0..space {
+            let a = gradient.sample(cursor).time_per_char_ns;
+            let b = gradient.sample(cursor + 1).time_per_char_ns;
+            integral += (a + b) / 2.0;
+        }
+        let relative_error = (integral - life as f64).abs() / life as f64;
+        assert!(relative_error < 1e-6, "{relative_error}");
+    }
+
+    #[test]
+    fn recollection_is_deliberately_lossy() {
+        let id = ids(101);
+        let life = 1000 * MOMENT_NS;
+        let mut spans = vec![(0, life, id[0])];
+        let mut costs = vec![10usize];
+        for i in 0..100 {
+            let start = i as i128 * 10 * MOMENT_NS;
+            spans.push((start, start + 10 * MOMENT_NS, id[i + 1]));
+            costs.push(10);
+        }
+
+        let cut = select_recollection_cut(&spans, &costs, &[true; 101], 50);
+        assert_eq!(cut.used, 50);
+        assert_eq!(cut.cover.len(), 5);
+        assert!(
+            cut.cover.len() < spans.len(),
+            "the unselected memories remain losslessly journaled, not forced into active recall"
         );
     }
 
-    /// The open tile wants leaf grain: every memory in it, nested, overlapping,
-    /// and the instant beside its container.
     #[test]
-    fn the_open_tile_wants_every_memory() {
-        let id = ids(5);
-        let spans = vec![
-            (unit(85), unit(85) + minutes(60), id[0]),
-            (unit(85) + minutes(10), unit(85) + minutes(25), id[1]),
-            (unit(85) + minutes(20), unit(85) + minutes(20), id[2]),
-            (unit(85) + minutes(50), unit(85) + minutes(90), id[3]),
-            (unit(85) + minutes(90), unit(85) + minutes(91), id[4]),
+    fn greedy_projection_ignores_candidate_input_order() {
+        let original = [
+            (0, 100 * MOMENT_NS, A),
+            (0, 50 * MOMENT_NS, B),
+            (50 * MOMENT_NS, 100 * MOMENT_NS, C),
         ];
-        let t = tiles(unit(85), unit(85) + minutes(120));
-        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 1, 2, 3, 4]);
-        assert_eq!(select_tiled(&spans, &t, 4096), vec![0, 1, 2, 3, 4]);
-        // The floor is the widest at every point: the two arcs, and the last
-        // minute that escapes them.
-        assert_eq!(select_tiled(&spans, &t, 0), vec![0, 3, 4]);
-    }
-
-    /// A closed tile wants its width over the detail; at every point the
-    /// memory closest to that, as a ratio.
-    #[test]
-    fn a_closed_tile_wants_its_grain() {
-        let id = ids(14);
-        let quarter = TILE_UNIT_NS / 4;
-        let entry = TILE_UNIT_NS / 64;
-        let mut spans = vec![(unit(84), unit(85), id[0])];
-        for q in 0..4 {
-            spans.push((
-                unit(84) + q * quarter,
-                unit(84) + (q + 1) * quarter,
-                id[1 + q as usize],
-            ));
-        }
-        for e in 0..8 {
-            let s = unit(84) + e * entry;
-            spans.push((s, s + entry, id[5 + e as usize]));
-        }
-        spans.push((unit(85) + minutes(30), unit(85) + minutes(40), id[13]));
-        let t = tiles(unit(84), unit(85) + minutes(60));
-        // One per tile: the unit arc, and the open tile's entry.
-        assert_eq!(select_tiled(&spans, &t, 1), vec![0, 13]);
-        // Four per tile: the quarter arcs.
-        assert_eq!(select_tiled(&spans, &t, 4), vec![1, 2, 3, 4, 13]);
-        // Sixty-four per tile: the entries where they exist, and where none
-        // does, the quarter arcs (closer to a sixty-fourth than the unit).
-        assert_eq!(
-            select_tiled(&spans, &t, 64),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        );
-    }
-
-    /// Closest as a ratio, from either side: a point covered by an entry and a
-    /// life root, wanting a unit, shows the entry; add an arc between and it
-    /// shows the arc. Ties go to the narrower.
-    #[test]
-    fn closest_by_ratio_takes_the_entry_over_the_root() {
-        let id = ids(3);
-        let root = (unit(0), unit(400), id[0]);
-        let entry = (unit(81) + minutes(10), unit(81) + minutes(27), id[1]);
-        let t = tiles(unit(0), unit(85) + minutes(30));
-        assert_eq!(select_tiled(&[root, entry], &t, 4), vec![0, 1]);
-        let arc = (unit(81), unit(81) + TILE_UNIT_NS / 2, id[2]);
-        assert_eq!(select_tiled(&[root, entry, arc], &t, 4), vec![0, 2]);
-        let half = (unit(81), unit(81) + TILE_UNIT_NS / 2, id[1]);
-        let double = (unit(80), unit(82), id[2]);
-        assert_eq!(select_tiled(&[half, double], &t, 4), vec![0, 1]);
-        assert_eq!(select_tiled(&[double, half], &t, 4), vec![0, 1]);
-    }
-
-    /// The floor is the widest memory at every point, and an overhang that
-    /// escapes the wide memory is the widest over itself.
-    #[test]
-    fn the_floor_is_the_widest_at_every_point() {
-        let id = ids(3);
-        let t = tiles(unit(0), unit(150));
-        let spans = vec![
-            (unit(0), unit(100), id[0]),
-            (unit(10), unit(20), id[1]),
-            (unit(30), unit(40), id[2]),
-        ];
-        assert_eq!(select_tiled(&spans, &t, 0), vec![0]);
-        let spans = vec![(unit(0), unit(100), id[0]), (unit(90), unit(150), id[1])];
-        assert_eq!(select_tiled(&spans, &t, 0), vec![0, 1]);
-    }
-
-    /// An asked detail steps down the ladder until a complete cover fits;
-    /// only the floor overflowing is a failure; with nothing asked, the finest
-    /// rung that fits is found.
-    #[test]
-    fn the_cut_steps_down_and_never_strands() {
-        let id = ids(34);
-        let sub = TILE_UNIT_NS / 32;
-        let mut spans = vec![(unit(84), unit(85), id[0])];
-        for e in 0..32 {
-            spans.push((
-                unit(84) + e * sub,
-                unit(84) + (e + 1) * sub,
-                id[1 + e as usize],
-            ));
-        }
-        spans.push((unit(85) + minutes(10), unit(85) + minutes(15), id[33]));
-        let t = tiles(unit(84), unit(85) + minutes(30));
-        let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
-        // Every sub-arc costs 330: at 200 only the unit arc fits.
-        let cut = fit_tiled(&spans, &t, &mut cost, 200, Some(32)).unwrap();
-        assert!(cut.fits);
-        assert_eq!(cut.asked, Some(32));
-        assert!(cut.detail < 32);
-        assert_eq!(cut.cover, vec![0, 33]);
-        // With room: every sub-arc, at the detail asked.
-        let cut = fit_tiled(&spans, &t, &mut cost, 400, Some(32)).unwrap();
-        assert_eq!(cut.detail, 32);
-        assert_eq!(cut.cover.len(), 33);
-        // Below the floor: not fitting, and the floor is what comes back.
-        let cut = fit_tiled(&spans, &t, &mut cost, 50, Some(32)).unwrap();
-        assert!(!cut.fits);
-        assert_eq!(cut.detail, 0);
-        assert_eq!(cut.cover, vec![0, 33]);
-        // Nothing asked: the finest rung, since it fits.
-        let cut = fit_tiled(&spans, &t, &mut cost, 400, None).unwrap();
-        assert_eq!(cut.asked, None);
-        assert_eq!(cut.detail, DETAIL_CAP);
-        assert_eq!(cut.cover.len(), 33);
-    }
-
-    /// Consecutive covers differ only in a suffix: a write in the open tile
-    /// changes nothing before it; the unit closing changes nothing before it;
-    /// a merge rewrites the merged tiles and nothing before them.
-    #[test]
-    fn consecutive_covers_differ_only_in_a_suffix() {
-        let mut spans = Vec::new();
-        let mut next = 1u128;
-        let mut mint = || {
-            let id = Id::new(u128::to_be_bytes(0xC1000000000000000000000000000000 + next)).unwrap();
-            next += 1;
-            id
-        };
-        let quarter = TILE_UNIT_NS / 4;
-        for u in 0..86 {
-            spans.push((unit(u), unit(u + 1), mint()));
-            for q in 0..4 {
-                spans.push((unit(u) + q * quarter, unit(u) + (q + 1) * quarter, mint()));
+        let mut expected = None;
+        for permutation in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let spans: Vec<_> = permutation.into_iter().map(|i| original[i]).collect();
+            let cut = select_recollection_cut(&spans, &[5; 3], &[true; 3], 10);
+            let ids: Vec<_> = cut.cover.iter().map(|&i| spans[i].2).collect();
+            if let Some(expected) = &expected {
+                assert_eq!(&ids, expected);
+            } else {
+                expected = Some(ids);
             }
         }
-        let shown_before = |spans: &[(i128, i128, Id)], now: i128, limit: i128| -> Vec<Id> {
-            let t = tiles(unit(0), now);
-            select_tiled(spans, &t, 6)
-                .into_iter()
-                .filter(|&i| spans[i].1 <= limit)
-                .map(|i| spans[i].2)
-                .collect()
-        };
-        let a = shown_before(&spans, unit(85) + minutes(30), unit(85));
-        // A write in the open tile.
-        spans.push((unit(85) + minutes(40), unit(85) + minutes(55), mint()));
-        assert_eq!(shown_before(&spans, unit(85) + minutes(60), unit(85)), a);
-        // The unit closes: nothing before it moves.
-        spans.push((unit(86) + minutes(5), unit(86) + minutes(20), mint()));
-        assert_eq!(shown_before(&spans, unit(86) + minutes(30), unit(85)), a);
-        // Unit 88: units 84 to 87 merge into one tile; nothing before 84 moves,
-        // and the merged stretch is rendered coarser.
-        let before_84 = shown_before(&spans, unit(86) + minutes(30), unit(84));
-        spans.push((unit(88) + minutes(5), unit(88) + minutes(20), mint()));
-        assert_eq!(
-            shown_before(&spans, unit(88) + minutes(30), unit(84)),
-            before_84
-        );
-        let merged_fine = shown_before(&spans, unit(87) + minutes(30), unit(88)).len();
-        let merged_coarse = shown_before(&spans, unit(88) + minutes(30), unit(88)).len();
+    }
+
+    #[test]
+    fn greedy_space_order_is_not_chronologically_repaired() {
+        let spans = vec![
+            (0, 80 * MOMENT_NS, A),
+            (80 * MOMENT_NS, 100 * MOMENT_NS, B),
+            (50 * MOMENT_NS, 60 * MOMENT_NS, C),
+        ];
+
+        let cut = select_recollection_cut(&spans, &[5; 3], &[true; 3], 15);
+        let selected: Vec<_> = cut.cover.iter().map(|&i| spans[i].2).collect();
+
+        assert_eq!(selected, vec![A, B, C]);
         assert!(
-            merged_coarse < merged_fine,
-            "{merged_coarse} < {merged_fine}"
+            spans[cut.cover[2]].0 < spans[cut.cover[1]].0,
+            "the final fallback stays in its selected SPACE slot"
         );
     }
 
-    /// The report names a tile whose memories are far from its want.
     #[test]
-    fn the_report_names_the_missing_arc() {
-        let id = ids(9);
-        let entry = TILE_UNIT_NS / 64;
-        let mut spans = Vec::new();
-        for e in 0..8 {
-            let s = unit(84) + e * entry;
-            spans.push((s, s + entry, id[e as usize]));
+    fn candidate_length_defines_one_ideal_temporal_slot() {
+        let id = ids(5);
+        let life = 1000 * MOMENT_NS;
+        let budget = 101;
+        let cost = 10;
+        let gradient = DensityGradient::new(life, budget);
+        let ideal_end = gradient.sample(cost).time_ns.round() as i128;
+        let shift = ideal_end / 4;
+        let spans = vec![
+            // Ineligible boundary observations establish LIFE without taking
+            // part in the choice.
+            (0, 0, id[0]),
+            (life, life, id[1]),
+            // Exact slot, same-width shifted slot, and same-centre narrow slot.
+            (0, ideal_end, id[2]),
+            (shift, ideal_end + shift, id[3]),
+            (ideal_end / 4, ideal_end * 3 / 4, id[4]),
+        ];
+        let cut = select_recollection_cut(
+            &spans,
+            &[1, 1, cost, cost, cost],
+            &[false, false, true, true, true],
+            budget,
+        );
+
+        assert_eq!(cut.cover.first(), Some(&2));
+    }
+
+    #[test]
+    fn sampled_grain_gets_finer_toward_the_present() {
+        let id = ids(17);
+        let life = 4096 * MOMENT_NS;
+        let mut spans = vec![(0, life, id[0])];
+        let mut costs = vec![1usize];
+
+        // Abundant support at geometrically decreasing widths. Each scale has
+        // an old and young representative, so the field rather than scarcity
+        // determines the selected grain.
+        for level in 0..8 {
+            let width = (1i128 << (11 - level)) * MOMENT_NS;
+            let old_start = (1i128 << level) * MOMENT_NS;
+            let young_end = life - (1i128 << level) * MOMENT_NS;
+            spans.push((old_start, old_start + width, id[1 + level * 2]));
+            spans.push((young_end - width, young_end, id[2 + level * 2]));
+            costs.extend([8, 8]);
         }
-        let t = tiles(unit(84), unit(85) + minutes(30));
-        let report = tile_report(&spans, &t, 1);
-        assert_eq!(report[0].picked, 8);
-        assert!(report[0].worst_ratio > 60.0, "{}", report[0].worst_ratio);
-        assert_eq!(report[1].want_ns, None, "the open tile wants leaf grain");
-        spans.push((unit(84), unit(85), id[8]));
-        let report = tile_report(&spans, &t, 1);
-        assert_eq!(report[0].picked, 1);
-        assert_eq!(report[0].worst_ratio, 1.0);
+
+        let cut = select_recollection_cut(&spans, &costs, &[true; 17], 49);
+        let selected: Vec<_> = cut.cover.iter().copied().filter(|&i| i != 0).collect();
+        assert!(selected.len() >= 2, "{selected:?}");
+        let oldest = selected
+            .iter()
+            .min_by_key(|&&i| spans[i].0 + (spans[i].1 - spans[i].0) / 2)
+            .copied()
+            .unwrap();
+        let youngest = selected
+            .iter()
+            .max_by_key(|&&i| spans[i].0 + (spans[i].1 - spans[i].0) / 2)
+            .copied()
+            .unwrap();
+        let old_width = spans[oldest].1 - spans[oldest].0;
+        let young_width = spans[youngest].1 - spans[youngest].0;
+        assert!(
+            old_width > young_width,
+            "old {oldest} width {old_width}, young {youngest} width {young_width}, selected {selected:?}"
+        );
+    }
+
+    #[test]
+    fn first_best_sample_that_does_not_fit_ends_the_walk() {
+        let id = ids(1);
+        let life = 100 * MOMENT_NS;
+        let spans = vec![(0, life, id[0])];
+        let cut = select_recollection_cut(&spans, &[11], &[true], 10);
+
+        assert!(cut.cover.is_empty());
+        assert_eq!(cut.used, 0);
+    }
+
+    #[test]
+    fn silent_era_detection_is_observation_not_selection() {
+        let id = ids(4);
+        let spans = vec![
+            (0, 100 * MOMENT_NS, id[0]),
+            (0, 20 * MOMENT_NS, id[1]),
+            (10 * MOMENT_NS, 25 * MOMENT_NS, id[2]),
+            (60 * MOMENT_NS, 100 * MOMENT_NS, id[3]),
+        ];
+        assert_eq!(
+            silent_life_quarters(&spans, &[1, 2, 3]),
+            vec![(25 * MOMENT_NS, 60 * MOMENT_NS)]
+        );
+        assert_eq!(
+            silent_life_quarters(&spans, &[]),
+            vec![(0, 100 * MOMENT_NS)]
+        );
+        assert!(
+            silent_life_quarters(&spans, &[0]).is_empty(),
+            "a broad selected arc makes the instrument quiet; it is not forced into selection"
+        );
     }
 }
