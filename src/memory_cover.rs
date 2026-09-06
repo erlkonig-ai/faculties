@@ -605,7 +605,8 @@ impl DensityGradient {
 }
 
 /// The lossy recollection selected for one reader. `cover` is in greedy SPACE
-/// cursor order. Temporal centres may wobble locally when ranges overlap.
+/// cursor order. Temporal centres may wobble when ranges overlap or support is
+/// sparse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecollectionCut {
     pub cover: Vec<usize>,
@@ -697,18 +698,6 @@ pub fn select_recollection_cut(
     }
 
     RecollectionCut { cover, used }
-}
-
-/// Put an already-selected recollection into the lived-time order a reader
-/// receives. This is presentation only and never feeds back into selection.
-fn sort_for_emission(spans: &[(i128, i128, Id)], cover: &mut [usize]) {
-    cover.sort_by(|&a, &b| {
-        spans[a]
-            .0
-            .cmp(&spans[b].0)
-            .then(spans[b].1.cmp(&spans[a].1))
-            .then(spans[a].2.cmp(&spans[b].2))
-    });
 }
 
 /// Gaps longer than one quarter of the currently available life which no
@@ -983,8 +972,7 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
         };
         let cut = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget_chars);
         let silent_life_quarters = silent_life_quarters(&sub, &cut.cover);
-        let mut cover: Vec<usize> = cut.cover.iter().map(|&j| map[j]).collect();
-        sort_for_emission(&spans, &mut cover);
+        let cover: Vec<usize> = cut.cover.iter().map(|&j| map[j]).collect();
         let mut kept = 0usize;
         let mut changed_at = None;
         for (n, (a, b)) in cover.iter().zip(previous.iter()).enumerate() {
@@ -1168,12 +1156,12 @@ where
     }
     let cut = select_recollection_cut(&spans, &costs, &class_eligible, budget_chars);
     let used = cut.used;
-    let mut cover = cut.cover;
-    sort_for_emission(&spans, &mut cover);
+    let cover = cut.cover;
 
-    // Selection walks SPACE; emission walks lived time. Ranges may overlap or
-    // leave gaps, and temporal centres may wobble inside nested ranges; none of
-    // those implies containment structure or a missing record.
+    // The selected SPACE order is the emitted order. Reordering by lived time
+    // would move memories away from the ideal slots which chose them and hide
+    // where the journal lacks appropriately dense support. Ranges may therefore
+    // overlap, leave gaps, or wobble backwards in lived time.
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("recollections about \"{q}\" within equal spans"),
@@ -1185,7 +1173,7 @@ where
         if let Some(q) = remove_q {
             parts.push(format!("excluding \"{q}\""));
         }
-        format!("old → young; {}", parts.join("; "))
+        format!("greedy SPACE order; {}", parts.join("; "))
     };
     // The status header goes to STDERR, not into the returned cover buffer: the
     // time-ranges are the drill key the wake ritual ingests, and this line's
@@ -1425,6 +1413,24 @@ mod recollection_tests {
     }
 
     #[test]
+    fn greedy_space_order_is_not_chronologically_repaired() {
+        let spans = vec![
+            (0, 80 * MOMENT_NS, A),
+            (80 * MOMENT_NS, 100 * MOMENT_NS, B),
+            (50 * MOMENT_NS, 60 * MOMENT_NS, C),
+        ];
+
+        let cut = select_recollection_cut(&spans, &[5; 3], &[true; 3], 15);
+        let selected: Vec<_> = cut.cover.iter().map(|&i| spans[i].2).collect();
+
+        assert_eq!(selected, vec![A, B, C]);
+        assert!(
+            spans[cut.cover[2]].0 < spans[cut.cover[1]].0,
+            "the final fallback stays in its selected SPACE slot"
+        );
+    }
+
+    #[test]
     fn candidate_length_defines_one_ideal_temporal_slot() {
         let id = ids(5);
         let life = 1000 * MOMENT_NS;
@@ -1451,16 +1457,6 @@ mod recollection_tests {
         );
 
         assert_eq!(cut.cover.first(), Some(&2));
-    }
-
-    #[test]
-    fn emission_orders_the_chosen_set_by_lived_time() {
-        let spans = vec![(20, 30, C), (10, 15, B), (10, 20, A)];
-        let mut cover = vec![0, 1, 2];
-
-        sort_for_emission(&spans, &mut cover);
-
-        assert_eq!(cover, vec![2, 1, 0], "wider first at an equal start");
     }
 
     #[test]

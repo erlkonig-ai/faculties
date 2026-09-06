@@ -8,11 +8,12 @@ All notable changes to this project will be documented in this file.
   cover.** A continuous logarithmic-age gradient maps the reader's available
   character space across lived time. Each candidate's charged length defines
   one ideal temporal slot on that map, and the greedy walk chooses the memory
-  whose actual start and end best match it. Gaps, overlap, locally wobbling
+  whose actual start and end best match it. Gaps, overlap, wobbling temporal
   centres, and omitted detail are valid active recall while the pile remains
   lossless; broad old arcs emerge from the gradient and available support
-  rather than a special coverage rule. The chosen set is rendered separately
-  in lived-time order without feeding that order back into selection. Remove
+  rather than a special coverage rule. The sampler's greedy SPACE order is
+  rendered unchanged: there is no chronological repair that relocates a chosen
+  memory and hides where the journal lacks appropriately dense support. Remove
   tile/detail controls and `memory levels`; `memory churn` now replays
   the sampler by journal observation time and reports any unselected stretch
   longer than one quarter of the available life. Budgets charge the exact
