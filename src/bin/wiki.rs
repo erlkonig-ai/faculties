@@ -12,7 +12,9 @@ use faculties::collection_names::{configured_handle, open_configured, open_exact
 use faculties::schemas::embeddings::{self, Embedding768};
 use faculties::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use faculties::schemas::wiki::{self as schema, extract_link_targets};
-use faculties::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
+use faculties::storage::{
+    load_signer, open_store, read, runtime, FactArchive, FacultySnapshot, FacultyStore,
+};
 use faculties::wiki::{
     self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
     RevisionRecord,
@@ -230,7 +232,7 @@ struct WikiStorage<'a> {
 #[derive(Clone)]
 struct WikiView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: FacultySnapshot,
     latest: LatestIndex,
 }
 
@@ -2051,7 +2053,7 @@ fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<()> {
                 if !current.contains(&revision) {
                     continue;
                 }
-                let vector: anybytes::View<[f32]> = view.reader.get(handle)?;
+                let vector: anybytes::View<[f32]> = BlobStoreGet::get(&view.reader, handle)?;
                 pairs.push((revision, vector.as_ref().to_vec()));
             }
             let mut report = String::new();
@@ -2262,7 +2264,7 @@ mod tests {
         .unwrap();
         let mut arrival = Some(arrival);
         let mut requested = Vec::new();
-        let mut original = None::<PileSnapshot>;
+        let mut original = None::<FacultySnapshot>;
         let (report, entry, title, content) = storage
             .view(|view| {
                 let original = original.get_or_insert_with(|| view.reader.clone());

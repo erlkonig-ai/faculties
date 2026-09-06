@@ -15,7 +15,9 @@ use faculties::message::{self, IntervalValue, MessageRow};
 use faculties::relations::{self, IdentityComponents, TextHandle};
 use faculties::schemas::message::DEFAULT_SCOPE_ID;
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
-use faculties::storage::{self, load_signer, open_store, runtime, FactArchive, FacultyStore};
+use faculties::storage::{
+    self, load_signer, open_store, runtime, FactArchive, FacultySnapshot, FacultyStore,
+};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -87,7 +89,7 @@ struct MessageStorage<'a> {
     pile: &'a mut FacultyStore,
     signer: &'a SigningKey,
     collection: Collection<SimpleArchive>,
-    reader: &'a PileSnapshot,
+    reader: &'a FacultySnapshot,
     messages: &'a FactArchive,
     relations: &'a FactArchive,
 }
