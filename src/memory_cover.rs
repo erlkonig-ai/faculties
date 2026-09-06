@@ -665,6 +665,50 @@ pub fn tiles(earliest: i128, now: i128) -> Vec<Tile> {
     out
 }
 
+/// An alternative tiling, for measuring beside the counter: every level
+/// renders the `k` most recent complete blocks of its size, aligned to the
+/// grid, except where a finer level already renders; the open unit renders
+/// at leaf grain. Older levels appear as the life grows. The number of tiles
+/// is then about `k` per level at every phase of the grid, where the
+/// counter's swings between one and three, and a level's window slides by
+/// one block at every boundary of its size, re-rendering from that block on.
+pub fn tiles_sliding(earliest: i128, now: i128, k: i128) -> Vec<Tile> {
+    let k = k.max(1);
+    let first = earliest.div_euclid(TILE_UNIT_NS);
+    let current = now.div_euclid(TILE_UNIT_NS);
+    let mut out = vec![Tile {
+        start: current * TILE_UNIT_NS,
+        end: (current + 1) * TILE_UNIT_NS,
+        units: 1,
+        open: true,
+    }];
+    let mut size = 1i128;
+    let mut covered_from = current;
+    loop {
+        let boundary = current - current.rem_euclid(size);
+        let start = boundary - k * size;
+        let first_aligned = first - first.rem_euclid(size);
+        let from = start.max(first_aligned);
+        let mut t = from;
+        while t < covered_from {
+            out.push(Tile {
+                start: t * TILE_UNIT_NS,
+                end: (t + size).min(covered_from) * TILE_UNIT_NS,
+                units: size,
+                open: false,
+            });
+            t += size;
+        }
+        if start <= first {
+            break;
+        }
+        covered_from = from;
+        size *= TILE_BASE;
+    }
+    out.sort_by_key(|t| t.start);
+    out
+}
+
 /// The grain a tile wants at `detail` memories per tile. `detail == 0` wants
 /// the widest memory everywhere: the completeness floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1121,6 +1165,7 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
     steps: usize,
     step_units: i128,
     asked: Option<usize>,
+    sliding: Option<i128>,
 ) -> Result<Vec<ReplayRow>> {
     let raw_spans = collect_chunk_spans(space);
     let (spans, classes) = recollection_classes(&raw_spans);
@@ -1163,7 +1208,10 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
             continue;
         };
         let first = sub.iter().map(|s| s.0).min().unwrap_or(earliest);
-        let tiles = tiles(first, now);
+        let tiles = match sliding {
+            Some(k) => tiles_sliding(first, now, k),
+            None => tiles(first, now),
+        };
         let mut cost_sub = |j: usize| -> Result<usize> { cost_of(map[j]) };
         let cut = fit_tiled(&sub, &tiles, &mut cost_sub, budget_chars, asked)?;
         // The emission order: time order, wider first at a tie.

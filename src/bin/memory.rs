@@ -2563,6 +2563,7 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let mut steps: usize = 160;
     let mut step_units: i128 = 1;
     let mut detail: Option<usize> = None;
+    let mut sliding: Option<i128> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -2577,7 +2578,8 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 step_units = value(i)?.parse().context("--step-units expects a number")?
             }
             "--detail" => detail = Some(value(i)?.parse().context("--detail expects a number")?),
-            other => bail!("unknown flag {other}; usage: memory churn [--chars N] [--steps K] [--step-units U] [--detail D]"),
+            "--sliding" => sliding = Some(value(i)?.parse().context("--sliding expects a count of blocks per level")?),
+            other => bail!("unknown flag {other}; usage: memory churn [--chars N] [--steps K] [--step-units U] [--detail D] [--sliding K]"),
         }
         i += 2;
     }
@@ -2590,6 +2592,7 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         steps,
         step_units,
         detail,
+        sliding,
     )?;
     if rows.is_empty() {
         println!("no memory chunks");
