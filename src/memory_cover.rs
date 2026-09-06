@@ -585,11 +585,14 @@ pub const TILE_BASE: i128 = 4;
 /// The most memories per tile a reader may ask for.
 pub const DETAIL_CAP: usize = 4096;
 
-/// The details the cut steps through: about a half-doubling apart, so a
-/// search visits two dozen cuts and a step down is a step, not a crawl.
-const DETAIL_LADDER: [usize; 24] = [
-    1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 91, 128, 181, 256, 362, 512, 724, 1024, 1448, 2048,
-    2896, 4096,
+/// The details a tile can render at: eighth-doublings from one memory per
+/// tile to `DETAIL_CAP`, so a tile fitting its share from below leaves at
+/// most a tenth of it unused.
+const DETAIL_LADDER: [usize; 79] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 21, 23, 25, 27, 29, 32, 35, 38, 41,
+    45, 49, 54, 59, 64, 70, 76, 83, 91, 99, 108, 117, 128, 140, 152, 166, 181, 197, 215, 235, 256,
+    279, 304, 332, 362, 395, 431, 470, 512, 558, 609, 664, 724, 790, 861, 939, 1024, 1117, 1218,
+    1328, 1448, 1579, 1722, 1878, 2048, 2233, 2435, 2656, 2896, 3158, 3444, 3756, 4096,
 ];
 
 /// One tile of the cover: a block of whole grid units on an absolute grid.
@@ -763,6 +766,17 @@ fn sweep(
     spans: &[(i128, i128, Id)],
     tiles: &[Tile],
     detail: usize,
+    visit: impl FnMut(usize, i128, i128, usize),
+) {
+    sweep_with(spans, tiles, |_| detail, visit)
+}
+
+/// `sweep` with a detail per tile (by tile index): the level-shares fit
+/// renders every tile at its own grain.
+fn sweep_with(
+    spans: &[(i128, i128, Id)],
+    tiles: &[Tile],
+    detail_of: impl Fn(usize) -> usize,
     mut visit: impl FnMut(usize, i128, i128, usize),
 ) {
     let n = spans.len();
@@ -801,7 +815,7 @@ fn sweep(
             at += 1;
         }
         if at < events.len() && !active.is_empty() {
-            let pick = closest(&active, want(&tiles[tile_at], detail));
+            let pick = closest(&active, want(&tiles[tile_at], detail_of(tile_at)));
             visit(tile_at, coordinate, events[at].0, pick);
         }
     }
@@ -814,6 +828,63 @@ pub fn select_tiled(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) -
     let mut shown = vec![false; spans.len()];
     sweep(spans, tiles, detail, |_, _, _, pick| shown[pick] = true);
     (0..spans.len()).filter(|&i| shown[i]).collect()
+}
+
+/// One cut with a detail per tile: the cover, its cost, and each tile's
+/// share of that cost. A memory shown in two tiles is charged to the older
+/// one, where the sweep met it first.
+fn select_with(
+    spans: &[(i128, i128, Id)],
+    tiles: &[Tile],
+    details: &[usize],
+    cost: &mut dyn FnMut(usize) -> Result<usize>,
+) -> Result<(Vec<usize>, usize, Vec<usize>)> {
+    let mut owner: Vec<Option<usize>> = vec![None; spans.len()];
+    sweep_with(
+        spans,
+        tiles,
+        |t| details[t],
+        |t, _, _, pick| {
+            if owner[pick].is_none() {
+                owner[pick] = Some(t);
+            }
+        },
+    );
+    let mut cover = Vec::new();
+    let mut per_tile = vec![0usize; tiles.len()];
+    let mut used = 0usize;
+    for i in 0..spans.len() {
+        if let Some(t) = owner[i] {
+            let c = cost(i)?;
+            per_tile[t] = per_tile[t].saturating_add(c);
+            used = used.saturating_add(c);
+            cover.push(i);
+        }
+    }
+    Ok((cover, used, per_tile))
+}
+
+/// The tiles in one line with their details, newest first, runs of equal
+/// width and detail joined: `now@4096, 3x4.6h@1218, 1x3.0d@256`.
+pub fn describe_details(tiles: &[Tile], details: &[usize]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut runs: Vec<(i128, usize, String, usize)> = Vec::new();
+    for (t, tile) in tiles.iter().enumerate().rev() {
+        if tile.open {
+            parts.push(format!("now@{}", details[t]));
+            continue;
+        }
+        match runs.last_mut() {
+            Some((units, detail, _, count)) if *units == tile.units && *detail == details[t] => {
+                *count += 1
+            }
+            _ => runs.push((tile.units, details[t], tile.width(), 1)),
+        }
+    }
+    for (_, detail, width, count) in runs {
+        parts.push(format!("{count}x{width}@{detail}"));
+    }
+    parts.join(", ")
 }
 
 /// How well the pile serves one tile at a detail: what the tile wanted, how
@@ -854,25 +925,42 @@ pub fn tile_report(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) ->
         .collect()
 }
 
-/// A cut that fits.
+/// A cut that fits, by level shares.
 ///
-/// `detail` is memories per tile. With none asked it is the finest rung of
-/// the ladder at which a complete cover fits the budget, chosen anew at every
-/// render, so the cover is as full as the pile allows. When the tiling's
-/// counter carries, or the pile grows, across a rung, the whole cover renders
-/// anew: on the live pile that was six times in the month to 2026-09-06 at
-/// the wake's budget, against the merges, which rewrite only the young end.
-/// An asked detail pins it, for measuring, and steps down the ladder until a
-/// complete cover fits, because one must always be produced. `fits` is false
+/// Every level of the tiling (every tile width present, the open unit with
+/// the one-unit tiles) gets an equal share of the budget, and the tiles at a
+/// level split their level's share. A tile renders at the finest rung of the
+/// ladder whose cost fits its share, so a level with one tile shows it three
+/// times as finely as a level with three. The cover is therefore always
+/// about as full as the ladder allows, whatever the counter's phase; between
+/// carries nothing but the open tile changes; a carry at level `l` re-shares
+/// levels `l` and `l + 1`, the young end, and leaves everything older as it
+/// was; and only a new level -- once per quadrupling of the life -- moves
+/// every share. That is what JP asked for on 2026-09-06: a fixed token
+/// count, temporal order, and recomputes that reach deeper ever more rarely.
+///
+/// `asked` pins one detail for every tile, for measuring. `fits` is false
 /// only when even the floor (the widest memory at every point) overflows, in
 /// which case `cover` is that floor and `used` its cost, so the caller can
 /// name the shortfall.
 pub struct TiledCut {
+    /// The finest detail any tile renders at.
     pub detail: usize,
+    /// The detail of each tile, by tile index.
+    pub details: Vec<usize>,
     pub asked: Option<usize>,
     pub cover: Vec<usize>,
     pub used: usize,
     pub fits: bool,
+}
+
+fn rung_below(detail: usize) -> usize {
+    DETAIL_LADDER
+        .iter()
+        .rev()
+        .copied()
+        .find(|&d| d < detail)
+        .unwrap_or(0)
 }
 
 pub fn fit_tiled(
@@ -882,46 +970,95 @@ pub fn fit_tiled(
     budget: usize,
     asked: Option<usize>,
 ) -> Result<TiledCut> {
-    let mut render = |detail: usize| -> Result<(Vec<usize>, usize)> {
-        let cover = select_tiled(spans, tiles, detail);
-        let mut used = 0usize;
-        for &i in &cover {
-            used = used.saturating_add(cost(i)?);
-        }
-        Ok((cover, used))
-    };
-    let (floor_cover, floor) = render(0)?;
+    let n = tiles.len();
+    let (floor_cover, floor, _) = select_with(spans, tiles, &vec![0; n], cost)?;
     if floor > budget {
         return Ok(TiledCut {
             detail: 0,
+            details: vec![0; n],
             asked,
             cover: floor_cover,
             used: floor,
             fits: false,
         });
     }
-    let done = |detail, (cover, used)| TiledCut {
-        detail,
-        asked,
-        cover,
-        used,
-        fits: true,
+    let mut details: Vec<usize> = match asked {
+        Some(wanted) => vec![wanted.min(DETAIL_CAP); n],
+        None => {
+            // Shares by level INDEX up to the top level, so the layout of the
+            // shares depends only on the life's length, not on which levels
+            // the counter happens to hold today. A level with no tile at this
+            // phase lends its share to the nearest older level that has one:
+            // that is the tile the missing levels just merged into, at the
+            // young end, so re-sharing it is a suffix change.
+            let level_of = |units: i128| -> usize {
+                let mut l = 0;
+                let mut u = units;
+                while u > 1 {
+                    u /= TILE_BASE;
+                    l += 1;
+                }
+                l
+            };
+            let top = tiles.iter().map(|t| level_of(t.units)).max().unwrap_or(0);
+            let mut present = vec![0usize; top + 1];
+            for t in tiles {
+                present[level_of(t.units)] += 1;
+            }
+            let unit_share = budget / (top + 1);
+            let mut level_share = vec![0usize; top + 1];
+            let mut lent = 0usize;
+            for l in 0..=top {
+                if present[l] > 0 {
+                    level_share[l] = unit_share.saturating_mul(1 + lent);
+                    lent = 0;
+                } else {
+                    lent += 1;
+                }
+            }
+            let tile_share: Vec<usize> = tiles
+                .iter()
+                .map(|t| {
+                    let l = level_of(t.units);
+                    level_share[l] / present[l].max(1)
+                })
+                .collect();
+            let mut chosen = vec![false; n];
+            let mut details = vec![0usize; n];
+            for &rung in DETAIL_LADDER.iter().rev() {
+                let (_, _, per_tile) = select_with(spans, tiles, &vec![rung; n], cost)?;
+                for t in 0..n {
+                    if !chosen[t] && per_tile[t] <= tile_share[t] {
+                        details[t] = rung;
+                        chosen[t] = true;
+                    }
+                }
+                if chosen.iter().all(|&c| c) {
+                    break;
+                }
+            }
+            details
+        }
     };
-    if let Some(wanted) = asked {
-        let wanted = wanted.min(DETAIL_CAP);
-        let cut = render(wanted)?;
-        if cut.1 <= budget {
-            return Ok(done(wanted, cut));
+    // The whole must fit; if the shares' sum of parts does not (a memory
+    // charged to one tile and shown in another), step every tile down one
+    // rung until it does. The floor fits, so this ends.
+    loop {
+        let (cover, used, _) = select_with(spans, tiles, &details, cost)?;
+        if used <= budget {
+            return Ok(TiledCut {
+                detail: details.iter().copied().max().unwrap_or(0),
+                details,
+                asked,
+                cover,
+                used,
+                fits: true,
+            });
+        }
+        for d in details.iter_mut() {
+            *d = rung_below(*d);
         }
     }
-    let top = asked.map(|a| a.min(DETAIL_CAP)).unwrap_or(usize::MAX);
-    for &detail in DETAIL_LADDER.iter().rev().filter(|&&d| d < top) {
-        let cut = render(detail)?;
-        if cut.1 <= budget {
-            return Ok(done(detail, cut));
-        }
-    }
-    Ok(done(0, (floor_cover, floor)))
 }
 
 /// The tiles in one line, newest first: `now, 3x4.6h, 2x18.2h, 1x3.0d`.
@@ -1426,6 +1563,7 @@ where
         );
     }
     let detail = cut.detail;
+    let details = cut.details;
     let asked = cut.asked;
     let mut cover = cut.cover;
     let mut used = cut.used;
@@ -1500,15 +1638,14 @@ where
     // selected summary and retry this resident-only computation. The status
     // line goes to STDERR so its volatile counts never enter the cover text.
     eprintln!(
-        "memory context — {} chunk(s), ~{} of {} characters ({mode}); detail {} per tile{}; tiles: {}; floor {} chunk(s)",
+        "memory context — {} chunk(s), ~{} of {} characters ({mode}); {}; tiles: {}; floor {} chunk(s)",
         cover.len(),
         used,
         budget_chars,
-        detail,
         match asked {
-            Some(wanted) if wanted != detail => format!(" (asked {wanted}, stepped down to fit)"),
-            Some(_) => " (asked)".to_string(),
-            None => " (the finest that fits)".to_string(),
+            Some(wanted) if wanted != detail => format!("detail {detail} per tile (asked {wanted}, stepped down to fit)"),
+            Some(_) => format!("detail {detail} per tile (asked)"),
+            None => format!("equal shares per level, each tile at the finest detail that fits its share: {}", describe_details(&tiles, &details)),
         },
         describe_tiles(&tiles),
         select_tiled(&spans, &tiles, 0).len(),
@@ -1857,9 +1994,14 @@ mod headroom_tests {
         assert!(!cut.fits);
         assert_eq!(cut.detail, 0);
         assert_eq!(cut.cover, vec![0, 33]);
-        // Nothing asked: the finest rung, since it fits.
+        // Nothing asked: level shares. The two one-unit tiles (the closed unit
+        // and the open one) split the level's share; at 400 the closed unit's
+        // 200 holds only the unit arc, at 800 it holds every sub-arc at the
+        // finest rung.
         let cut = fit_tiled(&spans, &t, &mut cost, 400, None).unwrap();
         assert_eq!(cut.asked, None);
+        assert_eq!(cut.cover, vec![0, 33]);
+        let cut = fit_tiled(&spans, &t, &mut cost, 800, None).unwrap();
         assert_eq!(cut.detail, DETAIL_CAP);
         assert_eq!(cut.cover.len(), 33);
     }
