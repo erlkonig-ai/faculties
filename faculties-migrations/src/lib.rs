@@ -5,3 +5,4 @@
 //! it consumes and publishes ordinary current facts or collection records.
 
 pub mod collection_policy;
+pub mod resource_capabilities;

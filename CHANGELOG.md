@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add `migrations resource-capabilities` for the exact direct READ/WRITE-policy
+  roots from core `35ec1817`. Plan and publish separately by author, with an
+  optional explicit authority root, exact descriptor handles, and report-only
+  predecessor inventory. Re-sign only the selected author's verified COMMITs
+  over unchanged data/metadata handles, including sparse replicas; report other
+  authors as deferred. Register complete current capability-definition closure,
+  including Secrets' explicit owner key-delivery binding. Zero matching author
+  input is a no-op and deterministic replay adds no bytes. Historical AUTH,
+  descriptors, and records remain untouched; grant reissuance is separate.
+
 - Secrets key delivery has its own capability definition and explicit policy
   binding on the source collection. Replication READ never selects DEK
   recipients; both initial sealing and additive envelope maintenance query the

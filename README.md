@@ -224,8 +224,38 @@ COMMITs whose signers satisfy that descriptor's WRITE policy using resident
 capability-proof evidence. There is no ambient team, owner namespace, mutable
 head, or CAS update, so independently extended pile copies converge by
 concatenation, all backed by the same content-addressed blob store. Ordinary
-runtime never probes historical Repository branches; the shipped migration is
-an explicit re-seat between native collection-policy descriptor epochs.
+runtime never probes historical Repository branches. Explicit native descriptor
+transitions live in the separate `migrations` binary.
+
+For the READ/WRITE-policy epoch immediately before resource capabilities, run
+`migrations --pile <PILE> --key <AUTHOR_KEY> resource-capabilities --authority
+<ROOT_PUBLIC_KEY> --dry-run --handles`, then repeat without `--dry-run` to append
+the planned successors. `--authority` defaults to the signer's public key. Check
+the printed exact old/new handles against the configured live collections;
+equal names alone do not select a predecessor. Only standard direct-policy
+roots for that authority are selected. Secrets' successor explicitly binds key
+delivery to the owner. `--inventory` optionally reports other resident
+predecessor roots without treating unrelated history as an error.
+
+Each pass re-signs only its own author's COMMITs and preserves their exact data
+and metadata handles, including absent blobs and every domain entity id. Other
+authors are reported as deferred and need their own key-local passes. Invalid
+selected-author signatures prevent publication. Zero selected-author COMMITs
+is a no-op. Old writers should be quiescent for the final pass; publication
+replans and verifies from fresh snapshots, and exact replay appends nothing.
+Old descriptors, proofs, records, and cache artifacts remain in place. Rebuild
+derived collections through ordinary maintenance; verify selected-author
+coverage on each author host and combined coverage after replication before
+claiming the shared collection has fully transitioned.
+
+Old AUTH signatures cannot be relabeled. Reissue grants separately against the
+exact new descriptor and current capability grammar, preserving the intended
+recipient, mode, and validity. The current `trible pile collection grant-read`
+and `grant-write` commands create unbounded Invoke grants; they do not preserve
+bounded or delegable grants automatically and do not grant Secrets key delivery.
+The older `migrations collection-policy` verb consumes the mandatory-authority
+epoch, not this transition. Neither verb is the historical branch-to-collection
+cutover.
 
 Reads use maintained Succinct/Rank9 collections through immutable store
 snapshots. The snapshot freezes both the stored prefix and its authorization
