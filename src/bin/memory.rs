@@ -49,19 +49,18 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--detail N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the cover's structure; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about chooses prose within an equal-span position, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — density-shaped, deliberately lossy recollection over journaled time, past→present, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, locally wobbling centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). They compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
              memory cover reset [--session KEY]   — rewind the cursor to 0 (does NOT regenerate the stored cover)\n  \
-             memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
+             memory density [<grain>]        — inspect where the stored hierarchy is bushy, balanced, or coarse (a journal diagnostic; it does not drive recollection)\n  \
              memory search <query>           — exact lexical (BM25) search rebuilt from the frozen Memory view\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
-             memory levels <detail>           — how well each tile of the cover is served at a reader's detail: the want, the count shown, the worst width ratio (a big ratio is the arc the comb should write)\n  \
-             memory churn [--chars N] [--steps K] [--step-units U] [--detail D] — replay the cover over the pile's own past, one grid unit at a time (K steps back from the newest memory, default 160), fitting the detail to the budget at every step (or holding --detail D): per step the tiles, the detail, the size, and how many characters of the previous cover survived as a prefix; then how often the detail changed and how much a step re-rendered\n  \
+             memory churn [--chars N] [--steps K] [--step-units U] — replay density-shaped recollection over the pile's own observation history (K diagnostic steps back, default 160): per step the fill, previous rendered prefix surviving, and any unselected stretch longer than one quarter of LIFE\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
@@ -897,9 +896,6 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "check") {
         return cmd_check(storage, &cli.ids[1..]);
-    }
-    if cli.ids.first().is_some_and(|value| value == "levels") {
-        return cmd_levels(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "churn") {
         return cmd_churn(storage, &cli.ids[1..]);
@@ -1989,29 +1985,20 @@ fn cmd_list(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `memory context [<budget-chars>]` — the antichain cover over ALL of my
-/// memories, coarse → fine, fit to a CHARACTER budget. This is the grounding cover a
-/// fresh context reads first to wake into its own past: every memory is
-/// represented (completeness is invariant), with detail concentrated toward the
-/// recent end and the deep past held as coarse summary.
-///
-/// Unlike the playground — which must degrade silently because the cover
-/// *bootstraps* the model and there is no model yet to repair the hierarchy — the
-/// faculty is called by an already-running agent. So when even the coarsest cover
-/// overflows the budget, it ERRORS with instructions for raising a coarser apex
-/// rather than dropping memories: the caller is right there to fix it.
+/// `memory context [<budget-chars>]` — a density-shaped recollection of my
+/// journal, old → young, fit to a CHARACTER budget. The active recollection is
+/// intentionally lossy; the pile is not. A continuous logarithmic-age gradient
+/// selects coarse old memories and increasingly fine recent ones from whatever
+/// support the journal actually contains.
 fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // Parse `[<budget>] [--chars N] [--about <query words...>]`. The budget is a
     // CHARACTER count: a bare number, `--chars N`, or (as an alias) `--tokens N`
     // all set it directly — there is no separate token estimate anymore (the old
     // estimate ran ~2× off the real token count, which was confusing; characters
     // are exact). `--about` chooses among recollections with the exact same
-    // temporal coverage; it never changes the recency-first cover structure.
+    // temporal coverage; it never changes the temporal sampler.
     let mut budget_chars: usize = 200_000;
     let mut chunk_overhead: usize = 0;
-    // `--detail N`: pins the memories per tile, for measuring; without it the
-    // renderer takes the finest that fits, at every render.
-    let mut detail: Option<usize> = None;
     let mut about: Option<String> = None;
     // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
     // ELIGIBILITY by positive similarity to their query; `--sim-threshold <f>` is
@@ -2036,7 +2023,6 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                     | "--tokens"
                     | "--chars"
                     | "--chunk-overhead"
-                    | "--detail"
                     | "--sim-threshold"
             )
         };
@@ -2079,16 +2065,6 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 i += 2;
                 continue;
             }
-            if args[i] == "--detail" {
-                let raw = args.get(i + 1).ok_or_else(|| {
-                    anyhow!("--detail needs a count of memories per tile, e.g. `--detail 12`")
-                })?;
-                detail = Some(raw.parse().map_err(|_| {
-                    anyhow!("--detail expects a non-negative integer, got `{raw}`")
-                })?);
-                i += 2;
-                continue;
-            }
             // `--tokens N` is a backward-compatible ALIAS for `--chars N` (the
             // budget is characters now; there is no separate token path).
             if args[i] == "--tokens" || args[i] == "--chars" {
@@ -2123,7 +2099,6 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         filter_q.as_deref(),
         remove_q.as_deref(),
         sim_threshold,
-        detail,
     )?;
     print!("{cover}");
     Ok(())
@@ -2132,7 +2107,7 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 /// Build the context-cover TEXT — exactly what `memory context` prints to
 /// stdout — without printing it. Shared by `cmd_context` (which prints it) and
 /// `cover start` (which stores it for cursor-chunked reading), so the cover
-/// semantics — antichain completeness, the character budget, the
+/// semantics — density-shaped recollection, the character budget, the
 /// `--about`/`--filter`/`--remove` composition — live in one place and the two
 /// callers can never drift. Memory and optional Embeddings are attached from
 /// one immutable maintained store snapshot held by `loaded`.
@@ -2144,7 +2119,6 @@ fn build_context_cover(
     filter_q: Option<&str>,
     remove_q: Option<&str>,
     sim_threshold: f32,
-    detail: Option<usize>,
 ) -> Result<String> {
     if collect_chunk_spans(&loaded.memory.memory.facts).is_empty() {
         return Ok("no memory chunks\n".to_string());
@@ -2157,7 +2131,6 @@ fn build_context_cover(
         filter: filter_q.map(str::to_string),
         remove: remove_q.map(str::to_string),
         sim_threshold,
-        detail,
     };
     if let Some(embeddings) = loaded.embeddings.as_ref() {
         faculties::memory_cover::render_cover(
@@ -2444,7 +2417,6 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 None,
                 None,
                 DEFAULT_SIM_THRESHOLD,
-                None,
             )?;
             let now = clock::now().context("generate cover state timestamp")?;
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
@@ -2500,70 +2472,13 @@ fn cmd_cover(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     }
 }
 
-/// the fine edge; `check 13w` finds regions with no coarse cover).
-/// `memory levels <detail>` -- how well the pile serves each tile of the cover
-/// at a reader's detail: what the tile wants, how many memories it showed, and
-/// the worst ratio between a shown width and the want. A ratio far from one is
-/// the arc the comb should write. This is the seam report the renderer no
-/// longer prints at load; an orient habit can run it off the wake path.
-fn cmd_levels(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
-    let detail: usize = args
-        .first()
-        .ok_or_else(|| anyhow!("usage: memory levels <detail: memories per tile, e.g. 12>"))?
-        .parse()
-        .context("detail must be a non-negative integer")?;
-    let loaded = storage.load()?;
-    let spans = collect_chunk_spans(&loaded.memory.facts);
-    if spans.is_empty() {
-        println!("no memory chunks");
-        return Ok(());
-    }
-    let earliest = spans.iter().map(|s| s.0).min().unwrap();
-    let latest = spans.iter().map(|s| s.1).max().unwrap();
-    let tiles = faculties::memory_cover::tiles(earliest, latest);
-    let mut report = faculties::memory_cover::tile_report(&spans, &tiles, detail);
-    println!(
-        "{} tile(s) at detail {}: {}",
-        tiles.len(),
-        detail,
-        faculties::memory_cover::describe_tiles(&tiles)
-    );
-    report.sort_by(|a, b| {
-        b.worst_ratio
-            .partial_cmp(&a.worst_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.tile.start.cmp(&b.tile.start))
-    });
-    for r in &report {
-        let want = match r.want_ns {
-            Some(w) => humanize_ns(w),
-            None => "every memory".to_string(),
-        };
-        println!(
-            "  {}  {:>7}  wants {:<12} shows {:>5}  worst x{:.1}{}",
-            format_time_range(key_to_epoch(r.tile.start), key_to_epoch(r.tile.end)),
-            r.tile.width(),
-            want,
-            r.picked,
-            r.worst_ratio,
-            if r.worst_ratio > 4.0 {
-                "  <- an arc is missing"
-            } else {
-                ""
-            },
-        );
-    }
-    Ok(())
-}
-
-/// `memory churn` -- the cover over the pile's own past, one grid unit at a
-/// time, to see how the tiling and the fit churn as the life grows.
+/// `memory churn` replays density-shaped recollection over the journal's
+/// observation history. The fixed step is diagnostic cadence only; it is not a
+/// boundary or quantisation in the selector.
 fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     let mut budget: usize = 800_000;
     let mut steps: usize = 160;
     let mut step_units: i128 = 1;
-    let mut detail: Option<usize> = None;
-    let mut sliding: Option<i128> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -2577,12 +2492,13 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             "--step-units" => {
                 step_units = value(i)?.parse().context("--step-units expects a number")?
             }
-            "--detail" => detail = Some(value(i)?.parse().context("--detail expects a number")?),
-            "--sliding" => sliding = Some(value(i)?.parse().context("--sliding expects a count of blocks per level")?),
-            other => bail!("unknown flag {other}; usage: memory churn [--chars N] [--steps K] [--step-units U] [--detail D] [--sliding K]"),
+            other => bail!(
+                "unknown flag {other}; usage: memory churn [--chars N] [--steps K] [--step-units U]"
+            ),
         }
         i += 2;
     }
+
     let loaded = storage.load()?;
     let rows = faculties::memory_cover::replay_cover(
         &loaded.memory.facts,
@@ -2591,75 +2507,81 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         0,
         steps,
         step_units,
-        detail,
-        sliding,
     )?;
     if rows.is_empty() {
         println!("no memory chunks");
         return Ok(());
     }
+
     println!(
-        "{:<20} {:>5} {:>6} {:>6} {:>8} {:>7} {:>8}",
-        "now", "tiles", "detail", "chunks", "used", "kept%", "reread"
+        "{:<20} {:<20} {:>6} {:>9} {:>7} {:>7} {:>9}",
+        "observed", "memory edge", "chunks", "used", "fill%", "kept%", "reread"
     );
-    let mut detail_changes = 0usize;
-    let mut rereads: Vec<usize> = Vec::new();
+    let mut rereads = Vec::new();
     let mut deep = 0usize;
+    let mut silent_steps = 0usize;
     for (k, r) in rows.iter().enumerate() {
         let reread = r.used.saturating_sub(r.kept);
-        let kept_pct = if r.used == 0 {
+        let fill_pct = if budget == 0 {
             0.0
         } else {
-            100.0 * r.kept as f64 / r.used as f64
+            100.0 * r.used as f64 / budget as f64
         };
-        let mut note = String::new();
+        let kept_pct = if r.prev_used == 0 {
+            0.0
+        } else {
+            100.0 * r.kept as f64 / r.prev_used as f64
+        };
         if k > 0 {
-            if r.detail != rows[k - 1].detail {
-                detail_changes += 1;
-                note.push_str("  detail changed");
-            }
             rereads.push(reread);
             if r.used > 0 && reread * 4 > r.used {
                 deep += 1;
             }
         }
-        if !r.fits {
-            note.push_str("  DOES NOT FIT");
+        let mut note = String::new();
+        if !r.silent_life_quarters.is_empty() {
+            silent_steps += 1;
+            let stretches: Vec<String> = r
+                .silent_life_quarters
+                .iter()
+                .map(|&(a, b)| format_time_range(key_to_epoch(a), key_to_epoch(b)))
+                .collect();
+            note.push_str(&format!("  SILENT > LIFE/4: {}", stretches.join(", ")));
         }
-        let changed = match r.changed_at {
-            Some((a, b)) => format!(
+        if let Some((a, b)) = r.changed_at {
+            note.push_str(&format!(
                 "  changed from {}",
                 format_time_range(key_to_epoch(a), key_to_epoch(b))
-            ),
-            None => String::new(),
-        };
+            ));
+        }
         println!(
-            "{:<20} {:>5} {:>6} {:>6} {:>8} {:>6.1}% {:>8}{}{}  [{}]",
-            fmt_epoch(key_to_epoch(r.now)),
-            r.tiles,
-            r.detail,
+            "{:<20} {:<20} {:>6} {:>9} {:>6.1}% {:>6.1}% {:>9}{}",
+            fmt_epoch(key_to_epoch(r.observed_now)),
+            fmt_epoch(key_to_epoch(r.semantic_now)),
             r.chunks,
             r.used,
+            fill_pct,
             kept_pct,
-            reread,
+            if k == 0 { 0 } else { reread },
             note,
-            changed,
-            r.layout,
         );
     }
+
     rereads.sort_unstable();
     let median = rereads.get(rereads.len() / 2).copied().unwrap_or(0);
     let max = rereads.last().copied().unwrap_or(0);
     let total: usize = rereads.iter().sum();
+    let unobserved = rows.last().map_or(0, |row| row.unobserved_classes);
     println!(
-        "{} step(s) of {} unit(s): the detail changed {} time(s); re-rendered per step median {} chars, max {}, total {}; {} step(s) re-rendered more than a quarter of the cover",
+        "{} transition(s) of {} quantum(s): re-rendered median {} chars, max {}, total {}; {} transition(s) re-rendered more than a quarter; {} step(s) had a silent stretch > LIFE/4; {} class(es) used range-end fallback for missing observation time",
         rereads.len(),
         step_units,
-        detail_changes,
         median,
         max,
         total,
         deep,
+        silent_steps,
+        unobserved,
     );
     Ok(())
 }
@@ -2726,14 +2648,11 @@ fn cmd_check(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
 
 /// `memory density [<grain>]` — inspection tooling that finds where the
 /// containment hierarchy is BUSHY: a span with many direct *leaf* children and
-/// no intermediate arc summary combing them into mid-level groups. Bushiness is
-/// exactly what makes a cover unable to drill granularly under budget — the only
-/// way to add detail beneath a bushy span is to dump ALL its leaves into the
-/// cover at once (the lumpy jump), because completeness forbids a partial split.
-/// The fix is never to drop memories; it is to ADD intermediate summaries
-/// (comb the leaves into arcs). This command only points at where to comb —
-/// it writes nothing. Optional `<grain>`: restrict the report to spans of width
-/// <= grain (zoom the analysis to e.g. day- vs week-level structure).
+/// no intermediate arc summary combing them into mid-level groups. That is a
+/// useful journal-maintenance signal: a middle-scale narrative may be missing,
+/// even though density-shaped recollection can freely sample the leaves. This
+/// diagnostic does not drive or constrain recollection and writes nothing.
+/// Optional `<grain>` restricts the report to spans of width <= grain.
 fn cmd_density(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // Threshold for the BUSHY flag: this many direct leaf-children with no
     // intermediate arc make a span expensive to expand in the cover.
@@ -2750,8 +2669,9 @@ fn cmd_density(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     }
     let n = spans.len();
 
-    // Same containment hierarchy cmd_context builds: a chunk's parent is the
-    // tightest strictly-wider chunk that spans it (time-range subsumption).
+    // A diagnostic containment projection only: recollection itself has no
+    // parent/child structure. A chunk's diagnostic parent is the tightest
+    // strictly-wider chunk that spans it.
     let strict_contains = |a: usize, b: usize| -> bool {
         spans[a].0 <= spans[b].0
             && spans[a].1 >= spans[b].1
@@ -3737,8 +3657,8 @@ mod tests {
     fn cover_start_generates_the_context_cover_from_a_pile() {
         let pile = TestPile::new();
         let storage = pile.storage();
-        // Seed a coarse apex over two fine day-chunks — the shape the
-        // antichain cover splits when the budget allows.
+        // Seed a coarse apex over two fine day-chunks: enough space lets the
+        // density sampler recall both scales without making either mandatory.
         let apex = (
             parse_tai_timestamp("2026-01-01T00:00:00").unwrap(),
             parse_tai_timestamp("2026-01-03T00:00:00").unwrap(),
@@ -3786,17 +3706,9 @@ mod tests {
         let loaded = storage
             .load_context(false)
             .expect("load seeded collections");
-        let cover = build_context_cover(
-            &loaded,
-            10_000,
-            0,
-            None,
-            None,
-            None,
-            DEFAULT_SIM_THRESHOLD,
-            None,
-        )
-        .expect("build context cover");
+        let cover =
+            build_context_cover(&loaded, 10_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("build context cover");
         // The status header now goes to stderr, not into the returned/ingested
         // cover text (prefix-stability + ranges-are-the-drill-key de-noise).
         assert!(!cover.contains("memory context — "));
@@ -3815,120 +3727,6 @@ mod tests {
             cover,
             "chunk reassembly must equal the stored cover"
         );
-    }
-
-    /// A write at the recent edge must not re-cut the cover's LEADING chunks.
-    ///
-    /// drive replays the cover as one `memory <range>` command / summary-output
-    /// pair per chunk, each its own KV-cache checkpoint, so a write costs
-    /// everything from the FIRST CHANGED CHUNK onward. When every split
-    /// competes for one global remainder the marginal decision is a function of
-    /// the TOTAL — and because the cover is emitted oldest-first while it is
-    /// refined recency-first, that marginal decision sits at the FRONT.
-    /// Measured on `self.pile` (2026-08-28, 200,000-char budget, 200-chunk
-    /// cover, one machine, one journal-sized memory per write): a median of 2
-    /// of 200 leading chunks survived. Subtracting the mandatory floor and
-    /// quantizing what is left makes the pool a constant between steps, and the
-    /// same 30-write sequence then re-cut nothing on 27 of them.
-    #[test]
-    fn a_write_in_the_open_tile_keeps_the_cover_before_it() {
-        let pile = TestPile::new();
-        let storage = pile.storage();
-        let at =
-            |d: u8, h: u8| parse_tai_timestamp(&format!("2026-01-{d:02}T{h:02}:00:00")).unwrap();
-        let write = |text: String, range: (Epoch, Epoch)| {
-            let loaded = storage.load().expect("load collections");
-            create_chunk(storage, &loaded, &text, range, None, range.1).expect("create chunk");
-        };
-        // An apex over five days, each day over three fine chunks. Sized so the
-        // budget BINDS: the coarsest cover is 400 characters, full detail needs
-        // 3,600, and a 4,000-character budget leaves the two oldest days
-        // unsplittable — i.e. the marginal decision sits at the very front,
-        // which is what gives the assertion below its teeth.
-        write("apex ".repeat(80), (at(1, 0), at(6, 0)));
-        for d in 1..=5u8 {
-            write(format!("day{d} ").repeat(70), (at(d, 0), at(d + 1, 0)));
-            for h in [1u8, 9, 17] {
-                write(format!("d{d}h{h:02} ").repeat(50), (at(d, h), at(d, h + 1)));
-            }
-        }
-
-        let cover_now = || {
-            let loaded = storage
-                .load_context(false)
-                .expect("load seeded collections");
-            build_context_cover(
-                &loaded,
-                4_000,
-                0,
-                None,
-                None,
-                None,
-                DEFAULT_SIM_THRESHOLD,
-                Some(6),
-            )
-            .expect("build context cover")
-        };
-        let before = cover_now();
-        assert_eq!(before, cover_now(), "two renders with no write must agree");
-        assert!(
-            !before.contains("d1h01 "),
-            "budget must bind — the oldest day should still be coarse:\n{before}"
-        );
-
-        // Writes in the open tile. With a stated detail the cover before the
-        // open tile is the same bytes after each write: the prefix a
-        // resident's cache can keep.
-        let (open_start, open_end) = {
-            let loaded = storage.load_context(false).expect("load");
-            let spans = collect_chunk_spans(&loaded.memory.memory.facts);
-            let earliest = spans.iter().map(|s| s.0).min().unwrap();
-            let now = spans.iter().map(|s| s.1).max().unwrap();
-            let open = *faculties::memory_cover::tiles(earliest, now)
-                .last()
-                .unwrap();
-            assert!(open.open);
-            (open.start, open.end)
-        };
-        let prefix = |cover: &str| -> String {
-            cover
-                .lines()
-                .take_while(|line| {
-                    let line = line.trim_start();
-                    !(line.starts_with("2026-")
-                        && line
-                            .split_once("..")
-                            .and_then(|(a, _)| parse_tai_timestamp(a.trim()).ok())
-                            .is_some_and(|start| {
-                                start.to_tai_duration().total_nanoseconds() >= open_start
-                            }))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim_end()
-                .to_string()
-        };
-        let now = at(6, 0).to_tai_duration().total_nanoseconds();
-        let room = open_end - now;
-        assert!(
-            room > 16 * 60_000_000_000,
-            "the fixture's now sits at the open tile's edge"
-        );
-        for k in [2i128, 4, 8] {
-            let start = key_to_epoch(now + room / k);
-            let end = key_to_epoch(now + room / k + 60_000_000_000);
-            write(format!("new{k} ").repeat(4), (start, end));
-            let after = cover_now();
-            assert!(
-                after.contains(&format!("new{k} ")),
-                "the new memory must appear"
-            );
-            assert_eq!(
-                prefix(&after),
-                prefix(&before),
-                "a write in the open tile changed the cover before it\nBEFORE:\n{before}\nAFTER:\n{after}"
-            );
-        }
     }
 
     fn seed_cover_cost_fixture(pile: &TestPile) -> LoadedContext {
@@ -3953,20 +3751,20 @@ mod tests {
         let pile = TestPile::new();
         let loaded = seed_cover_cost_fixture(&pile);
 
-        // Intrinsic lengths: root=4, children=3+3. With no consumer overhead,
-        // a budget of six admits the two-child split exactly.
+        // Rendered costs include 43 framing characters: root=47 and each
+        // child=46. A budget of 139 admits all three candidates.
         let intrinsic =
-            build_context_cover(&loaded, 6, 0, None, None, None, DEFAULT_SIM_THRESHOLD, None)
-                .expect("intrinsic split");
-        assert!(!intrinsic.contains("root"));
+            build_context_cover(&loaded, 139, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("intrinsic recollection");
+        assert!(intrinsic.contains("root"));
         assert!(intrinsic.contains("one"));
         assert!(intrinsic.contains("two"));
 
-        // Charging two per selected chunk makes root=6 and children=10, so the
-        // same budget remains complete by retaining the coarse root.
+        // Charging fifty per selected chunk makes root=97 and each child=96,
+        // so the same budget has only 42 characters of sampling space.
         let charged =
-            build_context_cover(&loaded, 6, 2, None, None, None, DEFAULT_SIM_THRESHOLD, None)
-                .expect("charged coarse cover");
+            build_context_cover(&loaded, 139, 50, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("charged recollection");
         assert!(charged.contains("root"));
         assert!(!charged.contains("one"));
         assert!(!charged.contains("two"));
@@ -3977,25 +3775,17 @@ mod tests {
         let pile = TestPile::new();
         let loaded = seed_cover_cost_fixture(&pile);
 
-        // The coarsest complete cover costs root(4) + one overhead(2) = 6.
-        let error =
-            build_context_cover(&loaded, 5, 2, None, None, None, DEFAULT_SIM_THRESHOLD, None)
-                .expect_err("budget below the charged root must remain incomplete");
-        assert!(error.to_string().contains("needs ~6 characters"));
+        // The best first memory costs root(47) + one overhead(2) = 49. Below
+        // that boundary the greedy walk stops without violating the budget.
+        let below_first =
+            build_context_cover(&loaded, 48, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("an empty in-budget recollection");
+        assert!(below_first.is_empty());
 
-        // The refined cover costs (one(3)+2) + (two(3)+2) = 10 exactly.
-        let exact = build_context_cover(
-            &loaded,
-            10,
-            2,
-            None,
-            None,
-            None,
-            DEFAULT_SIM_THRESHOLD,
-            None,
-        )
-        .expect("exact charged split");
-        assert!(!exact.contains("root"));
+        // The root plus both children costs 49 + 48 + 48 = 145.
+        let exact = build_context_cover(&loaded, 145, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
+            .expect("exact charged split");
+        assert!(exact.contains("root"));
         assert!(exact.contains("one"));
         assert!(exact.contains("two"));
     }
@@ -4065,41 +3855,20 @@ mod tests {
         } else {
             ("amber", amber.as_str(), cobalt.as_str())
         };
-        let render = |detail, about| {
-            build_context_cover(
-                &loaded,
-                10_000,
-                0,
-                about,
-                None,
-                None,
-                DEFAULT_SIM_THRESHOLD,
-                Some(detail),
-            )
-            .expect("render cover")
+        let render = |about| {
+            build_context_cover(&loaded, 10_000, 0, about, None, None, DEFAULT_SIM_THRESHOLD)
+                .expect("render cover")
         };
 
-        // The equal-span position shows at whatever detail wants about two
-        // days of the tile it sits in; wherever it shows, the plain cover
-        // deterministically selects the least-id account and context
-        // substitutes the other, relevant account at that exact position. At
-        // every detail, contextual ranking never moves a position.
-        let mut shown_somewhere = false;
-        for detail in [0usize, 1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 64, 512] {
-            let plain = render(detail, None);
-            let contextual = render(detail, Some(query));
-            assert_eq!(
-                rendered_ranges(&plain),
-                rendered_ranges(&contextual),
-                "context changed structural coverage at detail {detail}"
-            );
-            if plain.contains(plain_summary.trim_end()) {
-                shown_somewhere = true;
-                assert!(!plain.contains(contextual_summary.trim_end()));
-                assert!(contextual.contains(contextual_summary.trim_end()));
-                assert!(!contextual.contains(plain_summary.trim_end()));
-            }
-        }
-        assert!(shown_somewhere, "no detail showed the equal-span position");
+        // With enough room the equal-span position is recalled. The plain
+        // projection deterministically selects the least-id account and
+        // context substitutes the relevant account without moving the range.
+        let plain = render(None);
+        let contextual = render(Some(query));
+        assert_eq!(rendered_ranges(&plain), rendered_ranges(&contextual));
+        assert!(plain.contains(plain_summary.trim_end()));
+        assert!(!plain.contains(contextual_summary.trim_end()));
+        assert!(contextual.contains(contextual_summary.trim_end()));
+        assert!(!contextual.contains(plain_summary.trim_end()));
     }
 }
