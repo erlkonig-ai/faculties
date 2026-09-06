@@ -61,6 +61,7 @@ use triblespace::prelude::*;
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory levels <detail>           — how well each tile of the cover is served at a reader's detail: the want, the count shown, the worst width ratio (a big ratio is the arc the comb should write)\n  \
+             memory churn [--chars N] [--steps K] [--step-units U] [--detail D] — replay the cover over the pile's own past, one grid unit at a time (K steps back from the newest memory, default 160), fitting the detail to the budget at every step (or holding --detail D): per step the tiles, the detail, the size, and how many characters of the previous cover survived as a prefix; then how often the detail changed and how much a step re-rendered\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
@@ -899,6 +900,9 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "levels") {
         return cmd_levels(storage, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "churn") {
+        return cmd_churn(storage, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "density") {
         return cmd_density(storage, &cli.ids[1..]);
@@ -2005,7 +2009,8 @@ fn cmd_context(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
     // temporal coverage; it never changes the recency-first cover structure.
     let mut budget_chars: usize = 200_000;
     let mut chunk_overhead: usize = 0;
-    // `--detail N`: memories per tile, the reader's statement of its window.
+    // `--detail N`: pins the memories per tile, for measuring; without it the
+    // renderer takes the finest that fits, at every render.
     let mut detail: Option<usize> = None;
     let mut about: Option<String> = None;
     // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
@@ -2548,6 +2553,111 @@ fn cmd_levels(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             },
         );
     }
+    Ok(())
+}
+
+/// `memory churn` -- the cover over the pile's own past, one grid unit at a
+/// time, to see how the tiling and the fit churn as the life grows.
+fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
+    let mut budget: usize = 800_000;
+    let mut steps: usize = 160;
+    let mut step_units: i128 = 1;
+    let mut detail: Option<usize> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = |i: usize| -> Result<&String> {
+            args.get(i + 1)
+                .ok_or_else(|| anyhow!("{} needs a value", args[i]))
+        };
+        match flag {
+            "--chars" => budget = value(i)?.parse().context("--chars expects a number")?,
+            "--steps" => steps = value(i)?.parse().context("--steps expects a number")?,
+            "--step-units" => {
+                step_units = value(i)?.parse().context("--step-units expects a number")?
+            }
+            "--detail" => detail = Some(value(i)?.parse().context("--detail expects a number")?),
+            other => bail!("unknown flag {other}; usage: memory churn [--chars N] [--steps K] [--step-units U] [--detail D]"),
+        }
+        i += 2;
+    }
+    let loaded = storage.load()?;
+    let rows = faculties::memory_cover::replay_cover(
+        &loaded.memory.facts,
+        &loaded.memory.reader,
+        budget,
+        0,
+        steps,
+        step_units,
+        detail,
+    )?;
+    if rows.is_empty() {
+        println!("no memory chunks");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:>5} {:>6} {:>6} {:>8} {:>7} {:>8}",
+        "now", "tiles", "detail", "chunks", "used", "kept%", "reread"
+    );
+    let mut detail_changes = 0usize;
+    let mut rereads: Vec<usize> = Vec::new();
+    let mut deep = 0usize;
+    for (k, r) in rows.iter().enumerate() {
+        let reread = r.used.saturating_sub(r.kept);
+        let kept_pct = if r.used == 0 {
+            0.0
+        } else {
+            100.0 * r.kept as f64 / r.used as f64
+        };
+        let mut note = String::new();
+        if k > 0 {
+            if r.detail != rows[k - 1].detail {
+                detail_changes += 1;
+                note.push_str("  detail changed");
+            }
+            rereads.push(reread);
+            if r.used > 0 && reread * 4 > r.used {
+                deep += 1;
+            }
+        }
+        if !r.fits {
+            note.push_str("  DOES NOT FIT");
+        }
+        let changed = match r.changed_at {
+            Some((a, b)) => format!(
+                "  changed from {}",
+                format_time_range(key_to_epoch(a), key_to_epoch(b))
+            ),
+            None => String::new(),
+        };
+        println!(
+            "{:<20} {:>5} {:>6} {:>6} {:>8} {:>6.1}% {:>8}{}{}  [{}]",
+            fmt_epoch(key_to_epoch(r.now)),
+            r.tiles,
+            r.detail,
+            r.chunks,
+            r.used,
+            kept_pct,
+            reread,
+            note,
+            changed,
+            r.layout,
+        );
+    }
+    rereads.sort_unstable();
+    let median = rereads.get(rereads.len() / 2).copied().unwrap_or(0);
+    let max = rereads.last().copied().unwrap_or(0);
+    let total: usize = rereads.iter().sum();
+    println!(
+        "{} step(s) of {} unit(s): the detail changed {} time(s); re-rendered per step median {} chars, max {}, total {}; {} step(s) re-rendered more than a quarter of the cover",
+        rereads.len(),
+        step_units,
+        detail_changes,
+        median,
+        max,
+        total,
+        deep,
+    );
     Ok(())
 }
 

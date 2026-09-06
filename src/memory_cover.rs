@@ -810,15 +810,19 @@ pub fn tile_report(spans: &[(i128, i128, Id)], tiles: &[Tile], detail: usize) ->
         .collect()
 }
 
-/// A cut that fits. `detail` is what the reader asked for, `asked`; if that
-/// overflows, the cut steps down the detail ladder until a complete cover
-/// fits, because one must always be produced. `fits` is false only when even
-/// the floor (the widest memory at every point) overflows, in which case
-/// `cover` is that floor and `used` its cost, so the caller can name the
-/// shortfall. With no detail asked, every rung of the ladder is tried from
-/// the finest down and the first that fits wins (cost is not monotone in
-/// detail, so a search that stops at the first overflow could miss a finer
-/// fit); a reader that wants a stable cover states the detail this prints.
+/// A cut that fits.
+///
+/// `detail` is memories per tile. With none asked it is the finest rung of
+/// the ladder at which a complete cover fits the budget, chosen anew at every
+/// render, so the cover is as full as the pile allows. When the tiling's
+/// counter carries, or the pile grows, across a rung, the whole cover renders
+/// anew: on the live pile that was six times in the month to 2026-09-06 at
+/// the wake's budget, against the merges, which rewrite only the young end.
+/// An asked detail pins it, for measuring, and steps down the ladder until a
+/// complete cover fits, because one must always be produced. `fits` is false
+/// only when even the floor (the widest memory at every point) overflows, in
+/// which case `cover` is that floor and `used` its cost, so the caller can
+/// name the shortfall.
 pub struct TiledCut {
     pub detail: usize,
     pub asked: Option<usize>,
@@ -859,31 +863,21 @@ pub fn fit_tiled(
         used,
         fits: true,
     };
-    match asked {
-        Some(wanted) => {
-            let wanted = wanted.min(DETAIL_CAP);
-            let cut = render(wanted)?;
-            if cut.1 <= budget {
-                return Ok(done(wanted, cut));
-            }
-            for &detail in DETAIL_LADDER.iter().rev().filter(|&&d| d < wanted) {
-                let cut = render(detail)?;
-                if cut.1 <= budget {
-                    return Ok(done(detail, cut));
-                }
-            }
-            Ok(done(0, (floor_cover, floor)))
-        }
-        None => {
-            for &detail in DETAIL_LADDER.iter().rev() {
-                let cut = render(detail)?;
-                if cut.1 <= budget {
-                    return Ok(done(detail, cut));
-                }
-            }
-            Ok(done(0, (floor_cover, floor)))
+    if let Some(wanted) = asked {
+        let wanted = wanted.min(DETAIL_CAP);
+        let cut = render(wanted)?;
+        if cut.1 <= budget {
+            return Ok(done(wanted, cut));
         }
     }
+    let top = asked.map(|a| a.min(DETAIL_CAP)).unwrap_or(usize::MAX);
+    for &detail in DETAIL_LADDER.iter().rev().filter(|&&d| d < top) {
+        let cut = render(detail)?;
+        if cut.1 <= budget {
+            return Ok(done(detail, cut));
+        }
+    }
+    Ok(done(0, (floor_cover, floor)))
 }
 
 /// The tiles in one line, newest first: `now, 3x4.6h, 2x18.2h, 1x3.0d`.
@@ -1079,6 +1073,136 @@ pub fn cover_headroom<B: BlobStoreGet, P: TriblePattern>(
         used,
         budget: budget_chars,
     })
+}
+
+/// One step of a replay: the cover the pile would have rendered when its
+/// latest memory ended at `now`, and how much of the previous step's cover
+/// survived as a byte-for-byte prefix.
+#[derive(Clone, Debug)]
+pub struct ReplayRow {
+    /// The latest memory end at this step (TAI key): the `now` of the tiling.
+    pub now: i128,
+    pub tiles: usize,
+    pub detail: usize,
+    pub chunks: usize,
+    /// Characters the cover used.
+    pub used: usize,
+    /// Characters of the previous step's cover that this cover begins with,
+    /// unchanged and in the same order: what a cache would keep.
+    pub kept: usize,
+    /// Characters the previous step's cover used (0 on the first step).
+    pub prev_used: usize,
+    pub fits: bool,
+    /// The tiling, newest first, as `describe_tiles` prints it.
+    pub layout: String,
+    /// The span of the first chunk in the cover: where a re-render began if
+    /// nothing was kept.
+    pub first: Option<(i128, i128)>,
+    /// The span of the first chunk that differs from the previous cover.
+    pub changed_at: Option<(i128, i128)>,
+}
+
+/// Replay the cover over the pile's own past: pretend the newest memory ends
+/// at each of `steps` points, one `step_units` grid units apart, walking from
+/// the oldest point to the present, and at each point render the cover the
+/// pile would have rendered then (memories ending after the point are not yet
+/// there). Fit the detail to the budget at every step -- or hold `asked` --
+/// and report how much of each cover survives into the next.
+///
+/// A memory counts as present once its range has ended, not once it was
+/// written, so arcs the comb wrote later over earlier days are present from
+/// the start. That hides the comb's own re-renders on purpose: this measures
+/// the churn of the tiling and the fit, nothing else.
+pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    budget_chars: usize,
+    chunk_overhead: usize,
+    steps: usize,
+    step_units: i128,
+    asked: Option<usize>,
+) -> Result<Vec<ReplayRow>> {
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let mut rows = Vec::new();
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) else {
+        return Ok(rows);
+    };
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut cost_of = |i: usize| -> Result<usize> {
+        Ok(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+        )?
+        .saturating_add(chunk_overhead))
+    };
+    let step_ns = step_units.max(1) * TILE_UNIT_NS;
+    let mut previous: Vec<usize> = Vec::new();
+    let mut prev_used = 0usize;
+    for k in (0..=steps).rev() {
+        let point = latest - (k as i128) * step_ns;
+        // The pile as it stood: every memory whose range had ended by `point`.
+        let mut map: Vec<usize> = Vec::new();
+        let mut sub: Vec<(i128, i128, Id)> = Vec::new();
+        for (i, s) in spans.iter().enumerate() {
+            if s.1 <= point {
+                map.push(i);
+                sub.push(*s);
+            }
+        }
+        let Some(now) = sub.iter().map(|s| s.1).max() else {
+            continue;
+        };
+        let first = sub.iter().map(|s| s.0).min().unwrap_or(earliest);
+        let tiles = tiles(first, now);
+        let mut cost_sub = |j: usize| -> Result<usize> { cost_of(map[j]) };
+        let cut = fit_tiled(&sub, &tiles, &mut cost_sub, budget_chars, asked)?;
+        // The emission order: time order, wider first at a tie.
+        let mut cover: Vec<usize> = cut.cover.iter().map(|&j| map[j]).collect();
+        cover.sort_by(|&a, &b| {
+            spans[a]
+                .0
+                .cmp(&spans[b].0)
+                .then(spans[b].1.cmp(&spans[a].1))
+        });
+        let mut kept = 0usize;
+        let mut changed_at = None;
+        for (n, (a, b)) in cover.iter().zip(previous.iter()).enumerate() {
+            if a != b {
+                changed_at = Some((spans[*a].0, spans[*a].1));
+                break;
+            }
+            kept = kept.saturating_add(cost_of(*a)?);
+            if n + 1 == previous.len() && cover.len() > previous.len() {
+                changed_at = Some((spans[cover[n + 1]].0, spans[cover[n + 1]].1));
+            }
+        }
+        rows.push(ReplayRow {
+            now,
+            tiles: tiles.len(),
+            detail: cut.detail,
+            chunks: cover.len(),
+            used: cut.used,
+            kept,
+            prev_used,
+            fits: cut.fits,
+            layout: describe_tiles(&tiles),
+            first: cover.first().map(|&i| (spans[i].0, spans[i].1)),
+            changed_at,
+        });
+        previous = cover;
+        prev_used = cut.used;
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,8 +1459,8 @@ where
         detail,
         match asked {
             Some(wanted) if wanted != detail => format!(" (asked {wanted}, stepped down to fit)"),
-            Some(_) => String::new(),
-            None => " (fit; state it to keep the cover stable)".to_string(),
+            Some(_) => " (asked)".to_string(),
+            None => " (the finest that fits)".to_string(),
         },
         describe_tiles(&tiles),
         select_tiled(&spans, &tiles, 0).len(),
@@ -1652,9 +1776,9 @@ mod headroom_tests {
         assert_eq!(select_tiled(&spans, &t, 0), vec![0, 1]);
     }
 
-    /// The reader asks for a detail; the cut steps down the ladder until a
-    /// complete cover fits, and only the floor overflowing is a failure. With
-    /// no detail asked, the finest rung that fits is found.
+    /// An asked detail steps down the ladder until a complete cover fits;
+    /// only the floor overflowing is a failure; with nothing asked, the finest
+    /// rung that fits is found.
     #[test]
     fn the_cut_steps_down_and_never_strands() {
         let id = ids(34);
@@ -1670,13 +1794,13 @@ mod headroom_tests {
         spans.push((unit(85) + minutes(10), unit(85) + minutes(15), id[33]));
         let t = tiles(unit(84), unit(85) + minutes(30));
         let mut cost = |i: usize| -> Result<usize> { Ok(if i == 0 { 100 } else { 10 }) };
-        // Asked thirty-two (every sub-arc, 330): only the unit arc fits 200.
+        // Every sub-arc costs 330: at 200 only the unit arc fits.
         let cut = fit_tiled(&spans, &t, &mut cost, 200, Some(32)).unwrap();
         assert!(cut.fits);
         assert_eq!(cut.asked, Some(32));
         assert!(cut.detail < 32);
         assert_eq!(cut.cover, vec![0, 33]);
-        // Asked thirty-two with room: every sub-arc, at the detail asked.
+        // With room: every sub-arc, at the detail asked.
         let cut = fit_tiled(&spans, &t, &mut cost, 400, Some(32)).unwrap();
         assert_eq!(cut.detail, 32);
         assert_eq!(cut.cover.len(), 33);
