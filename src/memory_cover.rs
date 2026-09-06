@@ -1273,6 +1273,12 @@ pub struct ReplayRow {
     pub kept: usize,
     /// Characters the previous step's cover used (0 on the first step).
     pub prev_used: usize,
+    /// Characters of memories in this cover that were not in the previous
+    /// one: what a resident that appends what enters and evicts what leaves
+    /// would read in at this step.
+    pub entered: usize,
+    /// Characters of memories in the previous cover that are not in this one.
+    pub left: usize,
     pub fits: bool,
     /// The tiling, newest first, as `describe_tiles` prints it.
     pub layout: String,
@@ -1359,6 +1365,21 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
                 .cmp(&spans[b].0)
                 .then(spans[b].1.cmp(&spans[a].1))
         });
+        let (mut entered, mut left) = (0usize, 0usize);
+        {
+            let prev: std::collections::HashSet<usize> = previous.iter().copied().collect();
+            let now_set: std::collections::HashSet<usize> = cover.iter().copied().collect();
+            for &i in &cover {
+                if !prev.contains(&i) {
+                    entered = entered.saturating_add(cost_of(i)?);
+                }
+            }
+            for &i in &previous {
+                if !now_set.contains(&i) {
+                    left = left.saturating_add(cost_of(i)?);
+                }
+            }
+        }
         let mut kept = 0usize;
         let mut changed_at = None;
         for (n, (a, b)) in cover.iter().zip(previous.iter()).enumerate() {
@@ -1379,6 +1400,8 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
             used: cut.used,
             kept,
             prev_used,
+            entered,
+            left,
             fits: cut.fits,
             layout: describe_tiles(&tiles),
             first: cover.first().map(|&i| (spans[i].0, spans[i].1)),

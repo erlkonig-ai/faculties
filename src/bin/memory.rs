@@ -2599,11 +2599,12 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:>5} {:>6} {:>6} {:>8} {:>7} {:>8}",
-        "now", "tiles", "detail", "chunks", "used", "kept%", "reread"
+        "{:<20} {:>5} {:>6} {:>6} {:>8} {:>7} {:>8} {:>8} {:>8}",
+        "now", "tiles", "detail", "chunks", "used", "kept%", "reread", "entered", "left"
     );
     let mut detail_changes = 0usize;
     let mut rereads: Vec<usize> = Vec::new();
+    let mut entered: Vec<usize> = Vec::new();
     let mut deep = 0usize;
     for (k, r) in rows.iter().enumerate() {
         let reread = r.used.saturating_sub(r.kept);
@@ -2619,6 +2620,7 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
                 note.push_str("  detail changed");
             }
             rereads.push(reread);
+            entered.push(r.entered);
             if r.used > 0 && reread * 4 > r.used {
                 deep += 1;
             }
@@ -2634,7 +2636,7 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             None => String::new(),
         };
         println!(
-            "{:<20} {:>5} {:>6} {:>6} {:>8} {:>6.1}% {:>8}{}{}  [{}]",
+            "{:<20} {:>5} {:>6} {:>6} {:>8} {:>6.1}% {:>8} {:>8} {:>8}{}{}  [{}]",
             fmt_epoch(key_to_epoch(r.now)),
             r.tiles,
             r.detail,
@@ -2642,6 +2644,8 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
             r.used,
             kept_pct,
             reread,
+            r.entered,
+            r.left,
             note,
             changed,
             r.layout,
@@ -2660,6 +2664,13 @@ fn cmd_churn(storage: MemoryStorage<'_>, args: &[String]) -> Result<()> {
         max,
         total,
         deep,
+    );
+    entered.sort_unstable();
+    println!(
+        "entering per step (a resident that appends what enters and evicts what leaves): median {} chars, max {}, total {}",
+        entered.get(entered.len() / 2).copied().unwrap_or(0),
+        entered.last().copied().unwrap_or(0),
+        entered.iter().sum::<usize>(),
     );
     Ok(())
 }
