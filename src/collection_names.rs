@@ -329,11 +329,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-        CapabilityValidity,
+        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
     };
     use triblespace::core::collection::grant_collection_read;
-    use triblespace::core::collection::ACTION_READ;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{CapabilityProofStore, SnapshotSource};
@@ -483,7 +481,10 @@ mod tests {
             .insert_proof(CapabilityProof::issue_root(
                 &operator,
                 CapabilityResource::from(shared.handle()),
-                Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+                Capability::new(
+                    triblespace::core::collection::read_capability(),
+                    CapabilityMode::Invoke,
+                ),
                 Some(
                     CapabilityValidity::new(
                         Epoch::from_unix_seconds(10.0),
