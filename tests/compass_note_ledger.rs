@@ -193,7 +193,10 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     ));
     let addressed_goal = id_after("Added goal ", &addressed);
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!("new goal [{addressed_goal}] (todo)")));
+    assert!(
+        news.contains(&format!("goal [{addressed_goal}] is now todo")),
+        "unexpected news: {news}"
+    );
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     let foreign = stdout(run(
