@@ -258,7 +258,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     ));
     let participated_goal = id_after("Added goal ", &participated);
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
-    stdout(run(
+    let joining = stdout(run(
         compass,
         &pile.path,
         &[
@@ -269,6 +269,16 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
             "joining the discussion",
         ],
     ));
+    let joining_id = id_after("Added note ", &joining);
+    let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
+    assert!(
+        news.contains(&format!("goal [{participated_goal}] is now todo")),
+        "unexpected news: {news}"
+    );
+    assert!(
+        !news.contains(&format!("new note [{joining_id}]")),
+        "own note was presented: {news}"
+    );
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let response = stdout(run(
         compass,

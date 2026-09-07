@@ -171,8 +171,6 @@ fn literal_client_secret_is_rejected_without_echoing_it() {
             "tenant.example",
             "--client-id",
             "client-id",
-            "--vault",
-            "01010101010101010101010101010101",
             "--client-secret",
             "do-not-echo-this-secret",
         ],
