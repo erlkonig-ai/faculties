@@ -187,8 +187,23 @@ where
     S: AsyncBlobStoreAcquire,
     P: TriblePattern,
 {
+    if matches!(
+        relations::profile_head(facts, person)?,
+        relations::Head::Missing
+    ) {
+        return Ok(format!("{person:x} [profile unavailable]"));
+    }
     let profile = relations::current_profile(facts, person)?;
-    acquire_text(store, profile.label).await
+    let Some(bytes) = store
+        .acquire(profile.label.transmute())
+        .await
+        .context("acquire Message person label")?
+    else {
+        return Ok(format!("{person:x} [label unavailable]"));
+    };
+    Ok(std::str::from_utf8(&bytes)
+        .context("decode Message person label")?
+        .to_owned())
 }
 
 async fn recipient_label<S, P>(store: &mut S, facts: &P, row: &MessageRow) -> Result<String>
@@ -670,6 +685,10 @@ mod tests {
 
         assert_eq!(actual_person, relations::SelectorOutcome::Unique(person));
         assert_eq!(
+            message::resolve_person(&before, fragment.facts(), &fmt_id(test_id(3))).unwrap(),
+            relations::SelectorOutcome::Missing
+        );
+        assert_eq!(
             actual_group.require_unique("group").unwrap().anchor(),
             group
         );
@@ -747,6 +766,105 @@ mod tests {
     }
 
     #[test]
+    fn exact_inbox_message_keeps_an_unobserved_senders_anchor_and_body() {
+        let sender = test_id(8);
+        let reader = test_id(9);
+        let (relations, _, _) = relations::person_fragment(
+            reader,
+            relations::ProfileInput {
+                label: "reader".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (envelope, id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(reader),
+            "visible inbox body",
+            (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+                .try_to_inline()
+                .unwrap(),
+        );
+        let row = message::row_by_id(envelope.facts(), id).unwrap();
+        let identities = IdentityComponents::from_facts(relations.facts()).unwrap();
+        assert!(message::is_inbox_message(&row, reader, relations.facts(), &identities).unwrap());
+        assert!(!message::is_outgoing_message(&row, reader, &identities).unwrap());
+        let mut store = AcquiringPile::new(envelope.blobs().clone());
+
+        assert_eq!(
+            pollster::block_on(person_label(&mut store, relations.facts(), row.from)).unwrap(),
+            format!("{sender:x} [profile unavailable]")
+        );
+        assert!(store.requested.is_empty());
+        assert_eq!(
+            pollster::block_on(acquire_text(&mut store, row.body)).unwrap(),
+            "visible inbox body"
+        );
+        assert_eq!((row.from, row.to), (sender, reader));
+        assert_eq!(store.requested, vec![row.body.transmute()]);
+    }
+
+    #[test]
+    fn person_display_distinguishes_absent_profile_from_unavailable_label() {
+        let person = test_id(10);
+        let (fragment, _, _) = relations::person_fragment(
+            person,
+            relations::ProfileInput {
+                label: "unavailable label".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let profile = relations::current_profile(fragment.facts(), person).unwrap();
+        let mut store = AcquiringPile::new(MemoryBlobStore::new());
+        let anchor_only = entity! {
+            ExclusiveId::force_ref(&person) @
+            metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID
+        };
+
+        assert_eq!(
+            pollster::block_on(person_label(&mut store, anchor_only.facts(), person)).unwrap(),
+            format!("{person:x} [profile unavailable]")
+        );
+        assert!(store.requested.is_empty());
+
+        assert_eq!(
+            pollster::block_on(person_label(&mut store, fragment.facts(), person)).unwrap(),
+            format!("{person:x} [label unavailable]")
+        );
+        assert_eq!(store.requested, vec![profile.label.transmute()]);
+        assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn person_display_does_not_hide_a_profile_fork() {
+        let person = test_id(11);
+        let (mut fragment, _, _) = relations::person_fragment(
+            person,
+            relations::ProfileInput {
+                label: "first head".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fragment += relations::profile_fragment(
+            person,
+            relations::ProfileInput {
+                label: "second head".to_owned(),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let mut store = AcquiringPile::new(fragment.blobs().clone());
+
+        let error =
+            pollster::block_on(person_label(&mut store, fragment.facts(), person)).unwrap_err();
+        assert!(error.to_string().contains("profile is forked"));
+        assert!(store.requested.is_empty());
+    }
+
+    #[test]
     fn recipient_display_uses_the_messages_frozen_group_snapshot() {
         let group = test_id(5);
         let (mut fragment, original) =
@@ -812,6 +930,18 @@ mod tests {
         assert!(missing.to_string().contains("unavailable"));
         let malformed = pollster::block_on(acquire_text(&mut store, invalid)).unwrap_err();
         assert!(malformed.to_string().contains("decode Message text"));
+
+        let person = test_id(12);
+        let profile = entity! {
+            metadata::tag: &faculties::schemas::relations::KIND_PERSON_PROFILE,
+            faculties::schemas::relations::profile::of: &person,
+            metadata::name: invalid,
+        };
+        let malformed =
+            pollster::block_on(person_label(&mut store, profile.facts(), person)).unwrap_err();
+        assert!(malformed
+            .to_string()
+            .contains("decode Message person label"));
     }
 
     #[test]

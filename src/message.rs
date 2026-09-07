@@ -1305,6 +1305,55 @@ mod tests {
     }
 
     #[test]
+    fn unobserved_senders_do_not_poison_exact_inbox_membership() {
+        let reader = test_id(0x70);
+        let unknown_sender = test_id(0x71);
+        let unknown_recipient = test_id(0x72);
+        let relation_facts = person_anchor(reader).into_facts();
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let body = "body".to_owned().to_blob().get_handle();
+        let (unrelated, _) = row(
+            unknown_sender,
+            unknown_recipient,
+            body,
+            at_unix(15.0),
+            None,
+            None,
+        );
+        let (incoming, _) = row(unknown_sender, reader, body, at_unix(14.0), None, None);
+        let (outgoing, _) = row(reader, unknown_recipient, body, at_unix(13.0), None, None);
+        let mut selected = Vec::new();
+        for candidate in [unrelated, incoming, outgoing] {
+            let inbox = is_inbox_message(&candidate, reader, &relation_facts, &identities).unwrap();
+            let outbox = is_outgoing_message(&candidate, reader, &identities).unwrap();
+            if inbox || outbox {
+                selected.push((candidate.id, inbox, outbox));
+            }
+        }
+        assert_eq!(
+            selected,
+            vec![(incoming.id, true, false), (outgoing.id, false, true)]
+        );
+        assert_eq!((incoming.from, incoming.to), (unknown_sender, reader));
+    }
+
+    #[test]
+    fn unobserved_receipt_readers_do_not_acknowledge_or_hide_an_exact_reader() {
+        let reader = test_id(0x73);
+        let absent = test_id(0x74);
+        let message = test_id(0x75);
+        let relation_facts = person_anchor(reader).into_facts();
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mut facts = read_fragment(message, absent, None).0.into_facts();
+        let reads = load_read_rows(&facts).unwrap();
+        assert!(!is_read_by(&reads, message, reader, &identities).unwrap());
+        assert!(is_read_by(&reads, message, absent, &identities).unwrap());
+        facts += read_fragment(message, reader, None).0.into_facts();
+        let reads = load_read_rows(&facts).unwrap();
+        assert!(is_read_by(&reads, message, reader, &identities).unwrap());
+    }
+
+    #[test]
     fn settled_same_identity_delivers_without_rewriting_attribution() {
         let sender = test_id(0x36);
         let addressed = test_id(0x37);

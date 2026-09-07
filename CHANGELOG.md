@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Message inbox reads retain exact opaque participant IDs when Relations
+  metadata is not resident. Unobserved anchors identify only themselves, not
+  invented aliases or known-distinct people; known identity conflicts remain
+  errors. Missing profiles or selected label bytes display the full anchor with
+  an explicit unavailable marker instead of hiding the message. Reader
+  selection, profile forks, message body errors, and frozen group delivery are
+  unchanged.
+
 - Live Faculty snapshots now support shared async exact-blob reads without
   requiring a mutable store at each payload read. Records, authorization time,
   selected covers, and passive residency observations remain frozen while

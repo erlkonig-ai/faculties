@@ -1751,9 +1751,11 @@ impl IdentityComponents {
     /// Resolve the settled semantic relation without replacing either exact
     /// anchor with a canonical representative. Distinctness is lifted through
     /// settled same-person components in the same way as equality.
+    /// An unobserved anchor still identifies itself; absent Relations evidence
+    /// does not establish equality or distinctness with any other anchor.
     pub fn relation(&self, first: Id, second: Id) -> Result<IdentityRelation> {
-        let first_root = self.root(first)?;
-        let second_root = self.root(second)?;
+        let first_root = find_root(&self.parent, first);
+        let second_root = find_root(&self.parent, second);
         if self.contradictions.contains(&first_root)
             || self.contradictions.contains(&second_root)
             || self.poisoned_components.contains(&first_root)
@@ -2522,6 +2524,40 @@ mod tests {
     }
 
     #[test]
+    fn unobserved_anchors_are_reflexive_without_inventing_identity_evidence() {
+        let absent = genid().id;
+        let other_absent = genid().id;
+        let known = genid().id;
+        let facts = entity! {
+            ExclusiveId::force_ref(&known) @ metadata::tag: &KIND_PERSON_ID
+        };
+        let identities = IdentityComponents::from_facts(facts.facts()).unwrap();
+
+        assert_eq!(
+            identities.relation(absent, absent).unwrap(),
+            IdentityRelation::Same
+        );
+        assert!(identities.equivalent(absent, absent).unwrap());
+        for other in [other_absent, known] {
+            assert_eq!(
+                identities.relation(absent, other).unwrap(),
+                IdentityRelation::Unknown
+            );
+            assert_eq!(
+                identities.relation(other, absent).unwrap(),
+                IdentityRelation::Unknown
+            );
+            assert!(!identities.equivalent(absent, other).unwrap());
+        }
+        // Comparison does not declare the anchor or relax component selection.
+        assert!(identities.component(absent).is_err());
+        assert_eq!(
+            identities.component(known).unwrap(),
+            BTreeSet::from([known])
+        );
+    }
+
+    #[test]
     fn distinctness_propagates_through_settled_same_components() {
         let fixture = Fixture::new();
         let a = genid().id;
@@ -2565,6 +2601,10 @@ mod tests {
         validate_catalog(&view.reader, &view.facts).unwrap();
         let identities = IdentityComponents::from_facts(&view.facts).unwrap();
         assert!(identities.equivalent(a, c).is_err());
+        assert!(identities.equivalent(a, a).is_err());
+        let absent = genid().id;
+        assert!(identities.relation(a, absent).is_err());
+        assert!(identities.relation(absent, a).is_err());
     }
 
     #[test]
@@ -2587,6 +2627,10 @@ mod tests {
         let pair = if a < c { (a, c) } else { (c, a) };
         assert!(identities.mixed_forked_pairs().contains(&pair));
         assert!(identities.equivalent(a, b).is_err());
+        assert!(identities.equivalent(a, a).is_err());
+        let absent = genid().id;
+        assert!(identities.relation(a, absent).is_err());
+        assert!(identities.relation(absent, a).is_err());
         assert!(identities.component(c).is_err());
     }
 
