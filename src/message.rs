@@ -3,8 +3,18 @@
 //! This module is the single semantic boundary used by the Message CLI and by
 //! observers such as Orient. It owns typed envelope/read queries, explicit
 //! import validation, recipient selection, intrinsic write construction, and
-//! delivery against frozen Relations group snapshots. Presentation and command
-//! workflows stay in the binaries.
+//! delivery against frozen Relations group snapshots. Typed finite workflows
+//! live in [`operations`], with explicit [`cli`] and [`mcp`] frontends.
+
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+mod render;
+
+pub use operations::{
+    AckAllOptions, AcknowledgedMessages, Acknowledgement, ListOptions, Message, MessageList,
+    MessageObservation, MessageStatus, SendOptions, SentMessage,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 

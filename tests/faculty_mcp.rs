@@ -220,6 +220,53 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
     assert!(responses[1].contains(r#""name":"files_get""#));
     assert!(responses[1].contains(r#""name":"files_view""#));
     assert!(!responses[1].contains(r#""name":"files_read""#));
+    let discovery: serde_json::Value = serde_json::from_str(responses[1]).unwrap();
+    let tools = discovery["result"]["tools"].as_array().unwrap();
+    let names: std::collections::BTreeSet<_> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names.len(),
+        tools.len(),
+        "one unambiguous aggregate registry"
+    );
+    for name in [
+        "compass_add",
+        "compass_list",
+        "compass_move",
+        "compass_note",
+        "compass_show",
+        "compass_prioritize",
+        "compass_deprioritize",
+        "compass_resolve",
+        "message_send",
+        "message_list",
+        "message_ack",
+        "message_ack_all",
+        "wiki_create",
+        "wiki_edit",
+        "wiki_show",
+        "wiki_export",
+        "wiki_search",
+        "wiki_history",
+        "wiki_archive",
+        "wiki_restore",
+        "wiki_revert",
+    ] {
+        assert!(names.contains(name), "missing native tool {name}");
+    }
+    for tool in tools {
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        for ambient in ["pile", "key", "path", "dir", "scope", "branch"] {
+            assert!(
+                !properties.contains_key(ambient),
+                "{} exposes {ambient}",
+                tool["name"]
+            );
+        }
+    }
     assert!(!responses[1].contains("\"pile\":"));
     assert!(!responses[1].contains("\"key\":"));
     assert_eq!(responses[2], r#"{"jsonrpc":"2.0","id":3,"result":{}}"#);

@@ -8,6 +8,12 @@
 //! fragment anchor, alias entity, mutable head, or migration marker
 //! participates in either model.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+
+pub use operations::{Export, ImportDocument, ListOptions, Wiki};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;

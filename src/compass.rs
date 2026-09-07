@@ -7,6 +7,15 @@
 //! timestamp first, event id second. Replica merge therefore cannot make the
 //! visible board depend on insertion or iteration order.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+mod render;
+
+pub use operations::{
+    AddOptions, AddedGoal, AddedNote, Compass, ListOptions, MovedGoal, NoteOptions, PriorityChange,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;

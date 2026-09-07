@@ -9,6 +9,19 @@ All notable changes to this project will be documented in this file.
   before reporting corruption; persistent malformed records remain errors.
   Pile records, sync protocol, and collection identities are unchanged.
 
+- Compass, Message, and Wiki now have reusable operation APIs, tailored CLI
+  adapters, and explicit native MCP tools registered in the aggregate server.
+  Write receipts expose IDs without requiring another Rust caller to parse
+  command output. Preserve collection, frontier, priority, delivery, and read
+  receipt semantics; no schema migration or service activation is included.
+  MCP prose is literal rather than `@file`/stdin syntax; Message senders and
+  optional Compass attribution are explicit, not inherited from `PERSONA`.
+  Wiki export preserves selected revision bytes as a binary resource or raw
+  CLI stdout. Filesystem batch/import UX stays CLI-only. The shared CLI output
+  runner now also supports independent Clap grammars without `Spec` lowering.
+  Compass titles adopt the same `@@` escape as notes. Message listing acquires
+  selected content before emission and correctly returns no entries at limit 0.
+
 - Atlas and Files are library-first with explicit `cli` and `mcp` entrypoints.
   One aggregate `faculties mcp` server registers their tools in-process; thin
   individual CLI binaries call their adapters. Remove shared CLI-to-MCP grammar

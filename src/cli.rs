@@ -31,18 +31,27 @@ pub fn run(
             stdout.flush()?;
             Ok(())
         }
-        CliRequest::Invoke(invocation) => {
-            let mut sink = Output::from_env(spec.name);
-            let result = execute(&invocation, &mut Out::new(&mut |part| sink.emit(part)));
-            let finished = sink.finish(result.as_ref().err());
-            match (result, finished) {
-                (Ok(()), result) => result,
-                (Err(error), Ok(())) => Err(error),
-                (Err(error), Err(finish_error)) => Err(error.context(format!(
-                    "finishing faculty output also failed: {finish_error:#}"
-                ))),
-            }
-        }
+        CliRequest::Invoke(invocation) => with_output(spec.name, |out| execute(&invocation, out)),
+    }
+}
+
+/// Route native output for an explicitly defined CLI, independently of its
+/// argument grammar. Parse arguments and print help before entering this
+/// boundary. The result is returned unchanged after the output is finalized;
+/// a failed or partly delivered operation is never retried.
+pub fn with_output<T>(
+    label: &'static str,
+    execute: impl FnOnce(&mut Out<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut sink = Output::from_env(label);
+    let result = execute(&mut Out::new(&mut |part| sink.emit(part)));
+    let finished = sink.finish(result.as_ref().err());
+    match (result, finished) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(finish_error)) => Err(error.context(format!(
+            "finishing faculty output also failed: {finish_error:#}"
+        ))),
     }
 }
 

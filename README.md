@@ -84,13 +84,18 @@ CLI and MCP adapters. Thin individual binaries call the CLI adapters; the single
 `faculties` binary registers the MCP adapters together. Cargo reuses shared
 compilation within a build configuration; executables still link separately.
 
-Atlas and Files are the first complete frontend ports. `atlas::Store` returns
+Atlas, Compass, Files, Message, and Wiki have native frontend ports.
+`atlas::Store` returns
 owned `AtlasEntry` observations from `list` and `show`. `files::Files` supplies
 typed operations including resident-byte import, original-byte export,
 presentation, and extraction. Neither operation API requires a CLI invocation
 or an MCP value. `atlas::cli` / `files::cli` use an optional CLI declaration
 helper; `atlas::mcp` / `files::mcp` own independent tool schemas and argument
-types. A faculty's MCP interface need not resemble its command-line grammar:
+types. Compass, Message, and Wiki retain tailored Clap grammars and use
+`cli::with_output` for the same native output routing; they do not need the
+declaration helper. Their library operations are callable without parsing
+command output to recover write receipts. A faculty's MCP interface need not
+resemble its command-line grammar:
 
 ```sh
 atlas --pile ./self.pile list
@@ -100,8 +105,8 @@ faculties mcp --pile ./self.pile
 
 `faculties mcp` is a local, sequential stdio server for MCP 2025-06-18. The
 launcher owns the pile and optional `--key`; callers cannot substitute those
-through tool arguments. Both Atlas operations and fourteen Files tools are
-registered as `atlas_*` and `files_*` tools. No HTTP listener or generic shell
+through tool arguments. Native operations are registered as `atlas_*`,
+`compass_*`, `files_*`, `message_*`, and `wiki_*` tools. No HTTP listener or generic shell
 tool is exposed. Files MCP never takes arbitrary input/output filesystem paths;
 URL fetches still originate on the server's host. This is a trusted local server,
 not a filesystem or network sandbox, and not a deployed remote MCP service.
@@ -125,9 +130,33 @@ long-running cancellation and concurrent requests are not implemented yet.
 | Import bytes | `files add path` | `files_add {"name":"notes.txt","mime":"text/plain","data":"base64…"}` |
 | Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID", "files:HASH"]}` |
 
+Compass exposes goal creation, listing, status changes, notes, priority edges,
+and id resolution. Message exposes send, list, acknowledgement, and acknowledge
+all. Wiki exposes native revision, frontier, tag, search, and audit operations.
+The CLI-only Wiki import/batch directory operations are not exposed as remote
+host paths. MCP callers create or edit entries with resident content strings.
+
+MCP prose is always literal: a note or message containing `@-` is that text,
+not a request to read protocol stdin. Only CLI adapters expand `@path`, `@-`,
+and escaped `@@text` using the common text resolver. Message MCP requires an
+explicit `from`; Compass write tools accept an explicit optional `persona`.
+Neither silently attributes work to the MCP server process's `PERSONA`.
+These persona names are cooperative attribution, not authentication; publication
+still uses the launcher's configured signer and collection authority.
+
+Wiki `show` presents text and follows the current frontier unless `exact` is
+requested. `export` returns the selected revision's exact UTF-8 bytes: a binary
+resource through MCP, or raw CLI stdout even with a Drive endpoint configured.
+Forks stay visible; export refuses to choose between multiple current heads.
+Wiki create/edit retain their existing Typst validation. Its validation world
+denies external file/import access, but it is not a CPU/memory isolation
+boundary. Hosted untrusted use needs resource isolation; this local frontend
+port does not supply it. MCP `wiki_check` does not expose the CLI's optional
+compile flag.
+
 MCP numeric options are JSON numbers, and multiword names use underscores.
 Unknown fields, duplicate fields, and wrong types are rejected before operations.
-Exports return an embedded binary resource with a `files:` URI and generic
+Files exports return an embedded binary resource with a `files:` URI and generic
 `application/octet-stream` type. No `resources/read` call is needed for those
 inline bytes. Export needs only the payload, not MIME/name metadata that might
 be unavailable. Receiving an MCP resource does not by itself prove that a host

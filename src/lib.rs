@@ -4,7 +4,7 @@
 //! adapters, and widgets. Each ported faculty has explicit `cli` and `mcp`
 //! submodules; the aggregate MCP binary registers them in-process. Presentation
 //! and argument conventions belong to those frontends, not a universal grammar.
-//! Atlas and Files are the first complete frontend ports.
+//! Atlas, Compass, Files, Message, and Wiki have native frontend ports.
 
 /// Crate version + baked git hash (see `build.rs`) — lets every installed
 /// binary answer the stale-binary/version-skew question via `--version`.
@@ -101,8 +101,9 @@ pub(crate) mod test_support;
 ///
 /// `label` names the value in error messages (e.g. `"summary"`, `"message text"`).
 ///
-/// This is the canonical resolver; faculties must call it rather than
-/// re-implementing the `@` prefix logic, so the interface stays uniform. The
+/// This is the canonical CLI resolver; CLI adapters must call it rather than
+/// re-implementing the `@` prefix logic. Domain operations and MCP adapters
+/// accept literal content and must not call this filesystem/stdin helper. The
 /// footgun this closes: passing `@-` as a plain positional argv (with the body
 /// on a heredoc) silently stores the literal string `"@-"` unless the faculty
 /// actually routes the argument through here.

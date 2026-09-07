@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use faculties::mcp::{Faculty, Server};
-use faculties::{atlas, files};
+use faculties::{atlas, compass, files, message, wiki};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve native Atlas and Files commands over local MCP stdio.
+    /// Serve native Atlas, Compass, Files, Message, and Wiki tools over MCP stdio.
     Mcp {
         /// Pile configured by the local launcher, never an MCP tool argument.
         #[arg(long, env = "PILE")]
@@ -31,8 +31,11 @@ fn main() -> Result<()> {
     match command {
         Command::Mcp { pile, key } => {
             let atlas = atlas::mcp::Atlas::new(pile.clone(), key.clone());
-            let files = files::mcp::Files::new(pile, key);
-            let registrations: [&dyn Faculty; 2] = [&atlas, &files];
+            let compass = compass::mcp::Compass::new(pile.clone(), key.clone());
+            let files = files::mcp::Files::new(pile.clone(), key.clone());
+            let message = message::mcp::Message::new(pile.clone(), key.clone());
+            let wiki = wiki::mcp::Wiki::new(pile, key);
+            let registrations: [&dyn Faculty; 5] = [&atlas, &compass, &files, &message, &wiki];
             serve_stdio(&registrations)
         }
     }
