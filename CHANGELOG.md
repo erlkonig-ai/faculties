@@ -4,23 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Atlas and Files are library-first with explicit `cli` and `mcp` entrypoints.
+  One aggregate `faculties mcp` server registers their tools in-process; thin
+  individual CLI binaries call their adapters. Remove shared CLI-to-MCP grammar
+  generation and synthetic native invocation dispatch. Atlas exposes owned
+  metadata observations; Files exposes typed import/export/presentation and
+  extraction operations. Pile identities and framing are unchanged.
+
+- Files MCP uses recipient-specific interfaces: `get` takes only an id and
+  returns original bytes; `add` accepts base64 data instead of a host path;
+  `resolve` takes literal selector arrays. Numeric arguments are JSON numbers.
+  `view` replaces experimental `read`, with bounded PNG/JPEG conversion and
+  resizing, exact original export, and explicit unsupported audio/PDF conversion
+  errors. Fetch imports bytes directly instead of staging a caller-named temp
+  file, and bounds the response while downloading.
+
 - Explicit binary exports stay byte-exact on CLI stdout even when
   `DRIVE_ENDPOINT` is configured, so redirected `files get <id> @-` remains
   usable. Only text/image/audio perception opens the Drive connection; exports
   are never sent as senses. MCP binary-resource output is unchanged.
 
-- Files now shares its full command implementation between CLI and MCP, retaining
-  all existing commands and adding MIME-aware `read` for UTF-8 text, images, and
-  audio. Explicit `get <id> @-` exports remain byte-exact on the CLI and become
-  embedded binary resources on MCP. The shared argument declaration covers
-  flags, repeated options, defaults, short options, and native filesystem paths.
-  Stdin batches remain CLI-only; macOS/Linux MCP launchers isolate their
-  protocol descriptors from ordinary process stdio. No Files data model or IDs
-  change, and no migration is needed.
-
 - Native Faculty output now emits ordered text, image, and audio parts through
-  a fallible incremental sink. Atlas shares one handler and command declaration
-  between its CLI and a local `faculties mcp` stdio server. MCP preserves partial
+  a fallible incremental sink. MCP preserves partial
   output on handler errors and keeps pile/key configuration launcher-owned.
   The shared CLI runner routes output to Drive's existing `organ/1` receiver
   when `DRIVE_ENDPOINT` is configured, otherwise to the terminal. No schema

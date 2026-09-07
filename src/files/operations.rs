@@ -1,4 +1,6 @@
-//! Files commands shared by native CLI and MCP frontends.
+//! Files operations over maintained, immutable collection views.
+//!
+//! Callers use typed operations directly; no CLI invocation or MCP value enters here.
 
 use crate::clock;
 use crate::collection_names::{configured_handle, open, open_exact_in};
@@ -8,7 +10,6 @@ use crate::schemas::embeddings;
 use crate::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use crate::spec::{Faculty, Invocation, Param, Spec, Verb};
 use crate::storage::{
     load_signer, open_store, read, runtime, FactArchive, FacultySnapshot, FacultyStore,
 };
@@ -44,462 +45,6 @@ type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
 /// type from `EmbHandle` (CLIP-512) so the two spaces index independently and
 /// can never collide in one HNSW.
 type Mm7bHandle = Inline<inlineencodings::Handle<embeddings::Embedding3584>>;
-
-// ── native specification ─────────────────────────────────────────────────
-
-const SHARED: &[Param] = &[
-    Param::caller("pile", "Path to the pile file")
-        .path()
-        .ambient()
-        .env("PILE"),
-    Param::caller(
-        "key",
-        "Existing durable signing-key file; never created by commands",
-    )
-    .path()
-    .ambient()
-    .optional()
-    .env("TRIBLESPACE_KEY"),
-];
-
-const VERBS: &[Verb] = &[
-    Verb {
-        name: "add",
-        about: "Import a file or directory into the pile",
-        params: &[
-            Param::caller("path", "Path to a file or directory")
-                .path()
-                .positional(),
-            Param::caller("mime", "Override MIME type (single file only)").optional(),
-            Param::caller("tag", "Add tags to the import (repeatable)").repeated(),
-            Param::caller(
-                "dry-run",
-                "Preview what would be imported without committing",
-            )
-            .flag(),
-        ],
-    },
-    Verb {
-        name: "list",
-        about: "List all imported files",
-        params: &[
-            Param::caller("tag", "Filter by tag (repeatable)").repeated(),
-            Param::caller("mime", "Filter by MIME type prefix").optional(),
-        ],
-    },
-    Verb {
-        name: "show",
-        about: "Show metadata for a file, directory, or import",
-        params: &[
-            Param::caller("id", "Entity id/content hash or an unambiguous prefix").positional(),
-        ],
-    },
-    Verb {
-        name: "read",
-        about: "Present stored UTF-8 text, image, or audio content",
-        params: &[
-            Param::caller("id", "Entity id/content hash or an unambiguous prefix").positional(),
-        ],
-    },
-    Verb {
-        name: "get",
-        about: "Extract a file, directory, or import; use @- for byte-exact output",
-        params: &[
-            Param::caller("id", "Entity id/content hash or an unambiguous prefix").positional(),
-            Param::caller(
-                "output",
-                "Output path; omit for stored filename, @- for output bytes",
-            )
-            .positional()
-            .optional(),
-        ],
-    },
-    Verb {
-        name: "tag",
-        about: "Add a tag to a file",
-        params: &[
-            Param::caller("id", "Entity id/content hash or an unambiguous prefix").positional(),
-            Param::caller("name", "Tag to add").positional(),
-        ],
-    },
-    Verb {
-        name: "fetch",
-        about: "Fetch a URL and import it as a file",
-        params: &[
-            Param::caller("url", "URL to fetch").positional(),
-            Param::caller("mime", "Override MIME type").optional(),
-            Param::caller("name", "Override filename").optional(),
-            Param::caller("tag", "Add tags to the import (repeatable)").repeated(),
-            Param::caller(
-                "max-bytes",
-                "Maximum response size in bytes (default 8 MiB)",
-            )
-            .default("8388608"),
-        ],
-    },
-    Verb {
-        name: "search",
-        about: "Search files by name or tag",
-        params: &[
-            Param::caller("query", "Search query (substring, case-insensitive)").positional(),
-        ],
-    },
-    Verb {
-        name: "similar",
-        about: "Find semantically similar files by image id or cross-modal --text query",
-        params: &[
-            Param::caller("id", "Entity id/content hash or prefix; omit with --text")
-                .positional()
-                .optional(),
-            Param::caller("text", "Text query for cross-modal search").optional(),
-            Param::caller("floor", "Minimum cosine similarity, 0..1").default("0.15"),
-            Param::caller("limit", "Maximum results")
-                .default("10")
-                .short('n'),
-            Param::caller("tag", "Only results carrying all these tags (repeatable)").repeated(),
-            Param::caller(
-                "mm7b",
-                "Search the nomic-embed-multimodal-7b space; run embed7b first",
-            )
-            .flag(),
-        ],
-    },
-    Verb {
-        name: "embed7b",
-        about: "Embed images or PDF pages with nomic-embed-multimodal-7b (requires local-embed)",
-        params: &[
-            Param::caller(
-                "force",
-                "Re-embed files/pages already carrying a 7b embedding",
-            )
-            .flag(),
-            Param::caller("pdf", "Rasterize and embed PDF pages instead of images").flag(),
-            Param::caller("dpi", "PDF rasterization resolution in DPI").default("150"),
-            Param::caller("limit", "Process at most this many PDFs (0 = all)").default("0"),
-            Param::caller(
-                "max-pages",
-                "Embed at most this many pages per PDF (0 = all)",
-            )
-            .default("0"),
-        ],
-    },
-    Verb {
-        name: "imports",
-        about: "List imports (snapshots)",
-        params: &[],
-    },
-    Verb {
-        name: "tree",
-        about: "Show the tree structure of an import or directory",
-        params: &[
-            Param::caller("id", "Import/directory entity id or an unambiguous prefix").positional(),
-            Param::caller("depth", "Maximum depth (0 = root, 1 = immediate children)")
-                .optional()
-                .short('d'),
-        ],
-    },
-    Verb {
-        name: "resolve",
-        about: "Expand selectors to canonical tokens; @path batches, @- batches on CLI only",
-        params: &[Param::caller(
-            "input",
-            "Selector or @path/@- batch (one selector per line)",
-        )
-        .positional()],
-    },
-    Verb {
-        name: "diff",
-        about: "Compare two imports, directories, or files",
-        params: &[
-            Param::caller("left", "Left (older) entity/hash selector").positional(),
-            Param::caller("right", "Right (newer) entity/hash selector").positional(),
-        ],
-    },
-];
-
-pub static SPEC: Spec = Spec {
-    name: "files",
-    about: "Content-addressed file storage in a TribleSpace pile",
-    version: Some(crate::GIT_VERSION),
-    shared: SHARED,
-    verbs: VERBS,
-};
-
-// Parsed dispatch only: the public grammar is declared once, in SPEC.
-enum Command {
-    /// Import a file or directory into the pile
-    Add {
-        /// Path to a file or directory
-        path: PathBuf,
-        /// Override MIME type (single file only)
-        mime: Option<String>,
-        /// Add tags to the import (repeatable)
-        tag: Vec<String>,
-        /// Preview what would be imported without committing
-        dry_run: bool,
-    },
-    /// List all imported files
-    List {
-        /// Filter by tag
-        tag: Vec<String>,
-        /// Filter by MIME type prefix (e.g. "application/pdf")
-        mime: Option<String>,
-    },
-    /// Show metadata for a file, directory, or import
-    Show {
-        /// Entity id/content hash or an unambiguous prefix (optional files: prefix)
-        id: String,
-    },
-    /// Present a file using its stored media type.
-    Read {
-        id: String,
-    },
-    /// Extract a file, directory, or import.
-    /// Use @- to write to stdout, or omit for the stored filename.
-    Get {
-        /// Entity id/content hash or an unambiguous prefix (file, directory, or import)
-        id: String,
-        /// Output path. Omit to use the stored filename. Use @- for stdout.
-        output: Option<String>,
-    },
-    /// Add a tag to a file
-    Tag {
-        /// Entity id/content hash or an unambiguous prefix
-        id: String,
-        /// Tag to add
-        name: String,
-    },
-    /// Fetch a URL and import it as a file
-    Fetch {
-        /// URL to fetch
-        url: String,
-        /// Override MIME type
-        mime: Option<String>,
-        /// Override filename
-        name: Option<String>,
-        /// Add tags to the import (repeatable)
-        tag: Vec<String>,
-        /// Maximum response size in bytes (default 8 MiB)
-        max_bytes: usize,
-    },
-    /// Search files by name or tag
-    Search {
-        /// Search query (substring, case-insensitive)
-        query: String,
-    },
-    /// Find files semantically similar to a query — by an embedded image file,
-    /// or cross-modally by `--text "a description"` (same CLIP space). `--tag`
-    /// makes it a hybrid query: similar AND carrying the tag — the join that
-    /// tells "a form of me" from the project mascots.
-    Similar {
-        /// Entity id/content hash or an unambiguous prefix (omit with --text)
-        id: Option<String>,
-        /// Text query for cross-modal search (omit when querying by file)
-        text: Option<String>,
-        /// Minimum cosine similarity, 0..1. NB image↔image scores run high
-        /// (~0.9 for near-dupes) but text↔image run low (~0.2, CLIP's modality
-        /// gap), so this low default serves both; raise it to tighten.
-        floor: f32,
-        /// Maximum results
-        limit: usize,
-        /// Only results carrying ALL these tags (repeatable) — the hybrid filter
-        tag: Vec<String>,
-        /// Search the nomic-embed-multimodal-7b 3584-d space (run `files
-        /// embed-7b` first) instead of the CLIP-512 space. A *separate*,
-        /// stronger text→image space — not comparable to the CLIP one.
-        mm7b: bool,
-    },
-    /// Embed image files (or, with `--pdf`, PDF *pages*) with
-    /// nomic-embed-multimodal-7b (3584-d) and store the vector on
-    /// `attr_mm7b::embedding`. Idempotent: skips already-embedded files/pages
-    /// unless `--force`. The 7b model loads once (~20s cold), then ~0.5-1s per
-    /// image. Needs `--features local-embed` and macOS (Metal). This is the
-    /// index that powers `files similar --mm7b --text "…"` (text→image recall).
-    Embed7b {
-        /// Re-embed even files/pages that already carry a 7b embedding.
-        force: bool,
-        /// Embed `application/pdf` files instead of raster images: rasterize
-        /// each page (via `pdftoppm`) and embed it as a separate page entity,
-        /// so a hit points to "file X, page N". The big batch — combine with
-        /// `--limit`/`--max-pages` for incremental runs over a large corpus.
-        pdf: bool,
-        /// (PDF mode) Rasterization resolution in DPI. Lower = faster + smaller.
-        dpi: u32,
-        /// (PDF mode) Process at most this many PDF files this run (0 = all).
-        limit: usize,
-        /// (PDF mode) Embed at most this many pages per PDF (0 = all pages).
-        max_pages: usize,
-    },
-    /// List imports (snapshots)
-    Imports,
-    /// Show the tree structure of an import or directory
-    Tree {
-        /// Import/directory entity id or an unambiguous prefix
-        id: String,
-        /// Maximum depth to display (0 = root only, 1 = immediate children, etc.)
-        depth: Option<usize>,
-    },
-    /// Expand hash/id selectors to canonical reference tokens. Use @path/@- for batch input.
-    /// Batch mode outputs `old\tfiles:<full-token>`; failures go to stderr.
-    Resolve {
-        /// Selector, or @path/@- for batch input (one selector per line)
-        input: String,
-    },
-    // CLI stdin is read by the frontend, never by the native resolver.
-    ResolveBatch {
-        input: String,
-    },
-    /// Compare two imports, directories, or files
-    Diff {
-        /// Left (older) entity/hash selector
-        left: String,
-        /// Right (newer) entity/hash selector
-        right: String,
-    },
-}
-
-impl Command {
-    fn from_invocation(invocation: &Invocation) -> Result<Self> {
-        Ok(match invocation.verb().name {
-            "add" => Self::Add {
-                path: invocation.require_path("path")?.to_path_buf(),
-                mime: invocation.get("mime").map(str::to_owned),
-                tag: invocation.values("tag").to_vec(),
-                dry_run: invocation.flag("dry-run"),
-            },
-            "list" => Self::List {
-                tag: invocation.values("tag").to_vec(),
-                mime: invocation.get("mime").map(str::to_owned),
-            },
-            "show" => Self::Show {
-                id: invocation.require("id")?.into(),
-            },
-            "read" => Self::Read {
-                id: invocation.require("id")?.into(),
-            },
-            "get" => Self::Get {
-                id: invocation.require("id")?.into(),
-                output: invocation.get("output").map(str::to_owned),
-            },
-            "tag" => Self::Tag {
-                id: invocation.require("id")?.into(),
-                name: invocation.require("name")?.into(),
-            },
-            "fetch" => Self::Fetch {
-                url: invocation.require("url")?.into(),
-                mime: invocation.get("mime").map(str::to_owned),
-                name: invocation.get("name").map(str::to_owned),
-                tag: invocation.values("tag").to_vec(),
-                max_bytes: invocation
-                    .require("max-bytes")?
-                    .parse()
-                    .context("invalid --max-bytes")?,
-            },
-            "search" => Self::Search {
-                query: invocation.require("query")?.into(),
-            },
-            "similar" => Self::Similar {
-                id: invocation.get("id").map(str::to_owned),
-                text: invocation.get("text").map(str::to_owned),
-                floor: invocation
-                    .require("floor")?
-                    .parse()
-                    .context("invalid --floor")?,
-                limit: invocation
-                    .require("limit")?
-                    .parse()
-                    .context("invalid --limit")?,
-                tag: invocation.values("tag").to_vec(),
-                mm7b: invocation.flag("mm7b"),
-            },
-            "embed7b" => Self::Embed7b {
-                force: invocation.flag("force"),
-                pdf: invocation.flag("pdf"),
-                dpi: invocation
-                    .require("dpi")?
-                    .parse()
-                    .context("invalid --dpi")?,
-                limit: invocation
-                    .require("limit")?
-                    .parse()
-                    .context("invalid --limit")?,
-                max_pages: invocation
-                    .require("max-pages")?
-                    .parse()
-                    .context("invalid --max-pages")?,
-            },
-            "imports" => Self::Imports,
-            "tree" => Self::Tree {
-                id: invocation.require("id")?.into(),
-                depth: invocation
-                    .get("depth")
-                    .map(str::parse)
-                    .transpose()
-                    .context("invalid --depth")?,
-            },
-            "resolve" => Self::Resolve {
-                input: invocation.require("input")?.into(),
-            },
-            "diff" => Self::Diff {
-                left: invocation.require("left")?.into(),
-                right: invocation.require("right")?.into(),
-            },
-            other => bail!("Files handler has no verb {other:?}"),
-        })
-    }
-}
-
-struct FilesContext {
-    stdin: Option<String>,
-}
-
-static FILES: Faculty<FilesContext> = Faculty::new(&SPEC, handle);
-
-/// Execute one native invocation without reading process stdin.
-/// Output routing and any finite collection belong to the frontend.
-pub fn execute(invocation: &Invocation, out: &mut Out<'_>) -> Result<()> {
-    FILES.invoke(&mut FilesContext { stdin: None }, invocation, out)
-}
-
-/// The CLI alone may consume stdin for a resolve batch; MCP stdin is protocol.
-pub fn execute_cli(invocation: &Invocation, out: &mut Out<'_>) -> Result<()> {
-    execute_cli_with_input(invocation, out, &mut std::io::stdin().lock())
-}
-
-fn execute_cli_with_input(
-    invocation: &Invocation,
-    out: &mut Out<'_>,
-    input: &mut impl std::io::Read,
-) -> Result<()> {
-    let stdin = if invocation.verb().name == "resolve" && invocation.get("input") == Some("@-") {
-        let mut text = String::new();
-        input
-            .read_to_string(&mut text)
-            .context("read resolve batch from stdin")?;
-        Some(text)
-    } else {
-        None
-    };
-    FILES.invoke(&mut FilesContext { stdin }, invocation, out)
-}
-
-fn handle(context: &mut FilesContext, invocation: &Invocation, out: &mut Out<'_>) -> Result<()> {
-    // Parse numeric options and reject protocol-stdin reads before opening a store.
-    let command = match Command::from_invocation(invocation)? {
-        Command::Resolve { input } if input == "@-" => Command::ResolveBatch {
-            input: context.stdin.take().context(
-                "resolve @- stdin is only available through the CLI; use @path or a selector",
-            )?,
-        },
-        command => command,
-    };
-    run_command(
-        invocation.require_path("pile")?,
-        invocation.path("key"),
-        command,
-        out,
-    )
-}
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -1193,6 +738,7 @@ fn cmd_fetch(
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("playground-files-faculty/0")
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .context("build http client")?;
     let response = client
@@ -1210,7 +756,15 @@ fn cmd_fetch(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    let bytes = response.bytes().context("read response body")?;
+    use std::io::Read;
+    let read_limit = u64::try_from(max_bytes)?
+        .checked_add(1)
+        .context("max_bytes is too large")?;
+    let mut bytes = Vec::new();
+    response
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .context("read response body")?;
     if bytes.len() > max_bytes {
         bail!(
             "response too large: {} bytes (limit {})",
@@ -1240,25 +794,52 @@ fn cmd_fetch(
         });
     let fname = guessed_name.unwrap_or_else(|| "fetched".to_string());
 
-    // Write to a temp file so we can reuse build_tree / cmd_add flow.
-    let tmp_dir = std::env::temp_dir().join("files-fetch");
-    fs::create_dir_all(&tmp_dir).context("create temp dir")?;
-    let tmp_path = tmp_dir.join(&fname);
-    fs::write(&tmp_path, bytes.as_ref())
-        .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+    let size = bytes.len();
+    let (change, file_id, import_id) = stage_byte_import(bytes.into(), &fname, &mime, tags, url)?;
+    let content = content_handle_of(change.facts(), file_id).context("staged file content")?;
+    pile.commit(collection, signer, change)
+        .context("commit fetched file")?;
+    out.line(format!(
+        "{}  {}  ({})",
+        handle_hex(content),
+        file_capability::leaf_name(&fname),
+        human_size(size as u64)
+    ))?;
+    if mime.starts_with("image/") {
+        out.line(format!(
+            "![{}](files:{})",
+            file_capability::leaf_name(&fname),
+            handle_hex(content)
+        ))?;
+    }
+    out.line(format!("Import: {}", fmt_id(import_id)))
+}
 
-    let result = cmd_add(
-        pile,
-        collection,
-        signer,
-        &tmp_path,
-        Some(mime.as_str()),
-        tags,
-        out,
-    );
-    let _ = fs::remove_file(&tmp_path);
-    let _ = fs::remove_dir(&tmp_dir);
-    result
+fn stage_byte_import(
+    bytes: anybytes::Bytes,
+    name: &str,
+    mime: &str,
+    tags: &[String],
+    source: &str,
+) -> Result<(Fragment, Id, Id)> {
+    let mime = file_capability::normalize_media_type(mime)?;
+    let embedding = embed_image_on_add(&mut None, &mime, bytes.as_ref())?;
+    let mut change = file_capability::stage(bytes, name, &mime)?;
+    let file_id = change.root().expect("staged file has a root");
+    if let Some(vector) = embedding {
+        let handle: EmbHandle = change.put::<Embedding, _>(vector);
+        change += entity! { ExclusiveId::force_ref(&file_id) @ file::embedding: handle };
+    }
+    let import = entity! {
+        metadata::tag: &KIND_IMPORT,
+        file::root: &file_id,
+        file::imported_at: now_tai()?,
+        file::source_path: source.to_owned(),
+        file::tag*: tags.iter().map(String::as_str),
+    };
+    let import_id = import.root().expect("import has a root");
+    change += import;
+    Ok((change, file_id, import_id))
 }
 
 fn cmd_list<P: TriblePattern>(
@@ -1307,43 +888,6 @@ fn cmd_list<P: TriblePattern>(
     }
 
     Ok(output)
-}
-
-fn cmd_resolve<P: TriblePattern>(space: &P, input: &str, out: &mut Out<'_>) -> Result<()> {
-    if let Some(path) = input.strip_prefix('@') {
-        anyhow::ensure!(
-            path != "-",
-            "resolve @- stdin is only available through the CLI"
-        );
-        let content = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
-        return cmd_resolve_batch(space, &content, out);
-    }
-
-    let reference = file_capability::resolve_reference(space, input)?;
-    out.line(reference.hex())
-}
-
-fn cmd_resolve_batch<P: TriblePattern>(space: &P, content: &str, out: &mut Out<'_>) -> Result<()> {
-    let mut resolved = 0u32;
-    let mut failed = 0u32;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match file_capability::resolve_reference(space, line) {
-            Ok(reference) => {
-                out.line(format!("{line}\tfiles:{}", reference.hex()))?;
-                resolved += 1;
-            }
-            Err(error) => {
-                eprintln!("UNRESOLVED: {line} — {error}");
-                failed += 1;
-            }
-        }
-    }
-    eprintln!("{resolved} resolved, {failed} unresolved");
-    Ok(())
 }
 
 fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Result<String> {
@@ -1407,163 +951,6 @@ fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Res
     Ok(output)
 }
 
-/// Resolve the selected file and content handle once, then acquire only its
-/// MIME and payload against the maintained immutable view. Emission is outside
-/// the retryable read boundary.
-fn cmd_read<P, S>(
-    store: &mut S,
-    runtime: &tokio::runtime::Runtime,
-    space: &P,
-    reader: &S::Snapshot,
-    id: &str,
-    out: &mut Out<'_>,
-) -> Result<()>
-where
-    P: TriblePattern,
-    S: SnapshotSource + AsyncBlobStoreAcquire,
-    S::Snapshot: BlobStoreGet + BlobStoreList,
-{
-    let eid = file_capability::resolve_selector(space, id)?;
-    let target = if is_import(space, eid) {
-        root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))?
-    } else {
-        eid
-    };
-    anyhow::ensure!(
-        is_file(space, target),
-        "read requires a file; use get to extract a directory"
-    );
-    let content =
-        content_handle_of(space, target).ok_or_else(|| anyhow::anyhow!("no content for file"))?;
-    let (bytes, mime) = runtime.block_on(read(store, reader, |reader| {
-        let mime =
-            read_mime(space, reader, target)?.unwrap_or_else(|| "application/octet-stream".into());
-        anyhow::ensure!(
-            mime.starts_with("text/") || mime.starts_with("image/") || mime.starts_with("audio/"),
-            "cannot present MIME type {mime:?}; use files get {id} to extract it",
-        );
-        let bytes = reader
-            .get::<anybytes::Bytes, _>(content)
-            .context("read file content")?;
-        Ok((bytes, mime))
-    }))?;
-
-    if mime.starts_with("text/") {
-        let text = std::str::from_utf8(bytes.as_ref())
-            .context("stored text is not UTF-8; use files get to export its exact bytes")?;
-        out.text(text)
-    } else if mime.starts_with("image/") {
-        out.image(bytes, mime)
-    } else {
-        out.audio(bytes, mime)
-    }
-}
-
-fn cmd_get<P, S>(
-    store: &mut S,
-    runtime: &tokio::runtime::Runtime,
-    space: &P,
-    reader: &S::Snapshot,
-    id: &str,
-    output: Option<&str>,
-    out: &mut Out<'_>,
-) -> Result<()>
-where
-    P: TriblePattern,
-    S: SnapshotSource + AsyncBlobStoreAcquire,
-    S::Snapshot: BlobStoreGet + BlobStoreList,
-{
-    let eid = file_capability::resolve_selector(space, id)?;
-
-    // For imports, follow to root.
-    let target = if is_import(space, eid) {
-        root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))?
-    } else {
-        eid
-    };
-
-    let to_stdout = output == Some("@-");
-
-    if is_file(space, target) {
-        let h = content_handle_of(space, target)
-            .ok_or_else(|| anyhow::anyhow!("no content for file"))?;
-        let (bytes, out_path) = runtime.block_on(read(store, reader, |reader| {
-            let bytes = reader
-                .get::<anybytes::Bytes, _>(h)
-                .context("get file blob")?;
-            let path = if to_stdout {
-                None
-            } else if let Some(path) = output {
-                Some(PathBuf::from(path))
-            } else {
-                Some(PathBuf::from(
-                    read_name(space, reader, target)?.unwrap_or_else(|| "file.bin".into()),
-                ))
-            };
-            Ok((bytes, path))
-        }))?;
-
-        if let Some(out_path) = out_path {
-            fs::write(&out_path, bytes.as_ref())
-                .with_context(|| format!("write {}", out_path.display()))?;
-            eprintln!(
-                "Wrote {} ({})",
-                out_path.display(),
-                human_size(bytes.len() as u64)
-            );
-        } else {
-            // Raw export depends only on the selected payload. Display uses
-            // stored MIME in `read`; exporting must not acquire MIME metadata.
-            out.blob(
-                bytes,
-                "application/octet-stream",
-                format!("files:{}", handle_hex(h)),
-            )?;
-        }
-    } else if is_directory(space, target) {
-        if to_stdout {
-            bail!("cannot write directory to stdout");
-        }
-        // Prepare only this requested subtree. Bytes retain their backing read
-        // leases; a retry cannot create directories or overwrite earlier files.
-        let (out_dir, writes, stats) = runtime.block_on(read(store, reader, |reader| {
-            let out_dir = match output {
-                Some(path) => PathBuf::from(path),
-                None => PathBuf::from(
-                    read_name(space, reader, target)?.unwrap_or_else(|| "extracted".into()),
-                ),
-            };
-            let mut stats = TreeStats {
-                files: 0,
-                dirs: 0,
-                bytes: 0,
-            };
-            let mut writes = Vec::new();
-            extract_tree(space, reader, target, &out_dir, &mut stats, &mut writes)?;
-            Ok((out_dir, writes, stats))
-        }))?;
-        for (path, bytes) in writes {
-            match bytes {
-                Some(bytes) => fs::write(&path, bytes.as_ref())
-                    .with_context(|| format!("write {}", path.display()))?,
-                None => fs::create_dir_all(&path)
-                    .with_context(|| format!("mkdir {}", path.display()))?,
-            }
-        }
-        eprintln!(
-            "Extracted to {} ({} files, {} dirs, {})",
-            out_dir.display(),
-            stats.files,
-            stats.dirs,
-            human_size(stats.bytes),
-        );
-    } else {
-        bail!("entity is not a file, directory, or import");
-    }
-
-    Ok(())
-}
-
 fn extract_tree<P: TriblePattern, R: BlobStoreGet>(
     space: &P,
     reader: &R,
@@ -1585,7 +972,9 @@ fn extract_tree<P: TriblePattern, R: BlobStoreGet>(
         writes.push((dest.to_owned(), None));
         stats.dirs += 1;
         for cid in children_of(space, id) {
-            let cname = read_name(space, reader, cid)?.unwrap_or_else(|| fmt_id(cid));
+            let cname = file_capability::leaf_name(
+                &read_name(space, reader, cid)?.unwrap_or_else(|| fmt_id(cid)),
+            );
             extract_tree(space, reader, cid, &dest.join(&cname), stats, writes)?;
         }
     } else {
@@ -2575,156 +1964,449 @@ fn cmd_similar_mm7b<P: TriblePattern>(
     Ok(())
 }
 
-fn run_command(pile: &Path, key: Option<&Path>, command: Command, out: &mut Out<'_>) -> Result<()> {
-    match command {
-        Command::Add {
-            path,
-            mime,
-            tag,
-            dry_run,
-        } => {
-            if dry_run {
-                cmd_add_dry_run(&path, &tag, out)
-            } else {
-                with_files_store(pile, key, |store, collection, signer| {
-                    cmd_add(store, collection, signer, &path, mime.as_deref(), &tag, out)
-                })
+/// A configured Files capability. Constructing it performs no I/O; each operation
+/// opens and closes its own store and observes one maintained collection view.
+#[derive(Clone, Debug)]
+pub struct Files {
+    pile: PathBuf,
+    key: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Export {
+    pub bytes: anybytes::Bytes,
+    pub content: FileHandle,
+}
+
+impl Export {
+    pub fn uri(&self) -> String {
+        format!("files:{}", handle_hex(self.content))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredView {
+    pub bytes: anybytes::Bytes,
+    pub mime_type: String,
+}
+
+/// A fully acquired extraction plan. No filesystem write occurs while payload
+/// acquisition may retry. Paths are explicit; stdout conventions do not exist here.
+#[derive(Debug)]
+pub struct Extraction {
+    pub destination: PathBuf,
+    writes: Vec<(PathBuf, Option<anybytes::Bytes>)>,
+}
+
+impl Extraction {
+    pub fn write(self) -> Result<()> {
+        for (path, bytes) in self.writes {
+            match bytes {
+                Some(bytes) => fs::write(&path, bytes.as_ref())
+                    .with_context(|| format!("write {}", path.display()))?,
+                None => fs::create_dir_all(&path)
+                    .with_context(|| format!("mkdir {}", path.display()))?,
             }
         }
-        Command::List { tag, mime } => {
-            with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-                let output = rt.block_on(read(store, snapshot, |reader| {
-                    cmd_list(space, reader, &tag, mime.as_deref())
-                }))?;
-                out.text(output)
-            })
+        Ok(())
+    }
+}
+
+pub struct FetchOptions<'a> {
+    pub url: &'a str,
+    pub mime: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub tags: &'a [String],
+    pub max_bytes: usize,
+}
+
+pub struct SimilarityOptions<'a> {
+    pub id: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub floor: f32,
+    pub limit: usize,
+    pub tags: &'a [String],
+    pub mm7b: bool,
+}
+
+pub struct EmbeddingOptions {
+    pub force: bool,
+    pub pdf: bool,
+    pub dpi: u32,
+    pub limit: usize,
+    pub max_pages: usize,
+}
+
+impl Files {
+    pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self { pile, key }
+    }
+
+    /// Original payload only: neither MIME nor filename is needed for export.
+    pub fn get(&self, id: &str) -> Result<Export> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| load_export(store, rt, facts, snapshot, id),
+        )
+    }
+
+    pub fn view(
+        &self,
+        id: &str,
+        options: &super::presentation::ViewOptions,
+    ) -> Result<crate::out::Part> {
+        options.validate()?;
+        let selected = with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| load_view(store, rt, facts, snapshot, id),
+        )?;
+        super::presentation::present(selected.bytes, &selected.mime_type, options)
+    }
+
+    pub fn extract(&self, id: &str, destination: Option<&Path>) -> Result<Extraction> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                prepare_extraction(store, rt, facts, snapshot, id, destination)
+            },
+        )
+    }
+
+    pub fn add_path(
+        &self,
+        path: &Path,
+        mime: Option<&str>,
+        tags: &[String],
+        dry_run: bool,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        if dry_run {
+            return cmd_add_dry_run(path, tags, out);
         }
-        Command::Show { id } => with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-            let output =
-                rt.block_on(read(store, snapshot, |reader| cmd_show(space, reader, &id)))?;
-            out.text(output)
-        }),
-        Command::Read { id } => with_files_view(pile, key, |store, _, _, space, reader, rt| {
-            cmd_read(store, rt, space, reader, &id, out)
-        }),
-        Command::Get { id, output } => {
-            with_files_view(pile, key, |store, _, _, space, reader, rt| {
-                cmd_get(store, rt, space, reader, &id, output.as_deref(), out)
-            })
-        }
-        Command::Tag { id, name } => {
-            with_files_view(pile, key, |store, collection, signer, space, reader, rt| {
+        with_files_store(
+            &self.pile,
+            self.key.as_deref(),
+            |store, collection, signer| cmd_add(store, collection, signer, path, mime, tags, out),
+        )
+    }
+
+    /// Import resident bytes without manufacturing a temporary filesystem path.
+    /// Returns the intrinsic file id; import provenance is exhaust of publication.
+    pub fn add_bytes(
+        &self,
+        bytes: anybytes::Bytes,
+        name: &str,
+        mime: &str,
+        tags: &[String],
+    ) -> Result<Id> {
+        let (change, file_id, _) = stage_byte_import(bytes, name, mime, tags, "resident bytes")?;
+        with_files_store(
+            &self.pile,
+            self.key.as_deref(),
+            |store, collection, signer| {
+                store
+                    .commit(collection, signer, change)
+                    .context("commit Files byte import")?;
+                Ok(file_id)
+            },
+        )
+    }
+
+    pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| {
+                    cmd_list(facts, reader, tags, mime)
+                }))
+            },
+        )
+    }
+
+    pub fn show(&self, id: &str) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| cmd_show(facts, reader, id)))
+            },
+        )
+    }
+
+    pub fn tag(&self, id: &str, name: &str, out: &mut Out<'_>) -> Result<()> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, collection, signer, facts, snapshot, rt| {
                 cmd_tag(
-                    store, rt, collection, signer, space, reader, &id, &name, out,
+                    store, rt, collection, signer, facts, snapshot, id, name, out,
                 )
-            })
-        }
-        Command::Fetch {
-            url,
-            mime,
-            name,
-            tag,
-            max_bytes,
-        } => with_files_store(pile, key, |store, collection, signer| {
-            cmd_fetch(
-                store,
-                collection,
-                signer,
-                &url,
-                mime.as_deref(),
-                name.as_deref(),
-                &tag,
-                max_bytes,
-                out,
-            )
-        }),
-        Command::Search { query } => {
-            with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-                let output = rt.block_on(read(store, snapshot, |reader| {
-                    cmd_search(space, reader, &query)
-                }))?;
-                out.text(output)
-            })
-        }
-        // Model-backed commands still have separate input/inference boundaries.
-        // Do not retry these whole commands: they load models, emit progress,
-        // and (for Embed7b) publish results. Their selected blob reads need a
-        // separate per-input acquisition port before claiming lazy coverage.
-        Command::Similar {
-            id,
-            text,
-            floor,
-            limit,
-            tag,
-            mm7b,
-        } => with_files_view(pile, key, |_, _, _, space, reader, _rt| {
-            cmd_similar(
-                space,
-                reader,
-                id.as_deref(),
-                text.as_deref(),
-                floor,
-                limit,
-                &tag,
-                mm7b,
-                out,
-            )
-        }),
-        Command::Embed7b {
-            force,
-            pdf,
-            dpi,
-            limit,
-            max_pages,
-        } => with_files_view(
-            pile,
-            key,
-            |store, collection, signer, space, reader, _rt| {
-                if pdf {
+            },
+        )
+    }
+
+    pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
+        anyhow::ensure!(options.max_bytes > 0, "max_bytes must be positive");
+        with_files_store(
+            &self.pile,
+            self.key.as_deref(),
+            |store, collection, signer| {
+                cmd_fetch(
+                    store,
+                    collection,
+                    signer,
+                    options.url,
+                    options.mime,
+                    options.name,
+                    options.tags,
+                    options.max_bytes,
+                    out,
+                )
+            },
+        )
+    }
+
+    pub fn search(&self, query: &str) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| {
+                    cmd_search(facts, reader, query)
+                }))
+            },
+        )
+    }
+
+    pub fn similar(&self, options: &SimilarityOptions<'_>, out: &mut Out<'_>) -> Result<()> {
+        anyhow::ensure!(
+            options.id.is_some() ^ options.text.is_some(),
+            "provide exactly one of id or text"
+        );
+        anyhow::ensure!(
+            options.floor.is_finite() && (0.0..=1.0).contains(&options.floor),
+            "floor must be between 0 and 1"
+        );
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |_, _, _, facts, snapshot, _| {
+                cmd_similar(
+                    facts,
+                    snapshot,
+                    options.id,
+                    options.text,
+                    options.floor,
+                    options.limit,
+                    options.tags,
+                    options.mm7b,
+                    out,
+                )
+            },
+        )
+    }
+
+    pub fn embed7b(&self, options: &EmbeddingOptions, out: &mut Out<'_>) -> Result<()> {
+        anyhow::ensure!(options.dpi > 0, "dpi must be positive");
+        // Model-backed operations retain their separate inference/acquisition
+        // boundaries; never retry the whole operation after partial publication.
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, collection, signer, facts, snapshot, _| {
+                if options.pdf {
                     cmd_embed7b_pdf(
-                        store, collection, signer, space, reader, force, dpi, limit, max_pages, out,
+                        store,
+                        collection,
+                        signer,
+                        facts,
+                        snapshot,
+                        options.force,
+                        options.dpi,
+                        options.limit,
+                        options.max_pages,
+                        out,
                     )
                 } else {
-                    cmd_embed7b(store, collection, signer, space, reader, force, out)
+                    cmd_embed7b(
+                        store,
+                        collection,
+                        signer,
+                        facts,
+                        snapshot,
+                        options.force,
+                        out,
+                    )
                 }
             },
-        ),
-        Command::Imports => with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-            let output = rt.block_on(read(store, snapshot, |reader| cmd_imports(space, reader)))?;
-            out.text(output)
-        }),
-        Command::Tree { id, depth } => {
-            with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-                let output = rt.block_on(read(store, snapshot, |reader| {
-                    cmd_tree(space, reader, &id, depth)
-                }))?;
-                out.text(output)
-            })
-        }
-        Command::Resolve { input } => with_files_view(pile, key, |_, _, _, space, _reader, _rt| {
-            cmd_resolve(space, &input, out)
-        }),
-        Command::ResolveBatch { input } => {
-            with_files_view(pile, key, |_, _, _, space, _reader, _rt| {
-                cmd_resolve_batch(space, &input, out)
-            })
-        }
-        Command::Diff { left, right } => {
-            with_files_view(pile, key, |store, _, _, space, snapshot, rt| {
-                let output = rt.block_on(read(store, snapshot, |reader| {
-                    cmd_diff(space, reader, &left, &right)
-                }))?;
-                out.text(output)
-            })
-        }
+        )
     }
+
+    pub fn imports(&self) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| cmd_imports(facts, reader)))
+            },
+        )
+    }
+
+    pub fn tree(&self, id: &str, depth: Option<usize>) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| {
+                    cmd_tree(facts, reader, id, depth)
+                }))
+            },
+        )
+    }
+
+    /// Resolve a batch in one view. Individual misses remain individual results;
+    /// no selector is interpreted as an instruction to read a host file or stdin.
+    pub fn resolve(
+        &self,
+        selectors: &[String],
+    ) -> Result<Vec<Result<file_capability::FileReference>>> {
+        with_files_view(&self.pile, self.key.as_deref(), |_, _, _, facts, _, _| {
+            Ok(selectors
+                .iter()
+                .map(|selector| file_capability::resolve_reference(facts, selector))
+                .collect())
+        })
+    }
+
+    pub fn diff(&self, left: &str, right: &str) -> Result<String> {
+        with_files_view(
+            &self.pile,
+            self.key.as_deref(),
+            |store, _, _, facts, snapshot, rt| {
+                rt.block_on(read(store, snapshot, |reader| {
+                    cmd_diff(facts, reader, left, right)
+                }))
+            },
+        )
+    }
+}
+
+fn selected_target<P: TriblePattern>(space: &P, id: &str) -> Result<Id> {
+    let eid = file_capability::resolve_selector(space, id)?;
+    if is_import(space, eid) {
+        root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))
+    } else {
+        Ok(eid)
+    }
+}
+
+fn load_export<P, S>(
+    store: &mut S,
+    rt: &tokio::runtime::Runtime,
+    space: &P,
+    reader: &S::Snapshot,
+    id: &str,
+) -> Result<Export>
+where
+    P: TriblePattern,
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
+{
+    let content = match file_capability::resolve_reference(space, id)? {
+        file_capability::FileReference::Content(content) => content,
+        file_capability::FileReference::Entity(_) => {
+            let target = selected_target(space, id)?;
+            anyhow::ensure!(
+                is_file(space, target),
+                "get requires a file; use CLI extraction for directories"
+            );
+            content_handle_of(space, target).context("no content for file")?
+        }
+    };
+    let bytes = rt.block_on(read(store, reader, |reader| {
+        reader
+            .get::<anybytes::Bytes, _>(content)
+            .context("get file blob")
+    }))?;
+    Ok(Export { bytes, content })
+}
+
+fn load_view<P, S>(
+    store: &mut S,
+    rt: &tokio::runtime::Runtime,
+    space: &P,
+    reader: &S::Snapshot,
+    id: &str,
+) -> Result<StoredView>
+where
+    P: TriblePattern,
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
+{
+    let target = selected_target(space, id)?;
+    anyhow::ensure!(
+        is_file(space, target),
+        "view requires a file; use CLI get to extract a directory"
+    );
+    let content = content_handle_of(space, target).context("no content for file")?;
+    rt.block_on(read(store, reader, |reader| {
+        let mime_type =
+            read_mime(space, reader, target)?.unwrap_or_else(|| "application/octet-stream".into());
+        anyhow::ensure!(
+            mime_type.starts_with("text/")
+                || mime_type.starts_with("image/")
+                || mime_type.starts_with("audio/"),
+            "cannot present MIME type {mime_type:?}; use files get {id} to extract it",
+        );
+        let bytes = reader
+            .get::<anybytes::Bytes, _>(content)
+            .context("read file content")?;
+        Ok(StoredView { bytes, mime_type })
+    }))
+}
+
+fn prepare_extraction<P, S>(
+    store: &mut S,
+    rt: &tokio::runtime::Runtime,
+    space: &P,
+    reader: &S::Snapshot,
+    id: &str,
+    destination: Option<&Path>,
+) -> Result<Extraction>
+where
+    P: TriblePattern,
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
+{
+    let target = selected_target(space, id)?;
+    rt.block_on(read(store, reader, |reader| {
+        let destination = match destination {
+            Some(path) => path.to_owned(),
+            None => PathBuf::from(file_capability::leaf_name(
+                &read_name(space, reader, target)?.unwrap_or_else(|| "extracted".into()),
+            )),
+        };
+        let mut stats = TreeStats {
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+        };
+        let mut writes = Vec::new();
+        extract_tree(space, reader, target, &destination, &mut stats, &mut writes)?;
+        Ok(Extraction {
+            destination,
+            writes,
+        })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::out::Part;
-    use crate::spec::{ArgumentValue, Arguments, CliRequest};
     use crate::storage::initialize_signer;
     #[cfg(feature = "local-embed")]
     use ed25519_dalek::SigningKey;
@@ -2854,201 +2536,6 @@ mod tests {
     }
 
     #[test]
-    fn specification_preserves_verbs_and_native_option_shapes() {
-        assert_eq!(
-            SPEC.verbs.iter().map(|verb| verb.name).collect::<Vec<_>>(),
-            [
-                "add", "list", "show", "read", "get", "tag", "fetch", "search", "similar",
-                "embed7b", "imports", "tree", "resolve", "diff"
-            ],
-        );
-        let CliRequest::Invoke(cli) = SPEC
-            .lower_cli_from([
-                "files",
-                "--pile",
-                "configured",
-                "--key",
-                "explicit.key",
-                "similar",
-                "--text",
-                "a diagram",
-                "--tag",
-                "first",
-                "--tag",
-                "second",
-                "--mm7b",
-                "-n",
-                "3",
-            ])
-            .unwrap()
-        else {
-            panic!("expected invocation")
-        };
-        let native = SPEC
-            .lower_mcp(
-                "files_similar",
-                Arguments::new()
-                    .with("text", "a diagram")
-                    .with("limit", "3")
-                    .with_value(
-                        "tag",
-                        ArgumentValue::Repeated(vec!["first".into(), "second".into()]),
-                    )
-                    .with_value("mm7b", ArgumentValue::Flag(true)),
-                Arguments::new()
-                    .with("pile", "configured")
-                    .with("key", "explicit.key"),
-            )
-            .unwrap();
-        assert_eq!(cli, native);
-        let Command::Similar {
-            limit,
-            floor,
-            mm7b,
-            tag,
-            ..
-        } = Command::from_invocation(&native).unwrap()
-        else {
-            panic!("expected similar")
-        };
-        assert_eq!(limit, 3);
-        assert_eq!(floor, 0.15);
-        assert!(mm7b);
-        assert_eq!(tag, ["first", "second"]);
-        assert!(SPEC.mcp_tools().iter().all(|tool| tool
-            .parameters
-            .iter()
-            .all(|parameter| parameter.name != "pile" && parameter.name != "key")));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn files_path_arguments_preserve_non_utf8_os_bytes() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let pile = PathBuf::from(OsString::from_vec(b"pile-\xff.pile".to_vec()));
-        let key = PathBuf::from(OsString::from_vec(b"key-\xfe.key".to_vec()));
-        let path = PathBuf::from(OsString::from_vec(b"input-\xfd.bin".to_vec()));
-        let CliRequest::Invoke(cli) = SPEC
-            .lower_cli_from(vec![
-                OsString::from("files"),
-                "--pile".into(),
-                pile.clone().into_os_string(),
-                "--key".into(),
-                key.clone().into_os_string(),
-                "add".into(),
-                path.clone().into_os_string(),
-                "--dry-run".into(),
-            ])
-            .unwrap()
-        else {
-            panic!("expected invocation")
-        };
-        let native = SPEC
-            .lower_mcp(
-                "files_add",
-                Arguments::new()
-                    .with_value("path", ArgumentValue::Path(path.clone()))
-                    .with_value("dry-run", ArgumentValue::Flag(true)),
-                Arguments::new()
-                    .with_value("pile", ArgumentValue::Path(pile.clone()))
-                    .with_value("key", ArgumentValue::Path(key.clone())),
-            )
-            .unwrap();
-        assert_eq!(cli, native);
-        assert_eq!(native.require_path("pile").unwrap(), pile);
-        assert_eq!(native.path("key"), Some(key.as_path()));
-        let Command::Add { path: parsed, .. } = Command::from_invocation(&native).unwrap() else {
-            panic!("expected add")
-        };
-        assert_eq!(parsed, path);
-    }
-
-    #[test]
-    fn invalid_numeric_options_and_native_stdin_fail_before_storage() {
-        let test_pile = TestPile::new();
-        let absent = test_pile.dir.join("must-not-open.pile");
-        let ambient = Arguments::new().with("pile", absent.to_str().unwrap());
-        for (tool, arguments, expected) in [
-            (
-                "files_fetch",
-                Arguments::new()
-                    .with("url", "unused")
-                    .with("max-bytes", "wrong"),
-                "invalid --max-bytes",
-            ),
-            (
-                "files_tree",
-                Arguments::new().with("id", "unused").with("depth", "wrong"),
-                "invalid --depth",
-            ),
-            (
-                "files_similar",
-                Arguments::new().with("floor", "wrong"),
-                "invalid --floor",
-            ),
-            (
-                "files_similar",
-                Arguments::new().with("limit", "wrong"),
-                "invalid --limit",
-            ),
-            (
-                "files_embed7b",
-                Arguments::new().with("dpi", "wrong"),
-                "invalid --dpi",
-            ),
-            (
-                "files_embed7b",
-                Arguments::new().with("max-pages", "wrong"),
-                "invalid --max-pages",
-            ),
-            (
-                "files_resolve",
-                Arguments::new().with("input", "@-"),
-                "only available through the CLI",
-            ),
-        ] {
-            let invocation = SPEC.lower_mcp(tool, arguments, ambient.clone()).unwrap();
-            let mut parts = Vec::new();
-            let error = execute(
-                &invocation,
-                &mut Out::new(&mut |part| {
-                    parts.push(part);
-                    Ok(())
-                }),
-            )
-            .unwrap_err();
-            assert!(format!("{error:#}").contains(expected), "{error:#}");
-            assert!(parts.is_empty());
-            assert!(!absent.exists());
-        }
-    }
-
-    #[test]
-    fn native_invocation_honors_explicit_key_without_environment_mutation() {
-        let test_pile = TestPile::new();
-        let absent_key = test_pile.dir.join("explicit-absent.key");
-        // The default key exists. Ignoring the invocation's explicit key would
-        // incorrectly succeed instead of identifying this path.
-        let invocation = SPEC
-            .lower_mcp(
-                "files_imports",
-                Arguments::new(),
-                Arguments::new()
-                    .with("pile", test_pile.path.to_str().unwrap())
-                    .with("key", absent_key.to_str().unwrap()),
-            )
-            .unwrap();
-        let error = execute(&invocation, &mut Out::new(&mut |_| Ok(()))).unwrap_err();
-        assert!(
-            format!("{error:#}").contains(absent_key.to_str().unwrap()),
-            "{error:#}"
-        );
-        assert!(!absent_key.exists());
-    }
-
-    #[test]
     fn resident_raw_export_does_not_acquire_unavailable_mime_metadata() {
         let bytes = vec![0_u8, 255, 10, 128];
         let selected = file_capability::stage(bytes.clone(), "selected.png", "image/png").unwrap();
@@ -3056,48 +2543,29 @@ mod tests {
         let content = content_handle_of(selected.facts(), id).unwrap();
         let mime = file_capability::media_type_name_handle(selected.facts(), id).unwrap();
         let (_source, _target, facts, mut store) = sparse_store(selected);
-        assert_eq!(
-            store
-                .pile
-                .put::<blobencodings::RawBytes, _>(bytes.clone())
-                .unwrap(),
-            content,
-        );
+        store
+            .pile
+            .put::<blobencodings::RawBytes, _>(bytes.clone())
+            .unwrap();
         store.unavailable = Some(mime.raw);
         let snapshot = store.snapshot().unwrap();
-        assert!(snapshot.contains_blob(content).unwrap());
-        assert!(!snapshot.contains_blob(mime).unwrap());
-
-        let mut parts = Vec::new();
-        cmd_get(
+        let exported = load_export(
             &mut store,
             &runtime().unwrap(),
             &facts,
             &snapshot,
             &format!("{id:x}"),
-            Some("@-"),
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
         )
         .unwrap();
-
+        assert_eq!(exported.bytes.as_ref(), bytes);
+        assert_eq!(exported.uri(), format!("files:{}", handle_hex(content)));
         assert!(store.requests.is_empty());
         assert!(!store.snapshot().unwrap().contains_blob(mime).unwrap());
-        assert_eq!(
-            parts,
-            [Part::Blob {
-                bytes: bytes.into(),
-                mime_type: "application/octet-stream".into(),
-                uri: format!("files:{}", handle_hex(content)),
-            }]
-        );
         store.pile.close().unwrap();
     }
 
     #[test]
-    fn lazy_read_fetches_only_selected_mime_and_payload_and_emits_once() {
+    fn lazy_view_fetches_only_selected_mime_and_payload() {
         for (mime, bytes) in [
             ("text/plain", b"one\ntwo".as_slice()),
             ("text/plain", b"".as_slice()),
@@ -3113,47 +2581,19 @@ mod tests {
                 file_capability::stage(b"unrelated".to_vec(), "other", "text/plain").unwrap();
             let (_source, _target, facts, mut store) = sparse_store(selected + unrelated);
             let snapshot = store.snapshot().unwrap();
-            let mut parts = Vec::new();
-            cmd_read(
+            let selected = load_view(
                 &mut store,
                 &runtime().unwrap(),
                 &facts,
                 &snapshot,
                 &format!("{id:x}"),
-                &mut Out::new(&mut |part| {
-                    parts.push(part);
-                    Ok(())
-                }),
             )
             .unwrap();
             assert_eq!(store.requests, [mime_handle.raw, content.raw]);
             assert!(!snapshot.contains_blob(content).unwrap());
-            assert_eq!(parts.len(), 1, "retry must not emit twice");
             store.pile.close().unwrap();
-            // Emitted content retains its bytes after the acquisition store closes.
-            match &parts[0] {
-                Part::Text { text } => {
-                    assert!(mime.starts_with("text/"));
-                    assert_eq!(text.as_bytes(), bytes);
-                }
-                Part::Image {
-                    bytes: emitted,
-                    mime_type,
-                } => {
-                    assert!(mime.starts_with("image/"));
-                    assert_eq!(mime_type, mime);
-                    assert_eq!(emitted.as_ref(), bytes);
-                }
-                Part::Audio {
-                    bytes: emitted,
-                    mime_type,
-                } => {
-                    assert!(mime.starts_with("audio/"));
-                    assert_eq!(mime_type, mime);
-                    assert_eq!(emitted.as_ref(), bytes);
-                }
-                other => panic!("unexpected display part {other:?}"),
-            }
+            assert_eq!(selected.mime_type, mime);
+            assert_eq!(selected.bytes.as_ref(), bytes);
         }
     }
 
@@ -3165,21 +2605,15 @@ mod tests {
         let mime = file_capability::media_type_name_handle(selected.facts(), id).unwrap();
         let (_source, _target, facts, mut store) = sparse_store(selected);
         let snapshot = store.snapshot().unwrap();
-        let mut parts = Vec::new();
-        let error = cmd_read(
+        let error = load_view(
             &mut store,
             &runtime().unwrap(),
             &facts,
             &snapshot,
             &format!("{id:x}"),
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("use files get"), "{error:#}");
-        assert!(parts.is_empty());
         assert_eq!(store.requests, [mime.raw]);
         store.pile.close().unwrap();
     }
@@ -3257,15 +2691,16 @@ mod tests {
 
         store.requests.clear();
         let output = target.dir.join("selected.txt");
-        cmd_get(
+        prepare_extraction(
             &mut store,
             &rt,
             &facts,
             &snapshot,
             &format!("{selected_id:x}"),
-            output.to_str(),
-            &mut Out::new(&mut |_| Ok(())),
+            Some(&output),
         )
+        .unwrap()
+        .write()
         .unwrap();
         assert_eq!(store.requests, [content.raw]);
         assert_eq!(fs::read(&output).unwrap(), b"selected bytes");
@@ -3381,14 +2816,13 @@ mod tests {
         let rt = runtime().unwrap();
         let output = target.dir.join("extracted");
 
-        let error = cmd_get(
+        let error = prepare_extraction(
             &mut store,
             &rt,
             &facts,
             &snapshot,
             &format!("{id:x}"),
-            output.to_str(),
-            &mut Out::new(&mut |_| Ok(())),
+            Some(&output),
         )
         .unwrap_err();
 
@@ -3407,15 +2841,16 @@ mod tests {
         );
         assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
         store.unavailable = None;
-        cmd_get(
+        prepare_extraction(
             &mut store,
             &rt,
             &facts,
             &snapshot,
             &format!("{id:x}"),
-            output.to_str(),
-            &mut Out::new(&mut |_| Ok(())),
+            Some(&output),
         )
+        .unwrap()
+        .write()
         .unwrap();
         assert_eq!(fs::read(output.join("first.txt")).unwrap(), b"first");
         assert_eq!(fs::read(output.join("second.txt")).unwrap(), b"second");
@@ -3588,45 +3023,6 @@ mod tests {
     }
 
     #[test]
-    fn add_dry_run_needs_neither_signer_nor_pile() {
-        let nonce = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "faculties-files-dry-run-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let input = dir.join("local.txt");
-        fs::write(&input, b"local preview").unwrap();
-        let absent_pile = dir.join("must-not-be-opened.pile");
-
-        let invocation = SPEC
-            .lower_mcp(
-                "files_add",
-                Arguments::new()
-                    .with("path", input.to_str().unwrap())
-                    .with_value("tag", ArgumentValue::Repeated(vec!["preview".to_owned()]))
-                    .with_value("dry-run", ArgumentValue::Flag(true)),
-                Arguments::new().with("pile", absent_pile.to_str().unwrap()),
-            )
-            .unwrap();
-        let mut parts = Vec::new();
-        execute(
-            &invocation,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-        assert!(parts.iter().any(|part| matches!(part,
-            Part::Text { text } if text == "Tags: preview\n"
-        )));
-
-        assert!(!absent_pile.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn independent_commits_materialize_for_list_show_and_get() {
         let test_pile = TestPile::new();
         let first =
@@ -3662,25 +3058,26 @@ mod tests {
             cmd_list(space, reader, &[], None)?;
             cmd_show(space, reader, &format!("{first_id:x}"))?;
             cmd_show(space, reader, &format!("{second_id:x}"))?;
-            cmd_get(
+            prepare_extraction(
                 store,
                 rt,
                 space,
                 reader,
                 &format!("{first_id:x}"),
-                Some(first_out.to_str().unwrap()),
-                &mut Out::new(&mut |_| Ok(())),
-            )?;
-            cmd_get(
+                Some(&first_out),
+            )?
+            .write()?;
+            prepare_extraction(
                 store,
                 rt,
                 space,
                 reader,
                 &format!("{second_id:x}"),
-                Some(second_out.to_str().unwrap()),
-                &mut Out::new(&mut |_| Ok(())),
+                Some(&second_out),
             )
         })
+        .unwrap()
+        .write()
         .unwrap();
         assert_eq!(fs::read(first_out).unwrap(), b"first file");
         assert_eq!(fs::read(second_out).unwrap(), b"second file");

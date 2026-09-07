@@ -2,8 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use faculties::mcp::{Registration, Server};
-use faculties::spec::{ArgumentValue, Arguments};
+use faculties::mcp::{Faculty, Server};
 use faculties::{atlas, files};
 use std::path::PathBuf;
 
@@ -31,22 +30,9 @@ fn main() -> Result<()> {
     let Cli { command } = Cli::parse();
     match command {
         Command::Mcp { pile, key } => {
-            let mut ambient = Arguments::new().with_value("pile", ArgumentValue::Path(pile));
-            if let Some(key) = key {
-                ambient.insert_value("key", ArgumentValue::Path(key))?;
-            }
-            let registrations = [
-                Registration {
-                    spec: &atlas::command::SPEC,
-                    invoke: atlas::command::execute,
-                    ambient: ambient.clone(),
-                },
-                Registration {
-                    spec: &files::command::SPEC,
-                    invoke: files::command::execute,
-                    ambient,
-                },
-            ];
+            let atlas = atlas::mcp::Atlas::new(pile.clone(), key.clone());
+            let files = files::mcp::Files::new(pile, key);
+            let registrations: [&dyn Faculty; 2] = [&atlas, &files];
             serve_stdio(&registrations)
         }
     }
@@ -57,7 +43,7 @@ fn main() -> Result<()> {
 /// a stray print nor a /dev/std{in,out} file path may consume/corrupt JSON-RPC.
 /// This is stdio hygiene, not a filesystem sandbox against arbitrary fd access.
 #[cfg(unix)]
-fn serve_stdio(registrations: &[Registration]) -> Result<()> {
+fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
     use std::fs::File;
     use std::io::{BufReader, Write};
     use std::os::fd::{AsFd, AsRawFd};
@@ -85,6 +71,6 @@ fn serve_stdio(registrations: &[Registration]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn serve_stdio(registrations: &[Registration]) -> Result<()> {
+fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
     Server::new(registrations)?.serve(std::io::stdin().lock(), std::io::stdout().lock())
 }

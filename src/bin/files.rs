@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use faculties::files::command::{execute_cli, SPEC};
+use faculties::files::cli::{execute, SPEC};
 
 fn main() -> Result<()> {
-    faculties::cli::run(&SPEC, execute_cli)
+    faculties::cli::run(&SPEC, execute)
 }

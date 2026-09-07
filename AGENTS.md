@@ -102,10 +102,15 @@ reconciliation.
 
 ## Conventions
 
-* **Thin faculty binary.** A new faculty normally has
-  `src/bin/<name>.rs`, a reusable domain module, and a schema module. Share
-  capabilities when several faculties need the same model; keep the CLI a
-  small projection over that library.
+* **Library first; explicit frontends.** A faculty's reusable operations come
+  first, with separate `cli` and `mcp` submodules and a thin
+  `src/bin/<name>.rs`. The aggregate `faculties` binary registers all ported MCP
+  adapters in one server. Share domain logic and native output, not a mandatory
+  CLI/MCP grammar. Another Rust caller must be able to use operations without
+  constructing argv, a synthetic invocation, or a transport. Paths/pipes belong
+  to CLI UX; MCP adapters own tool schemas, typed arguments, and file/media
+  delivery. Atlas and Files are the initial ports; other binaries are not yet
+  MCP-registered. Never expose a CLI subprocess wrapper as a faculty MCP port.
 * **Faithful CLI to pile.** Each publication into one collection commits one
   self-contained `Fragment`; a compound operation may publish to several fixed
   collections. Construct all dependent fragments before the first

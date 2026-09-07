@@ -122,7 +122,7 @@ web-export = []
 # embeddings via mary's embedder). Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
-imagine = ["dep:mary", "mary/flux", "dep:image"]
+imagine = ["dep:mary", "mary/flux"]
 # In-process Qwen3-TTS in the `voice` faculty (`voice say`/
 # `voice shout`) via mary's ported Burn/Metal pipeline. Calls
 # `mary::speak::synthesize_stream` directly — no separately-built binary that can
@@ -171,7 +171,7 @@ framed-stream = { path = "framed-stream" }  # native ordered media framing
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net"] }
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
-# Per-faculty deps (kept here so faculties stay single-file in src/bin/).
+# Per-faculty dependencies shared by library operations and explicit frontends.
 anybytes = "0.20"           # files
 base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
@@ -224,9 +224,8 @@ cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "st
 #                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
 #   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
 mary = { path = "../mary", default-features = false, optional = true }
-# imagine-only: the `image` crate, matching mary's flux feature, so the
-# RgbImage the pipeline returns can be `.save()`d to a PNG here.
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Files presentation codecs; also matches the image type returned by Mary FLUX.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] } # files view; imagine
 
 [dev-dependencies]
 tempfile = "3"

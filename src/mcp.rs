@@ -1,8 +1,9 @@
-//! A finite, local stdio MCP boundary over native faculty declarations.
+//! A finite, local stdio MCP boundary over explicit faculty MCP adapters.
 //!
 //! This implements MCP 2025-06-18 initialization, ping, tool discovery and
-//! calls. JSON exists only at this boundary: handlers receive an Invocation
-//! and emit native Parts. No CLI process or stdout parser is involved.
+//! calls. Each faculty supplies its own tool schemas and decodes its arguments
+//! before calling shared library operations. No CLI grammar, process, or stdout
+//! parser is involved. Results are emitted as native Parts.
 //!
 //! Dispatch is deliberately blocking and sequential. Register finite commands,
 //! not watchers such as `orient wait`. A future asynchronous frontend must run
@@ -20,21 +21,68 @@ use std::io::{BufRead, Write};
 use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
+use serde::de::DeserializeOwned;
 use triblespace::core::import::scanner as sc;
 
 use crate::archive_source::{canonical_json_string as quote, string};
 use crate::out::{Out, Part};
-use crate::spec::{ArgumentValue, Arguments, Invocation, McpTool, ParamKind, Spec};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const ERROR_RESERVE: usize = 2048;
 
-/// Native command registration. Ambient arguments belong to this registration,
-/// never to an MCP caller; Spec validates their origin on every invocation.
-pub struct Registration {
-    pub spec: &'static Spec,
-    pub invoke: for<'a> fn(&Invocation, &mut Out<'a>) -> Result<()>,
-    pub ambient: Arguments,
+/// An explicit MCP tool, independent of any CLI declaration. The input schema
+/// is a JSON object with `type: "object"`; it is checked and compacted once when
+/// a server registers this tool. Argument validation belongs to the adapter.
+pub struct Tool {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: &'static str,
+}
+
+/// A faculty's MCP entrypoint. Store trusted launcher configuration in the
+/// implementing value, not among caller-supplied arguments. Decode and validate
+/// all arguments before performing an operation or emitting output.
+pub trait Faculty {
+    fn tools(&self) -> &[Tool];
+    fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()>;
+}
+
+/// Typed argument-decoding failure, reported as JSON-RPC invalid params rather
+/// than as a failed tool operation. An anyhow context preserves this marker.
+#[derive(Debug)]
+pub struct InvalidArguments(serde_json::Error);
+
+impl std::fmt::Display for InvalidArguments {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Invalid tool arguments: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidArguments {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Decode the original argument bytes directly into an MCP-specific type. Use
+/// `#[serde(deny_unknown_fields)]` on argument structs (including nested ones):
+/// serde then rejects unknown fields, duplicates, and incorrect types before
+/// the adapter calls its library operations. Deserializing through a JSON map
+/// first would silently erase duplicate fields and must be avoided.
+pub fn decode_arguments<T: DeserializeOwned>(bytes: Bytes) -> Result<T> {
+    serde_json::from_slice(bytes.as_ref()).map_err(|error| InvalidArguments(error).into())
+}
+
+/// Mark a semantic constraint failure detected by an MCP adapter before it
+/// invokes an operation (for example, an invalid recipient byte budget).
+pub fn invalid_arguments(message: impl std::fmt::Display) -> anyhow::Error {
+    InvalidArguments(<serde_json::Error as serde::de::Error>::custom(message)).into()
+}
+
+struct RegisteredTool<'a> {
+    name: &'static str,
+    descriptor: String,
+    faculty: &'a dyn Faculty,
 }
 
 /// Wire budgets, excluding the newline delimiter. Defaults permit modest
@@ -66,17 +114,17 @@ enum State {
 /// One stdio connection. Only tools are advertised; there are no server-side
 /// requests, subscriptions, task execution, or tool-list change notifications.
 pub struct Server<'a> {
-    registrations: &'a [Registration],
+    tools: Vec<RegisteredTool<'a>>,
     limits: Limits,
     state: State,
 }
 
 impl<'a> Server<'a> {
-    pub fn new(registrations: &'a [Registration]) -> Result<Self> {
-        Self::with_limits(registrations, Limits::default())
+    pub fn new(faculties: &[&'a dyn Faculty]) -> Result<Self> {
+        Self::with_limits(faculties, Limits::default())
     }
 
-    pub fn with_limits(registrations: &'a [Registration], limits: Limits) -> Result<Self> {
+    pub fn with_limits(faculties: &[&'a dyn Faculty], limits: Limits) -> Result<Self> {
         if limits.request_bytes == 0 || limits.response_bytes < 4096 || limits.json_depth == 0 {
             bail!("MCP requires a positive input/depth budget and at least 4096 output bytes");
         }
@@ -85,16 +133,21 @@ impl<'a> Server<'a> {
             bail!("MCP JSON nesting limit cannot exceed 64");
         }
         let mut names = BTreeSet::new();
-        for registration in registrations {
-            registration.spec.validate()?;
-            for tool in registration.spec.mcp_tools() {
-                if !names.insert(tool.name.clone()) {
+        let mut tools = Vec::new();
+        for &faculty in faculties {
+            for tool in faculty.tools() {
+                if !names.insert(tool.name) {
                     bail!("duplicate MCP tool name {:?}", tool.name);
                 }
+                tools.push(RegisteredTool {
+                    name: tool.name,
+                    descriptor: tool_descriptor(tool)?,
+                    faculty,
+                });
             }
         }
         Ok(Self {
-            registrations,
+            tools,
             limits,
             state: State::New,
         })
@@ -235,22 +288,19 @@ impl<'a> Server<'a> {
         }
         let mut result = String::from("{\"tools\":[");
         let mut first = true;
-        for registration in self.registrations {
-            for tool in registration.spec.mcp_tools() {
-                let item = tool_descriptor(tool);
-                let additional = item.len() + usize::from(!first) + 2;
-                if additional > budget.saturating_sub(result.len()) {
-                    return Err(RpcError::new(
-                        -32603,
-                        "Tool list exceeds the response budget",
-                    ));
-                }
-                if !first {
-                    result.push(',');
-                }
-                first = false;
-                result.push_str(&item);
+        for tool in &self.tools {
+            let additional = tool.descriptor.len() + usize::from(!first) + 2;
+            if additional > budget.saturating_sub(result.len()) {
+                return Err(RpcError::new(
+                    -32603,
+                    "Tool list exceeds the response budget",
+                ));
             }
+            if !first {
+                result.push(',');
+            }
+            first = false;
+            result.push_str(&tool.descriptor);
         }
         result.push_str("]}");
         Ok(result)
@@ -259,22 +309,17 @@ impl<'a> Server<'a> {
     fn call(&self, params: Option<Bytes>, budget: usize) -> std::result::Result<String, RpcError> {
         let params = fields::<2>(required_params(params)?, ["name", "arguments"])?;
         let name = required_string(params[0].clone(), "name")?;
-        let registration = self
-            .registrations
+        let tool = self
+            .tools
             .iter()
-            .find(|registration| {
-                registration
-                    .spec
-                    .verbs
-                    .iter()
-                    .any(|verb| name == format!("{}_{}", registration.spec.name, verb.name))
-            })
+            .find(|tool| name == tool.name)
             .ok_or_else(|| RpcError::params("Unknown tool"))?;
-        let caller = arguments(params[1].clone())?;
-        let invocation = registration
-            .spec
-            .lower_mcp(&name, caller, registration.ambient.clone())
-            .map_err(|error| RpcError::params(&brief(&error)))?;
+        let arguments = params[1]
+            .clone()
+            .unwrap_or_else(|| Bytes::from(b"{}".to_vec()));
+        if !is_object(&arguments) {
+            return Err(RpcError::params("arguments must be an object"));
+        }
 
         let mut content = String::new();
         let content_budget = budget.saturating_sub(ERROR_RESERVE + 64);
@@ -302,8 +347,14 @@ impl<'a> Server<'a> {
                     }
                 }
             };
-            (registration.invoke)(&invocation, &mut Out::new(&mut emit))
+            tool.faculty
+                .call(&name, arguments, &mut Out::new(&mut emit))
         };
+        if let Err(error) = &result {
+            if error.is::<InvalidArguments>() {
+                return Err(RpcError::params(&brief(error)));
+            }
+        }
         let failed = result.is_err() || rejected;
         if failed {
             let message = if rejected {
@@ -539,83 +590,24 @@ fn fields<const N: usize>(
     .map_err(|_| RpcError::params("Expected an object without duplicate parameters"))
 }
 
-fn arguments(value: Option<Bytes>) -> std::result::Result<Arguments, RpcError> {
-    let Some(mut value) = value else {
-        return Ok(Arguments::new());
-    };
-    sc::object(&mut value, Arguments::new(), |mut arguments, key, value| {
-        let key = key
-            .view::<str>()
-            .map_err(|_| sc::ScanError::Syntax("invalid argument name".into()))?;
-        let argument = match value.first() {
-            Some(b'"') => ArgumentValue::Text(string(value)?.as_ref().to_owned()),
-            Some(b't') => {
-                sc::expect_literal(value, b"true")?;
-                ArgumentValue::Flag(true)
-            }
-            Some(b'f') => {
-                sc::expect_literal(value, b"false")?;
-                ArgumentValue::Flag(false)
-            }
-            Some(b'[') => {
-                ArgumentValue::Repeated(sc::array(value, Vec::new(), |mut values, value| {
-                    values.push(string(value)?.as_ref().to_owned());
-                    Ok(values)
-                })?)
-            }
-            _ => {
-                return Err(sc::ScanError::Syntax(
-                    "argument must be text, a boolean, or a string array".into(),
-                ));
-            }
-        };
-        arguments
-            .insert_value(key.as_ref(), argument)
-            .map_err(|_| sc::ScanError::Syntax("duplicate argument".into()))?;
-        Ok(arguments)
-    })
-    .map_err(|_| {
-        RpcError::params("arguments must contain unique text, boolean, or string-array parameters")
-    })
-}
-
-fn tool_descriptor(tool: McpTool) -> String {
-    let mut properties = String::new();
-    let mut required = String::new();
-    for parameter in tool.parameters {
-        if !properties.is_empty() {
-            properties.push(',');
-        }
-        let shape = match parameter.kind {
-            ParamKind::Text | ParamKind::Path => "\"type\":\"string\"",
-            ParamKind::Flag => "\"type\":\"boolean\"",
-            ParamKind::Repeated => "\"type\":\"array\",\"items\":{\"type\":\"string\"}",
-        };
-        write!(
-            properties,
-            "{}:{{{shape},\"description\":{}",
-            quote(parameter.name),
-            quote(parameter.description)
-        )
-        .unwrap();
-        match parameter.kind {
-            ParamKind::Text | ParamKind::Path => {
-                if let Some(default) = parameter.default {
-                    write!(properties, ",\"default\":{}", quote(default)).unwrap();
-                }
-            }
-            ParamKind::Flag => properties.push_str(",\"default\":false"),
-            ParamKind::Repeated => properties.push_str(",\"default\":[]"),
-        }
-        properties.push('}');
-        if parameter.required {
-            if !required.is_empty() {
-                required.push(',');
-            }
-            required.push_str(&quote(parameter.name));
-        }
+fn tool_descriptor(tool: &Tool) -> Result<String> {
+    let schema: serde_json::Value = serde_json::from_str(tool.input_schema)
+        .map_err(|error| anyhow!("invalid input schema for MCP tool {:?}: {error}", tool.name))?;
+    if !schema.is_object()
+        || schema.get("type").and_then(serde_json::Value::as_str) != Some("object")
+    {
+        bail!(
+            "input schema for MCP tool {:?} must declare type object",
+            tool.name
+        );
     }
-    format!("{{\"name\":{},\"description\":{},\"inputSchema\":{{\"type\":\"object\",\"properties\":{{{properties}}},\"required\":[{required}],\"additionalProperties\":false}}}}", quote(&tool.name), quote(tool.description))
+    // Compact at registration, not on every tools/list. Literal newlines in a
+    // readable schema must never introduce extra newline-delimited wire frames.
+    Ok(serde_json::to_string(&serde_json::json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": schema,
+    }))?)
 }
 
 fn quoted_len(value: &str) -> usize {

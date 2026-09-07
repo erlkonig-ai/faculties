@@ -1,8 +1,8 @@
-//! One faculty declaration projected into CLI and MCP front-ends.
+//! Optional declarations for a faculty's CLI grammar and argument lowering.
 //!
-//! A front-end lowers named native arguments into [`Invocation`]. Handlers see neither
-//! `clap::ArgMatches` nor MCP transport values, and receive storage separately
-//! through their context.
+//! CLI adapters can use these helpers instead of defining clap parsers directly.
+//! Their [`Invocation`] is a CLI detail, not the shared library's operation API.
+//! MCP adapters define their own schemas and call those operations independently.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -11,15 +11,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Result};
 use clap::{Arg, ArgAction, Command};
 
-use crate::out::Out;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Supply {
     Caller,
     Ambient,
 }
 
-/// Argument shapes shared by CLI parsing and native invocation.
+/// CLI argument shapes. Filesystem paths retain their native OS representation.
 /// Numeric values remain text and are interpreted by their faculty handler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParamKind {
@@ -84,8 +82,7 @@ impl Param {
         self
     }
 
-    /// A filesystem path. CLI parsing preserves native OS bytes; MCP strings
-    /// become paths during shared lowering.
+    /// A filesystem path. Parsing preserves native OS bytes.
     pub const fn path(mut self) -> Self {
         assert!(
             matches!(self.kind, ParamKind::Text),
@@ -95,7 +92,7 @@ impl Param {
         self
     }
 
-    /// A bare CLI flag or MCP boolean. Missing flags lower to false.
+    /// A bare flag. Missing flags lower to false.
     pub const fn flag(mut self) -> Self {
         assert!(
             !self.positional && self.default.is_none() && matches!(self.kind, ParamKind::Text),
@@ -106,8 +103,8 @@ impl Param {
         self
     }
 
-    /// A repeatable CLI option or MCP string array. Missing values lower to an
-    /// empty array; order and duplicates are preserved.
+    /// A repeatable option. Missing values lower to an empty array; order and
+    /// duplicates are preserved.
     pub const fn repeated(mut self) -> Self {
         assert!(
             !self.positional && self.default.is_none() && matches!(self.kind, ParamKind::Text),
@@ -118,7 +115,7 @@ impl Param {
         self
     }
 
-    /// A text or path default, applied by shared lowering on every frontend.
+    /// A text or path default, applied by CLI parsing.
     pub const fn default(mut self, value: &'static str) -> Self {
         assert!(
             matches!(self.kind, ParamKind::Text | ParamKind::Path),
@@ -173,7 +170,7 @@ impl Spec {
         verb.params.iter().chain(self.shared.iter())
     }
 
-    /// Reject declarations whose name projection would be ambiguous.
+    /// Reject declarations whose CLI names or aliases would be ambiguous.
     pub fn validate(&self) -> Result<()> {
         let mut shared = BTreeSet::new();
         let mut shared_short = BTreeSet::new();
@@ -228,7 +225,7 @@ impl Spec {
         Ok(())
     }
 
-    /// Generate the complete CLI grammar from the canonical declaration.
+    /// Generate the complete CLI grammar from this declaration.
     pub fn to_clap(&self) -> Command {
         self.validate().expect("invalid faculty specification");
         let mut command = Command::new(self.name)
@@ -251,33 +248,6 @@ impl Spec {
         command
     }
 
-    /// Generate transport-neutral MCP descriptors. An outer adapter decides
-    /// how these typed values are represented on the wire.
-    pub fn mcp_tools(&self) -> Vec<McpTool> {
-        self.validate().expect("invalid faculty specification");
-        self.verbs
-            .iter()
-            .map(|verb| {
-                let parameters = self
-                    .params_of(verb)
-                    .filter(|param| param.supply == Supply::Caller)
-                    .map(|param| McpParameter {
-                        name: param.name,
-                        description: param.help,
-                        required: param.required,
-                        kind: param.kind,
-                        default: param.default,
-                    })
-                    .collect();
-                McpTool {
-                    name: format!("{}_{}", self.name, verb.name),
-                    description: verb.about,
-                    parameters,
-                }
-            })
-            .collect()
-    }
-
     pub fn lower_cli_from<I, T>(
         &'static self,
         arguments: I,
@@ -294,8 +264,7 @@ impl Spec {
         let verb = self
             .verb(verb_name)
             .expect("clap emits only declared subcommands");
-        let mut caller = Arguments::new();
-        let mut ambient = Arguments::new();
+        let mut values = BTreeMap::new();
         for param in self.params_of(verb) {
             let value = match param.kind {
                 ParamKind::Text => subcommand
@@ -307,109 +276,29 @@ impl Spec {
                     .cloned()
                     .map(ArgumentValue::Path),
                 ParamKind::Flag => Some(ArgumentValue::Flag(subcommand.get_flag(param.name))),
-                ParamKind::Repeated => subcommand
-                    .get_many::<String>(param.name)
-                    .map(|values| ArgumentValue::Repeated(values.cloned().collect())),
+                ParamKind::Repeated => Some(ArgumentValue::Repeated(
+                    subcommand
+                        .get_many::<String>(param.name)
+                        .map(|values| values.cloned().collect())
+                        .unwrap_or_default(),
+                )),
             };
-            let Some(value) = value else {
-                continue;
-            };
-            let target = match param.supply {
-                Supply::Caller => &mut caller,
-                Supply::Ambient => &mut ambient,
-            };
-            target.insert_value(param.name, value).map_err(|error| {
-                clap::Error::raw(clap::error::ErrorKind::ArgumentConflict, error.to_string())
-            })?;
-        }
-        let invocation = self.lower(verb_name, caller, ambient).map_err(|error| {
-            clap::Error::raw(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                error.to_string(),
-            )
-        })?;
-        Ok(CliRequest::Invoke(invocation))
-    }
-
-    pub fn lower_mcp(
-        &'static self,
-        tool_name: &str,
-        caller: Arguments,
-        ambient: Arguments,
-    ) -> Result<Invocation> {
-        self.validate()?;
-        let prefix = format!("{}_", self.name);
-        let verb = tool_name
-            .strip_prefix(&prefix)
-            .ok_or_else(|| anyhow!("tool {tool_name:?} does not belong to {}", self.name))?;
-        self.lower(verb, caller, ambient)
-    }
-
-    fn lower(
-        &'static self,
-        verb_name: &str,
-        mut caller: Arguments,
-        mut ambient: Arguments,
-    ) -> Result<Invocation> {
-        let verb = self
-            .verb(verb_name)
-            .ok_or_else(|| anyhow!("unknown {} verb {verb_name:?}", self.name))?;
-        let declared = self
-            .params_of(verb)
-            .map(|param| (param.name, param))
-            .collect::<BTreeMap<_, _>>();
-        validate_origin(&caller, Supply::Caller, &declared)?;
-        validate_origin(&ambient, Supply::Ambient, &declared)?;
-
-        let mut values = BTreeMap::new();
-        for param in self.params_of(verb) {
-            let source = match param.supply {
-                Supply::Caller => &mut caller.values,
-                Supply::Ambient => &mut ambient.values,
-            };
-            // JSON paths arrive as strings, as do native Arguments::with calls.
-            // A native Path never passes through a UTF-8 conversion.
-            let supplied = match (param.kind, source.remove(param.name)) {
-                (ParamKind::Path, Some(ArgumentValue::Text(value))) => {
-                    Some(ArgumentValue::Path(PathBuf::from(value)))
-                }
-                (_, value) => value,
-            };
-            if let Some(value) = &supplied {
-                if value.kind() != param.kind {
-                    bail!(
-                        "parameter {:?} requires {:?}, not {:?}",
-                        param.name,
-                        param.kind,
-                        value.kind()
-                    );
-                }
-            }
-            let value = supplied.or_else(|| match param.kind {
-                ParamKind::Text => param
-                    .default
-                    .map(|value| ArgumentValue::Text(value.to_owned())),
-                ParamKind::Path => param
-                    .default
-                    .map(|value| ArgumentValue::Path(PathBuf::from(value))),
-                ParamKind::Flag => Some(ArgumentValue::Flag(false)),
-                ParamKind::Repeated => Some(ArgumentValue::Repeated(Vec::new())),
-            });
             match value {
                 Some(value) => {
                     values.insert(param.name, value);
                 }
-                None if param.required => bail!(
-                    "{} {} requires {:?} from {:?}",
-                    self.name,
-                    verb.name,
-                    param.name,
-                    param.supply
-                ),
+                // Clap cannot mark global arguments required while preserving
+                // no-subcommand help. Enforce them only after a verb is selected.
+                None if param.required => {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        format!("{} {} requires {:?}", self.name, verb.name, param.name),
+                    ));
+                }
                 None => {}
             }
         }
-        Ok(Invocation { verb, values })
+        Ok(CliRequest::Invoke(Invocation { verb, values }))
     }
 }
 
@@ -441,80 +330,13 @@ fn clap_arg(param: &'static Param, global: bool) -> Arg {
     argument
 }
 
-fn validate_origin(
-    arguments: &Arguments,
-    expected: Supply,
-    declared: &BTreeMap<&str, &Param>,
-) -> Result<()> {
-    for name in arguments.values.keys() {
-        let parameter = declared
-            .get(name.as_str())
-            .ok_or_else(|| anyhow!("undeclared parameter {name:?}"))?;
-        if parameter.supply != expected {
-            bail!(
-                "parameter {name:?} is {:?}, not {:?}",
-                parameter.supply,
-                expected
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Native argument data, independent of any CLI or JSON representation.
+/// Values already parsed and type-checked by the CLI grammar.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ArgumentValue {
+enum ArgumentValue {
     Text(String),
     Path(PathBuf),
     Flag(bool),
     Repeated(Vec<String>),
-}
-
-impl ArgumentValue {
-    fn kind(&self) -> ParamKind {
-        match self {
-            Self::Text(_) => ParamKind::Text,
-            Self::Path(_) => ParamKind::Path,
-            Self::Flag(_) => ParamKind::Flag,
-            Self::Repeated(_) => ParamKind::Repeated,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Arguments {
-    values: BTreeMap<String, ArgumentValue>,
-}
-
-impl Arguments {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) -> Result<()> {
-        self.insert_value(name, ArgumentValue::Text(value.into()))
-    }
-
-    pub fn insert_value(&mut self, name: impl Into<String>, value: ArgumentValue) -> Result<()> {
-        let name = name.into();
-        if self.values.contains_key(&name) {
-            bail!("parameter {name:?} supplied twice");
-        }
-        self.values.insert(name, value);
-        Ok(())
-    }
-
-    pub fn with(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.insert(name, value)
-            .expect("Arguments builder inserts each name once");
-        self
-    }
-
-    pub fn with_value(mut self, name: impl Into<String>, value: ArgumentValue) -> Self {
-        self.insert_value(name, value)
-            .expect("Arguments builder inserts each name once");
-        self
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -568,67 +390,20 @@ impl Invocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct McpParameter {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub required: bool,
-    pub kind: ParamKind,
-    pub default: Option<&'static str>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct McpTool {
-    pub name: String,
-    pub description: &'static str,
-    pub parameters: Vec<McpParameter>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CliRequest {
     Help(String),
     Invoke(Invocation),
 }
 
-pub struct Faculty<C> {
-    pub spec: &'static Spec,
-    handler: fn(&mut C, &Invocation, &mut Out<'_>) -> Result<()>,
-}
-
-impl<C> Faculty<C> {
-    pub const fn new(
-        spec: &'static Spec,
-        handler: fn(&mut C, &Invocation, &mut Out<'_>) -> Result<()>,
-    ) -> Self {
-        Self { spec, handler }
-    }
-
-    /// Run the shared handler with the frontend's incremental emitter.
-    ///
-    /// Invocation is synchronous and does not collect output. A handler or
-    /// emission error leaves previously accepted parts with the frontend.
-    pub fn invoke(
-        &self,
-        context: &mut C,
-        invocation: &Invocation,
-        output: &mut Out<'_>,
-    ) -> Result<()> {
-        (self.handler)(context, invocation, output)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
-    use crate::out::Part;
-
     use super::*;
 
     const SPEC: Spec = Spec {
         name: "example",
         about: "Example",
         version: None,
-        shared: &[Param::caller("pile", "Pile").ambient().env("PILE")],
+        shared: &[Param::caller("pile", "Pile").ambient()],
         verbs: &[Verb {
             name: "show",
             about: "Show one",
@@ -636,59 +411,9 @@ mod tests {
         }],
     };
 
-    #[test]
-    fn one_declaration_projects_both_frontends() {
-        let request = SPEC
-            .lower_cli_from(["example", "--pile", "test.pile", "show", "abcd"])
-            .unwrap();
-        let CliRequest::Invoke(invocation) = request else {
-            panic!("expected invocation")
-        };
-        assert_eq!(invocation.require("id").unwrap(), "abcd");
-        assert_eq!(invocation.require("pile").unwrap(), "test.pile");
-
-        let tools = SPEC.mcp_tools();
-        assert_eq!(tools[0].name, "example_show");
-        assert_eq!(tools[0].parameters.len(), 1);
-        assert_eq!(tools[0].parameters[0].name, "id");
-    }
-
-    #[test]
-    fn caller_cannot_supply_ambient_values() {
-        let error = SPEC
-            .lower_mcp(
-                "example_show",
-                Arguments::new().with("id", "abcd").with("pile", "wrong"),
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("not Caller"), "{error:#}");
-    }
-
-    #[test]
-    fn declaration_rejects_ambiguous_origins_and_names() {
-        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").env("X")).is_err());
-        assert!(
-            std::panic::catch_unwind(|| Param::caller("x", "X").ambient().positional()).is_err()
-        );
-
-        const DUPLICATE: Spec = Spec {
-            name: "duplicate",
-            about: "Duplicate",
-            version: None,
-            shared: &[Param::caller("id", "Shared id")],
-            verbs: &[Verb {
-                name: "show",
-                about: "Show",
-                params: &[Param::caller("id", "Verb id")],
-            }],
-        };
-        assert!(DUPLICATE.validate().is_err());
-    }
-
     const OPTIONS_SPEC: Spec = Spec {
         name: "options",
-        about: "Native options",
+        about: "CLI options",
         version: None,
         shared: &[
             Param::caller("pile", "Pile").ambient(),
@@ -706,204 +431,6 @@ mod tests {
             ],
         }],
     };
-
-    #[test]
-    fn flags_repeated_options_and_short_aliases_lower_identically() {
-        let CliRequest::Invoke(cli) = OPTIONS_SPEC
-            .lower_cli_from([
-                "options",
-                "--pile",
-                "configured",
-                "fetch",
-                "https://example.org/file",
-                "--dry-run",
-                "--tag",
-                "first",
-                "--tag",
-                "first",
-                "--tag",
-                "second",
-                "-n",
-                "7",
-            ])
-            .unwrap()
-        else {
-            panic!("expected invocation");
-        };
-        let mcp = OPTIONS_SPEC
-            .lower_mcp(
-                "options_fetch",
-                Arguments::new()
-                    .with("url", "https://example.org/file")
-                    .with_value("dry-run", ArgumentValue::Flag(true))
-                    .with_value(
-                        "tag",
-                        ArgumentValue::Repeated(vec![
-                            "first".into(),
-                            "first".into(),
-                            "second".into(),
-                        ]),
-                    )
-                    .with("limit", "7"),
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap();
-        assert_eq!(cli, mcp);
-        assert!(mcp.flag("dry-run"));
-        assert_eq!(mcp.values("tag"), ["first", "first", "second"]);
-        assert_eq!(mcp.require("limit").unwrap(), "7");
-        assert!(mcp.get("tag").is_none());
-        assert!(mcp.get("dry-run").is_none());
-    }
-
-    #[test]
-    fn omissions_and_explicit_empty_values_share_native_defaults() {
-        let CliRequest::Invoke(cli) = OPTIONS_SPEC
-            .lower_cli_from(["options", "--pile", "configured", "fetch", "url"])
-            .unwrap()
-        else {
-            panic!("expected invocation");
-        };
-        let ambient = Arguments::new().with("pile", "configured");
-        let omitted = OPTIONS_SPEC
-            .lower_mcp(
-                "options_fetch",
-                Arguments::new().with("url", "url"),
-                ambient.clone(),
-            )
-            .unwrap();
-        let explicit = OPTIONS_SPEC
-            .lower_mcp(
-                "options_fetch",
-                Arguments::new()
-                    .with("url", "url")
-                    .with_value("dry-run", ArgumentValue::Flag(false))
-                    .with_value("tag", ArgumentValue::Repeated(Vec::new())),
-                ambient,
-            )
-            .unwrap();
-        assert_eq!(cli, omitted);
-        assert_eq!(omitted, explicit);
-        assert!(!omitted.flag("dry-run"));
-        assert!(omitted.values("tag").is_empty());
-        assert_eq!(omitted.require("limit").unwrap(), "10");
-        assert!(omitted.get("mime").is_none());
-        assert!(OPTIONS_SPEC
-            .to_clap()
-            .find_subcommand("fetch")
-            .unwrap()
-            .clone()
-            .render_help()
-            .to_string()
-            .contains("[default: 10]"));
-    }
-
-    #[test]
-    fn declared_argument_shapes_are_checked_before_invocation() {
-        for (name, value) in [
-            ("tag", ArgumentValue::Text("not an array".into())),
-            ("dry-run", ArgumentValue::Text("true".into())),
-            ("limit", ArgumentValue::Flag(false)),
-            ("mime", ArgumentValue::Repeated(vec!["text/plain".into()])),
-        ] {
-            let error = OPTIONS_SPEC
-                .lower_mcp(
-                    "options_fetch",
-                    Arguments::new().with("url", "url").with_value(name, value),
-                    Arguments::new().with("pile", "configured"),
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("requires"), "{error:#}");
-        }
-        let error = OPTIONS_SPEC
-            .lower_mcp(
-                "options_fetch",
-                Arguments::new()
-                    .with("url", "url")
-                    .with_value("pile", ArgumentValue::Flag(false)),
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("not Caller"));
-        let error = OPTIONS_SPEC
-            .lower_mcp(
-                "options_fetch",
-                Arguments::new().with("url", "url"),
-                Arguments::new().with_value("pile", ArgumentValue::Repeated(Vec::new())),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("requires Text"));
-        assert!(OPTIONS_SPEC
-            .lower_cli_from([
-                "options",
-                "--pile",
-                "configured",
-                "fetch",
-                "url",
-                "--dry-run=false",
-            ])
-            .is_err());
-    }
-
-    #[test]
-    fn duplicate_arguments_do_not_replace_previously_supplied_values() {
-        let mut arguments = Arguments::new().with("id", "abcd");
-        assert!(arguments
-            .insert_value("id", ArgumentValue::Flag(true))
-            .is_err());
-        let invocation = SPEC
-            .lower_mcp(
-                "example_show",
-                arguments,
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap();
-        assert_eq!(invocation.require("id").unwrap(), "abcd");
-    }
-
-    #[test]
-    fn invalid_option_shapes_and_alias_collisions_are_rejected() {
-        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").positional().flag()).is_err());
-        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").flag().positional()).is_err());
-        assert!(
-            std::panic::catch_unwind(|| Param::caller("x", "X").repeated().default("x")).is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| Param::caller("x", "X").default("true").flag()).is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| Param::caller("x", "X").positional().short('n')).is_err()
-        );
-        const DUPLICATE_SHORT: Spec = Spec {
-            name: "duplicate",
-            about: "Duplicate",
-            version: None,
-            shared: &[Param::caller("shared", "Shared").short('n').optional()],
-            verbs: &[Verb {
-                name: "show",
-                about: "Show",
-                params: &[Param::caller("limit", "Limit").short('n')],
-            }],
-        };
-        assert!(DUPLICATE_SHORT.validate().is_err());
-    }
-
-    #[test]
-    fn native_descriptors_include_shapes_and_scalar_defaults() {
-        let tools = OPTIONS_SPEC.mcp_tools();
-        let params = &tools[0].parameters;
-        assert_eq!(params[0].kind, ParamKind::Text);
-        assert!(params[0].required);
-        assert_eq!(params[1].kind, ParamKind::Repeated);
-        assert!(!params[1].required);
-        assert_eq!(params[2].kind, ParamKind::Flag);
-        assert!(!params[2].required);
-        assert_eq!(params[3].default, Some("10"));
-        assert!(!params[3].required);
-        assert!(params
-            .iter()
-            .all(|param| !matches!(param.name, "pile" | "key")));
-    }
 
     const PATH_SPEC: Spec = Spec {
         name: "paths",
@@ -926,216 +453,366 @@ mod tests {
         }],
     };
 
-    #[test]
-    fn string_paths_and_path_defaults_lower_identically() {
-        let CliRequest::Invoke(cli) = PATH_SPEC
-            .lower_cli_from(["paths", "--pile", "configured.pile", "add", "input.txt"])
-            .unwrap()
+    fn invoke(spec: &'static Spec, arguments: &[&str]) -> Invocation {
+        let CliRequest::Invoke(invocation) =
+            spec.lower_cli_from(arguments.iter().copied()).unwrap()
         else {
             panic!("expected invocation");
         };
-        let mcp = PATH_SPEC
-            .lower_mcp(
-                "paths_add",
-                Arguments::new().with("path", "input.txt"),
-                Arguments::new().with("pile", "configured.pile"),
-            )
-            .unwrap();
-        assert_eq!(cli, mcp);
-        assert_eq!(mcp.require_path("path").unwrap(), Path::new("input.txt"));
-        assert_eq!(mcp.require_path("base").unwrap(), Path::new("."));
+        invocation
+    }
+
+    #[test]
+    fn cli_lowers_global_arguments_before_or_after_the_verb() {
+        for arguments in [
+            ["example", "--pile", "test.pile", "show", "abcd"],
+            ["example", "show", "abcd", "--pile", "test.pile"],
+        ] {
+            let invocation = invoke(&SPEC, &arguments);
+            assert_eq!(invocation.verb().name, "show");
+            assert_eq!(invocation.require("id").unwrap(), "abcd");
+            assert_eq!(invocation.require("pile").unwrap(), "test.pile");
+            assert!(invocation.require("unknown").is_err());
+        }
+    }
+
+    #[test]
+    fn no_verb_returns_help_without_requiring_global_configuration() {
+        let CliRequest::Help(help) = SPEC.lower_cli_from(["example"]).unwrap() else {
+            panic!("expected help");
+        };
+        assert!(help.contains("show"));
+        assert!(help.contains("--pile"));
+        let error = SPEC.lower_cli_from(["example", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn required_arguments_and_unknown_cli_names_are_rejected() {
+        for arguments in [
+            vec!["example", "show", "abcd"],
+            vec!["example", "--pile", "test.pile", "show"],
+        ] {
+            let error = SPEC.lower_cli_from(arguments).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        assert!(SPEC.lower_cli_from(["example", "unknown"]).is_err());
+        assert!(SPEC
+            .lower_cli_from([
+                "example",
+                "--pile",
+                "test.pile",
+                "show",
+                "abcd",
+                "--unknown"
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn declaration_rejects_ambiguous_names_and_invalid_environment_sources() {
+        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").env("X")).is_err());
+        assert!(
+            std::panic::catch_unwind(|| Param::caller("x", "X").ambient().positional()).is_err()
+        );
+
+        const DUPLICATE_PARAMETER: Spec = Spec {
+            shared: &[Param::caller("id", "Shared id")],
+            ..SPEC
+        };
+        const DUPLICATE_SHARED: Spec = Spec {
+            shared: &[
+                Param::caller("pile", "First pile"),
+                Param::caller("pile", "Second pile"),
+            ],
+            ..SPEC
+        };
+        const DUPLICATE_VERB: Spec = Spec {
+            verbs: &[
+                Verb {
+                    name: "show",
+                    about: "First",
+                    params: &[],
+                },
+                Verb {
+                    name: "show",
+                    about: "Second",
+                    params: &[],
+                },
+            ],
+            ..SPEC
+        };
+        const SHARED_POSITIONAL: Spec = Spec {
+            shared: &[Param::caller("pile", "Pile").positional()],
+            ..SPEC
+        };
+        for spec in [
+            DUPLICATE_PARAMETER,
+            DUPLICATE_SHARED,
+            DUPLICATE_VERB,
+            SHARED_POSITIONAL,
+        ] {
+            assert!(spec.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn flags_repeated_options_and_short_aliases_keep_their_shapes() {
+        let invocation = invoke(
+            &OPTIONS_SPEC,
+            &[
+                "options",
+                "--pile",
+                "configured",
+                "fetch",
+                "https://example.org/file",
+                "--dry-run",
+                "--tag",
+                "first",
+                "--tag",
+                "first",
+                "--tag",
+                "second",
+                "-n",
+                "7",
+            ],
+        );
+        assert!(invocation.flag("dry-run"));
+        assert_eq!(invocation.values("tag"), ["first", "first", "second"]);
+        assert_eq!(invocation.require("limit").unwrap(), "7");
         assert_eq!(
-            mcp.require_path("pile").unwrap(),
+            invocation.require("url").unwrap(),
+            "https://example.org/file"
+        );
+        assert!(invocation.get("tag").is_none());
+        assert!(invocation.get("dry-run").is_none());
+    }
+
+    #[test]
+    fn omitted_options_keep_defaults_and_optional_values_absent() {
+        let invocation = invoke(
+            &OPTIONS_SPEC,
+            &["options", "--pile", "configured", "fetch", "url"],
+        );
+        assert!(!invocation.flag("dry-run"));
+        assert!(invocation.values("tag").is_empty());
+        assert_eq!(invocation.require("limit").unwrap(), "10");
+        assert!(invocation.get("mime").is_none());
+        assert!(invocation.get("key").is_none());
+        assert!(invocation.require("mime").is_err());
+    }
+
+    #[test]
+    fn scalar_values_stay_text_until_the_faculty_interprets_them() {
+        for limit in ["7", "1e2", "not-a-number"] {
+            let invocation = invoke(
+                &OPTIONS_SPEC,
+                &[
+                    "options",
+                    "--pile",
+                    "configured",
+                    "fetch",
+                    "url",
+                    "-n",
+                    limit,
+                ],
+            );
+            assert_eq!(invocation.require("limit").unwrap(), limit);
+        }
+        let invocation = invoke(
+            &OPTIONS_SPEC,
+            &[
+                "options",
+                "--pile",
+                "configured",
+                "fetch",
+                "url",
+                "--mime",
+                "",
+                "--tag",
+                "",
+            ],
+        );
+        assert_eq!(invocation.get("mime"), Some(""));
+        assert_eq!(invocation.values("tag"), [""]);
+    }
+
+    #[test]
+    fn scalar_duplicates_and_invalid_flag_syntax_are_not_silently_overwritten() {
+        for tail in [
+            vec!["--limit", "1", "--limit", "2"],
+            vec!["--dry-run", "--dry-run"],
+            vec!["--dry-run=false"],
+            vec!["--tag"],
+            vec!["--limit"],
+        ] {
+            let arguments = ["options", "--pile", "configured", "fetch", "url"]
+                .into_iter()
+                .chain(tail);
+            assert!(OPTIONS_SPEC.lower_cli_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_option_shapes_and_alias_collisions_are_rejected() {
+        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").positional().flag()).is_err());
+        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").flag().positional()).is_err());
+        assert!(
+            std::panic::catch_unwind(|| Param::caller("x", "X").repeated().default("x")).is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| Param::caller("x", "X").default("true").flag()).is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| Param::caller("x", "X").positional().short('n')).is_err()
+        );
+        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").path().flag()).is_err());
+        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").repeated().path()).is_err());
+        const DUPLICATE_SHORT: Spec = Spec {
+            shared: &[Param::caller("shared", "Shared").short('n').optional()],
+            verbs: &[Verb {
+                name: "show",
+                about: "Show",
+                params: &[Param::caller("limit", "Limit").short('n')],
+            }],
+            ..SPEC
+        };
+        assert!(DUPLICATE_SHORT.validate().is_err());
+    }
+
+    #[test]
+    fn cli_help_describes_options_and_scalar_defaults() {
+        let help = OPTIONS_SPEC
+            .to_clap()
+            .find_subcommand_mut("fetch")
+            .unwrap()
+            .render_help()
+            .to_string();
+        for text in ["--dry-run", "--tag", "-n", "--limit", "[default: 10]"] {
+            assert!(help.contains(text), "{text}: {help}");
+        }
+    }
+
+    #[test]
+    fn cli_paths_keep_native_shapes_and_declared_defaults() {
+        let invocation = invoke(
+            &PATH_SPEC,
+            &["paths", "--pile", "configured.pile", "add", "input.txt"],
+        );
+        assert_eq!(
+            invocation.require_path("path").unwrap(),
+            Path::new("input.txt")
+        );
+        assert_eq!(invocation.require_path("base").unwrap(), Path::new("."));
+        assert_eq!(
+            invocation.require_path("pile").unwrap(),
             Path::new("configured.pile")
         );
-        assert!(mcp.path("key").is_none());
-        assert!(mcp.get("path").is_none());
-        assert!(mcp.require("pile").is_err());
-        let tools = PATH_SPEC.mcp_tools();
-        assert_eq!(tools[0].parameters[0].kind, ParamKind::Path);
-        assert_eq!(tools[0].parameters[1].kind, ParamKind::Path);
-        assert_eq!(tools[0].parameters[1].default, Some("."));
+        assert!(invocation.path("key").is_none());
+        assert!(invocation.get("path").is_none());
+        assert!(invocation.require("pile").is_err());
+
+        let explicit = invoke(
+            &PATH_SPEC,
+            &[
+                "paths",
+                "--pile",
+                "configured.pile",
+                "add",
+                "input.txt",
+                "-b",
+                "root/é",
+            ],
+        );
+        assert_eq!(explicit.require_path("base").unwrap(), Path::new("root/é"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn cli_and_native_paths_preserve_non_utf8_os_bytes() {
+    fn cli_paths_preserve_non_utf8_os_bytes() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-        let pile = OsString::from_vec(b"pile-\xff".to_vec());
-        let key = OsString::from_vec(b"key-\xfe".to_vec());
-        let path = OsString::from_vec(b"input-\xfd".to_vec());
-        let CliRequest::Invoke(cli) = PATH_SPEC
+        let CliRequest::Invoke(invocation) = PATH_SPEC
             .lower_cli_from([
                 OsString::from("paths"),
                 OsString::from("--pile"),
-                pile.clone(),
+                OsString::from_vec(b"pile-\xff".to_vec()),
                 OsString::from("--key"),
-                key.clone(),
+                OsString::from_vec(b"key-\xfe".to_vec()),
                 OsString::from("add"),
-                path.clone(),
+                OsString::from_vec(b"input-\xfd".to_vec()),
             ])
             .unwrap()
         else {
             panic!("expected invocation");
         };
-        let native = PATH_SPEC
-            .lower_mcp(
-                "paths_add",
-                Arguments::new().with_value("path", ArgumentValue::Path(PathBuf::from(path))),
-                Arguments::new()
-                    .with_value("pile", ArgumentValue::Path(PathBuf::from(pile)))
-                    .with_value("key", ArgumentValue::Path(PathBuf::from(key))),
-            )
-            .unwrap();
-        assert_eq!(cli, native);
         for (name, expected) in [
             ("pile", b"pile-\xff".as_slice()),
             ("key", b"key-\xfe".as_slice()),
             ("path", b"input-\xfd".as_slice()),
         ] {
-            let path = cli.require_path(name).unwrap();
+            let path = invocation.require_path(name).unwrap();
             assert_eq!(path.as_os_str().as_bytes(), expected);
             assert!(path.to_str().is_none());
         }
     }
 
     #[test]
-    fn paths_keep_declared_shapes_and_origin_guards() {
-        for value in [ArgumentValue::Flag(false), ArgumentValue::Repeated(vec![])] {
-            let error = PATH_SPEC
-                .lower_mcp(
-                    "paths_add",
-                    Arguments::new().with_value("path", value),
-                    Arguments::new().with("pile", "configured"),
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("requires Path"), "{error:#}");
+    fn ambient_environment_is_native_and_cli_flags_take_precedence() {
+        const ENV_SPEC: Spec = Spec {
+            shared: &[
+                Param::caller("pile", "Pile")
+                    .path()
+                    .ambient()
+                    .env("FACULTIES_SPEC_TEST_PILE"),
+                Param::caller("key", "Key")
+                    .path()
+                    .ambient()
+                    .optional()
+                    .env("FACULTIES_SPEC_TEST_KEY"),
+            ],
+            ..PATH_SPEC
+        };
+        // Set environment only on a child, never in the multithreaded harness.
+        if std::env::var_os("FACULTIES_SPEC_TEST_CHILD").is_none() {
+            #[cfg(unix)]
+            let value = {
+                use std::os::unix::ffi::OsStringExt;
+                OsString::from_vec(b"environment-\xff.pile".to_vec())
+            };
+            #[cfg(not(unix))]
+            let value = OsString::from("environment-é.pile");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "spec::tests::ambient_environment_is_native_and_cli_flags_take_precedence",
+                    "--nocapture",
+                ])
+                .env("FACULTIES_SPEC_TEST_CHILD", "1")
+                .env("FACULTIES_SPEC_TEST_PILE", value)
+                .env_remove("FACULTIES_SPEC_TEST_KEY")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
         }
-        let error = PATH_SPEC
-            .lower_mcp(
-                "paths_add",
-                Arguments::new()
-                    .with("path", "input.txt")
-                    .with_value("pile", ArgumentValue::Path("wrong".into())),
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("not Caller"), "{error:#}");
-        let error = SPEC
-            .lower_mcp(
-                "example_show",
-                Arguments::new().with_value("id", ArgumentValue::Path("abcd".into())),
-                Arguments::new().with("pile", "configured"),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("requires Text"), "{error:#}");
-        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").path().flag()).is_err());
-        assert!(std::panic::catch_unwind(|| Param::caller("x", "X").repeated().path()).is_err());
-    }
-
-    fn example_invocation() -> Invocation {
-        SPEC.lower_mcp(
-            "example_show",
-            Arguments::new().with("id", "abcd"),
-            Arguments::new().with("pile", "test.pile"),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn emission_is_observed_before_the_handler_continues() {
-        let observed = Cell::new(0);
-        let faculty = Faculty::new(&SPEC, |observed: &mut &Cell<usize>, _, output| {
-            assert_eq!(observed.get(), 0);
-            output.line("first")?;
-            assert_eq!(observed.get(), 1);
-            output.line("second")?;
-            assert_eq!(observed.get(), 2);
-            Ok(())
-        });
-        let mut emit = |_| {
-            observed.set(observed.get() + 1);
-            Ok(())
-        };
-        faculty
-            .invoke(
-                &mut &observed,
-                &example_invocation(),
-                &mut Out::new(&mut emit),
-            )
-            .unwrap();
-        assert_eq!(observed.get(), 2);
-    }
-
-    #[test]
-    fn emission_failure_preserves_prior_output_and_stops_production() {
-        let faculty = Faculty::new(&SPEC, |produced: &mut usize, _, output| {
-            for text in ["first", "rejected", "never produced"] {
-                *produced += 1;
-                output.line(text)?;
-            }
-            Ok(())
-        });
-        let mut parts = Vec::new();
-        let mut produced = 0;
-        let error = {
-            let mut emit = |part| {
-                if !parts.is_empty() {
-                    bail!("output closed");
-                }
-                parts.push(part);
-                Ok(())
-            };
-            faculty
-                .invoke(
-                    &mut produced,
-                    &example_invocation(),
-                    &mut Out::new(&mut emit),
-                )
-                .unwrap_err()
-        };
-        assert_eq!(error.to_string(), "output closed");
-        assert_eq!(produced, 2);
+        let expected = std::env::var_os("FACULTIES_SPEC_TEST_PILE").unwrap();
+        let invocation = invoke(&ENV_SPEC, &["paths", "add", "input.txt"]);
         assert_eq!(
-            parts,
-            [Part::Text {
-                text: "first\n".into()
-            }]
+            invocation.require_path("pile").unwrap().as_os_str(),
+            expected.as_os_str()
         );
-    }
-
-    #[test]
-    fn handler_error_preserves_partial_output_without_an_implicit_error_part() {
-        let faculty = Faculty::new(&SPEC, |_: &mut (), _, output| {
-            output.text("partial")?;
-            bail!("handler failed");
-        });
-        let mut parts = Vec::new();
-        let error = {
-            let mut collect = |part| {
-                parts.push(part);
-                Ok(())
-            };
-            faculty
-                .invoke(&mut (), &example_invocation(), &mut Out::new(&mut collect))
-                .unwrap_err()
-        };
-        assert_eq!(error.to_string(), "handler failed");
+        assert!(invocation.path("key").is_none());
+        let explicit = invoke(
+            &ENV_SPEC,
+            &["paths", "--pile", "cli.pile", "add", "input.txt"],
+        );
         assert_eq!(
-            parts,
-            [Part::Text {
-                text: "partial".into()
-            }]
+            explicit.require_path("pile").unwrap(),
+            Path::new("cli.pile")
         );
-    }
-
-    #[test]
-    fn an_empty_handler_does_not_emit() {
-        let faculty = Faculty::new(&SPEC, |_: &mut (), _, _| Ok(()));
-        let mut emit = |_| -> Result<()> { panic!("empty handler emitted output") };
-        faculty
-            .invoke(&mut (), &example_invocation(), &mut Out::new(&mut emit))
-            .unwrap();
     }
 }

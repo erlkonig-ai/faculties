@@ -77,46 +77,77 @@ wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
 
-### One native command, multiple frontends
+### Library-first faculties, explicit frontends
 
-Atlas and Files use the shared `Spec` / `Faculty` / `Out` interface. Their command
-handlers live in `atlas::command` and `files::command`, not in subprocess
-adapters. One declaration per faculty supplies the CLI grammar and MCP tools,
-including flags, repeatable options, and defaults:
+One `faculties` library contains the per-faculty operations and their explicit
+CLI and MCP adapters. Thin individual binaries call the CLI adapters; the single
+`faculties` binary registers the MCP adapters together. Cargo reuses shared
+compilation within a build configuration; executables still link separately.
+
+Atlas and Files are the first complete frontend ports. `atlas::Store` returns
+owned `AtlasEntry` observations from `list` and `show`. `files::Files` supplies
+typed operations including resident-byte import, original-byte export,
+presentation, and extraction. Neither operation API requires a CLI invocation
+or an MCP value. `atlas::cli` / `files::cli` use an optional CLI declaration
+helper; `atlas::mcp` / `files::mcp` own independent tool schemas and argument
+types. A faculty's MCP interface need not resemble its command-line grammar:
 
 ```sh
 atlas --pile ./self.pile list
-files --pile ./self.pile read <file-id>
+files --pile ./self.pile view <file-id> --accept image/png --max-dimension 1024
 faculties mcp --pile ./self.pile
 ```
 
 `faculties mcp` is a local, sequential stdio server for MCP 2025-06-18. The
 launcher owns the pile and optional `--key`; callers cannot substitute those
-through tool arguments. Both Atlas commands and all fourteen Files commands are
+through tool arguments. Both Atlas operations and fourteen Files tools are
 registered as `atlas_*` and `files_*` tools. No HTTP listener or generic shell
-tool is exposed. File paths and fetch URLs retain their ordinary CLI meaning on
-the server's host; this local server is not a filesystem sandbox.
+tool is exposed. Files MCP never takes arbitrary input/output filesystem paths;
+URL fetches still originate on the server's host. This is a trusted local server,
+not a filesystem or network sandbox, and not a deployed remote MCP service.
 On macOS/Linux the launcher reserves private close-on-exec protocol descriptors
 before running handlers: ordinary stdin becomes EOF and stdout becomes
 diagnostic stderr. Standard-stream file aliases cannot consume or corrupt the
 protocol, and child tools do not inherit its private descriptors.
 
-Native handlers emit ordered text, image, audio, and explicit binary exports
-incrementally through `Out`. No JSON or base64 belongs in a handler. The MCP
+Streaming operations and adapters emit ordered text, image, audio, and explicit
+binary exports through `Out`. JSON/base64 decoding belongs only in the MCP
+adapter, not in the shared operations. The MCP
 boundary encodes these parts in a bounded tool response, retaining partial output
 and marking an error if the handler fails. Default limits are 1 MiB per request
 and 8 MiB per response;
 long-running cancellation and concurrent requests are not implemented yet.
 
-`files read <id>` uses the stored MIME type to present UTF-8 text, images, or
-audio. Other formats can be exported with `files get <id> [path]`. In particular,
-`files get <id> @-` preserves the original bytes: stdout is byte-exact on the CLI,
-and MCP returns a self-contained embedded binary resource with a `files:` URI
-and generic `application/octet-stream` type. Export needs only the payload, not
-MIME-name bytes that might be unavailable; `read` supplies MIME-aware presentation.
-No `resources/read` endpoint is required to retrieve that response's bytes.
-`files resolve @-` remains a CLI-only stdin batch; native/MCP calls reject it
-without reading the protocol stream. `@path` batches work in both frontends.
+| Operation | CLI | MCP |
+| --- | --- | --- |
+| Perceive | `files view ID --accept image/png` | `files_view {"id":"ID","accept":["image/png"]}` |
+| Export original | `files get ID path` or `files get ID @-` | `files_get {"id":"ID"}` |
+| Import bytes | `files add path` | `files_add {"name":"notes.txt","mime":"text/plain","data":"base64…"}` |
+| Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID", "files:HASH"]}` |
+
+MCP numeric options are JSON numbers, and multiword names use underscores.
+Unknown fields, duplicate fields, and wrong types are rejected before operations.
+Exports return an embedded binary resource with a `files:` URI and generic
+`application/octet-stream` type. No `resources/read` call is needed for those
+inline bytes. Export needs only the payload, not MIME/name metadata that might
+be unavailable. Receiving an MCP resource does not by itself prove that a host
+has imported it into its file sandbox.
+
+`view` replaces the experimental `read` command. The presentation helper accepts
+UTF-8 text, supported raster images, and accepted audio containers. PNG/JPEG
+conversion and aspect-preserving resizing are bounded by `max_bytes` (4 MiB by
+default) and optional `max_dimension`. Original bytes are unchanged. Image
+decoding has independent 16,384-pixel side and 128 MiB encoded/decoded-surface
+limits; codec scratch limits are best-effort, not a process-wide memory cap.
+Converted images use the first frame and discard container metadata; JPEG also
+loses alpha. PDF rendering and audio transcoding are not implemented. Unsupported
+formats, malformed images, and results that cannot fit return an error rather
+than silently relabelling or truncating content.
+
+URL fetch imports acquired bytes directly, never through a caller-named temporary
+file, and enforces its byte budget during download. CLI extraction acquires its
+complete selected subtree before writing any destination. The MCP adapter does
+not expose that filesystem-writing operation.
 
 The shared CLI runner writes text to stdout, with textual markers for displayed
 image/audio parts, unless `DRIVE_ENDPOINT` is set. With an endpoint configured,
@@ -127,6 +158,13 @@ failure:
 ```sh
 DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' atlas --pile ./self.pile list
 ```
+
+With a Drive endpoint, `files view` defaults to text and PNG/JPEG. Stored MIME
+identity currently keeps only the essence, so raw L16 audio loses its required
+rate/channel metadata; WAV containers likewise need decoding before Inkling can
+hear them. That audio conversion/metadata path is not implemented. An explicit
+`--accept` list overrides the default. MCP callers independently select their
+accepted media types; the server never consults `DRIVE_ENDPOINT` for MCP calls.
 
 Explicit binary exports always stay on stdout: `files get <id> @- > original`
 preserves the stored bytes even with `DRIVE_ENDPOINT` set. Export is not

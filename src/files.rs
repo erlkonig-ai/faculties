@@ -13,7 +13,12 @@
 //! those facts to imports or source-specific occurrence entities; complete
 //! catalogs also preserve historical path/timestamp provenance on file ids.
 
-pub mod command;
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod presentation;
+
+pub use operations::Files;
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;

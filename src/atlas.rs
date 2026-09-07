@@ -6,7 +6,12 @@
 //! ask for the projection they need directly; the strict whole-value validator
 //! at the bottom of this module is reserved for explicit migration/tests.
 
-pub mod command;
+pub mod cli;
+pub mod mcp;
+mod render;
+mod store;
+
+pub use store::Store;
 
 use std::collections::{BTreeMap, BTreeSet};
 

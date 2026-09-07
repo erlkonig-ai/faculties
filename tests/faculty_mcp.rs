@@ -1,133 +1,155 @@
+use std::cell::Cell;
 use std::io::{BufReader, Cursor, Write};
 use std::process::{Command, Stdio};
 
 use anybytes::Bytes;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use faculties::archive_source::canonical_json;
-use faculties::mcp::{Limits, Registration, Server};
+use faculties::mcp::{decode_arguments, Faculty, Limits, Server, Tool};
 use faculties::out::Out;
-use faculties::spec::{Arguments, Invocation, Param, Spec, Verb};
+use serde::Deserialize;
 
-static SPEC: Spec = Spec {
-    name: "sample",
-    about: "Native test faculty",
-    version: None,
-    shared: &[
-        Param::caller("pile", "Configured pile").ambient(),
-        Param::caller("key", "Configured key").ambient().optional(),
-    ],
-    verbs: &[
-        Verb {
-            name: "mixed",
-            about: "Ordered native media",
-            params: &[Param::caller("label", "A text label")],
-        },
-        Verb {
-            name: "empty",
-            about: "No emissions",
-            params: &[],
-        },
-        Verb {
-            name: "fail",
-            about: "Partial failure",
-            params: &[],
-        },
-        Verb {
-            name: "large",
-            about: "Output limit",
-            params: &[],
-        },
-        Verb {
-            name: "media_limit",
-            about: "Media limit",
-            params: &[],
-        },
-        Verb {
-            name: "ignore_limit",
-            about: "Ignored sink failure",
-            params: &[],
-        },
-        Verb {
-            name: "blob",
-            about: "Exact binary export",
-            params: &[],
-        },
-        Verb {
-            name: "blob_limit",
-            about: "Binary export limit",
-            params: &[],
-        },
-        Verb {
-            name: "blob_metadata_limit",
-            about: "Binary metadata limit",
-            params: &[],
-        },
-    ],
-};
+const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
-fn execute(invocation: &Invocation, output: &mut Out<'_>) -> Result<()> {
-    assert_eq!(invocation.require("pile")?, "configured.pile");
-    assert_eq!(invocation.get("key"), Some("configured.key"));
-    match invocation.verb().name {
-        "mixed" => {
-            output.line(invocation.require("label")?)?;
+static TOOLS: &[Tool] = &[
+    Tool {
+        name: "sample_mixed",
+        description: "Ordered native media",
+        input_schema: r#"{
+            "type":"object",
+            "properties":{"label":{"type":"string","description":"A text label"}},
+            "required":["label"],
+            "additionalProperties":false
+        }"#,
+    },
+    Tool {
+        name: "sample_empty",
+        description: "No emissions",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_fail",
+        description: "Partial failure",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_large",
+        description: "Output limit",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_media_limit",
+        description: "Media limit",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_ignore_limit",
+        description: "Ignored sink failure",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_blob",
+        description: "Exact binary export",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_blob_limit",
+        description: "Binary export limit",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
+        name: "sample_blob_metadata_limit",
+        description: "Binary metadata limit",
+        input_schema: EMPTY_SCHEMA,
+    },
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabelArguments {
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArguments {}
+
+struct Sample {
+    pile: &'static str,
+    key: &'static str,
+}
+
+impl Faculty for Sample {
+    fn tools(&self) -> &[Tool] {
+        TOOLS
+    }
+
+    fn call(&self, name: &str, arguments: Bytes, output: &mut Out<'_>) -> Result<()> {
+        assert_eq!(self.pile, "configured.pile");
+        assert_eq!(self.key, "configured.key");
+        if name == "sample_mixed" {
+            let arguments: LabelArguments =
+                decode_arguments(arguments).context("decode the sample label")?;
+            output.line(arguments.label)?;
             output.image(vec![0_u8, 255], "image/png")?;
             output.text("between")?;
             output.audio(vec![1_u8, 2, 3], "audio/wav")?;
-            output.text("")?;
+            return output.text("");
         }
-        "empty" => {}
-        "fail" => {
-            output.text("accepted before failure")?;
-            bail!("native failure after output");
-        }
-        "large" => {
-            output.text("accepted before limit")?;
-            output.text("\u{0001}".repeat(10_000))?;
-        }
-        "media_limit" => {
-            output.text("accepted before limit")?;
-            output.image(vec![0_u8; 10_000], "image/png")?;
-        }
-        "ignore_limit" => {
-            output.text("accepted before limit")?;
-            let _ = output.text("x".repeat(10_000));
-            let _ = output.text("must not leak after rejection");
-        }
-        "blob" => output.blob(
-            vec![0_u8, 0xff, b'\n'],
-            "application/octet-stream",
-            "files:test-export",
-        )?,
-        "blob_limit" => {
-            output.text("accepted before limit")?;
-            output.blob(
-                vec![0_u8; 10_000],
+        let _: EmptyArguments = decode_arguments(arguments)?;
+        match name {
+            "sample_empty" => {}
+            "sample_fail" => {
+                output.text("accepted before failure")?;
+                bail!("native failure after output");
+            }
+            "sample_large" => {
+                output.text("accepted before limit")?;
+                output.text("\u{0001}".repeat(10_000))?;
+            }
+            "sample_media_limit" => {
+                output.text("accepted before limit")?;
+                output.image(vec![0_u8; 10_000], "image/png")?;
+            }
+            "sample_ignore_limit" => {
+                output.text("accepted before limit")?;
+                let _ = output.text("x".repeat(10_000));
+                let _ = output.text("must not leak after rejection");
+            }
+            "sample_blob" => output.blob(
+                vec![0_u8, 0xff, b'\n'],
                 "application/octet-stream",
                 "files:test-export",
-            )?;
+            )?,
+            "sample_blob_limit" => {
+                output.text("accepted before limit")?;
+                output.blob(
+                    vec![0_u8; 10_000],
+                    "application/octet-stream",
+                    "files:test-export",
+                )?;
+            }
+            "sample_blob_metadata_limit" => {
+                output.text("accepted before limit")?;
+                output.blob(
+                    Vec::<u8>::new(),
+                    "application/octet-stream",
+                    format!("files:{}", "a".repeat(10_000)),
+                )?;
+            }
+            other => panic!("unexpected test tool {other}"),
         }
-        "blob_metadata_limit" => {
-            output.text("accepted before limit")?;
-            output.blob(
-                Vec::<u8>::new(),
-                "application/octet-stream",
-                format!("files:{}", "a".repeat(10_000)),
-            )?;
-        }
-        other => panic!("unexpected test verb {other}"),
+        Ok(())
     }
-    Ok(())
 }
 
-fn registrations() -> [Registration; 1] {
-    [Registration {
-        spec: &SPEC,
-        invoke: execute,
-        ambient: Arguments::new()
-            .with("pile", "configured.pile")
-            .with("key", "configured.key"),
-    }]
+static SAMPLE: Sample = Sample {
+    pile: "configured.pile",
+    key: "configured.key",
+};
+
+fn registrations() -> [&'static dyn Faculty; 1] {
+    [&SAMPLE]
 }
 
 fn dispatch(server: &mut Server<'_>, request: &str) -> Option<String> {
@@ -195,13 +217,9 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
     }
     assert!(responses[1].contains(r#""name":"atlas_list""#));
     assert!(responses[1].contains(r#""name":"atlas_show""#));
-    for verb in faculties::files::command::SPEC.verbs {
-        assert!(responses[1].contains(&format!("\"name\":\"files_{}\"", verb.name)));
-    }
-    assert_eq!(
-        responses[1].matches("\"inputSchema\"").count(),
-        faculties::atlas::command::SPEC.verbs.len() + faculties::files::command::SPEC.verbs.len(),
-    );
+    assert!(responses[1].contains(r#""name":"files_get""#));
+    assert!(responses[1].contains(r#""name":"files_view""#));
+    assert!(!responses[1].contains(r#""name":"files_read""#));
     assert!(!responses[1].contains("\"pile\":"));
     assert!(!responses[1].contains("\"key\":"));
     assert_eq!(responses[2], r#"{"jsonrpc":"2.0","id":3,"result":{}}"#);
@@ -255,7 +273,7 @@ fn handshake_gates_calls_and_negotiates_supported_version() {
 }
 
 #[test]
-fn list_is_derived_from_spec_and_hides_ambient_parameters() {
+fn list_uses_explicit_mcp_schemas_and_hides_launcher_configuration() {
     let registrations = registrations();
     let mut server = Server::new(&registrations).unwrap();
     initialize(&mut server);
@@ -264,10 +282,14 @@ fn list_is_derived_from_spec_and_hides_ambient_parameters() {
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#,
     )
     .unwrap();
-    for tool in SPEC.mcp_tools() {
+    for tool in TOOLS {
         assert!(response.contains(&format!(r#""name":"{}""#, tool.name)));
     }
-    assert!(response.contains(r#""label":{"type":"string","description":"A text label"}"#));
+    let decoded: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        decoded["result"]["tools"][0]["inputSchema"]["properties"]["label"],
+        serde_json::json!({"type":"string","description":"A text label"}),
+    );
     assert!(response.contains(r#""required":["label"]"#));
     assert!(response.contains(r#""additionalProperties":false"#));
     assert!(!response.contains("pile"));
@@ -322,7 +344,11 @@ fn tool_errors_preserve_partial_content_but_validation_is_protocol_error() {
         r#"{"label":"ok","key":"elsewhere"}"#,
         r#"{"label":"ok","other":"value"}"#,
         r#"{"label":"ok","label":"again"}"#,
+        r#"{"label":"ok","\u006cabel":"again"}"#,
         "{}",
+        "[]",
+        "null",
+        "1",
     ] {
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"sample_mixed","arguments":{args}}}}}"#
@@ -333,29 +359,21 @@ fn tool_errors_preserve_partial_content_but_validation_is_protocol_error() {
     }
 }
 
-#[test]
-fn invalid_ambient_origins_are_rejected_before_handler() {
-    let registrations = [Registration {
-        spec: &SPEC,
-        invoke: |_, _| panic!("invalid ambient arguments reached handler"),
-        ambient: Arguments::new()
-            .with("pile", "configured.pile")
-            .with("label", "wrong origin"),
-    }];
-    let mut server = Server::new(&registrations).unwrap();
-    initialize(&mut server);
-    let response = dispatch(&mut server, r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"sample_mixed","arguments":{"label":"caller"}}}"#).unwrap();
-    assert!(response.contains(r#""code":-32602"#));
+struct NeverCall;
+
+impl Faculty for NeverCall {
+    fn tools(&self) -> &[Tool] {
+        TOOLS
+    }
+
+    fn call(&self, _: &str, _: Bytes, _: &mut Out<'_>) -> Result<()> {
+        panic!("a notification invoked a write-capable native handler");
+    }
 }
 
 #[test]
 fn notifications_and_unsolicited_responses_never_invoke_or_reply() {
-    let registrations = [Registration {
-        spec: &SPEC,
-        invoke: |_, _| panic!("a notification invoked a write-capable native handler"),
-        ambient: Arguments::new().with("pile", "configured.pile"),
-    }];
-    let mut server = Server::new(&registrations).unwrap();
+    let mut server = Server::new(&[&NeverCall]).unwrap();
     initialize(&mut server);
     for request in [
         r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"sample_empty"}}"#,
@@ -495,4 +513,97 @@ fn duplicate_native_tool_names_are_rejected() {
     let mut registrations = Vec::from(registrations());
     registrations.extend(self::registrations());
     assert!(Server::new(&registrations).is_err());
+}
+
+struct Declared {
+    tools: Vec<Tool>,
+    snapshots: Cell<usize>,
+}
+
+impl Faculty for Declared {
+    fn tools(&self) -> &[Tool] {
+        self.snapshots.set(self.snapshots.get() + 1);
+        &self.tools
+    }
+
+    fn call(&self, name: &str, arguments: Bytes, output: &mut Out<'_>) -> Result<()> {
+        let _: EmptyArguments = decode_arguments(arguments)?;
+        output.text(format!("declared faculty called: {name}"))
+    }
+}
+
+#[test]
+fn registration_snapshots_schemas_once_and_routes_to_each_faculty() {
+    let declared = Declared {
+        tools: vec![Tool {
+            name: "custom.name",
+            description: "An independent MCP name\nand description",
+            input_schema: EMPTY_SCHEMA,
+        }],
+        snapshots: Cell::new(0),
+    };
+    let mut server = Server::new(&[&SAMPLE, &declared]).unwrap();
+    initialize(&mut server);
+    for _ in 0..2 {
+        let response = dispatch(
+            &mut server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        )
+        .unwrap();
+        assert!(response.contains("sample_mixed"));
+        assert!(response.contains("custom.name"));
+    }
+    let response = dispatch(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"custom.name"}}"#,
+    )
+    .unwrap();
+    assert!(response.contains("declared faculty called: custom.name"));
+    let response = dispatch(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sample_empty"}}"#,
+    )
+    .unwrap();
+    assert!(response.contains(r#""content":[],"isError":false"#));
+    assert_eq!(declared.snapshots.get(), 1);
+}
+
+#[test]
+fn invalid_schema_shapes_and_intrafaculty_duplicate_names_are_rejected() {
+    for schema in [
+        "{",
+        "{} trailing",
+        "true",
+        "null",
+        "[]",
+        "{}",
+        r#"{"type":"array"}"#,
+        r#"{"type":["object","null"]}"#,
+    ] {
+        let declared = Declared {
+            tools: vec![Tool {
+                name: "invalid_schema",
+                description: "A broken descriptor",
+                input_schema: schema,
+            }],
+            snapshots: Cell::new(0),
+        };
+        assert!(Server::new(&[&declared]).is_err(), "{schema}");
+    }
+    let declared = Declared {
+        tools: vec![
+            Tool {
+                name: "duplicate",
+                description: "First declaration",
+                input_schema: EMPTY_SCHEMA,
+            },
+            Tool {
+                name: "duplicate",
+                description: "Second declaration",
+                input_schema: EMPTY_SCHEMA,
+            },
+        ],
+        snapshots: Cell::new(0),
+    };
+    assert!(Server::new(&[&declared]).is_err());
 }

@@ -1,11 +1,10 @@
-//! Shared infrastructure for triblespace-backed faculties.
+//! Reusable capabilities for TribleSpace-backed faculties.
 //!
-//! The individual rust-script faculties at the root of this repo (e.g.
-//! `compass.rs`, `wiki.rs`, `message.rs`) all store data in
-//! triblespace piles using attribute IDs defined here. Centralizing the
-//! schemas means every consumer — the rust-script itself, other faculties
-//! that cross-reference, the playground dashboard, and any GORBIE notebook
-//! that embeds a faculty widget — uses the same attribute IDs.
+//! Domain operations and schemas are shared by direct Rust callers, CLI and MCP
+//! adapters, and widgets. Each ported faculty has explicit `cli` and `mcp`
+//! submodules; the aggregate MCP binary registers them in-process. Presentation
+//! and argument conventions belong to those frontends, not a universal grammar.
+//! Atlas and Files are the first complete frontend ports.
 
 /// Crate version + baked git hash (see `build.rs`) — lets every installed
 /// binary answer the stale-binary/version-skew question via `--version`.
