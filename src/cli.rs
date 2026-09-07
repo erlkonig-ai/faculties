@@ -2,7 +2,8 @@
 //!
 //! `DRIVE_ENDPOINT` selects Drive's existing framed organ transport. Without
 //! it, text is written exactly to stdout and media receives a descriptive text
-//! marker. An explicitly configured endpoint failure is an error, not a reason
+//! marker. An explicit Blob export writes byte-for-byte to stdout. An explicitly
+//! configured endpoint failure is an error, not a reason
 //! to silently deliver the same output through another channel.
 
 use std::io::{self, Write};
@@ -87,6 +88,7 @@ fn render_terminal(writer: &mut impl Write, part: Part) -> Result<()> {
         Part::Audio { bytes, mime_type } => {
             writeln!(writer, "[audio: {mime_type}, {} bytes]", bytes.len())?;
         }
+        Part::Blob { bytes, .. } => writer.write_all(bytes.as_ref())?,
     }
     writer.flush().context("emit faculty stdout")
 }
@@ -134,5 +136,21 @@ mod tests {
             }
         }
         assert!(render_terminal(&mut Broken, Part::Text { text: "x".into() }).is_err());
+    }
+
+    #[test]
+    fn explicit_blob_export_is_byte_exact_even_for_non_utf8() {
+        let bytes = anybytes::Bytes::from(vec![0_u8, 0xff, b'\n', 0x80]);
+        let mut output = Vec::new();
+        render_terminal(
+            &mut output,
+            Part::Blob {
+                bytes: bytes.clone(),
+                mime_type: "application/octet-stream".into(),
+                uri: "files:test-export".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(output, bytes.as_ref());
     }
 }

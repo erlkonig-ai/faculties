@@ -101,9 +101,11 @@ impl DriveOutput {
 fn write_part<W: Write>(writer: &mut FramedWriter<W>, part: Part) -> Result<()> {
     match part {
         Part::Text { text } => writer.record_as(TEXT_PLAIN, text.as_bytes(), text.len() as u64),
-        Part::Image { bytes, mime_type } | Part::Audio { bytes, mime_type } => {
-            writer.record_as(&mime_type, bytes.as_ref(), bytes.len() as u64)
-        }
+        Part::Image { bytes, mime_type }
+        | Part::Audio { bytes, mime_type }
+        | Part::Blob {
+            bytes, mime_type, ..
+        } => writer.record_as(&mime_type, bytes.as_ref(), bytes.len() as u64),
     }
 }
 
@@ -194,6 +196,15 @@ mod tests {
             },
         )
         .unwrap();
+        write_part(
+            &mut writer,
+            Part::Blob {
+                bytes: vec![0_u8, 255, 10, 128].into(),
+                mime_type: "application/octet-stream".into(),
+                uri: "files:binary-export".into(),
+            },
+        )
+        .unwrap();
         let bytes = writer.finish(EndStatus::Complete).unwrap();
         let mut reader = FramedReader::open(bytes.as_slice()).unwrap();
         let mut types = Vec::new();
@@ -211,8 +222,24 @@ mod tests {
                 Frame::Gap(_) => panic!("unexpected gap"),
             }
         }
-        assert_eq!(types, [TEXT_PLAIN, "image/png", "audio/wav"]);
-        assert_eq!(payloads, [b"hello\n".to_vec(), vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(
+            types,
+            [
+                TEXT_PLAIN,
+                "image/png",
+                "audio/wav",
+                "application/octet-stream"
+            ]
+        );
+        assert_eq!(
+            payloads,
+            [
+                b"hello\n".to_vec(),
+                vec![1, 2, 3],
+                vec![4, 5],
+                vec![0, 255, 10, 128]
+            ]
+        );
     }
 
     #[test]

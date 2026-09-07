@@ -23,6 +23,13 @@ pub enum Part {
     Image { bytes: Bytes, mime_type: String },
     /// An audio clip and its declared media type. Cloning shares its storage.
     Audio { bytes: Bytes, mime_type: String },
+    /// An exact binary export, not a request to display or play its contents.
+    /// The URI identifies the exported value; transports carry resident bytes.
+    Blob {
+        bytes: Bytes,
+        mime_type: String,
+        uri: String,
+    },
 }
 
 /// A borrowed synchronous emitter, with no implicit buffering.
@@ -69,6 +76,20 @@ impl<'a> Out<'a> {
         self.emit(Part::Audio {
             bytes: bytes.into(),
             mime_type: mime_type.into(),
+        })
+    }
+
+    /// Export bytes without interpreting them as text or a displayed modality.
+    pub fn blob(
+        &mut self,
+        bytes: impl Into<Bytes>,
+        mime_type: impl Into<String>,
+        uri: impl Into<String>,
+    ) -> Result<()> {
+        self.emit(Part::Blob {
+            bytes: bytes.into(),
+            mime_type: mime_type.into(),
+            uri: uri.into(),
         })
     }
 }

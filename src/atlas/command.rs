@@ -24,12 +24,14 @@ use triblespace::prelude::{find, pattern, Id};
 
 const SHARED: &[Param] = &[
     Param::caller("pile", "Path to the pile file to use")
+        .path()
         .ambient()
         .env("PILE"),
     Param::caller(
         "key",
         "Existing durable signing-key file. Reads and writes never create it.",
     )
+    .path()
     .ambient()
     .optional()
     .env("TRIBLESPACE_KEY"),
@@ -118,8 +120,8 @@ impl AtlasContext {
 
 /// Execute one native invocation. The frontend owns output routing.
 pub fn execute(invocation: &Invocation, output: &mut Out<'_>) -> Result<()> {
-    let pile_path = Path::new(invocation.require("pile")?);
-    let key_path = invocation.get("key").map(Path::new);
+    let pile_path = invocation.require_path("pile")?;
+    let key_path = invocation.path("key");
     let mut context = AtlasContext::open(pile_path, key_path)?;
     let result = ATLAS.invoke(&mut context, invocation, output);
     context.finish(result)

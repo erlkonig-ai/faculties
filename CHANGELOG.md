@@ -4,13 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Files now shares its full command implementation between CLI and MCP, retaining
+  all existing commands and adding MIME-aware `read` for UTF-8 text, images, and
+  audio. Explicit `get <id> @-` exports remain byte-exact on the CLI and become
+  embedded binary resources on MCP. The shared argument declaration covers
+  flags, repeated options, defaults, short options, and native filesystem paths.
+  Stdin batches remain CLI-only; macOS/Linux MCP launchers isolate their
+  protocol descriptors from ordinary process stdio. No Files data model or IDs
+  change, and no migration is needed.
+
 - Native Faculty output now emits ordered text, image, and audio parts through
   a fallible incremental sink. Atlas shares one handler and command declaration
   between its CLI and a local `faculties mcp` stdio server. MCP preserves partial
   output on handler errors and keeps pile/key configuration launcher-owned.
   The shared CLI runner routes output to Drive's existing `organ/1` receiver
-  when `DRIVE_ENDPOINT` is configured, otherwise to the terminal. Only Atlas is
-  ported in this slice; no schema migration or live service cutover is needed.
+  when `DRIVE_ENDPOINT` is configured, otherwise to the terminal. No schema
+  migration or live service cutover is needed for this frontend boundary.
   The unchanged `framed-stream` crate moves here from Drive so public source
   builds can use the native framing without a private Drive checkout.
 

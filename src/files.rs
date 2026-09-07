@@ -13,6 +13,8 @@
 //! those facts to imports or source-specific occurrence entities; complete
 //! catalogs also preserve historical path/timestamp provenance on file ids.
 
+pub mod command;
+
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;

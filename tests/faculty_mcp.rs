@@ -47,6 +47,21 @@ static SPEC: Spec = Spec {
             about: "Ignored sink failure",
             params: &[],
         },
+        Verb {
+            name: "blob",
+            about: "Exact binary export",
+            params: &[],
+        },
+        Verb {
+            name: "blob_limit",
+            about: "Binary export limit",
+            params: &[],
+        },
+        Verb {
+            name: "blob_metadata_limit",
+            about: "Binary metadata limit",
+            params: &[],
+        },
     ],
 };
 
@@ -78,6 +93,27 @@ fn execute(invocation: &Invocation, output: &mut Out<'_>) -> Result<()> {
             output.text("accepted before limit")?;
             let _ = output.text("x".repeat(10_000));
             let _ = output.text("must not leak after rejection");
+        }
+        "blob" => output.blob(
+            vec![0_u8, 0xff, b'\n'],
+            "application/octet-stream",
+            "files:test-export",
+        )?,
+        "blob_limit" => {
+            output.text("accepted before limit")?;
+            output.blob(
+                vec![0_u8; 10_000],
+                "application/octet-stream",
+                "files:test-export",
+            )?;
+        }
+        "blob_metadata_limit" => {
+            output.text("accepted before limit")?;
+            output.blob(
+                Vec::<u8>::new(),
+                "application/octet-stream",
+                format!("files:{}", "a".repeat(10_000)),
+            )?;
         }
         other => panic!("unexpected test verb {other}"),
     }
@@ -121,7 +157,7 @@ fn initialize(server: &mut Server<'_>) {
 }
 
 #[test]
-fn executable_stdio_exposes_only_atlas_without_opening_the_pile_or_drive() {
+fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("not-opened.pile");
     let mut child = Command::new(env!("CARGO_BIN_EXE_faculties"))
@@ -159,7 +195,13 @@ fn executable_stdio_exposes_only_atlas_without_opening_the_pile_or_drive() {
     }
     assert!(responses[1].contains(r#""name":"atlas_list""#));
     assert!(responses[1].contains(r#""name":"atlas_show""#));
-    assert_eq!(responses[1].matches("\"inputSchema\"").count(), 2);
+    for verb in faculties::files::command::SPEC.verbs {
+        assert!(responses[1].contains(&format!("\"name\":\"files_{}\"", verb.name)));
+    }
+    assert_eq!(
+        responses[1].matches("\"inputSchema\"").count(),
+        faculties::atlas::command::SPEC.verbs.len() + faculties::files::command::SPEC.verbs.len(),
+    );
     assert!(!responses[1].contains("\"pile\":"));
     assert!(!responses[1].contains("\"key\":"));
     assert_eq!(responses[2], r#"{"jsonrpc":"2.0","id":3,"result":{}}"#);
@@ -241,6 +283,19 @@ fn native_parts_preserve_order_text_and_binary_content() {
     let response = dispatch(&mut server, r#"{"jsonrpc":"2.0","id":"quote\"id","method":"tools/call","params":{"name":"sample_mixed","arguments":{"label":"first\nsecond \"quoted\""}}}"#).unwrap();
     assert!(response.contains(r#""id":"quote\"id""#));
     assert!(response.contains(r#""content":[{"type":"text","text":"first\nsecond \"quoted\"\n"},{"type":"image","data":"AP8=","mimeType":"image/png"},{"type":"text","text":"between"},{"type":"audio","data":"AQID","mimeType":"audio/wav"},{"type":"text","text":""}],"isError":false"#), "{response}");
+}
+
+#[test]
+fn blob_exports_are_embedded_binary_resources_not_text() {
+    let registrations = registrations();
+    let mut server = Server::new(&registrations).unwrap();
+    initialize(&mut server);
+    let response = dispatch(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sample_blob"}}"#,
+    )
+    .unwrap();
+    assert!(response.contains(r#""content":[{"type":"resource","resource":{"uri":"files:test-export","mimeType":"application/octet-stream","blob":"AP8K"}}],"isError":false"#), "{response}");
 }
 
 #[test]
@@ -372,7 +427,13 @@ fn output_limits_reject_expansion_preserve_prior_parts_and_are_sticky() {
     )
     .unwrap();
     initialize(&mut server);
-    for name in ["sample_large", "sample_media_limit", "sample_ignore_limit"] {
+    for name in [
+        "sample_large",
+        "sample_media_limit",
+        "sample_ignore_limit",
+        "sample_blob_limit",
+        "sample_blob_metadata_limit",
+    ] {
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{{"name":"{name}"}}}}"#
         );

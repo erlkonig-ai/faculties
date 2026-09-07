@@ -79,29 +79,48 @@ viewer               # picks up PILE from the environment
 
 ### One native command, multiple frontends
 
-Atlas is the first faculty exposed through the shared `Spec` / `Faculty` / `Out`
-interface. Its command handlers live in `atlas::command`, not in a subprocess
-adapter. The same declarations generate the CLI and the MCP tools `atlas_list`
-and `atlas_show`:
+Atlas and Files use the shared `Spec` / `Faculty` / `Out` interface. Their command
+handlers live in `atlas::command` and `files::command`, not in subprocess
+adapters. One declaration per faculty supplies the CLI grammar and MCP tools,
+including flags, repeatable options, and defaults:
 
 ```sh
 atlas --pile ./self.pile list
+files --pile ./self.pile read <file-id>
 faculties mcp --pile ./self.pile
 ```
 
 `faculties mcp` is a local, sequential stdio server for MCP 2025-06-18. The
 launcher owns the pile and optional `--key`; callers cannot substitute those
-through tool arguments. Only Atlas is registered so far. No HTTP listener or
-generic shell tool is exposed.
+through tool arguments. Both Atlas commands and all fourteen Files commands are
+registered as `atlas_*` and `files_*` tools. No HTTP listener or generic shell
+tool is exposed. File paths and fetch URLs retain their ordinary CLI meaning on
+the server's host; this local server is not a filesystem sandbox.
+On macOS/Linux the launcher reserves private close-on-exec protocol descriptors
+before running handlers: ordinary stdin becomes EOF and stdout becomes
+diagnostic stderr. Standard-stream file aliases cannot consume or corrupt the
+protocol, and child tools do not inherit its private descriptors.
 
-Native handlers emit ordered text, image, and audio parts incrementally through
-`Out`. No JSON or base64 belongs in a handler. The MCP boundary encodes these
-parts in a bounded tool response, retaining partial output and marking an error
-if the handler fails. Default limits are 1 MiB per request and 8 MiB per response;
+Native handlers emit ordered text, image, audio, and explicit binary exports
+incrementally through `Out`. No JSON or base64 belongs in a handler. The MCP
+boundary encodes these parts in a bounded tool response, retaining partial output
+and marking an error if the handler fails. Default limits are 1 MiB per request
+and 8 MiB per response;
 long-running cancellation and concurrent requests are not implemented yet.
 
-The shared CLI runner writes text to stdout (and descriptions of binary parts)
-unless `DRIVE_ENDPOINT` is set. With an endpoint configured, it sends each part
+`files read <id>` uses the stored MIME type to present UTF-8 text, images, or
+audio. Other formats can be exported with `files get <id> [path]`. In particular,
+`files get <id> @-` preserves the original bytes: stdout is byte-exact on the CLI,
+and MCP returns a self-contained embedded binary resource with a `files:` URI
+and generic `application/octet-stream` type. Export needs only the payload, not
+MIME-name bytes that might be unavailable; `read` supplies MIME-aware presentation.
+No `resources/read` endpoint is required to retrieve that response's bytes.
+`files resolve @-` remains a CLI-only stdin batch; native/MCP calls reject it
+without reading the protocol stream. `@path` batches work in both frontends.
+
+The shared CLI runner writes text and explicit binary exports to stdout, with
+textual markers for displayed image/audio parts, unless `DRIVE_ENDPOINT` is set.
+With an endpoint configured, it sends each part
 directly to Drive's existing `organ/1` receiver using `framed-stream`, without a
 second stdout copy or a fallback on delivery failure:
 

@@ -24,7 +24,7 @@ use triblespace::core::import::scanner as sc;
 
 use crate::archive_source::{canonical_json_string as quote, string};
 use crate::out::{Out, Part};
-use crate::spec::{Arguments, Invocation, McpTool, Spec};
+use crate::spec::{ArgumentValue, Arguments, Invocation, McpTool, ParamKind, Spec};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const ERROR_RESERVE: usize = 2048;
@@ -547,13 +547,36 @@ fn arguments(value: Option<Bytes>) -> std::result::Result<Arguments, RpcError> {
         let key = key
             .view::<str>()
             .map_err(|_| sc::ScanError::Syntax("invalid argument name".into()))?;
-        let text = string(value)?;
+        let argument = match value.first() {
+            Some(b'"') => ArgumentValue::Text(string(value)?.as_ref().to_owned()),
+            Some(b't') => {
+                sc::expect_literal(value, b"true")?;
+                ArgumentValue::Flag(true)
+            }
+            Some(b'f') => {
+                sc::expect_literal(value, b"false")?;
+                ArgumentValue::Flag(false)
+            }
+            Some(b'[') => {
+                ArgumentValue::Repeated(sc::array(value, Vec::new(), |mut values, value| {
+                    values.push(string(value)?.as_ref().to_owned());
+                    Ok(values)
+                })?)
+            }
+            _ => {
+                return Err(sc::ScanError::Syntax(
+                    "argument must be text, a boolean, or a string array".into(),
+                ));
+            }
+        };
         arguments
-            .insert(key.as_ref(), text.as_ref())
+            .insert_value(key.as_ref(), argument)
             .map_err(|_| sc::ScanError::Syntax("duplicate argument".into()))?;
         Ok(arguments)
     })
-    .map_err(|_| RpcError::params("arguments must be an object of unique string parameters"))
+    .map_err(|_| {
+        RpcError::params("arguments must contain unique text, boolean, or string-array parameters")
+    })
 }
 
 fn tool_descriptor(tool: McpTool) -> String {
@@ -563,13 +586,28 @@ fn tool_descriptor(tool: McpTool) -> String {
         if !properties.is_empty() {
             properties.push(',');
         }
+        let shape = match parameter.kind {
+            ParamKind::Text | ParamKind::Path => "\"type\":\"string\"",
+            ParamKind::Flag => "\"type\":\"boolean\"",
+            ParamKind::Repeated => "\"type\":\"array\",\"items\":{\"type\":\"string\"}",
+        };
         write!(
             properties,
-            "{}:{{\"type\":\"string\",\"description\":{}}}",
+            "{}:{{{shape},\"description\":{}",
             quote(parameter.name),
             quote(parameter.description)
         )
         .unwrap();
+        match parameter.kind {
+            ParamKind::Text | ParamKind::Path => {
+                if let Some(default) = parameter.default {
+                    write!(properties, ",\"default\":{}", quote(default)).unwrap();
+                }
+            }
+            ParamKind::Flag => properties.push_str(",\"default\":false"),
+            ParamKind::Repeated => properties.push_str(",\"default\":[]"),
+        }
+        properties.push('}');
         if parameter.required {
             if !required.is_empty() {
                 required.push(',');
@@ -600,6 +638,32 @@ fn encode_part(part: Part, budget: usize) -> Result<String> {
         }
         Part::Image { bytes, mime_type } => encode_media("image", bytes, mime_type, budget),
         Part::Audio { bytes, mime_type } => encode_media("audio", bytes, mime_type, budget),
+        Part::Blob {
+            bytes,
+            mime_type,
+            uri,
+        } => {
+            let encoded_len = bytes
+                .len()
+                .checked_add(2)
+                .and_then(|length| (length / 3).checked_mul(4))
+                .ok_or_else(|| anyhow!("MCP blob length overflow"))?;
+            let overhead = r#"{"type":"resource","resource":{"uri":,"mimeType":,"blob":""}}"#.len();
+            if encoded_len
+                .saturating_add(quoted_len(&uri))
+                .saturating_add(quoted_len(&mime_type))
+                .saturating_add(overhead)
+                > budget
+            {
+                bail!("MCP blob output exceeds the response budget");
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+            Ok(format!(
+                "{{\"type\":\"resource\",\"resource\":{{\"uri\":{},\"mimeType\":{},\"blob\":\"{data}\"}}}}",
+                quote(&uri),
+                quote(&mime_type),
+            ))
+        }
     }
 }
 
