@@ -1,0 +1,22 @@
+[package]
+name = "framed-stream"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "The framed-stream convention: content-typed, continuity-checked records carrying a modality over an ordinary pipe, in either direction."
+
+# std + anyhow, deliberately. A faculty that speaks the convention must be able
+# to link it without pulling in a pile, a sandbox client, or a cognition loop —
+# that is the whole reason this is a crate and not a module in `drive`.
+[dependencies]
+anyhow = "1"
+
+# The reference streaming faculty AND the fixture the convention is proved
+# against: it reads a framed stream on stdin and writes one on stdout,
+# incrementally, so `tests/framed_stream.rs` can drive real records through real
+# OS pipes into a real child process. It lives here rather than in a consumer so
+# the crate's guarantees are testable on their own.
+[[bin]]
+name = "framed_relay"
+path = "src/bin/framed_relay.rs"

@@ -382,26 +382,37 @@ pub enum CliRequest {
 
 pub struct Faculty<C> {
     pub spec: &'static Spec,
-    handler: fn(&mut C, &Invocation, &mut Out) -> Result<()>,
+    handler: fn(&mut C, &Invocation, &mut Out<'_>) -> Result<()>,
 }
 
 impl<C> Faculty<C> {
     pub const fn new(
         spec: &'static Spec,
-        handler: fn(&mut C, &Invocation, &mut Out) -> Result<()>,
+        handler: fn(&mut C, &Invocation, &mut Out<'_>) -> Result<()>,
     ) -> Self {
         Self { spec, handler }
     }
 
-    pub fn invoke(&self, context: &mut C, invocation: &Invocation) -> Result<Out> {
-        let mut output = Out::new();
-        (self.handler)(context, invocation, &mut output)?;
-        Ok(output)
+    /// Run the shared handler with the frontend's incremental emitter.
+    ///
+    /// Invocation is synchronous and does not collect output. A handler or
+    /// emission error leaves previously accepted parts with the frontend.
+    pub fn invoke(
+        &self,
+        context: &mut C,
+        invocation: &Invocation,
+        output: &mut Out<'_>,
+    ) -> Result<()> {
+        (self.handler)(context, invocation, output)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use crate::out::Part;
+
     use super::*;
 
     const SPEC: Spec = Spec {
@@ -464,5 +475,110 @@ mod tests {
             }],
         };
         assert!(DUPLICATE.validate().is_err());
+    }
+
+    fn example_invocation() -> Invocation {
+        SPEC.lower_mcp(
+            "example_show",
+            Arguments::new().with("id", "abcd"),
+            Arguments::new().with("pile", "test.pile"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn emission_is_observed_before_the_handler_continues() {
+        let observed = Cell::new(0);
+        let faculty = Faculty::new(&SPEC, |observed: &mut &Cell<usize>, _, output| {
+            assert_eq!(observed.get(), 0);
+            output.line("first")?;
+            assert_eq!(observed.get(), 1);
+            output.line("second")?;
+            assert_eq!(observed.get(), 2);
+            Ok(())
+        });
+        let mut emit = |_| {
+            observed.set(observed.get() + 1);
+            Ok(())
+        };
+        faculty
+            .invoke(
+                &mut &observed,
+                &example_invocation(),
+                &mut Out::new(&mut emit),
+            )
+            .unwrap();
+        assert_eq!(observed.get(), 2);
+    }
+
+    #[test]
+    fn emission_failure_preserves_prior_output_and_stops_production() {
+        let faculty = Faculty::new(&SPEC, |produced: &mut usize, _, output| {
+            for text in ["first", "rejected", "never produced"] {
+                *produced += 1;
+                output.line(text)?;
+            }
+            Ok(())
+        });
+        let mut parts = Vec::new();
+        let mut produced = 0;
+        let error = {
+            let mut emit = |part| {
+                if !parts.is_empty() {
+                    bail!("output closed");
+                }
+                parts.push(part);
+                Ok(())
+            };
+            faculty
+                .invoke(
+                    &mut produced,
+                    &example_invocation(),
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap_err()
+        };
+        assert_eq!(error.to_string(), "output closed");
+        assert_eq!(produced, 2);
+        assert_eq!(
+            parts,
+            [Part::Text {
+                text: "first\n".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn handler_error_preserves_partial_output_without_an_implicit_error_part() {
+        let faculty = Faculty::new(&SPEC, |_: &mut (), _, output| {
+            output.text("partial")?;
+            bail!("handler failed");
+        });
+        let mut parts = Vec::new();
+        let error = {
+            let mut collect = |part| {
+                parts.push(part);
+                Ok(())
+            };
+            faculty
+                .invoke(&mut (), &example_invocation(), &mut Out::new(&mut collect))
+                .unwrap_err()
+        };
+        assert_eq!(error.to_string(), "handler failed");
+        assert_eq!(
+            parts,
+            [Part::Text {
+                text: "partial".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_handler_does_not_emit() {
+        let faculty = Faculty::new(&SPEC, |_: &mut (), _, _| Ok(()));
+        let mut emit = |_| -> Result<()> { panic!("empty handler emitted output") };
+        faculty
+            .invoke(&mut (), &example_invocation(), &mut Out::new(&mut emit))
+            .unwrap();
     }
 }

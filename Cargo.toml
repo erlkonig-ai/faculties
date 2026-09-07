@@ -1,7 +1,7 @@
-# This package is also the workspace root so the reusable secrets core can stay
-# independently consumable. The `[patch.crates-io]` below applies workspace-wide.
+# This package is also the workspace root so the secrets and media-framing
+# crates stay independently consumable. Patches below apply workspace-wide.
 [workspace]
-members = ["faculties-migrations", "faculties-secrets"]
+members = ["faculties-migrations", "faculties-secrets", "framed-stream"]
 resolver = "2"
 
 [package]
@@ -166,7 +166,9 @@ triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace
 triblespace-net = { path = "../triblespace-rs/triblespace-net" }
 iroh-base = "1.0"
 iroh-tickets = "1.0"
-tokio = { version = "1", features = ["rt", "time", "net"] }
+iroh = "1.0"  # CLI output to Drive's existing organ endpoint
+framed-stream = { path = "framed-stream" }  # native ordered media framing
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net"] }
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
 # Per-faculty deps (kept here so faculties stay single-file in src/bin/).

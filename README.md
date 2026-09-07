@@ -44,7 +44,7 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout b6848a3320ab4cecb77da0dc7a8dd22e5d653b27
+git -C triblespace-rs checkout 786c438113711f9e76f84c364ebe50fde672a1aa
 git -C mary checkout ffc6fbf6647dab60da81d298067c09302a2517f4
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
@@ -76,6 +76,52 @@ compass add "ship the demo" --status doing
 wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
+
+### One native command, multiple frontends
+
+Atlas is the first faculty exposed through the shared `Spec` / `Faculty` / `Out`
+interface. Its command handlers live in `atlas::command`, not in a subprocess
+adapter. The same declarations generate the CLI and the MCP tools `atlas_list`
+and `atlas_show`:
+
+```sh
+atlas --pile ./self.pile list
+faculties mcp --pile ./self.pile
+```
+
+`faculties mcp` is a local, sequential stdio server for MCP 2025-06-18. The
+launcher owns the pile and optional `--key`; callers cannot substitute those
+through tool arguments. Only Atlas is registered so far. No HTTP listener or
+generic shell tool is exposed.
+
+Native handlers emit ordered text, image, and audio parts incrementally through
+`Out`. No JSON or base64 belongs in a handler. The MCP boundary encodes these
+parts in a bounded tool response, retaining partial output and marking an error
+if the handler fails. Default limits are 1 MiB per request and 8 MiB per response;
+long-running cancellation and concurrent requests are not implemented yet.
+
+The shared CLI runner writes text to stdout (and descriptions of binary parts)
+unless `DRIVE_ENDPOINT` is set. With an endpoint configured, it sends each part
+directly to Drive's existing `organ/1` receiver using `framed-stream`, without a
+second stdout copy or a fallback on delivery failure:
+
+```sh
+DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' atlas --pile ./self.pile list
+```
+
+The transport-independent `framed-stream` crate lives in this workspace and can
+also be consumed on its own. Building Faculties does not require a Drive source
+checkout; a running Drive receiver is needed only for that optional output sink.
+
+The direct address is optional. The sender uses an ephemeral transport identity
+unless `DRIVE_KEY` names an existing dedicated signing-key file. For a Drive
+receiver with a peer allowlist, configure that key explicitly and admit its
+public identity at the receiver; the adapter never silently borrows a pile's
+custody key. Completion confirms QUIC receipt, not application processing or
+durable storage. MCP never consults `DRIVE_ENDPOINT`.
+
+Other faculty binaries retain their existing output paths until ported. This
+frontend slice does not change pile schemas or require a migration.
 
 ### Reading cold blobs from peers
 

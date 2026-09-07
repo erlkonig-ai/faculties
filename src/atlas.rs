@@ -6,6 +6,8 @@
 //! ask for the projection they need directly; the strict whole-value validator
 //! at the bottom of this module is reserved for explicit migration/tests.
 
+pub mod command;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};

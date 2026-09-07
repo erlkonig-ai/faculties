@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Native Faculty output now emits ordered text, image, and audio parts through
+  a fallible incremental sink. Atlas shares one handler and command declaration
+  between its CLI and a local `faculties mcp` stdio server. MCP preserves partial
+  output on handler errors and keeps pile/key configuration launcher-owned.
+  The shared CLI runner routes output to Drive's existing `organ/1` receiver
+  when `DRIVE_ENDPOINT` is configured, otherwise to the terminal. Only Atlas is
+  ported in this slice; no schema migration or live service cutover is needed.
+  The unchanged `framed-stream` crate moves here from Drive so public source
+  builds can use the native framing without a private Drive checkout.
+
 - Message inbox reads retain exact opaque participant IDs when Relations
   metadata is not resident. Unobserved anchors identify only themselves, not
   invented aliases or known-distinct people; known identity conflicts remain
