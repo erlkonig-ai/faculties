@@ -198,14 +198,21 @@ fn files_mcp_returns_real_image_audio_and_binary_export_bytes() {
             "exact native media bytes survive the transport"
         );
     }
-    let response = request(&mut server, &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"files_get","arguments":{{"id":{},"output":"@-"}}}}}}"#, quote(&fixture.ids[3]))).unwrap();
-    assert!(response.contains(r#""isError":false"#));
-    assert!(response.contains(r#""type":"resource""#));
-    assert!(response.contains(r#""mimeType":"application/octet-stream""#));
-    assert!(response.contains(&format!(
-        r#""blob":"{}""#,
-        base64::engine::general_purpose::STANDARD.encode(BINARY)
-    )));
+    for (index, bytes) in [TEXT, PNG, fixture.audio.as_slice(), BINARY]
+        .into_iter()
+        .enumerate()
+    {
+        let response = request(&mut server, &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"files_get","arguments":{{"id":{},"output":"@-"}}}}}}"#, quote(&fixture.ids[index]))).unwrap();
+        assert!(response.contains(r#""isError":false"#));
+        assert!(response.contains(r#""type":"resource""#));
+        assert!(response.contains(r#""mimeType":"application/octet-stream""#));
+        assert!(!response.contains(r#""type":"image""#));
+        assert!(!response.contains(r#""type":"audio""#));
+        assert!(response.contains(&format!(
+            r#""blob":"{}""#,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )));
+    }
 }
 
 #[test]
@@ -247,6 +254,60 @@ fn executable_cli_keeps_export_exact_and_read_display_oriented() {
         String::from_utf8(image.stdout).unwrap(),
         format!("[image: image/png, {} bytes]\n", PNG.len())
     );
+}
+
+#[test]
+fn executable_exports_ignore_the_perception_endpoint_even_for_media_files() {
+    let fixture = Fixture::new();
+    for (index, bytes) in [TEXT, PNG, fixture.audio.as_slice(), BINARY]
+        .into_iter()
+        .enumerate()
+    {
+        let output = fixture
+            .cli()
+            .env("DRIVE_ENDPOINT", "deliberately-not-an-endpoint")
+            .env("DRIVE_KEY", fixture._directory.path().join("absent.key"))
+            .args(["get", &fixture.ids[index], "@-"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "raw export must not connect to a sensory endpoint: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, bytes, "export {index} changed its bytes");
+
+        let path = fixture._directory.path().join(format!("export-{index}"));
+        let disk = fixture
+            .cli()
+            .env("DRIVE_ENDPOINT", "deliberately-not-an-endpoint")
+            .env("DRIVE_KEY", fixture._directory.path().join("absent.key"))
+            .args(["get", &fixture.ids[index]])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            disk.status.success(),
+            "{}",
+            String::from_utf8_lossy(&disk.stderr)
+        );
+        assert!(disk.stdout.is_empty());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn executable_perception_endpoint_failure_does_not_fall_back_to_stdout() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .cli()
+        .env("DRIVE_ENDPOINT", "deliberately-not-an-endpoint")
+        .args(["read", &fixture.ids[0]])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "failed perception was rerouted");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("configured Drive output"));
 }
 
 #[test]

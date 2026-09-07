@@ -118,15 +118,22 @@ No `resources/read` endpoint is required to retrieve that response's bytes.
 `files resolve @-` remains a CLI-only stdin batch; native/MCP calls reject it
 without reading the protocol stream. `@path` batches work in both frontends.
 
-The shared CLI runner writes text and explicit binary exports to stdout, with
-textual markers for displayed image/audio parts, unless `DRIVE_ENDPOINT` is set.
-With an endpoint configured, it sends each part
-directly to Drive's existing `organ/1` receiver using `framed-stream`, without a
-second stdout copy or a fallback on delivery failure:
+The shared CLI runner writes text to stdout, with textual markers for displayed
+image/audio parts, unless `DRIVE_ENDPOINT` is set. With an endpoint configured,
+it sends these perception parts directly to Drive's existing `organ/1` receiver
+using `framed-stream`, without a second stdout copy or a fallback on delivery
+failure:
 
 ```sh
 DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' atlas --pile ./self.pile list
 ```
+
+Explicit binary exports always stay on stdout: `files get <id> @- > original`
+preserves the stored bytes even with `DRIVE_ENDPOINT` set. Export is not
+perception, including when the original is an image or audio file. A command
+that emits only exports (or nothing) never opens the sensory connection; the
+endpoint and key are used only when the first perception part is emitted.
+`files get <id> path` likewise writes the original to disk without sensing it.
 
 The transport-independent `framed-stream` crate lives in this workspace and can
 also be consumed on its own. Building Faculties does not require a Drive source

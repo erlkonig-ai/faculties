@@ -25,6 +25,8 @@ pub enum Part {
     Audio { bytes: Bytes, mime_type: String },
     /// An exact binary export, not a request to display or play its contents.
     /// The URI identifies the exported value; transports carry resident bytes.
+    /// CLI exports stay on stdout even when perception uses DRIVE_ENDPOINT;
+    /// MCP exports are file resources, never sensory input.
     Blob {
         bytes: Bytes,
         mime_type: String,

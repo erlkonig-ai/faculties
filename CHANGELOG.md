@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Explicit binary exports stay byte-exact on CLI stdout even when
+  `DRIVE_ENDPOINT` is configured, so redirected `files get <id> @-` remains
+  usable. Only text/image/audio perception opens the Drive connection; exports
+  are never sent as senses. MCP binary-resource output is unchanged.
+
 - Files now shares its full command implementation between CLI and MCP, retaining
   all existing commands and adding MIME-aware `read` for UTF-8 text, images, and
   audio. Explicit `get <id> @-` exports remain byte-exact on the CLI and become
