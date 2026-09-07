@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Pin the source/release cohort to the Pile concurrent-append fix. A reader
+  encountering an incomplete append rechecks under the existing exclusive lock
+  before reporting corruption; persistent malformed records remain errors.
+  Pile records, sync protocol, and collection identities are unchanged.
+
 - Atlas and Files are library-first with explicit `cli` and `mcp` entrypoints.
   One aggregate `faculties mcp` server registers their tools in-process; thin
   individual CLI binaries call their adapters. Remove shared CLI-to-MCP grammar
