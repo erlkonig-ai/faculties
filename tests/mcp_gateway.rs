@@ -51,11 +51,14 @@ impl Process {
                 .unwrap(),
         };
         let deadline = Instant::now() + Duration::from_secs(15);
-        while TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
+        loop {
             assert!(
                 process.child.try_wait().unwrap().is_none(),
                 "owned process exited before binding {address}"
             );
+            if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                break;
+            }
             assert!(Instant::now() < deadline, "process did not bind {address}");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -282,10 +285,12 @@ fn real_workers_preserve_media_isolation_revocation_and_reconnects() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let alice = Tenant::new(root, "alice");
-    let bob = Tenant::new(root, "bob");
-    assert_ne!(alice.ids[0], bob.ids[0]);
     let mut alice_worker = alice.start();
+    // Bind each worker before choosing the next address; do not let the two
+    // disposable-port allocations accidentally select the same vacant port.
+    let bob = Tenant::new(root, "bob");
     let _bob_worker = bob.start();
+    assert_ne!(alice.ids[0], bob.ids[0]);
     write_tokens(root, ALICE);
     fs::write(
         root.join("workers.json"),
