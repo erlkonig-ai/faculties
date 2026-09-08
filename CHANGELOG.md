@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add native MCP Streamable HTTP alongside stdio, with the same complete tool
+  catalogue and ordered image/audio/resource responses. Extract the aggregate
+  catalogue into a reusable library; keep pile/key/model configuration owned by
+  the launcher. HTTP adds bearer-token-file authentication, exact Origin checks,
+  independent expiring sessions, bounded admission/body reads, and a sequential
+  native worker outside the I/O runtime. Public TLS/OAuth and per-user routing
+  remain with the hosting edge; no live service cutover or new OAuth authority.
+
 - Pin the source/release cohort to the Pile concurrent-append fix. A reader
   encountering an incomplete append rechecks under the existing exclusive lock
   before reporting corruption; persistent malformed records remain errors.

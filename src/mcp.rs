@@ -1,4 +1,4 @@
-//! A finite, local stdio MCP boundary over explicit faculty MCP adapters.
+//! A finite MCP boundary over explicit faculty MCP adapters.
 //!
 //! This implements MCP 2025-06-18 initialization, ping, tool discovery and
 //! calls. Each faculty supplies its own tool schemas and decodes its arguments
@@ -6,14 +6,16 @@
 //! parser is involved. Results are emitted as native Parts.
 //!
 //! Dispatch is deliberately blocking and sequential. Register finite commands,
-//! not watchers such as `orient wait`. A future asynchronous frontend must run
-//! native handlers at its blocking-work boundary (for example `spawn_blocking`)
-//! and construct Out there; this adapter supplies no async runtime or workers.
+//! not watchers such as `orient wait`. The HTTP frontend runs this dispatch on
+//! a bounded native worker outside its asynchronous I/O runtime, constructing
+//! Out there. The stdio frontend calls it directly on the caller's thread.
 //! Handler allocation/computation is outside the transport budget. The adapter
 //! bounds incoming frames, JSON nesting, and encoded responses, including media
 //! expansion. It closes the transport on an oversized frame rather than trying
 //! to identify or reply to a possibly truncated notification.
 
+pub mod catalog;
+pub mod http;
 pub mod object;
 
 use std::collections::BTreeSet;
@@ -125,7 +127,7 @@ enum State {
     Ready,
 }
 
-/// One stdio connection. Only tools are advertised; there are no server-side
+/// One protocol session. Only tools are advertised; there are no server-side
 /// requests, subscriptions, task execution, or tool-list change notifications.
 pub struct Server<'a> {
     tools: Vec<RegisteredTool<'a>>,
@@ -182,7 +184,8 @@ impl<'a> Server<'a> {
         }
     }
 
-    /// Dispatch one complete frame without its delimiter. Notifications and
+    /// Dispatch one complete JSON-RPC message. HTTP may include JSON whitespace;
+    /// stdio enforces its physical-line framing separately. Notifications and
     /// unsolicited responses produce None. Resource-limit errors are fatal to
     /// this transport; ordinary JSON-RPC errors are encoded response messages.
     pub fn dispatch(&mut self, bytes: Bytes) -> Result<Option<String>> {
@@ -441,6 +444,9 @@ fn read_frame(input: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>>
             if frame.len() > limit {
                 bail!("MCP request exceeds {limit} bytes");
             }
+            if frame.contains(&b'\r') {
+                bail!("MCP stdio frame contains an embedded carriage return");
+            }
             return Ok(Some(frame));
         }
     }
@@ -504,7 +510,6 @@ fn envelope(mut bytes: Bytes, depth_limit: usize) -> std::result::Result<Envelop
                     }
                 }
                 b'}' | b']' => depth = depth.saturating_sub(1),
-                b'\n' | b'\r' => return Err(invalid()),
                 _ => {}
             }
         }

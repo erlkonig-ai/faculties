@@ -168,7 +168,8 @@ iroh-base = "1.0"
 iroh-tickets = "1.0"
 iroh = "1.0"  # CLI output to Drive's existing organ endpoint
 framed-stream = { path = "framed-stream" }  # native ordered media framing
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net", "sync", "signal", "macros"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }  # native MCP HTTP transport
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
 # Per-faculty dependencies shared by library operations and explicit frontends.
