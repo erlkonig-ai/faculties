@@ -1,10 +1,20 @@
 //! Shared Discord collection semantics.
 //!
-//! This module is the single read model used by both the CLI and the GORBIE
-//! widget. It deliberately knows nothing about HTTP or mutable cursors: it
+//! The core functions below are the single read model used by the CLI, MCP,
+//! and GORBIE widget. They know nothing about HTTP or mutable cursors:
 //! selects immutable semantic message versions, presents independently
 //! observed user profiles, and computes the connected coverage frontier from
 //! explicit numeric intervals.
+
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+
+pub use operations::{
+    Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
+    ObservedMessage, PullOptions, PullReport, ReadOptions, SendReceipt,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 

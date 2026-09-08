@@ -2,10 +2,9 @@
 
 An office suite for AI agents.
 
-Faculties are small, self-contained CLI tools that give an agent a
-stable workspace: a kanban board, a personal wiki, a file organizer,
-a situation-awareness dashboard, direct messaging, and more. They
-persist their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
+Faculties are shared Rust capabilities with CLI and MCP frontends that give
+an agent a stable workspace: a kanban board, a personal wiki, a file organizer,
+situation awareness, direct messaging, and more. They persist their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
 pile — typically `./self.pile` — so the agent owns its own history
 across sessions.
 
@@ -33,26 +32,33 @@ Install a Rust toolchain (if you don't have one):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Faculties is developed with TribleSpace, Mary, Soma, and a small CubeCL fork as one
-source cohort. Clone them as siblings, then install every faculty CLI (and the
-GUI viewer) onto `$PATH`:
+Faculties is developed with TribleSpace, Mary, Soma, GORBIE, and a small CubeCL
+fork as one source cohort. This development branch uses the pinned resident
+audio/capture seams below. Clone the siblings, then install every faculty CLI
+(and the GUI viewer) onto `$PATH`:
 
 ```sh
 mkdir faculties-source && cd faculties-source
-git clone https://github.com/erlkonig-ai/faculties
+git clone --branch native-faculty-frontends https://github.com/erlkonig-ai/faculties
 git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
+git clone https://github.com/erlkonig-ai/GORBIE
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout d0db6da2098727a9c2d106a53de678ec33a2f1e1
-git -C mary checkout ffc6fbf6647dab60da81d298067c09302a2517f4
+git -C mary checkout d60840d34e72afdebfa7d9c0334dc6301920ac42
+git -C GORBIE checkout 8999c6fa584f906a6016e661d7e61cd3bbb397ef
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
 cd faculties
-cargo build --release --workspace --bins --locked
+RUSTFLAGS='-Ctarget-cpu=native' cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
 cargo install --path ../triblespace-rs/trible --locked
 ```
+
+That recipe targets the local CPU; use target-appropriate flags for portable
+or cross-compiled artifacts. In particular, the AArch64 half-precision math
+dependency needs an FP16-capable target during code generation.
 
 The cohort installer publishes one content-verified, versioned generation
 through `~/.local/bin`. Each generation path is write-once by the installer,
@@ -79,23 +85,19 @@ viewer               # picks up PILE from the environment
 
 ### Library-first faculties, explicit frontends
 
-One `faculties` library contains the per-faculty operations and their explicit
-CLI and MCP adapters. Thin individual binaries call the CLI adapters; the single
-`faculties` binary registers the MCP adapters together. Cargo reuses shared
-compilation within a build configuration; executables still link separately.
+All 32 ordinary faculties have callable Rust operations, separate CLI and MCP
+adapters, and thin individual binaries. Viewer and the 11 capture binaries share
+one notebook-composition/capture API. The single `faculties` binary registers
+all adapters together: 218 tools, including `viewer_capture`. See the
+[complete inventory](#the-faculties) below.
 
-Atlas, Compass, Files, Message, and Wiki have native frontend ports.
-`atlas::Store` returns
-owned `AtlasEntry` observations from `list` and `show`. `files::Files` supplies
-typed operations including resident-byte import, original-byte export,
-presentation, and extraction. Neither operation API requires a CLI invocation
-or an MCP value. `atlas::cli` / `files::cli` use an optional CLI declaration
-helper; `atlas::mcp` / `files::mcp` own independent tool schemas and argument
-types. Compass, Message, and Wiki retain tailored Clap grammars and use
-`cli::with_output` for the same native output routing; they do not need the
-declaration helper. Their library operations are callable without parsing
-command output to recover write receipts. A faculty's MCP interface need not
-resemble its command-line grammar:
+Shared operations own domain logic, resident inputs, observations and write
+receipts; a Rust caller does not construct argv, an MCP request, or parse stdout
+to use them. Each frontend owns its UX. Atlas and Files use the optional CLI
+declaration helper; the other ordinary CLIs retain tailored parsers and use
+`cli::with_output` where appropriate. MCP schemas are independent of those
+parsers. Cargo shares compilation within a build configuration, while binaries
+still link separately.
 
 ```sh
 atlas --pile ./self.pile list
@@ -103,118 +105,211 @@ files --pile ./self.pile view <file-id> --accept image/png --max-dimension 1024
 faculties mcp --pile ./self.pile
 ```
 
-`faculties mcp` is a local, sequential stdio server for MCP 2025-06-18. The
-launcher owns the pile and optional `--key`; callers cannot substitute those
-through tool arguments. Native operations are registered as `atlas_*`,
-`compass_*`, `files_*`, `message_*`, and `wiki_*` tools. No HTTP listener or generic shell
-tool is exposed. Files MCP never takes arbitrary input/output filesystem paths;
-URL fetches still originate on the server's host. This is a trusted local server,
-not a filesystem or network sandbox, and not a deployed remote MCP service.
-On macOS/Linux the launcher reserves private close-on-exec protocol descriptors
-before running handlers: ordinary stdin becomes EOF and stdout becomes
-diagnostic stderr. Standard-stream file aliases cannot consume or corrupt the
-protocol, and child tools do not inherit its private descriptors.
+#### Local MCP server and launcher configuration
 
-Streaming operations and adapters emit ordered text, image, audio, and explicit
-binary exports through `Out`. JSON/base64 decoding belongs only in the MCP
-adapter, not in the shared operations. The MCP
-boundary encodes these parts in a bounded tool response, retaining partial output
-and marking an error if the handler fails. Default limits are 1 MiB per request
-and 8 MiB per response;
-long-running cancellation and concurrent requests are not implemented yet.
+`faculties mcp` implements MCP 2025-06-18 over local, sequential stdio. It
+does **not** provide an HTTP listener, remote authentication, public download
+URLs, or an already deployed ChatGPT HTTPS connector. A remote service and its
+access/resource controls are a separate deployment boundary. This server is
+trusted local software, not a filesystem, network, or model-runtime sandbox.
+
+The launcher owns `--pile`/`PILE` and optional `--key`/`TRIBLESPACE_KEY`;
+tools cannot substitute those paths. Additional launcher configuration is:
+
+| Capability | Launcher configuration |
+| --- | --- |
+| Discord bot access | Optional `--discord-token` / `DISCORD_TOKEN` |
+| LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
+| Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
+| Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
+
+Prefer the token environment variables to visible argv; help hides their
+values. Discovery needs neither tokens nor model assets. Resident Discord and
+LinkedIn operations work without their network tokens. Teams and Mail use
+configured pile-backed auth/account state and exact encrypted Secrets-version
+references, not raw credential or host-file arguments on their MCP adapters.
+Voice/Imagine model sources are also launcher configuration, described below.
+
+On macOS/Linux the server reserves private close-on-exec protocol descriptors:
+ordinary stdin becomes EOF and ordinary stdout becomes diagnostic stderr.
+Standard-stream aliases cannot consume/corrupt JSON-RPC, and child processes do
+not inherit its private descriptors. There is no generic CLI subprocess wrapper.
+Explicit native tools can still make network requests, send messages, decrypt
+secrets, or evaluate stored Habit predicates; their descriptions name those
+effects.
+
+Adapters emit ordered text, perceptual images/audio, and explicit binary
+resources through `Out`. MCP packages them in one bounded response, retaining
+accepted partial output and marking handler failures. Defaults are 1 MiB per
+request and 8 MiB per response, including encoded content. Calls are sequential;
+concurrent requests and long-running cancellation are not implemented.
+A failure does not undo a completed publication or external send, and the server
+does not automatically retry it.
+Ordinary handler unwinds also become tool errors, retaining already accepted
+output. This is not backend-state repair or recovery from aborts, GPU failures,
+or out-of-memory termination.
+
+#### Literal values and transport-specific UX
+
+MCP prose and names are literal: `@-`, `@path`, and `@@text` do not read
+host input. CLI free-text arguments that support the shared resolver expand
+`@path` and `@-`, with `@@text` escaping a leading at-sign. Numeric MCP
+options use JSON numbers. Typed decoders reject duplicate/unknown fields;
+nested record fields require JSON objects, not positional arrays.
+
+Attribution is explicit in MCP: for example, Message requires `from`, Mail
+read tracking requires `persona`, and Compass writes accept optional
+`persona`. No adapter silently takes `PERSONA`, `TURN_ID`, or `WORKER_ID`
+from the host to attribute an action. These fields are cooperative attribution,
+not authentication: publication still uses the configured signer and collection
+authority.
 
 | Operation | CLI | MCP |
 | --- | --- | --- |
 | Perceive | `files view ID --accept image/png` | `files_view {"id":"ID","accept":["image/png"]}` |
 | Export original | `files get ID path` or `files get ID @-` | `files_get {"id":"ID"}` |
 | Import bytes | `files add path` | `files_add {"name":"notes.txt","mime":"text/plain","data":"base64…"}` |
-| Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID", "files:HASH"]}` |
+| Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID","files:HASH"]}` |
+| Render a notebook | `atlas-capture --headless --out-dir captures` | `viewer_capture {"target":"atlas"}` |
 
-Compass exposes goal creation, listing, status changes, notes, priority edges,
-and id resolution. Message exposes send, list, acknowledgement, and acknowledge
-all. Wiki exposes native revision, frontier, tag, search, and audit operations.
-The CLI-only Wiki import/batch directory operations are not exposed as remote
-host paths. MCP callers create or edit entries with resident content strings.
+MCP resident reads do not imply a fresh external sync. `teams_read` and
+`discord_read` inspect the archive; their `*_pull` tools explicitly contact
+the service, unlike the CLI read commands' sync-first UX. `linkedin_import`
+takes resident connection rows, while `linkedin_pull` fetches a finite DMA
+export before importing. `mail_fetch` explicitly drains configured POP
+accounts with the existing archive-before-delete/QUIT boundary; `mail_send`
+requires its existing Decide authorization and records uncertain delivery.
 
-MCP prose is always literal: a note or message containing `@-` is that text,
-not a request to read protocol stdin. Only CLI adapters expand `@path`, `@-`,
-and escaped `@@text` using the common text resolver. Message MCP requires an
-explicit `from`; Compass write tools accept an explicit optional `persona`.
-Neither silently attributes work to the MCP server process's `PERSONA`.
-These persona names are cooperative attribution, not authentication; publication
-still uses the launcher's configured signer and collection authority.
+Some useful capabilities deliberately remain host interfaces:
 
-Wiki `show` presents text and follows the current frontier unless `exact` is
-requested. `export` returns the selected revision's exact UTF-8 bytes: a binary
-resource through MCP, or raw CLI stdout even with a Drive endpoint configured.
-Forks stay visible; export refuses to choose between multiple current heads.
-Wiki create/edit retain their existing Typst validation. Its validation world
-denies external file/import access, but it is not a CPU/memory isolation
-boundary. Hosted untrusted use needs resource isolation; this local frontend
-port does not supply it. MCP `wiki_check` does not expose the CLI's optional
-compile flag.
+| Host-only UX | Native/MCP alternative |
+| --- | --- |
+| Orient waits and Memory's local cover-chunk cache | Finite Orient observations and resident Memory context/replay tools |
+| Teams interactive OAuth; Mail password input | Safe auth metadata and exact Secrets-version configuration |
+| Files directory extraction; Wiki batch directories; local import paths | Resident records/bytes, document imports, and explicit resource exports |
+| Posture Git/hook/sweep commands | Resident document scanning and recorded findings/policy tools |
+| Reason/Patience command execution wrappers | Explicit reasoning/action records and timeout-extension requests |
+| Body robot/daemon/camera actions | Already acquired captures, intent state, raw exports and bounded views |
+| Hear listening; Duplex devices/ear/run loops | One resident audio clip, or finite interaction with a launcher-selected existing Duplex session |
+| Voice device probing/private-public playback | Resident speech audio plus stored routing metadata; synthesis is not evidence anyone heard it |
+| GUI startup and filesystem/web notebook exports | Finite resident PNG capture from the shared composition |
 
-MCP numeric options are JSON numbers, and multiword names use underscores.
-Unknown fields, duplicate fields, and wrong types are rejected before operations.
-Files exports return an embedded binary resource with a `files:` URI and generic
-`application/octet-stream` type. No `resources/read` call is needed for those
-inline bytes. Export needs only the payload, not MIME/name metadata that might
-be unavailable. Receiving an MCP resource does not by itself prove that a host
-has imported it into its file sandbox.
+Planner's local `today`/`week` convenience commands become explicit time
+windows in MCP. Host-only does not mean the functionality is trapped in a binary:
+configured device/runtime libraries remain separate from the finite MCP UX.
 
-`view` replaces the experimental `read` command. The presentation helper accepts
-UTF-8 text, supported raster images, and accepted audio containers. PNG/JPEG
-conversion and aspect-preserving resizing are bounded by `max_bytes` (4 MiB by
-default) and optional `max_dimension`. Original bytes are unchanged. Image
-decoding has independent 16,384-pixel side and 128 MiB encoded/decoded-surface
-limits; codec scratch limits are best-effort, not a process-wide memory cap.
-Converted images use the first frame and discard container metadata; JPEG also
-loses alpha. PDF rendering and audio transcoding are not implemented. Unsupported
-formats, malformed images, and results that cannot fit return an error rather
-than silently relabelling or truncating content.
+#### Model and rendering capabilities
 
-URL fetch imports acquired bytes directly, never through a caller-named temporary
-file, and enforces its byte budget during download. CLI extraction acquires its
-complete selected subtree before writing any destination. The MCP adapter does
-not expose that filesystem-writing operation.
+The default build enables `local-embed`, `widgets`, `audio`, and `hear`.
+`--no-default-features` keeps the ordinary CLIs and complete MCP discovery,
+but does not provide those optional runtimes. Feature-dependent tools remain
+discoverable and report missing capabilities/configuration when invoked;
+discovery itself does not load weights, open devices, or start a GPU.
 
-The shared CLI runner writes text to stdout, with textual markers for displayed
-image/audio parts, unless `DRIVE_ENDPOINT` is set. With an endpoint configured,
-it sends these perception parts directly to Drive's existing `organ/1` receiver
-using `framed-stream`, without a second stdout copy or a fallback on delivery
-failure:
+| Feature | Capability and required local runtime |
+| --- | --- |
+| `local-embed` | Semantic embedding/search with installed compatible model assets |
+| `widgets` | Viewer/capture binaries and native notebook PNG rendering with a local graphics runtime |
+| `audio` | Host device enumeration/playback plumbing, not speech-model weights |
+| `hear` | Resident audio inference using the explicitly configured model pile, configuration and tokenizer |
+| `voice` (opt-in) | Qwen3-TTS synthesis using a native model pile and voice-reference assets |
+| `imagine` (opt-in) | FLUX image generation using native weights and cached model configuration/tokenizer assets |
+| `duplex` (opt-in) | Continuous host speech runtime; finite session read/say/status operations do not load that model |
+
+The continuous Duplex dependency currently selects Apple's Accelerate BLAS
+backend, so this feature does not compile on Linux; its finite session tools
+remain available there. The separate `web-export` feature invokes GORBIE's
+legacy build-time WebAssembly exporter. That generated build is currently
+blocked at `getrandom`'s WebAssembly backend selection; it is not a validated
+export path. Neither restriction affects the native notebook/MCP capture path.
+
+`FACULTIES_MODEL_DIR` selects the common model/reference directory, otherwise
+`$HOME/.cache/faculties/models`. Voice accepts `QWEN3TTS_PILE`; Imagine
+accepts `FLUX_PILE` and reads its installed Hugging Face configuration cache.
+Direct Rust callers can supply explicit model-source structs. A feature flag
+does not install models or guarantee that the chosen backend/hardware can run
+them.
+
+`voice_synthesize` returns a WAV audio attachment without playing local
+speakers. `imagine_generate` returns a PNG image; optional remembering is a
+separate publication after output acceptance. `hear_once` returns ordered
+hearing metadata and raw f32le embedding resources, not a synthetic audio
+playback result.
+
+#### Perception versus exact exports
+
+Files exports return original bytes as an embedded binary resource with a
+`files:` URI and generic `application/octet-stream` type. No
+`resources/read` call is needed for those inline bytes. Export needs only the
+payload, not MIME/name metadata that might be unavailable. A receiving MCP host
+does not necessarily import embedded resources into its file sandbox; this
+frontend does not invent a download URL or claim that such an import occurred.
+
+`files view` presents UTF-8 text, supported raster images, and accepted audio
+containers. PNG/JPEG conversion and aspect-preserving resizing are bounded by
+`max_bytes` (4 MiB by default) and optional `max_dimension`. Original bytes
+are unchanged. Image decoding has independent 16,384-pixel side and 128 MiB
+encoded/decoded-surface limits; codec scratch limits are best-effort, not a
+process-wide memory cap. Converted images use the first frame and discard
+container metadata; JPEG also loses alpha. Files/MCP presentation does not
+render PDFs or transcode audio. Unsupported formats, malformed inputs and
+results that cannot fit fail explicitly. The CLI Drive sink's narrow WAV
+adaptation is described below.
+
+Wiki `show` presents text and follows the current frontier unless `exact`
+is requested. `export` returns the selected revision's exact UTF-8 bytes:
+a binary MCP resource, or raw CLI stdout even with Drive configured. Unresolved
+forks stay visible rather than being arbitrarily selected. Wiki create/edit
+retain Typst validation; its world denies external file/import access, but is
+not CPU/memory isolation. MCP `wiki_check` omits the CLI's compile option.
+
+URL fetch imports acquired bytes directly and enforces its download budget;
+requests originate on the server host. CLI extraction acquires its complete
+selected subtree before writing a destination. MCP never exposes that
+filesystem-writing operation.
+
+#### Optional CLI perception through Drive
+
+The shared CLI runner normally writes text to stdout and textual markers for
+image/audio parts. With `DRIVE_ENDPOINT`, perception goes to Drive's existing
+`organ/1` receiver via `framed-stream`, without a second stdout copy or a
+fallback on delivery failure:
 
 ```sh
 DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' atlas --pile ./self.pile list
 ```
 
-With a Drive endpoint, `files view` defaults to text and PNG/JPEG. Stored MIME
-identity currently keeps only the essence, so raw L16 audio loses its required
-rate/channel metadata; WAV containers likewise need decoding before Inkling can
-hear them. That audio conversion/metadata path is not implemented. An explicit
-`--accept` list overrides the default. MCP callers independently select their
-accepted media types; the server never consults `DRIVE_ENDPOINT` for MCP calls.
+For Drive, `files view` defaults to text, PNG/JPEG, and WAV MIME aliases
+(`audio/wav`, `audio/x-wav`, `audio/vnd.wave`). The CLI sensory sink
+decodes supported PCM16 WAV, downmixes channels to mono, and sends little-endian
+PCM16 at the original sample rate with explicit rate/channel metadata. It does
+not resample or implement a general audio transcoder; unsupported encodings
+fail. Stored raw L16 retains only its MIME essence, without the sample rate
+needed for correct delivery, so it remains excluded from that default.
+An explicit `--accept` overrides presentation selection, not missing metadata
+or decoder limitations.
 
-Explicit binary exports always stay on stdout: `files get <id> @- > original`
-preserves the stored bytes even with `DRIVE_ENDPOINT` set. Export is not
-perception, including when the original is an image or audio file. A command
-that emits only exports (or nothing) never opens the sensory connection; the
-endpoint and key are used only when the first perception part is emitted.
-`files get <id> path` likewise writes the original to disk without sensing it.
+This adaptation is CLI perception only. MCP keeps the original audio/container
+bytes and chooses its accepted media independently; it never consults
+`DRIVE_ENDPOINT`. Explicit binary exports remain byte-for-byte on stdout or
+the requested disk path, even when the original is an image/audio file:
 
-The transport-independent `framed-stream` crate lives in this workspace and can
-also be consumed on its own. Building Faculties does not require a Drive source
-checkout; a running Drive receiver is needed only for that optional output sink.
+```sh
+files get <id> @- > original
+```
 
-The direct address is optional. The sender uses an ephemeral transport identity
-unless `DRIVE_KEY` names an existing dedicated signing-key file. For a Drive
-receiver with a peer allowlist, configure that key explicitly and admit its
-public identity at the receiver; the adapter never silently borrows a pile's
-custody key. Completion confirms QUIC receipt, not application processing or
-durable storage. MCP never consults `DRIVE_ENDPOINT`.
+A command emitting only exports (or nothing) never opens a sensory connection.
+The endpoint and key are used only on the first perception part. The direct
+address is optional; `DRIVE_KEY` can name an existing dedicated transport
+signing key, otherwise the sender uses an ephemeral identity. A peer-allowlisted
+receiver must explicitly admit that identity: no pile custody key is silently
+borrowed. Completion confirms QUIC receipt, not application processing or
+durable storage. The standalone workspace `framed-stream` crate does not
+require a Drive source checkout; only this optional output sink needs a running
+receiver.
 
-Other faculty binaries retain their existing output paths until ported. This
-frontend slice does not change pile schemas or require a migration.
+The frontend reorganization preserves pile schemas; it does not itself require
+a migration.
 
 ### Reading cold blobs from peers
 
@@ -226,7 +321,7 @@ commands retain their resident-only model/input paths for now.
 Live snapshots expose async exact-blob reads: fetching a selected handle caches
 its bytes without advancing the snapshot's records, authorization instant, or
 selected collection covers. Relations uses this reader directly; the other
-ported commands still use the shared payload-retry adapter. Neither path emits
+live-enabled commands still use the shared payload-retry adapter. Neither path emits
 an implicit `WANT`.
 Configure one or more bootstrap routes as comma-separated Iroh endpoint
 tickets or endpoint IDs:
@@ -254,10 +349,10 @@ answer. Output and publication occur outside acquisition retries. An
 unavailable provider is not interpreted as empty text or an acknowledgement;
 Orient wait keeps the news pending for a later poll.
 
-This is an incremental command port, not permission to switch every deployment
-to records-only repair: commands still using plain `Pile` require their
-payloads to be resident. Keep those deployments' existing replication policy
-until all readers they use have acquired a live boundary.
+Frontend completeness does not imply universal cold-blob acquisition.
+Operations still using plain `Pile` require resident payloads. Keep those
+deployments' existing replication policy until all readers they use have
+acquired a live boundary.
 
 ### For agent onboarding: the portable bootstrap
 
@@ -331,34 +426,56 @@ telling the tool what to show you next, and the history falls out naturally.
 
 ## The faculties
 
-| Faculty | Purpose |
-|---|---|
-| `compass` | Goal/status/priority board plus referenceable ledger notes |
-| `wiki` | Personal wiki with typst fragments, links, full-text search, and a classified frontier link audit (`wiki links`) |
-| `files` | File organizer backed by blob storage and tags |
-| `orient` | Situation awareness and directed message/goal/note notifications |
-| `atlas` | Cross-collection map of the pile's contents |
-| `gauge` | Metrics and counters |
-| `memory` | Long-term memory: compact history and salient fragments |
-| `headspace` | Model/prompt configuration |
-| `reason` | Record reasoning steps alongside actions |
-| `patience` | Soft timers and pacing |
-| `message` | Direct messaging between personas and humans |
-| `relations` | People, affinity, contact info |
-| `teams` | Microsoft Teams archive and bridge |
-| `triage` | Workflow staging for inbound items |
-| `archive` | Import external archives (chats, exports) into the pile |
-| `web` | Web search and fetch with results recorded |
+All ordinary faculty rows below have native CLI and MCP entrypoints. The
+aggregate `faculties mcp` serves them together; command-specific help and tool
+schemas describe exact arguments and effects.
 
-Each faculty's command surface lives under [`src/bin/`](src/bin/), while
-shared schemas, collection semantics, validators, and reusable capabilities
-live in the library.
+| Faculty | Purpose |
+| --- | --- |
+| `archive` | Resident conversation imports, provenance, search and replay |
+| `atlas` | Cross-collection catalog inspection |
+| `body` | Deliberate sensory captures and intent; separate host robot/device API |
+| `bootstrap` | Idempotent recipient-authored onboarding import |
+| `cognition` | Validate shared execution/context evidence |
+| `compass` | Goals, status, priority edges and referenceable ledger notes |
+| `decide` | Proposals, factors and fork-visible decision resolutions |
+| `discord` | Resident chat archive, explicit bot pulls/sends and channel discovery |
+| `duplex` | Finite session interaction; separate continuous host speech runtime |
+| `files` | Blob import, tags, discovery, perception and exact export |
+| `gauge` | Research-health, link and quality diagnostics |
+| `habit` | Standing intentions, activation and explicitly evaluated predicates |
+| `headspace` | Fork-visible model/profile configuration and credential references |
+| `hear` | Resident-clip hearing/embeddings; separate continuous listener |
+| `imagine` | Local image generation and optional memory publication |
+| `linkedin` | Conservative connection imports and Relations identity review |
+| `mail` | Account state, POP evidence, drafts, authorization and delivery receipts |
+| `memory` | Journaled time ranges, lossy recollection, search and replay |
+| `message` | Direct messages and explicit per-reader acknowledgements |
+| `orient` | Situation awareness and directed news; CLI background waits |
+| `patience` | Explicit execution timeout-extension requests |
+| `planner` | Calendar events, recurrence windows, notes and resident iCalendar import |
+| `posture` | Disclosure candidates, coverage and policy over resident documents |
+| `reason` | Reasoning notes and intended-action evidence |
+| `relations` | People, full profiles, groups and non-destructive identity verdicts |
+| `secrets` | Encrypted secret versions and explicit retrieval/maintenance |
+| `status` | Per-persona window status |
+| `teams` | Resident Graph archive, explicit sync/actions and professional context |
+| `triage` | Execution-loop, timeline and context diagnostics |
+| `voice` | Resident speech synthesis and routing policy; host playback separately |
+| `web` | Explicit web search/fetch and optional evidence recording |
+| `wiki` | Typst knowledge, revisions/frontiers, links, tags, search and audits |
+| `viewer` and `*-capture` | Shared notebooks; one finite `viewer_capture` MCP tool |
+
+Thin binaries live under [`src/bin/`](src/bin/); domain logic, schemas and
+explicit frontend modules live in the library. `habit` uses the `habits`
+Rust module. The GUI family shares `viewer` composition instead of copying
+widget setup or invoking a capture subprocess.
 
 ## Notes on piles & collections
 
-Every faculty reads `PILE` from the environment (via clap's native
-env-var support). You can pass `--pile <path>` to override it for a
-single call. Create a pile explicitly with `trible pile create new.pile`, then
+Pile-backed commands honor `PILE`; `--pile <path>` overrides it for one
+call. Hardware-only commands and model/session-specific frontends have their
+own explicit configuration. Create a pile explicitly with `trible pile create new.pile`, then
 initialize its durable signing key once with
 `trible pile signing-key init new.pile`. Faculties publish independent signed
 COMMITs into self-describing collections. A descriptor fixes the collection's
@@ -428,21 +545,34 @@ replacement or appends an inert COMMIT.
 
 ## GORBIE viewer
 
-The installed `viewer` binary composes the full faculty dashboard —
-activity, wiki, compass, messages, relations, archives, and
-the other available panels — against a single pile. See the screenshot
-above.
-
-From a checkout:
+The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile.
+The 11 small capture binaries select shared compositions for Atlas, Discord,
+Files, Gauge, Headspace, Memory, Messages, Planner, Status, Teams and Triage.
+They retain GORBIE's explicit window, headless-file and web-export CLI UX;
+help/version do not start a GPU or open a pile.
 
 ```sh
 cargo run --release --bin viewer -- ./self.pile
+atlas-capture --pile ./self.pile --headless --out-dir captures
 ```
 
-Standalone per-widget demos (showing how to embed a single widget
-in your own [GORBIE] notebook) are in `examples/`: `compass_board.rs`,
-`wiki_viewer.rs`, `messages_panel.rs`, `branch_timeline.rs`, and
-`pile_inspector.rs` (a compact multi-widget composition example).
+Rust callers can use `viewer::Viewer::capture_with` for typed resident PNG
+pages, or `capture` for native `Out` delivery. MCP `viewer_capture` accepts
+`target: "dashboard"` or one of the 11 panel names and returns card/page
+metadata followed by image attachments. It neither opens a window nor writes
+a host capture directory. Normal loading/error banners remain part of the
+image: rendering is not a certification that every source has been acquired.
+
+Capture defaults to scale 2, a 2000 ms settle timeout per layout pass, at most
+64 images and 4 MiB of encoded PNGs. `max_images`/`max_bytes` bound delivered
+PNGs, **not GPU-memory or raw-renderer allocation**; a large card may already
+have rendered before its encoded output is rejected. MCP's response/base64
+budget applies separately. Dashboard composition may initialize its widgets'
+own GPU computations. An error stops delivery without retrying accepted pages.
+
+Standalone embedding examples remain under `examples/`:
+`compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
+`branch_timeline.rs`, and `pile_inspector.rs`.
 
 [GORBIE]: https://github.com/triblespace/GORBIE
 

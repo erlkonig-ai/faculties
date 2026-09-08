@@ -52,6 +52,7 @@ struct OptionsArguments {
     tags: Vec<String>,
     #[serde(default = "default_limit")]
     limit: u32,
+    #[serde(default, deserialize_with = "faculties::mcp::object::optional")]
     window: Option<Window>,
 }
 
@@ -172,6 +173,7 @@ fn wrong_types_duplicates_and_unknown_fields_fail_before_the_operation() {
         r#""tags":["first"],"tags":["second"]"#,
         r#""tags":["first"],"\u0074ags":["second"]"#,
         r#""window":[]"#,
+        r#""window":[0,1]"#,
         r#""window":{"start":0}"#,
         r#""window":{"start":"0","end":1}"#,
         r#""window":{"start":0,"end":1,"unknown":2}"#,

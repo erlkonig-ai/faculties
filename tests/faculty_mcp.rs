@@ -11,6 +11,44 @@ use serde::Deserialize;
 
 const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 
+#[test]
+fn direct_adapter_decoding_requires_an_object_without_erasing_duplicate_fields() {
+    #[derive(Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    struct Arguments {
+        #[serde(default)]
+        evaluate: bool,
+    }
+    for raw in [
+        "[]",
+        "[true]",
+        "null",
+        "true",
+        "0",
+        "\"text\"",
+        " ",
+        r#"{"evaluate":true,"evaluate":false}"#,
+    ] {
+        let error = decode_arguments::<Arguments>(raw.to_owned().into()).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<faculties::mcp::InvalidArguments>()
+                .is_some(),
+            "{error:#}"
+        );
+    }
+    assert!(
+        !decode_arguments::<Arguments>(" \n\t{}\r ".to_owned().into())
+            .unwrap()
+            .evaluate
+    );
+    assert!(
+        decode_arguments::<Arguments>(r#"{"evaluate":true}"#.to_owned().into())
+            .unwrap()
+            .evaluate
+    );
+}
+
 static TOOLS: &[Tool] = &[
     Tool {
         name: "sample_mixed",
@@ -253,6 +291,34 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "wiki_archive",
         "wiki_restore",
         "wiki_revert",
+        "archive_import",
+        "body_capture",
+        "bootstrap_import",
+        "cognition_check",
+        "decide_propose",
+        "discord_read",
+        "duplex_status",
+        "gauge_health",
+        "habit_list",
+        "headspace_list",
+        "hear_once",
+        "imagine_generate",
+        "linkedin_import",
+        "mail_list",
+        "memory_context",
+        "orient_poll",
+        "patience_extend",
+        "planner_list",
+        "posture_scan",
+        "reason_record",
+        "relations_list",
+        "secrets_list",
+        "status_list",
+        "teams_read",
+        "triage_scan",
+        "viewer_capture",
+        "voice_synthesize",
+        "web_search",
     ] {
         assert!(names.contains(name), "missing native tool {name}");
     }

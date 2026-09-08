@@ -4,6 +4,8 @@
 //! transport identity; a receiver with a peer allowlist needs an explicit
 //! dedicated sender key via `DRIVE_KEY`. This adapter is not used by MCP.
 
+mod audio;
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -101,7 +103,11 @@ impl DriveOutput {
 fn write_part<W: Write>(writer: &mut FramedWriter<W>, part: Part) -> Result<()> {
     match part {
         Part::Text { text } => writer.record_as(TEXT_PLAIN, text.as_bytes(), text.len() as u64),
-        Part::Image { bytes, mime_type } | Part::Audio { bytes, mime_type } => {
+        Part::Image { bytes, mime_type } => {
+            writer.record_as(&mime_type, bytes.as_ref(), bytes.len() as u64)
+        }
+        Part::Audio { bytes, mime_type } => {
+            let (bytes, mime_type) = audio::prepare(bytes, &mime_type)?;
             writer.record_as(&mime_type, bytes.as_ref(), bytes.len() as u64)
         }
         Part::Blob { .. } => anyhow::bail!("binary exports are not sensory input"),
@@ -191,7 +197,7 @@ mod tests {
             &mut writer,
             Part::Audio {
                 bytes: vec![4_u8, 5].into(),
-                mime_type: "audio/wav".into(),
+                mime_type: "audio/L16;rate=24000;channels=1".into(),
             },
         )
         .unwrap();
@@ -212,7 +218,10 @@ mod tests {
                 Frame::Gap(_) => panic!("unexpected gap"),
             }
         }
-        assert_eq!(types, [TEXT_PLAIN, "image/png", "audio/wav"]);
+        assert_eq!(
+            types,
+            [TEXT_PLAIN, "image/png", "audio/L16;rate=24000;channels=1"]
+        );
         assert_eq!(payloads, [b"hello\n".to_vec(), vec![1, 2, 3], vec![4, 5]]);
     }
 

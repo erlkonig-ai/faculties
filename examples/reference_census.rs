@@ -111,8 +111,7 @@ fn main() -> Result<()> {
     )
     .context("register Wiki collection descriptor")?;
     let reader = store.snapshot().context("freeze Wiki store snapshot")?;
-    let instant = triblespace::core::clock::epoch_now();
-    let (facts, _) = faculties::storage::read_fact_collection(collection, &reader, instant)
+    let (facts, _) = faculties::storage::read_fact_collection(collection, &reader)
         .context("snapshot Wiki collection")?;
     let catalog = wiki_model::load_catalog(&facts)?;
     let model = &catalog.revisions;

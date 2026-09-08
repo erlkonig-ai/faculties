@@ -109,7 +109,9 @@ where
 }
 
 fn project_file(path: &Path) -> Result<(Fragment, ProjectionStats)> {
-    let bytes = archive_source::map_immutable_file(path)?;
+    project_content(path, archive_source::map_immutable_file(path)?)
+}
+fn project_content(path: &Path, bytes: Bytes) -> Result<(Fragment, ProjectionStats)> {
     let conversations = parse_export(bytes)
         .map_err(anyhow::Error::new)
         .with_context(|| format!("scan Claude Web export {}", path.display()))?;
@@ -125,6 +127,29 @@ fn project_file(path: &Path) -> Result<(Fragment, ProjectionStats)> {
         },
     )?;
     Ok((fragment, stats))
+}
+
+/// Project resident export bytes; the source name is only a provenance label.
+/// Embedded attachments retain the existing projection. No host files are read.
+pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    let (fragment, stats) = project_content(Path::new(source_name), bytes)?;
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        stats,
+        ..ProjectionSummary::default()
+    };
+    if !fragment.facts().is_empty() {
+        emit(ProjectedFile {
+            source_path: PathBuf::from(source_name),
+            fragment,
+            stats,
+        })?;
+        summary.fragments_emitted = 1;
+    }
+    Ok(summary)
 }
 
 fn collect_conversation_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

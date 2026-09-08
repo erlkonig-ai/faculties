@@ -1,10 +1,15 @@
 //! Reusable capabilities for TribleSpace-backed faculties.
 //!
-//! Domain operations and schemas are shared by direct Rust callers, CLI and MCP
-//! adapters, and widgets. Each ported faculty has explicit `cli` and `mcp`
-//! submodules; the aggregate MCP binary registers them in-process. Presentation
-//! and argument conventions belong to those frontends, not a universal grammar.
-//! Atlas, Compass, Files, Message, and Wiki have native frontend ports.
+//! All 32 ordinary faculties expose native operations with explicit `cli` and
+//! `mcp` frontends. Viewer and its capture binaries share notebook composition
+//! and resident PNG capture. The aggregate binary serves these adapters locally
+//! over sequential MCP stdio, not a deployed remote HTTP connector.
+//!
+//! Domain logic, schemas, observations and receipts are shared without argv or
+//! output parsing. CLI host paths, devices and `@` expansion remain distinct
+//! from literal MCP values and native image/audio/resource responses. Optional
+//! model/rendering capabilities are checked when invoked; discovery does not
+//! initialize them.
 
 /// Crate version + baked git hash (see `build.rs`) — lets every installed
 /// binary answer the stale-binary/version-skew question via `--version`.
@@ -31,6 +36,7 @@ pub fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache/faculties/models")
 }
 
+pub mod archive;
 pub mod archive_agy;
 pub mod archive_bm25;
 pub mod archive_chatgpt;
@@ -53,9 +59,14 @@ pub mod comb;
 pub mod compass;
 pub mod decide;
 pub mod discord;
+pub mod duplex;
 pub mod files;
+pub mod gauge;
 pub mod habits;
 pub mod headspace;
+pub mod hear;
+pub mod imagine;
+pub mod linkedin;
 pub mod mail;
 pub mod mail_pop;
 pub mod mcp;
@@ -67,9 +78,12 @@ pub mod nomic;
 mod organ_client;
 pub mod orient;
 pub mod out;
+pub mod patience;
 pub mod planner;
+pub mod posture;
 pub mod posture_finding;
 pub mod posture_policy;
+pub mod reason;
 pub mod relations;
 pub mod schemas;
 pub mod spec;
@@ -79,7 +93,9 @@ pub mod teams;
 pub mod tokens;
 pub mod triage;
 pub mod turntaking;
+pub mod viewer;
 pub mod voice;
+pub mod web;
 pub mod wiki;
 pub mod wiki_additive;
 
@@ -130,7 +146,7 @@ pub fn text_arg(raw: &str, label: &str) -> anyhow::Result<String> {
 /// faculties consumers can reach it as `faculties::secrets`. It
 /// lives in the standalone `faculties-secrets` crate so other consumers can use
 /// the same implementation without pulling the mary/GORBIE/egui stack.
-pub use faculties_secrets as secrets;
+pub mod secrets;
 
 #[cfg(feature = "widgets")]
 pub mod widgets;

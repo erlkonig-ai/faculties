@@ -227,12 +227,19 @@ fn execute_with_input(
             if !accept.is_empty() {
                 options.accept = accept.to_vec();
             } else if std::env::var_os("DRIVE_ENDPOINT").is_some() {
-                // Stored MIME identity keeps only the essence, so L16 has no
-                // rate/channel parameters. Audio needs a future explicit
-                // metadata/conversion path before it can be sent to Inkling.
-                options.accept = ["text/*", "image/png", "image/jpeg"]
-                    .map(str::to_owned)
-                    .to_vec();
+                // WAV carries its own rate/channels and the Drive adapter
+                // derives mono PCM16 from it. Stored L16 retains only a MIME
+                // essence, so it cannot safely supply the required sample rate.
+                options.accept = [
+                    "text/*",
+                    "image/png",
+                    "image/jpeg",
+                    "audio/wav",
+                    "audio/x-wav",
+                    "audio/vnd.wave",
+                ]
+                .map(str::to_owned)
+                .to_vec();
             }
             out.emit(files.view(invocation.require("id")?, &options)?)
         }

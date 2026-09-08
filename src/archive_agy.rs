@@ -70,6 +70,30 @@ where
     Ok(summary)
 }
 
+/// Project immutable resident content. `source_name` is provenance only,
+/// never opened as a file or directory. External references remain unresolved.
+pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    let path = Path::new(source_name);
+    let records = parse_bytes(path, bytes)?;
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        ..ProjectionSummary::default()
+    };
+    summary.stats = archive_source::project_records(
+        schema::source_projection::SOURCE_AGY,
+        path,
+        records,
+        |projected| {
+            summary.fragments_emitted += 1;
+            emit(projected)
+        },
+    )?;
+    Ok(summary)
+}
+
 fn collect_transcripts(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let entry = entry.context("read Antigravity directory entry")?;
@@ -88,7 +112,10 @@ fn collect_transcripts(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn parse_file(path: &Path) -> Result<Vec<SourceRecord>> {
-    let bytes = archive_source::read_file(path)?;
+    parse_bytes(path, archive_source::read_file(path)?)
+}
+
+fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Vec<SourceRecord>> {
     let lines = exact_lines(&bytes);
     let conversation = conversation_anchor(lines.first());
     let mut records = Vec::new();

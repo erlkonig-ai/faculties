@@ -20,6 +20,13 @@
 //! interface to time-range adjustments; a journal is not a mutable fact
 //! store). Both chunks remain members of the journal and answer by id.
 
+pub mod cli;
+mod cli_cover;
+pub mod mcp;
+pub mod operations;
+pub use crate::memory_cover::{CoverOpts, CoverReport};
+pub use operations::{ChurnOptions, CreatedMemory, Memory, RespanReceipt};
+
 use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Context, Result};

@@ -7,6 +7,14 @@
 //! second catalog, validate intrinsic ids, or impose a closed-world shape on
 //! the collection.
 
+pub mod cli;
+pub mod device;
+pub mod mcp;
+mod operations;
+pub mod routing;
+pub mod synthesis;
+pub use operations::{Channel, RoutePolicy, RouteReceipt, Voice};
+
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;

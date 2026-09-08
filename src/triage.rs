@@ -10,6 +10,11 @@
 //! This module is the shared semantic boundary for both the `triage` CLI and
 //! the GORBIE widget. Callers own storage and presentation only.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub use operations::{InspectOptions, Triage};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anybytes::View;

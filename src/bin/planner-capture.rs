@@ -11,45 +11,15 @@
 //!   --out-dir /tmp/planner-capture --scale 2 --headless-wait-ms 2000
 //! ```
 
-use std::path::PathBuf;
-
-use faculties::widgets::{PlannerViewer, SourceKey, StorageState};
-use GORBIE::notebook;
-use GORBIE::prelude::*;
-
-fn resolve_pile_path() -> PathBuf {
-    // Handled before anything else so `--version` works without a pile or a
-    // display. Prints crate version + baked git hash (the stale-binary question).
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!(
-            "{} {} ({})",
-            env!("CARGO_BIN_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            env!("FACULTIES_GIT_VERSION"),
-        );
-        std::process::exit(0);
-    }
-    faculties::widgets::resolve_pile_path(std::env::args().skip(1), std::env::var("PILE").ok())
+fn main() -> anyhow::Result<()> {
+    faculties::viewer::cli::run(env!("CARGO_BIN_NAME"), notebook)
 }
 
-#[notebook]
-fn main(nb: &mut NotebookCtx) {
-    let path = resolve_pile_path();
-
-    let storage = nb.state(
-        "storage",
-        StorageState::for_sources(path, [SourceKey::Planner]),
-        |ctx, st| {
-            st.top_bar(ctx);
-        },
+#[GORBIE::notebook]
+fn notebook(nb: &mut GORBIE::NotebookCtx) {
+    faculties::viewer::compose(
+        nb,
+        &faculties::viewer::cli::configuration_from_env(),
+        faculties::viewer::Target::Planner,
     );
-
-    nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
-        let mut st = storage.read_mut(ctx);
-        let sources = st.context();
-        let Some(planner) = sources.dataset(SourceKey::Planner) else {
-            return;
-        };
-        panel.render(ctx, planner, sources.dataset(SourceKey::Relations));
-    });
 }

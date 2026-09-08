@@ -8,6 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod cli;
+pub mod device;
+pub mod mcp;
+mod operations;
+pub mod presentation;
+pub use operations::*;
+
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::succinctarchive::{

@@ -153,7 +153,17 @@ fn collect_html_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn parse_file(path: &Path) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
-    let bytes = archive_source::map_immutable_file(path)?;
+    parse_content(
+        path,
+        archive_source::map_immutable_file(path)?,
+        &mut |pointer| resolve_asset(path, pointer),
+    )
+}
+fn parse_content(
+    path: &Path,
+    bytes: Bytes,
+    resolve: &mut dyn FnMut(&str) -> Result<Option<Bytes>>,
+) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
     let cards = scan_outer_cards(&bytes)
         .with_context(|| format!("scan Gemini activity cards in {}", path.display()))?;
     let mut parsed = Vec::new();
@@ -209,7 +219,7 @@ fn parse_file(path: &Path) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
                 ));
             }
             append_assets(
-                path,
+                resolve,
                 card.input_assets,
                 schema::content_fact::direction::IN,
                 &mut input_parts,
@@ -243,7 +253,7 @@ fn parse_file(path: &Path) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
                 ));
             }
             append_assets(
-                path,
+                resolve,
                 card.output_assets,
                 schema::content_fact::direction::OUT,
                 &mut output_parts,
@@ -281,7 +291,7 @@ fn parse_file(path: &Path) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
             let mut ambient_assets = card.input_assets;
             ambient_assets.extend(card.output_assets);
             append_assets(
-                path,
+                resolve,
                 ambient_assets,
                 schema::content_fact::direction::AMBIENT,
                 &mut parts,
@@ -308,9 +318,47 @@ fn parse_file(path: &Path) -> Result<Option<(Vec<SourceRecord>, FileStats)>> {
 
     Ok(Some((records, stats)))
 }
+/// Project resident Gemini activity HTML. Attachment keys match exact exported
+/// pointer strings; missing keys stay external. Neither names nor HTML links
+/// are opened on the host, and no network resolution is performed.
+pub fn project_bytes<F>(
+    source_name: &str,
+    bytes: Bytes,
+    attachments: &std::collections::BTreeMap<String, Bytes>,
+    mut emit: F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    let path = Path::new(source_name);
+    let (records, stats) = parse_content(path, bytes, &mut |pointer| {
+        Ok(attachments.get(pointer).cloned())
+    })?
+    .ok_or_else(|| {
+        anyhow::anyhow!("resident content is not a recognized Gemini Apps activity export")
+    })?;
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        cards_seen: stats.cards,
+        records_emitted: records.len(),
+        assets_seen: stats.assets,
+        assets_resolved: stats.assets_resolved,
+        ..ProjectionSummary::default()
+    };
+    summary.stats = archive_source::project_records(
+        schema::source_projection::SOURCE_GEMINI,
+        path,
+        records,
+        |projected| {
+            summary.fragments_emitted += 1;
+            emit(projected)
+        },
+    )?;
+    Ok(summary)
+}
 
 fn append_assets(
-    source_path: &Path,
+    resolve: &mut dyn FnMut(&str) -> Result<Option<Bytes>>,
     assets: Vec<HtmlAsset>,
     direction: triblespace::prelude::Id,
     parts: &mut Vec<SourcePart>,
@@ -322,7 +370,7 @@ fn append_assets(
             continue;
         }
         stats.assets += 1;
-        let resolved = resolve_asset(source_path, asset.pointer.as_ref())?;
+        let resolved = resolve(asset.pointer.as_ref())?;
         #[cfg(test)]
         if resolved.is_none() && std::env::var_os("GEMINI_REPORT_MISSING_ASSETS").is_some() {
             eprintln!("unresolved Gemini asset: {}", asset.pointer.as_ref());

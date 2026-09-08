@@ -419,6 +419,7 @@ pub struct StorageState {
     secrets: Option<LoadedSecrets>,
     sources: BTreeSet<SourceKey>,
     pile_path: PathBuf,
+    key_path: Option<PathBuf>,
     pile_path_text: String,
     stamp: Option<FileStamp>,
     error: Option<String>,
@@ -455,10 +456,26 @@ impl StorageState {
             secrets: None,
             sources: source_closure(sources),
             pile_path,
+            key_path: None,
             pile_path_text,
             stamp: None,
             error: None,
         }
+    }
+
+    /// Select an explicit launcher-owned signing key for lazy observation.
+    /// This constructor performs no I/O. CLI viewers retain the adjacent-key
+    /// default by leaving it unset; changing the pile does not change an
+    /// explicitly configured key.
+    pub fn with_key_path(mut self, key_path: Option<PathBuf>) -> Self {
+        if self.key_path != key_path {
+            self.key_path = key_path;
+            self.datasets = None;
+            self.secrets = None;
+            self.stamp = None;
+            self.error = None;
+        }
+        self
     }
 
     /// Borrow all currently loaded datasets through their logical keys.
@@ -508,7 +525,11 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match pollster::block_on(load_consistent_inputs(&self.pile_path, &self.sources)) {
+        match pollster::block_on(load_consistent_inputs(
+            &self.pile_path,
+            self.key_path.as_deref(),
+            &self.sources,
+        )) {
             Ok((inputs, stamp)) => {
                 self.datasets = Some(inputs.datasets);
                 self.secrets = inputs.secrets;
@@ -618,11 +639,12 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
 
 async fn load_consistent_inputs(
     path: &Path,
+    key_path: Option<&Path>,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<(LoadedInputs, FileStamp), String> {
     for _ in 0..2 {
         let before = file_stamp(path)?;
-        let inputs = load_inputs(path, sources).await?;
+        let inputs = load_inputs(path, key_path, sources).await?;
         let after = file_stamp(path)?;
         if before == after {
             return Ok((inputs, after));
@@ -634,8 +656,12 @@ async fn load_consistent_inputs(
     ))
 }
 
-async fn load_inputs(path: &Path, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
-    let signer = load_signer(path, None)
+async fn load_inputs(
+    path: &Path,
+    key_path: Option<&Path>,
+    sources: &BTreeSet<SourceKey>,
+) -> Result<LoadedInputs, String> {
+    let signer = load_signer(path, key_path)
         .map_err(|error| format!("load durable collection signer: {error:#}"))?;
     let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
 
@@ -966,6 +992,29 @@ mod tests {
             .into_iter()
             .filter(|key| context.contains(*key))
             .collect()
+    }
+
+    #[test]
+    fn explicit_key_is_lazy_used_for_loading_and_invalidates_previous_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("explicit.pile");
+        create_pile(&path);
+        let key = directory.path().join("launcher.key");
+        std::fs::rename(crate::storage::signer_path(&path, None), &key).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let mut storage = StorageState::for_sources(&path, [SourceKey::Teams])
+            .with_key_path(Some(key));
+        assert!(storage.datasets.is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        assert!(storage.context().contains(SourceKey::Teams));
+        assert!(storage.error().is_none());
+
+        // Rebinding an already-loaded value cannot keep the previous key's
+        // readable datasets while waiting for a reload under another identity.
+        storage = storage.with_key_path(Some(directory.path().join("missing.key")));
+        assert!(storage.datasets.is_none());
+        assert!(!storage.context().contains(SourceKey::Teams));
+        assert!(storage.error().unwrap().contains("missing.key"));
     }
 
     #[test]

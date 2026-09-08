@@ -109,7 +109,22 @@ fn project_file<F>(
 where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
-    let mapped = archive_source::map_immutable_file(source_path)?;
+    project_content(
+        source_path,
+        archive_source::map_immutable_file(source_path)?,
+        sidecars,
+        emit,
+    )
+}
+fn project_content<F>(
+    source_path: &Path,
+    mapped: Bytes,
+    sidecars: &ExportFiles,
+    emit: &mut F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
     let conversations = scan_export(mapped)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("scan {}", source_path.display()))?;
@@ -188,6 +203,28 @@ where
         summary.stats.raw_only_records += 1;
     }
     Ok(summary)
+}
+
+/// Project resident export bytes with only explicitly supplied attachment
+/// bytes. Keys are logical export filenames, not host paths. Ambiguous file-id
+/// or basename matches remain unresolved exactly as in filesystem imports.
+pub fn project_bytes<F>(
+    source_name: &str,
+    bytes: Bytes,
+    attachments: &std::collections::BTreeMap<String, Bytes>,
+    mut emit: F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    let mut sidecars = ExportFiles::from_paths(attachments.keys().map(PathBuf::from));
+    sidecars.resident = Some(
+        attachments
+            .iter()
+            .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
+            .collect(),
+    );
+    project_content(Path::new(source_name), bytes, &sidecars, &mut emit)
 }
 
 #[derive(Debug)]
@@ -465,8 +502,12 @@ impl Attachment {
         };
         let resolved_path = sidecars.resolve(source_id.as_deref(), self.name.as_deref());
         let resolved = resolved_path
-            .map(|path| archive_source::map_immutable_file(path))
-            .transpose()?;
+            .map(|path| match &sidecars.resident {
+                Some(resident) => Ok(resident.get(path).cloned()),
+                None => archive_source::map_immutable_file(path).map(Some),
+            })
+            .transpose()?
+            .flatten();
 
         let media_type = clean_media_type(
             self.media_type.clone(),
@@ -504,6 +545,8 @@ enum ExportFile {
 struct ExportFiles {
     by_id: HashMap<String, ExportFile>,
     by_name: HashMap<String, ExportFile>,
+    /// Some means resident-only resolution; never fall back to opening a key.
+    resident: Option<HashMap<PathBuf, Bytes>>,
 }
 
 impl ExportFiles {

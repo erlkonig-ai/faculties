@@ -160,7 +160,7 @@ struct CodexPayload {
 /// cover the entire exact frozen prefix without creating one receipt per
 /// telemetry event. Callers must stage every emitted fragment and publish only
 /// after this function returns successfully.
-pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
+pub fn project_path<F>(path: &Path, emit: F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
@@ -178,6 +178,18 @@ where
             path.display()
         );
     }
+    project_planned(path, plan, frozen, emit)
+}
+
+fn project_planned<F>(
+    path: &Path,
+    plan: PrefixPlan,
+    frozen: archive_source::FrozenSource,
+    mut emit: F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
     let mut projector = Projector {
         session_id: &plan.session_id,
         source_path: path,
@@ -235,6 +247,60 @@ where
         ..ProjectionSummary::default()
     };
     Ok(summary)
+}
+
+/// Project resident immutable rollout bytes. Like live-file imports, a trailing
+/// non-newline record is retained exactly but deferred semantically. The source
+/// name is provenance only; local media pointers are never opened.
+pub fn project_bytes<F>(source_name: &str, bytes: Bytes, emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    let path = Path::new(source_name);
+    let mut session_id = None;
+    let scan = scan_frozen_prefix(&bytes, |_line, raw| {
+        if !contains(raw.as_ref(), b"\"session_meta\"") {
+            return Ok(());
+        }
+        // The live planning pass owns only candidate session metadata rows;
+        // the large immutable snapshot is created immediately afterwards.
+        let record = parse_record(raw, path)?;
+        if record.record_type.as_deref() != Some("session_meta") {
+            return Ok(());
+        }
+        let payload = record
+            .payload
+            .as_ref()
+            .ok_or_else(|| anyhow!("Codex session_meta has no object field \"payload\""))?;
+        let id = consistent_session_id(payload)?;
+        match &session_id {
+            Some(previous) if previous != &id => bail!(
+                "Codex rollout {} contains conflicting session ids {:?} and {:?}",
+                path.display(),
+                previous,
+                id
+            ),
+            Some(_) => {}
+            None => session_id = Some(id),
+        }
+        Ok(())
+    })?;
+    let session_id = session_id.ok_or_else(|| anyhow!("resident Codex rollout has no stable session_meta.payload.id/session_id in its complete prefix"))?;
+    let observed_bytes = u64::try_from(bytes.len()).context("resident Codex length exceeds u64")?;
+    let digest = *blake3::hash(bytes.as_ref()).as_bytes();
+    let plan = PrefixPlan {
+        session_id,
+        observed_bytes,
+        complete_bytes: scan.complete_bytes,
+        trailing_bytes: observed_bytes.saturating_sub(scan.complete_bytes),
+        digest,
+    };
+    project_planned(
+        path,
+        plan,
+        archive_source::FrozenSource { bytes, digest },
+        emit,
+    )
 }
 
 fn plan_prefix(path: &Path) -> Result<PrefixPlan> {

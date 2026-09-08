@@ -5,6 +5,9 @@
 //! stdout and media receives a descriptive text marker. Explicit Blob exports
 //! always write byte-for-byte to stdout, without opening a sensory connection.
 //! A configured perception endpoint failure is an error, never a stdout fallback.
+//! Audio perception accepts mono PCM16 with an explicit rate, or derives it
+//! from PCM16 WAV (downmixing channels, without resampling). MCP and raw exports
+//! retain the original container bytes. Unsupported encodings fail explicitly.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -53,6 +56,26 @@ pub fn with_output<T>(
             "finishing faculty output also failed: {finish_error:#}"
         ))),
     }
+}
+
+/// Perception for CLI annotations which historically accompany a child
+/// command on stderr. Drive delivery is unchanged; without Drive only the
+/// annotations use stderr, leaving the child's stdout pipe intact. Explicit
+/// binary exports still use stdout and never become sensory input.
+pub fn with_diagnostic_output<T>(
+    label: &'static str,
+    execute: impl FnOnce(&mut Out<'_>) -> Result<T>,
+) -> Result<T> {
+    if std::env::var_os("DRIVE_ENDPOINT").is_some() {
+        return with_output(label, execute);
+    }
+    let mut stderr = io::stderr();
+    with_output(label, |out| {
+        execute(&mut Out::new(&mut |part| match part {
+            part @ Part::Blob { .. } => out.emit(part),
+            part => render_terminal(&mut stderr, part),
+        }))
+    })
 }
 
 struct DriveConfig {
@@ -148,7 +171,7 @@ fn render_terminal(writer: &mut impl Write, part: Part) -> Result<()> {
         }
         Part::Blob { bytes, .. } => writer.write_all(bytes.as_ref())?,
     }
-    writer.flush().context("emit faculty stdout")
+    writer.flush().context("emit faculty terminal output")
 }
 
 #[cfg(test)]
@@ -306,6 +329,7 @@ mod tests {
             .unwrap()
         });
         let mut stdout = Vec::new();
+        let clip = crate::voice::synthesis::AudioClip::from_samples(&[0.25, -0.5], 24000).unwrap();
         let mut output = Output::Drive {
             stdout: &mut stdout,
             config: Some(DriveConfig {
@@ -329,7 +353,7 @@ mod tests {
                 mime_type: "image/png".into(),
             },
             Part::Audio {
-                bytes: vec![3_u8, 4].into(),
+                bytes: clip.wav.clone(),
                 mime_type: "audio/wav".into(),
             },
         ] {
@@ -344,7 +368,7 @@ mod tests {
         for (mime, bytes) in [
             (framed_stream::TEXT_PLAIN, b"first\n".as_slice()),
             ("image/png", &[1, 2][..]),
-            ("audio/wav", &[3, 4][..]),
+            ("audio/L16;rate=24000;channels=1", &clip.wav[44..]),
         ] {
             let Frame::Record(record) = reader.next_frame().unwrap() else {
                 panic!("missing perception")

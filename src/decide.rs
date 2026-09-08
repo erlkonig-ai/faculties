@@ -8,6 +8,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub mod cli;
+pub mod mcp;
+mod operations;
+pub mod presentation;
+pub use operations::*;
+
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;

@@ -5,6 +5,13 @@
 //! is a pure maximum over `(timestamp, event id)`, so collection union cannot
 //! make iteration order or process arrival order observable.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+
+pub use operations::{SetStatus, Status, StatusEntry, StatusHistory, WindowStatus};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;

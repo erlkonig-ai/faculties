@@ -6,6 +6,11 @@
 //! There is no branch, head, repository checkout, caller-selected scope, or
 //! compare-and-swap cell in this layer.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub use operations::{CheckReport, Cognition};
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

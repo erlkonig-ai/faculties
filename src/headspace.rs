@@ -17,6 +17,14 @@
 //! complete historical catalog remains only for reconciliation and strict
 //! migration boundaries.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub use operations::{
+    AddProfileOptions, Credential, CredentialUpdateError, Headspace, OptionalProfileField,
+    ProfileEdit, SecretRole,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;

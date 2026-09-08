@@ -12,6 +12,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod cli;
+pub mod mcp;
+mod operations;
+pub mod presentation;
+pub use operations::*;
+
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;

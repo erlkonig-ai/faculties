@@ -151,6 +151,31 @@ where
     )
 }
 
+/// Project an immutable resident JSONL stream with the same canonical lineage
+/// plan and exact source snapshot as a single CLI file. The name is provenance
+/// only; all scans use the supplied allocation and never open host paths.
+pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    let path = Path::new(source_name);
+    let prescan = prescan_reader(&mut std::io::Cursor::new(bytes.as_ref()), path)?;
+    let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
+        .context("plan canonical resident Claude Code lineage")?;
+    let snapshot = archive_source::FrozenSource {
+        digest: *blake3::hash(bytes.as_ref()).as_bytes(),
+        bytes,
+    };
+    project_snapshot(
+        path,
+        snapshot,
+        prescan.digest,
+        prescan.file_anchor.as_ref(),
+        &plan,
+        &mut emit,
+    )
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct SourceKey {
     session: String,

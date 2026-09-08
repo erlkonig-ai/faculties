@@ -1,11 +1,25 @@
 //! Canonical Teams collection semantics shared by the faculty and cutovers.
 //!
-//! Network transport, OAuth, and CLI presentation live in `bin/teams.rs`.
-//! This module owns the monotone data model: intrinsic source/context/receipt
+//! Direct configured operations live in [`operations`], with tailored [`cli`]
+//! and [`mcp`] frontends. This module also owns the monotone data model:
+//! intrinsic source/context/receipt
 //! construction, receipt-DAG evaluation, and catalog validation. Keeping that
 //! seam shared is especially important for the generation-0 legacy snapshot:
 //! migrated history and the first genuine Graph page must agree on one causal
 //! interpretation.
+
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+
+pub use operations::{
+    Activity, ArchiveAccess, ArchivedMessage, AttachmentData, AttachmentGetOptions, AttachmentInfo,
+    AttachmentListOptions, AttachmentLookup, AttachmentMatch, AuthProfileInput, AuthSet,
+    ContextSet, DirectoryUser, InvitedMember, LoginInput, LoginReceipt, Presence, PresenceActivity,
+    PresenceAvailability, PresenceSet, PresentationContext, PullReceipt, ReadOptions, SentMessage,
+    Teams,
+};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 

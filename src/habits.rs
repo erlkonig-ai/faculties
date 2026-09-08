@@ -7,6 +7,16 @@
 //! keeps concurrent state visible instead of letting time or append order pick
 //! a winner.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+mod render;
+
+pub use operations::{
+    AddedHabit, EvaluatedHabit, HabitList, HabitObservation, HabitOccurrence, HabitStateChange,
+    Habits,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 

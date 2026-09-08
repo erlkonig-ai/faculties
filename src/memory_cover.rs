@@ -1010,12 +1010,53 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
 // the render
 // ---------------------------------------------------------------------------
 
+/// Exact charged cover text plus non-cover diagnostics. Diagnostics must not be
+/// inserted into the stored cover or counted as selected-memory framing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverReport {
+    pub text: String,
+    pub diagnostics: Vec<String>,
+}
+
+fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
+    if unscorable.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
+    Some(format!(
+        "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
+         run `memory embed` to make them filterable: {}",
+        unscorable.len(),
+        ids.join(", ")
+    ))
+}
+
+/// Legacy text-only entrypoint: retain its stderr diagnostics and byte framing.
 pub fn render_cover<B, P, E>(
     space: &P,
     embeddings_space: &E,
     reader: &B,
     opts: &CoverOpts,
 ) -> Result<String>
+where
+    B: BlobStoreGet,
+    P: TriblePattern,
+    E: TriblePattern,
+{
+    let report = render_cover_report(space, embeddings_space, reader, opts)?;
+    for diagnostic in report.diagnostics {
+        eprintln!("{diagnostic}");
+    }
+    Ok(report.text)
+}
+
+/// Render using the same sampler, with fail-open warnings returned explicitly.
+pub fn render_cover_report<B, P, E>(
+    space: &P,
+    embeddings_space: &E,
+    reader: &B,
+    opts: &CoverOpts,
+) -> Result<CoverReport>
 where
     B: BlobStoreGet,
     P: TriblePattern,
@@ -1030,16 +1071,23 @@ where
     let remove_q = opts.remove.as_deref();
     let sim_threshold = opts.sim_threshold;
 
+    let mut diagnostics = Vec::new();
     let mut out = String::new();
     let raw_spans = collect_chunk_spans(space);
     if raw_spans.is_empty() {
         writeln!(out, "no memory chunks")?;
-        return Ok(out);
+        return Ok(CoverReport {
+            text: out,
+            diagnostics,
+        });
     }
     let (spans, classes) = recollection_classes(&raw_spans);
     if spans.is_empty() {
-        eprintln!("memory context — 0 chunk(s)");
-        return Ok(String::new());
+        diagnostics.push("memory context — 0 chunk(s)".to_owned());
+        return Ok(CoverReport {
+            text: String::new(),
+            diagnostics,
+        });
     }
     let n = spans.len();
 
@@ -1078,14 +1126,8 @@ where
     // intimate-exclusion use of `--remove` a silent keep would LEAK.
     for (label, elig) in [("--filter", &filter_elig), ("--remove", &remove_elig)] {
         if let Some((_, unscorable)) = elig {
-            if !unscorable.is_empty() {
-                let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
-                eprintln!(
-                    "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
-                     run `memory embed` to make them filterable: {}",
-                    unscorable.len(),
-                    ids.join(", ")
-                );
+            if let Some(warning) = unscorable_warning(label, unscorable) {
+                diagnostics.push(warning);
             }
         }
     }
@@ -1204,14 +1246,17 @@ where
     } else {
         100.0 * used as f64 / budget_chars as f64
     };
-    eprintln!(
+    diagnostics.push(format!(
         "memory context — {} of {} eligible memories recalled, ~{} of {} characters ({fill:.1}% full; {mode})",
         cover.len(),
         class_eligible.iter().filter(|&&yes| yes).count(),
         used,
         budget_chars,
-    );
-    Ok(out)
+    ));
+    Ok(CoverReport {
+        text: out,
+        diagnostics,
+    })
 }
 
 #[cfg(test)]
@@ -1222,6 +1267,17 @@ mod recollection_tests {
     const A: Id = id_hex!("C1000000000000000000000000000001");
     const B: Id = id_hex!("C1000000000000000000000000000002");
     const C: Id = id_hex!("C1000000000000000000000000000003");
+
+    #[test]
+    fn fail_open_diagnostic_names_the_gate_and_exact_unscorable_ids() {
+        assert_eq!(unscorable_warning("--remove", &[]), None);
+        for gate in ["--filter", "--remove"] {
+            assert_eq!(
+                unscorable_warning(gate, &[B, A]).unwrap(),
+                format!("memory: 2 unembedded chunk(s) not scorable for {gate} — kept (fail-open); run `memory embed` to make them filterable: {B:x}, {A:x}")
+            );
+        }
+    }
 
     #[test]
     fn exact_span_is_the_structural_equivalence_class() {

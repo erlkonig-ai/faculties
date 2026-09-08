@@ -1463,7 +1463,7 @@ fn cmd_embed7b<P: TriblePattern>(
         let bytes: anybytes::Bytes = match reader.get::<anybytes::Bytes, _>(*content) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("  skip {hash}: read content failed: {e:?}");
+                out.line(format!("  skip {hash}: read content failed: {e:?}"))?;
                 failed += 1;
                 continue;
             }
@@ -1471,7 +1471,7 @@ fn cmd_embed7b<P: TriblePattern>(
         let v = match mm7b_embed_image(&embedder, bytes.as_ref()) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("  skip {hash}: embed failed: {e:#}");
+                out.line(format!("  skip {hash}: embed failed: {e:#}"))?;
                 failed += 1;
                 continue;
             }
@@ -1487,7 +1487,10 @@ fn cmd_embed7b<P: TriblePattern>(
             };
             assigned += 1;
         }
-        eprintln!("  embedded {hash}  ({} bytes → 3584-d)", bytes.len());
+        out.line(format!(
+            "  embedded {hash}  ({} bytes → 3584-d)",
+            bytes.len()
+        ))?;
     }
 
     if change.is_empty() {
@@ -1683,7 +1686,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
         let bytes: anybytes::Bytes = match reader.get::<anybytes::Bytes, _>(*content) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("  skip {hash}: read content failed: {e:?}");
+                out.line(format!("  skip {hash}: read content failed: {e:?}"))?;
                 failed += 1;
                 continue;
             }
@@ -1691,13 +1694,13 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
         let pages = match render_pdf_pages(bytes.as_ref(), dpi, max_pages) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("  skip {hash}: render failed: {e:#}");
+                out.line(format!("  skip {hash}: render failed: {e:#}"))?;
                 failed += 1;
                 continue;
             }
         };
         if pages.is_empty() {
-            eprintln!("  skip {hash}: pdftoppm produced no pages");
+            out.line(format!("  skip {hash}: pdftoppm produced no pages"))?;
             failed += 1;
             continue;
         }
@@ -1706,7 +1709,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
             let v = match mm7b_embed_image(&embedder, png) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("  {hash} page {page_no}: embed failed: {e:#}");
+                    out.line(format!("  {hash} page {page_no}: embed failed: {e:#}"))?;
                     failed += 1;
                     continue;
                 }
@@ -1732,10 +1735,10 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
             pages_embedded += 1;
         }
         pdfs_done += 1;
-        eprintln!(
+        out.line(format!(
             "  {hash}: {this_pages} pages → {} entities",
             this_pages * eids.len()
-        );
+        ))?;
     }
 
     if change.is_empty() {

@@ -14,6 +14,8 @@
 //! expansion. It closes the transport on an oversized frame rather than trying
 //! to identify or reply to a possibly truncated notification.
 
+pub mod object;
+
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
@@ -68,8 +70,20 @@ impl std::error::Error for InvalidArguments {
 /// `#[serde(deny_unknown_fields)]` on argument structs (including nested ones):
 /// serde then rejects unknown fields, duplicates, and incorrect types before
 /// the adapter calls its library operations. Deserializing through a JSON map
-/// first would silently erase duplicate fields and must be avoided.
+/// first would silently erase duplicate fields and must be avoided. For nested
+/// object fields also use [`object::deserialize`] or [`object::vec`]: derived
+/// named structs otherwise accept positional arrays as an alternative shape.
 pub fn decode_arguments<T: DeserializeOwned>(bytes: Bytes) -> Result<T> {
+    // Serde also accepts positional sequences for named structs (including
+    // `[]` for an empty/default-only one). MCP arguments are always objects,
+    // even when a native caller invokes the adapter without Server dispatch.
+    if bytes
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        != Some(&b'{')
+    {
+        return Err(invalid_arguments("arguments must be a JSON object"));
+    }
     serde_json::from_slice(bytes.as_ref()).map_err(|error| InvalidArguments(error).into())
 }
 
@@ -347,8 +361,16 @@ impl<'a> Server<'a> {
                     }
                 }
             };
-            tool.faculty
-                .call(&name, arguments, &mut Out::new(&mut emit))
+            // Some optional model/rendering libraries still expose panicking
+            // loaders. Isolate an ordinary unwind to this call, retaining any
+            // accepted output. This does not recover process aborts/OOM, undo
+            // effects, repair backend state, or permit automatic retries.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tool.faculty.call(&name, arguments, &mut Out::new(&mut emit))
+            }))
+            .unwrap_or_else(|_| Err(anyhow!(
+                "faculty handler panicked; output or side effects may already exist; the operation was not retried"
+            )))
         };
         if let Err(error) = &result {
             if error.is::<InvalidArguments>() {

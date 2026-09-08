@@ -5,6 +5,9 @@
 //! durable signer. No builder signature, branch pin, repository commit, or
 //! private key crosses that boundary.
 
+pub mod cli;
+pub mod mcp;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -235,6 +238,22 @@ pub struct ImportReport {
     pub generation: [u8; 32],
     pub wiki_commit: CollectionCommit,
     pub compass_commit: CollectionCommit,
+}
+
+pub(crate) fn render_import(report: &ImportReport, out: &mut crate::out::Out<'_>) -> Result<()> {
+    use triblespace::core::collection::CollectionRecord;
+    out.line(format!(
+        "bootstrap generation {}",
+        hex::encode(report.generation)
+    ))?;
+    out.line(format!(
+        "wiki COMMIT record fingerprint {}",
+        CollectionRecord::Commit(report.wiki_commit).fingerprint()
+    ))?;
+    out.line(format!(
+        "compass COMMIT record fingerprint {}",
+        CollectionRecord::Commit(report.compass_commit).fingerprint()
+    ))
 }
 
 fn seed_time(nanosecond: u32) -> compass::IntervalValue {

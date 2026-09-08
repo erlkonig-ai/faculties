@@ -13,6 +13,11 @@ use triblespace::prelude::*;
 
 use crate::schemas::orient::{presentation, KIND_PRESENTED};
 
+pub mod cli;
+pub mod mcp;
+mod operations;
+pub use operations::{BaselineReceipt, Orient, ShowOptions, WaitOptions, WakeOptions};
+
 fn presented_record(persona: Id, event: Id) -> Fragment {
     entity! {
         metadata::tag: &KIND_PRESENTED,

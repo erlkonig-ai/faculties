@@ -155,6 +155,32 @@ where
     Ok(summary)
 }
 
+/// Project immutable resident content. `source_name` is provenance only,
+/// never opened as a file or directory. External references remain unresolved.
+pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    let path = Path::new(source_name);
+    let records = parse_bytes(path, bytes)?.ok_or_else(|| {
+        anyhow::anyhow!("resident content is not a recognized Copilot chat-session JSON")
+    })?;
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        ..ProjectionSummary::default()
+    };
+    summary.stats = archive_source::project_records(
+        schema::source_projection::SOURCE_COPILOT,
+        path,
+        records,
+        |projected| {
+            summary.fragments_emitted += 1;
+            emit(projected)
+        },
+    )?;
+    Ok(summary)
+}
+
 fn collect_json_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let entry = entry.context("read Copilot directory entry")?;
@@ -172,9 +198,12 @@ fn collect_json_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn parse_file(path: &Path) -> Result<Option<Vec<SourceRecord>>> {
+    parse_bytes(path, archive_source::read_file(path)?)
+}
+
+fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
     // VS Code may still be updating these files. One owned snapshot avoids the
     // unsafe concurrently-mutated mmap case while retaining zero-copy views.
-    let bytes = archive_source::read_file(path)?;
     let root = scan_root(bytes.clone())
         .with_context(|| format!("parse Copilot root {}", path.display()))?;
     if !root.is_recognized() {

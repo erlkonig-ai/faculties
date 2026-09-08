@@ -182,6 +182,7 @@ struct Document {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Import {
+    #[serde(deserialize_with = "crate::mcp::object::vec")]
     documents: Vec<Document>,
     #[serde(default)]
     tags: Vec<String>,

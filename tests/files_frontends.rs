@@ -698,7 +698,7 @@ fn download_budget_rejects_oversized_content_without_publication() {
 }
 
 #[test]
-fn drive_default_does_not_send_undecoded_audio_containers() {
+fn drive_default_accepts_self_describing_wav_for_the_audio_adapter() {
     let fixture = Fixture::new();
     let output = fixture
         .cli()
@@ -708,5 +708,10 @@ fn drive_default_does_not_send_undecoded_audio_containers() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("audio conversion is not supported"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("parse Drive endpoint id"), "{error}");
+    assert!(
+        !error.contains("audio conversion is not supported"),
+        "{error}"
+    );
 }

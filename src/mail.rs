@@ -5,6 +5,17 @@
 //! collection union and durably publish those fragments before asking a POP
 //! or SMTP transport to perform an irreversible action.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+
+pub use operations::{
+    AccountFetched, AccountOptions, AccountSetReceipt, AccountState, AccountSummary,
+    DraftAttachment, DraftDelivery, DraftReceipt, DraftRequest, DraftStatus, InboxMessage, Mail,
+    ReadReceipt, ReplyRequest, SendReceipt, SendStatus,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anybytes::View;

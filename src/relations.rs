@@ -8,6 +8,17 @@
 //! pure view over the current profile text and can later be accelerated by a
 //! derived collection without changing truth.
 
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+
+pub use operations::{
+    AddedGroup, AddedPerson, GroupAddition, GroupReconciliation, GroupRemoval, GroupRename,
+    IdentityChange, LifecycleChange, PeopleFilter, ProfileField, ProfilePatch,
+    ProfileReconciliation, ProfileUpdate, Relations,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anybytes::View;
