@@ -105,13 +105,16 @@ files --pile ./self.pile view <file-id> --accept image/png --max-dimension 1024
 faculties mcp --pile ./self.pile
 ```
 
-#### Local MCP server and launcher configuration
+#### MCP server and launcher configuration
 
-`faculties mcp` implements MCP 2025-06-18 over local, sequential stdio. It
-does **not** provide an HTTP listener, remote authentication, public download
-URLs, or an already deployed ChatGPT HTTPS connector. A remote service and its
-access/resource controls are a separate deployment boundary. This server is
-trusted local software, not a filesystem, network, or model-runtime sandbox.
+`faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
+Streamable HTTP with `--http-listen`. Both transports use the same 33 adapters,
+218 tools, argument decoding, and native image/audio/resource output. The
+library's `mcp::catalog::{Config, Catalog}` constructs the aggregate independently
+of either transport, without opening storage, keys, devices, or models.
+This server is trusted software, not a filesystem, network, or model-runtime
+sandbox. HTTP provides an authenticated internal hop; public TLS/OAuth and
+per-user provisioning remain the hosting edge's responsibility.
 
 The launcher owns `--pile`/`PILE` and optional `--key`/`TRIBLESPACE_KEY`;
 tools cannot substitute those paths. Additional launcher configuration is:
@@ -131,8 +134,9 @@ configured pile-backed auth/account state and exact encrypted Secrets-version
 references, not raw credential or host-file arguments on their MCP adapters.
 Voice/Imagine model sources are also launcher configuration, described below.
 
-On macOS/Linux the server reserves private close-on-exec protocol descriptors:
-ordinary stdin becomes EOF and ordinary stdout becomes diagnostic stderr.
+On Unix both executable transports detach ordinary stdin to EOF and ordinary
+stdout to diagnostic stderr before starting handlers or threads. Stdio alone
+reserves private close-on-exec protocol descriptors first.
 Standard-stream aliases cannot consume/corrupt JSON-RPC, and child processes do
 not inherit its private descriptors. There is no generic CLI subprocess wrapper.
 Explicit native tools can still make network requests, send messages, decrypt
@@ -142,13 +146,65 @@ effects.
 Adapters emit ordered text, perceptual images/audio, and explicit binary
 resources through `Out`. MCP packages them in one bounded response, retaining
 accepted partial output and marking handler failures. Defaults are 1 MiB per
-request and 8 MiB per response, including encoded content. Calls are sequential;
-concurrent requests and long-running cancellation are not implemented.
+request and 8 MiB per response, including encoded content. Native calls are
+sequential; HTTP can receive concurrent requests through bounded admission, but
+does not run faculty handlers concurrently or forcibly cancel native calls.
 A failure does not undo a completed publication or external send, and the server
 does not automatically retry it.
 Ordinary handler unwinds also become tool errors, retaining already accepted
 output. This is not backend-state repair or recovery from aborts, GPU failures,
 or out-of-memory termination.
+
+#### Streamable HTTP and existing hosting infrastructure
+
+Provision an independent random bearer token (32..=1024 bearer-token characters)
+in a launcher-readable, access-restricted file, then select HTTP explicitly:
+
+```sh
+faculties mcp --pile /srv/faculties/self.pile --key /srv/faculties/self.key \
+  --http-listen 127.0.0.1:8378 \
+  --http-token-file /srv/faculties/http.token \
+  --http-origin https://mcp.example.com
+```
+
+`FACULTIES_MCP_TOKEN_FILE` can supply the token-file path. The token itself is
+not a CLI argument or tool input. It is read once at startup; rotating it means
+restarting that worker. A final LF/CRLF is allowed. HTTP-only flags require
+HTTP mode; they cannot silently start a stdio server instead.
+
+The endpoint is `/`, not `/mcp`. POST accepts one JSON-RPC message and returns
+JSON, or empty 202 for an accepted notification. Initialize returns an opaque
+`Mcp-Session-Id`; subsequent requests use that header and the negotiated
+`MCP-Protocol-Version`. DELETE closes the session. GET returns 405 because
+there is no standalone SSE stream. POST clients must accept both
+`application/json` and `text/event-stream`, as required by
+[Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports).
+The transport validates every present Origin against the exact repeatable
+allowlist; absent Origin is supported for server-to-server clients. No wildcard
+origins or browser CORS access are installed.
+
+Defaults are 64 sessions, 30-minute session idle expiry, 16 admitted requests
+(body reads + queued/running calls + retained response bodies), and a 30-second
+body-read timeout. Work is executed outside the HTTP I/O runtime, preserving
+blocking native APIs and
+adapters that are not Send/Sync. Saturation is rejected before dispatch; a
+disconnect after admission does not cancel or retry a call. Shutdown drains
+admitted work, so an uninterruptible native call or slow response consumer can
+delay shutdown. These are transport bounds, not limits on model allocations,
+external calls, or all
+HTTP/socket buffering.
+
+For an existing Playground deployment, reuse Caddy/TLS and the current OAuth
+authority. The authenticated edge should select a worker with the colleague's
+existing fixed pile/key/filesystem context and replace the public credential
+with that worker's internal bearer token. Never choose the worker from an
+untrusted tenant header, forward public OAuth tokens as internal credentials,
+or switch process-wide collection/key variables between users. Loopback alone
+is not sufficient when child jails share the parent's network stack. Preserve
+the current OAuth resource identity and keep shared-pile access explicitly
+separate from the personal pile. The HTTP implementation does not itself deploy
+this routing, provision coworkers, add public download URLs, or change an
+existing public service; that integration is a distinct hosting step.
 
 #### Literal values and transport-specific UX
 

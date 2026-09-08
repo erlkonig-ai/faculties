@@ -1,13 +1,12 @@
-//! Local MCP stdio entrypoint. Only natively ported commands are registered.
+//! Native aggregate MCP entrypoint with explicit stdio or HTTP transport.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use faculties::hear;
+use faculties::mcp::catalog::{Catalog, Config as CatalogConfig};
+use faculties::mcp::http;
 use faculties::mcp::{Faculty, Server};
-use faculties::{
-    archive, atlas, body, bootstrap, cognition, compass, decide, discord, duplex, files, gauge,
-    habits, headspace, hear, imagine, linkedin, mail, memory, message, orient, patience, planner,
-    posture, reason, relations, secrets, status, teams, triage, viewer, voice, web, wiki,
-};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -19,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the native faculty tools together over local MCP stdio.
+    /// Serve native faculty tools over stdio, or opt into authenticated HTTP.
     Mcp {
         /// Pile configured by the local launcher, never an MCP tool argument.
         #[arg(long, env = "PILE")]
@@ -46,6 +45,21 @@ enum Command {
         hear_config_json: Option<PathBuf>,
         #[arg(long, env = "HEAR_TOKENIZER_JSON", requires = "hear_model_pile")]
         hear_tokenizer_json: Option<PathBuf>,
+        /// Bind a Streamable HTTP listener instead of using stdio.
+        #[arg(long, value_name = "ADDR", requires = "http_token_file")]
+        http_listen: Option<SocketAddr>,
+        /// Read the HTTP bearer credential from this launcher-owned file.
+        #[arg(
+            long,
+            env = "FACULTIES_MCP_TOKEN_FILE",
+            hide_env_values = true,
+            value_name = "PATH",
+            requires = "http_listen"
+        )]
+        http_token_file: Option<PathBuf>,
+        /// Allow this exact browser origin; repeat for additional origins.
+        #[arg(long, value_name = "URL", requires = "http_listen")]
+        http_origin: Vec<String>,
     },
 }
 
@@ -62,61 +76,44 @@ fn main() -> Result<()> {
             hear_model,
             hear_config_json,
             hear_tokenizer_json,
+            http_listen,
+            http_token_file,
+            http_origin,
         } => {
-            let archive = archive::mcp::Archive::new(pile.clone(), key.clone());
-            let atlas = atlas::mcp::Atlas::new(pile.clone(), key.clone());
-            let body = body::mcp::Body::new(pile.clone(), key.clone());
-            let bootstrap = bootstrap::mcp::Bootstrap::new(pile.clone(), key.clone());
-            let cognition = cognition::mcp::Cognition::new(pile.clone(), key.clone());
-            let compass = compass::mcp::Compass::new(pile.clone(), key.clone());
-            let decide = decide::mcp::Decide::new(pile.clone(), key.clone());
-            let duplex = duplex::mcp::Duplex::new(duplex_session);
-            let files = files::mcp::Files::new(pile.clone(), key.clone());
-            let gauge = gauge::mcp::Gauge::new(pile.clone(), key.clone());
-            let habits = habits::mcp::Habits::new(pile.clone(), key.clone());
-            let headspace = headspace::mcp::Headspace::new(pile.clone(), key.clone());
-            let hear = hear::mcp::Hear::new(match (hear_model_pile, hear_config_json, hear_tokenizer_json) {
+            let hear = match (hear_model_pile, hear_config_json, hear_tokenizer_json) {
                 (None, None, None) => None,
                 (Some(pile), Some(config_json), Some(tokenizer_json)) => Some(hear::ModelConfig {
-                    pile, model: hear_model, config_json, tokenizer_json,
+                    pile,
+                    model: hear_model,
+                    config_json,
+                    tokenizer_json,
                 }),
-                _ => anyhow::bail!("Hear requires its model pile, configuration JSON, and tokenizer JSON together"),
+                _ => anyhow::bail!(
+                    "Hear requires its model pile, configuration JSON, and tokenizer JSON together"
+                ),
+            };
+            let catalog = Catalog::new(CatalogConfig {
+                pile,
+                key,
+                discord_token,
+                linkedin_token,
+                duplex_session,
+                hear,
             });
-            let imagine = imagine::mcp::Imagine::new(pile.clone(), key.clone());
-            let linkedin = linkedin::mcp::LinkedIn::new(pile.clone(), key.clone());
-            let linkedin = match linkedin_token {
-                Some(token) => linkedin.with_token(token),
-                None => linkedin,
-            };
-            let mail = mail::mcp::Mail::new(pile.clone(), key.clone());
-            let memory = memory::mcp::Memory::new(pile.clone(), key.clone());
-            let message = message::mcp::Message::new(pile.clone(), key.clone());
-            let patience = patience::mcp::Patience::new(pile.clone(), key.clone());
-            let posture = posture::mcp::Posture::new(pile.clone(), key.clone());
-            let reason = reason::mcp::Reason::new(pile.clone(), key.clone());
-            let relations = relations::mcp::Relations::new(pile.clone(), key.clone());
-            let status = status::mcp::Status::new(pile.clone(), key.clone());
-            let triage = triage::mcp::Triage::new(pile.clone(), key.clone());
-            let planner = planner::mcp::Planner::new(pile.clone(), key.clone());
-            let secrets = secrets::mcp::Secrets::new(pile.clone(), key.clone());
-            let teams = teams::mcp::Teams::new(pile.clone(), key.clone());
-            let orient = orient::mcp::Orient::new(pile.clone(), key.clone());
-            let web = web::mcp::Web::new(pile.clone(), key.clone());
-            let voice = voice::mcp::Voice::new(pile.clone(), key.clone());
-            let discord = discord::mcp::Discord::new(pile.clone(), key.clone());
-            let discord = match discord_token {
-                Some(token) => discord.with_token(token),
-                None => discord,
-            };
-            let viewer = viewer::mcp::Viewer::new(pile.clone(), key.clone());
-            let wiki = wiki::mcp::Wiki::new(pile, key);
-            let registrations: &[&dyn Faculty] = &[
-                &archive, &atlas, &body, &bootstrap, &cognition, &compass, &decide, &discord,
-                &duplex, &files, &gauge, &habits, &headspace, &hear, &imagine, &linkedin, &mail,
-                &memory, &message, &orient, &patience, &planner, &posture, &reason, &relations,
-                &secrets, &status, &teams, &triage, &viewer, &voice, &web, &wiki,
-            ];
-            serve_stdio(registrations)
+            let registrations = catalog.registrations();
+            match http_listen {
+                Some(bind) => {
+                    let token_file = http_token_file
+                        .as_deref()
+                        .context("HTTP requires --http-token-file")?;
+                    let token = http::BearerToken::from_file(token_file)?;
+                    let mut config = http::Config::new(bind, token);
+                    config.allowed_origins = http_origin;
+                    detach_handler_stdio()?;
+                    http::serve(&registrations, config)
+                }
+                None => serve_stdio(&registrations),
+            }
         }
     }
 }
@@ -128,15 +125,25 @@ fn main() -> Result<()> {
 #[cfg(unix)]
 fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
     use std::fs::File;
-    use std::io::{BufReader, Write};
-    use std::os::fd::{AsFd, AsRawFd};
-
-    use anyhow::Context;
+    use std::io::BufReader;
+    use std::os::fd::AsFd;
 
     // OwnedFd clones are close-on-exec; subprocesses must not inherit the
     // private protocol descriptors and keep a disconnected transport alive.
     let input = File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     let output = File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    detach_handler_stdio()?;
+    Server::new(registrations)?.serve(BufReader::new(input), output)
+}
+
+/// Both executable transports isolate handlers from launcher input before
+/// starting threads. The reusable library API does not change process fds.
+#[cfg(unix)]
+fn detach_handler_stdio() -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
     let empty = File::open("/dev/null").context("open empty handler stdin")?;
     std::io::stdout().flush()?;
     for (from, to) in [
@@ -150,7 +157,12 @@ fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
             return Err(std::io::Error::last_os_error()).context("detach handler stdio");
         }
     }
-    Server::new(registrations)?.serve(BufReader::new(input), output)
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn detach_handler_stdio() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
