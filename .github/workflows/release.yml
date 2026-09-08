@@ -34,7 +34,7 @@ jobs:
 
     steps:
       # Faculties is intentionally developed as one source cohort with
-      # TribleSpace, Mary, Soma, and the CubeCL zero-copy fork. Keep the repositories
+      # TribleSpace, Mary, Soma, GORBIE, and the CubeCL zero-copy fork. Keep the repositories
       # as siblings: their paths are part of the local Cargo manifests.
       - name: Check out Faculties
         uses: actions/checkout@v4
@@ -52,8 +52,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: ffc6fbf6647dab60da81d298067c09302a2517f4
+          ref: f5468c8b071d7666bf5a0a3d1484fc1fdb8c813a
           path: mary
+
+      - name: Check out GORBIE cohort
+        uses: actions/checkout@v4
+        with:
+          repository: erlkonig-ai/GORBIE
+          ref: 2340cc2a406877ed25cf5024ed768dd9c76cd1ff
+          path: GORBIE
 
       - name: Check out Soma cohort
         uses: actions/checkout@v4

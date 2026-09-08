@@ -240,7 +240,7 @@ tempfile = "3"
 # resolve to the same cubecl — widgets, local-embed, imagine, and voice are
 # co-buildable in a single `cargo install`.
 [patch.crates-io]
-# Resident PNG capture extends the exact published 0.18.1 renderer.
+# The pinned GORBIE source cohort provides resident PNG capture.
 GORBIE = { path = "../GORBIE" }
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
 cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }

@@ -33,21 +33,21 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 Faculties is developed with TribleSpace, Mary, Soma, GORBIE, and a small CubeCL
-fork as one source cohort. This development branch uses the pinned resident
-audio/capture seams below. Clone the siblings, then install every faculty CLI
+fork as one source cohort. The pinned Mary and GORBIE revisions include resident
+audio decoding and PNG capture. Clone the siblings, then install every faculty CLI
 (and the GUI viewer) onto `$PATH`:
 
 ```sh
 mkdir faculties-source && cd faculties-source
-git clone --branch native-faculty-frontends https://github.com/erlkonig-ai/faculties
+git clone https://github.com/erlkonig-ai/faculties
 git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout d0db6da2098727a9c2d106a53de678ec33a2f1e1
-git -C mary checkout d60840d34e72afdebfa7d9c0334dc6301920ac42
-git -C GORBIE checkout 8999c6fa584f906a6016e661d7e61cd3bbb397ef
+git -C mary checkout f5468c8b071d7666bf5a0a3d1484fc1fdb8c813a
+git -C GORBIE checkout 2340cc2a406877ed25cf5024ed768dd9c76cd1ff
 git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
 git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
 cd faculties
