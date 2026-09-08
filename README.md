@@ -120,6 +120,7 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | --- | --- |
 | Discord bot access | Optional `--discord-token` / `DISCORD_TOKEN` |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
+| Files raster-image imports and CLIP similarity | With `local-embed` (enabled by default), `CLIP_PILE` or `clip.pile` under `FACULTIES_MODEL_DIR` (default `~/.cache/faculties/models`); requires a populated native Mary model collection and supported runtime |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 

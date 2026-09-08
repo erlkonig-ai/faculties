@@ -577,10 +577,17 @@ fn mcp_image_conversion_does_not_change_the_original_export() {
         .write_to(&mut buffer, image::ImageFormat::Bmp)
         .unwrap();
     let bytes = buffer.into_inner();
-    let id = fixture
-        .files()
-        .add_bytes(bytes.clone().into(), "original.bmp", "image/bmp", &[])
-        .unwrap();
+    // This tests presentation, not image import's feature-gated CLIP inference.
+    // Seed the original through the same storage seam as the other media fixtures.
+    let fragment = stage(bytes.clone(), "original.bmp", "image/bmp").unwrap();
+    let id = fragment.root().unwrap();
+    publish_fragment(
+        &fixture.pile,
+        Some(&fixture.key),
+        DEFAULT_SCOPE_ID,
+        fragment,
+    )
+    .unwrap();
     let args =
         serde_json::json!({"id": format!("{id:x}"), "accept": ["image/png"], "max_dimension": 8});
     let mut parts = Vec::new();

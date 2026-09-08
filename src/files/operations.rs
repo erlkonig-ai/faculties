@@ -2098,6 +2098,8 @@ impl Files {
 
     /// Import resident bytes without manufacturing a temporary filesystem path.
     /// Returns the intrinsic file id; import provenance is exhaust of publication.
+    /// With `local-embed`, raster images also require the configured CLIP model
+    /// and runtime for the same automatic embedding used by CLI image imports.
     pub fn add_bytes(
         &self,
         bytes: anybytes::Bytes,
