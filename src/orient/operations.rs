@@ -4,6 +4,10 @@
 //! exact payloads are acquired. Condition scripts run only after acquisition,
 //! once per evaluation. Presentation follows successful output acceptance.
 
+#[path = "health.rs"]
+mod health;
+use health::HealthSources;
+
 #[derive(Clone, Debug)]
 pub struct Orient {
     pile: PathBuf,
@@ -181,7 +185,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, MissingBlob, StorageClose, StoreSnapshot,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, StorageClose, StoreSnapshot,
 };
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
@@ -281,6 +285,18 @@ impl OrientSource {
         } else {
             open_configured(pile, scope, authority)?
         };
+        Self::register(pile, source, label)
+    }
+
+    fn register<S>(
+        pile: &mut S,
+        source: Collection<SimpleArchive>,
+        label: &'static str,
+    ) -> Result<Self>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: BlobStoreGet + CapabilityProofRead,
+    {
         let descriptors = pile
             .snapshot()
             .with_context(|| format!("freeze {label} source policy snapshot"))?;
@@ -1838,6 +1854,14 @@ fn is_persona_not_found(error: &anyhow::Error) -> bool {
 }
 
 fn resolve_native_persona(query: &OrientQuery<'_>, input: &str) -> Result<Id> {
+    resolve_resident_persona(query.relations, query.snapshot, input)
+}
+
+fn resolve_resident_persona(
+    facts: &FactArchive,
+    snapshot: &FacultySnapshot,
+    input: &str,
+) -> Result<Id> {
     let input = input.trim();
     if let Some(id) = Id::from_hex(input) {
         // Exact anchors remain useful before a profile has arrived.
@@ -1849,20 +1873,20 @@ fn resolve_native_persona(query: &OrientQuery<'_>, input: &str) -> Result<Id> {
     let wanted = relations::lookup_key(input);
     let mut settled = Vec::new();
     let mut forked = Vec::new();
-    for person in person_anchors(query.relations) {
-        let heads = profile_heads(query.relations, person);
+    for person in person_anchors(facts) {
+        let heads = profile_heads(facts, person);
         let mut matched = false;
-        for handle in profile_lookup_handles(query.relations, person) {
-            let value = read_utf8(query.snapshot, handle, "Relations profile selector")?;
+        for handle in profile_lookup_handles(facts, person) {
+            let value = read_utf8(snapshot, handle, "Relations profile selector")?;
             if relations::lookup_key(&value) == wanted {
                 matched = true;
                 break;
             }
         }
-        if !matched || lifecycle_retired(query.relations, person)? == Some(true) {
+        if !matched || lifecycle_retired(facts, person)? == Some(true) {
             continue;
         }
-        if heads.len() == 1 && lifecycle_retired(query.relations, person)?.is_some() {
+        if heads.len() == 1 && lifecycle_retired(facts, person)?.is_some() {
             settled.push(person);
         } else {
             forked.push(person);
@@ -2013,6 +2037,7 @@ enum AttentionEvent {
     Goal { event: Id, goal: Id, status: String },
     Note { note: Id, goal: Id },
     StatusWindow(Id),
+    Health { event: Id, detail: String },
 }
 
 impl AttentionEvent {
@@ -2021,6 +2046,7 @@ impl AttentionEvent {
             Self::Message(id) | Self::Mail(id) | Self::Teams(id) | Self::StatusWindow(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
+            Self::Health { event, .. } => *event,
         }
     }
 
@@ -2043,6 +2069,7 @@ impl AttentionEvent {
             Self::StatusWindow(window) => {
                 format!("new status window [{}]", fmt_id(*window))
             }
+            Self::Health { detail, .. } => format!("swarm health: {detail}"),
         }
     }
 }
@@ -2185,13 +2212,22 @@ async fn cmd_baseline(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
+        let health = HealthSources::open(&pile, &signer)?.observe(&mut pile)?;
+        let health_events = health.report().attention;
         let sources = OrientSources::open(&mut pile, &signer, false).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let (persona, events) = read(&mut pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
             let view = load_attention_view(&query, persona)?;
-            Ok((persona, view.ids().collect::<Vec<_>>()))
+            Ok((
+                persona,
+                view.ids()
+                    .chain(health_events.ids())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ))
         })
         .await?;
         save_presentations(&mut pile, &signer, persona, events.iter().copied())?;
@@ -2219,6 +2255,18 @@ async fn cmd_show(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
+        let health = HealthSources::open(&pile, &signer)?.observe(&mut pile)?;
+        let health_report = health.report();
+        write_complete_report(output, &health_report.text, "local swarm health overview")?;
+        if let Some(input) = persona {
+            match health.persona(input) {
+                Ok(persona) => {
+                    save_presentations(&mut pile, &signer, persona, health_report.attention.ids())?
+                }
+                Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let sources = OrientSources::open(&mut pile, &signer, true).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let instant = observation.snapshot.instant();
@@ -2479,6 +2527,10 @@ async fn cmd_poll(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
+        let health = HealthSources::open(&pile, &signer)?;
+        if health.poll(&mut pile, &signer, input, peek, output)?.0 {
+            return Ok(());
+        }
         let sources = OrientSources::open(&mut pile, &signer, false).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
         let prepared = read(&mut pile, &observation.snapshot, |reader| {
@@ -2669,6 +2721,37 @@ fn authorization_change_elapsed(boundary: Option<Epoch>, now: Epoch) -> bool {
     boundary.is_some_and(|boundary| now >= boundary)
 }
 
+/// Ordinary source acquisition must yield at a local health validity boundary.
+/// Its completed cache work is reusable; the caller re-observes health locally
+/// before deciding whether to resume this attention view.
+async fn load_wait_frame_before_health_deadline(
+    pile: &mut FacultyStore,
+    sources: &OrientSources,
+    snapshot: FacultySnapshot,
+    pile_path: &Path,
+    persona_input: &str,
+    next_health_change: Option<Epoch>,
+) -> Result<Option<WaitFrameLoad>> {
+    tokio::select! {
+        boundary = health::deadline(next_health_change) => {
+            boundary?;
+            Ok(None)
+        }
+        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+    }
+}
+
+async fn ensure_sources_before_health_deadline(
+    pile: &mut FacultyStore,
+    sources: &OrientSources,
+    next_health_change: Option<Epoch>,
+) -> Result<bool> {
+    tokio::select! {
+        boundary = health::deadline(next_health_change) => { boundary?; Ok(false) }
+        ensured = sources.ensure(pile) => { ensured?; Ok(true) }
+    }
+}
+
 async fn cmd_wait(
     pile_path: &Path,
     key: Option<&Path>,
@@ -2683,40 +2766,64 @@ async fn cmd_wait(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
-        let sources = OrientSources::open(&mut pile, &signer, true).await?;
+        let health = HealthSources::open(&pile, &signer)?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let mut view_pending;
+        let mut next_health_change;
+
+        let sources = loop {
+            let (fired, deadline) =
+                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            next_health_change = deadline;
+            if fired {
+                return Ok(WaitOutcome {
+                    news_printed: true,
+                    view_pending: false,
+                    had_ready_frame: true,
+                });
+            }
+            tokio::select! {
+                boundary = health::deadline(next_health_change) => { boundary?; }
+                sources = OrientSources::open(&mut pile, &signer, true) => break sources?,
+            }
+        };
 
         // `observed_snapshot` is the pre-maintenance prefix we attempted. It
         // deliberately remains the polling watermark after derived writes so
         // a concurrent source append cannot be swallowed by those writes.
-        sources.ensure(&mut pile).await?;
-        let first_snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("freeze initial Orient wait snapshot: {error}"))?;
-        let mut attempt = load_wait_frame(
-            &mut pile,
-            &sources,
-            first_snapshot,
-            pile_path,
-            persona_input,
-        )
-        .await?;
-        let mut observed_snapshot = attempt.watermark_snapshot().clone();
-        let mut next_authorization_change = attempt.next_authorization_change();
-
         let initial = loop {
-            if matches!(attempt, WaitFrameLoad::Ready(_)) {
-                let WaitFrameLoad::Ready(frame) = attempt else {
-                    unreachable!()
-                };
-                view_pending = false;
-                break frame;
+            let (fired, deadline) =
+                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            next_health_change = deadline;
+            if fired {
+                return Ok(WaitOutcome {
+                    news_printed: true,
+                    view_pending: false,
+                    had_ready_frame: true,
+                });
             }
-            let WaitFrameLoad::Pending(_) = &attempt else {
-                unreachable!()
-            };
+            if !ensure_sources_before_health_deadline(&mut pile, &sources, next_health_change)
+                .await?
+            {
+                continue;
+            }
+            let sampled = pile.snapshot()?;
+            if let Some(attempt) = load_wait_frame_before_health_deadline(
+                &mut pile,
+                &sources,
+                sampled,
+                pile_path,
+                persona_input,
+                next_health_change,
+            )
+            .await?
+            {
+                if let WaitFrameLoad::Ready(frame) = attempt {
+                    view_pending = false;
+                    break frame;
+                }
+            }
             view_pending = true;
 
             if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
@@ -2726,18 +2833,15 @@ async fn cmd_wait(
                     had_ready_frame: false,
                 });
             }
-            tokio::time::sleep(poll).await;
-            sources.ensure(&mut pile).await?;
-            let sampled = pile
-                .snapshot()
-                .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
+            let sleep = health::until(next_health_change, clock::now()?)
+                .map_or(poll, |delay| delay.min(poll));
+            tokio::time::sleep(sleep).await;
             // Provider availability can change without an appended record.
             // Retry maintenance and choose a new resident target observation.
-            attempt =
-                load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
-            observed_snapshot = attempt.watermark_snapshot().clone();
-            next_authorization_change = attempt.next_authorization_change();
         };
+
+        let mut observed_snapshot = initial.watermark.clone();
+        let mut next_authorization_change = initial.observation.next_authorization_change;
 
         let WaitFrame {
             watermark: _,
@@ -2772,8 +2876,25 @@ async fn cmd_wait(
                     });
                 }
             }
-            tokio::time::sleep(poll).await;
-            sources.ensure(&mut pile).await?;
+            let sleep = health::until(next_health_change, clock::now()?)
+                .map_or(poll, |delay| delay.min(poll));
+            tokio::time::sleep(sleep).await;
+            let (fired, deadline) =
+                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            next_health_change = deadline;
+            if fired {
+                return Ok(WaitOutcome {
+                    news_printed: true,
+                    view_pending: false,
+                    had_ready_frame: true,
+                });
+            }
+            if !ensure_sources_before_health_deadline(&mut pile, &sources, next_health_change)
+                .await?
+            {
+                view_pending = true;
+                continue;
+            }
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
@@ -2796,8 +2917,19 @@ async fn cmd_wait(
             }
 
             if storage_changed || authorization_changed || view_pending {
-                let attempt =
-                    load_wait_frame(&mut pile, &sources, sampled, pile_path, persona_input).await?;
+                let Some(attempt) = load_wait_frame_before_health_deadline(
+                    &mut pile,
+                    &sources,
+                    sampled,
+                    pile_path,
+                    persona_input,
+                    next_health_change,
+                )
+                .await?
+                else {
+                    view_pending = true;
+                    continue;
+                };
                 observed_snapshot = attempt.watermark_snapshot().clone();
                 next_authorization_change = attempt.next_authorization_change();
                 match attempt {

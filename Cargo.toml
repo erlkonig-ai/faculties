@@ -241,6 +241,7 @@ tempfile = "3"
 # resolve to the same cubecl — widgets, local-embed, imagine, and voice are
 # co-buildable in a single `cargo install`.
 [patch.crates-io]
+netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 # The pinned GORBIE source cohort provides resident PNG capture.
 GORBIE = { path = "../GORBIE" }
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }

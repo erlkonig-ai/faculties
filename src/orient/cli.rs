@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 #[command(
     version = crate::GIT_VERSION,
     name = "orient",
-    about = "Orient the agent with recent messages and goals"
+    about = "Orient the agent with local swarm health, recent messages and goals"
 )]
 pub struct Cli {
     /// Path to the pile file to use
@@ -50,7 +50,7 @@ pub struct Cli {
 /// is out of place in the other however cheap it would be to add.
 #[derive(Subcommand)]
 enum Command {
-    /// Mid-session overview of the current situation (no memories, no wiki)
+    /// Mid-session overview, with resident local swarm health first (no memories, no wiki)
     Show {
         /// Max local messages to show
         #[arg(long, default_value_t = 10)]
@@ -78,7 +78,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Wait until the persona-visible semantic view gains news
+    /// Wait for directed news or a local health alert/recovery/report expiry
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,

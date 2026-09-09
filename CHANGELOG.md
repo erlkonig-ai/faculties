@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient shows resident local daemon health before ordinary source acquisition.
+  Poll and one-shot wait surface stable alert/recovery episodes through the
+  existing presentation ledger; healthy heartbeats stay quiet and an expired
+  latest report wakes wait without a new append. Health reads maintain local
+  fact and LWW targets only, never probe the network, and distinguish reported
+  pairwise record convergence from DHT publication and blob availability.
+  Reporting must be explicitly configured on the daemon; absence is unknown.
+
 - Add native MCP Streamable HTTP alongside stdio, with the same complete tool
   catalogue and ordered image/audio/resource responses. Extract the aggregate
   catalogue into a reusable library; keep pile/key/model configuration owned by

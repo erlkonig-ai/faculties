@@ -3,6 +3,7 @@ use clap::Parser;
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::orient::{mcp, Orient, ShowOptions, WaitOptions, WakeOptions};
 use faculties::out::{Out, Part};
+use faculties::schemas::swarm_health::{self as health, Component, Condition, Recorder, State};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -116,6 +117,49 @@ impl Fixture {
             )
             .unwrap();
         parts
+    }
+
+    fn health_recorder(&self) -> Recorder {
+        let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        Recorder::new(signer.verifying_key())
+    }
+
+    fn health(
+        &self,
+        recorder: &mut Recorder,
+        at: hifitime::Epoch,
+        state: State,
+        alert: bool,
+    ) -> Fragment {
+        let facts = recorder
+            .record(
+                at,
+                Duration::from_secs(180),
+                [Condition {
+                    component: Component::Dht,
+                    collection: None,
+                    peer: None,
+                    state,
+                    alert,
+                }],
+            )
+            .unwrap();
+        self.publish(health::DEFAULT_SCOPE_ID, facts.clone());
+        facts
+    }
+
+    fn presented(&self) -> std::collections::BTreeSet<Id> {
+        let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        let mut store = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let collection = faculties::collection_names::open_configured(
+            &mut store,
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let (facts, _) = faculties::storage::read_fact_collection(collection, &snapshot).unwrap();
+        faculties::orient::presented_events(&facts, self.persona)
     }
 }
 fn text(parts: &[Part]) -> String {
@@ -334,4 +378,128 @@ fn mcp_is_finite_and_rejects_host_config_waits_and_duplicate_fields() {
             "{tool}: {error:#}"
         );
     }
+}
+
+#[test]
+fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger() {
+    let f = Fixture::new();
+    let at = faculties::clock::now().unwrap();
+    let mut recorder = f.health_recorder();
+    let failure = f.health(&mut recorder, at + -30.0, State::Stalled, true);
+    let issues: std::collections::BTreeSet<Id> = find!(event: Id, pattern!(failure.facts(), [{
+        ?event @ triblespace::core::metadata::tag: &health::KIND_ALERT,
+    }]))
+    .collect();
+    assert_eq!(issues.len(), 1);
+    let cli = f.cli(&["--persona", &f.who(), "poll", "--peek"]);
+    assert!(text(&cli).contains("DHT publication: stalled"));
+    assert!(text(&cli).contains("do not prove blob availability"));
+    assert!(f.presented().is_empty());
+    assert!(text(&f.call("orient_poll", json!({"persona":f.who()})))
+        .contains("DHT publication: stalled"));
+    assert!(f.presented().is_empty());
+    f.call("orient_poll", json!({"persona":f.who(),"peek":false}));
+    assert_eq!(f.presented(), issues);
+
+    f.health(&mut recorder, at + -20.0, State::Stalled, true);
+    assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
+    f.health(&mut recorder, at + -10.0, State::Current, false);
+    assert!(
+        text(&f.call("orient_poll", json!({"persona":f.who(),"peek":false}))).contains("recovered")
+    );
+    f.health(&mut recorder, at, State::Current, false);
+    assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
+}
+
+#[test]
+fn health_is_visible_before_unavailable_message_bodies_and_wait_records_only_what_it_shows() {
+    let f = Fixture::new();
+    let mut recorder = f.health_recorder();
+    let facts = f.health(
+        &mut recorder,
+        faculties::clock::now().unwrap() + -600.0,
+        State::Current,
+        false,
+    );
+    let report = facts.root().unwrap();
+    // This attachment exists only in an uncommitted fixture fragment. Its
+    // envelope is resident, so the ordinary attention path would need a fetch.
+    let mut unattached = Fragment::empty();
+    let body = unattached.put("test-only unavailable body".to_owned());
+    let envelope = faculties::message::envelope_fragment(
+        f.sender,
+        f.persona,
+        body,
+        faculties::clock::point_now().unwrap(),
+        None,
+        None,
+    );
+    let message = envelope.root().unwrap();
+    f.publish(faculties::schemas::message::DEFAULT_SCOPE_ID, envelope);
+    let news = f.call("orient_poll", json!({"persona":f.who()}));
+    assert!(text(&news).contains("report expired; current health unknown"));
+    assert!(!text(&news).contains("unavailable body"));
+    assert!(f.presented().is_empty());
+    let mut parts = Vec::new();
+    f.orient()
+        .wait(
+            &f.who(),
+            &WaitOptions {
+                timeout: Some(Duration::ZERO),
+                poll_interval: Duration::from_millis(1),
+            },
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("report expired; current health unknown"));
+    assert_eq!(f.presented(), std::collections::BTreeSet::from([report]));
+    assert!(!f.presented().contains(&message));
+}
+
+#[test]
+fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() {
+    let f = Fixture::new();
+    assert!(text(&f.call("orient_show", json!({}))).contains("not observed / not configured"));
+    let at = faculties::clock::now().unwrap();
+    let mut recorder = f.health_recorder();
+    f.health(&mut recorder, at + -10.0, State::Current, false);
+    let mut parts = Vec::new();
+    f.orient()
+        .wait(
+            &f.who(),
+            &WaitOptions {
+                timeout: Some(Duration::ZERO),
+                poll_interval: Duration::from_millis(1),
+            },
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("No change detected"));
+    assert!(!text(&parts).contains("News:"));
+
+    f.health(&mut recorder, at, State::Stalled, true);
+    let error = f
+        .orient()
+        .show(
+            Some(&f.who()),
+            &ShowOptions {
+                evaluate_habits: false,
+                ..Default::default()
+            },
+            &mut Out::new(&mut |_| anyhow::bail!("health output rejected")),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("health output rejected"));
+    assert!(f.presented().is_empty());
+    let show = f.call("orient_show", json!({"persona":f.who()}));
+    assert!(text(&show).starts_with("\nSwarm health (local observations):"));
+    assert!(text(&show).contains("DHT publication: stalled"));
+    assert_eq!(f.presented().len(), 1);
+    assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }
