@@ -134,7 +134,6 @@ impl Fixture {
         let facts = recorder
             .record(
                 at,
-                Duration::from_secs(180),
                 [Condition {
                     component: Component::Dht,
                     collection: None,
@@ -437,7 +436,7 @@ fn health_is_visible_before_unavailable_message_bodies_and_wait_records_only_wha
     let message = envelope.root().unwrap();
     f.publish(faculties::schemas::message::DEFAULT_SCOPE_ID, envelope);
     let news = f.call("orient_poll", json!({"persona":f.who()}));
-    assert!(text(&news).contains("report expired; current health unknown"));
+    assert!(text(&news).contains("report exceeds reader maximum age; current health unknown"));
     assert!(!text(&news).contains("unavailable body"));
     assert!(f.presented().is_empty());
     let mut parts = Vec::new();
@@ -454,9 +453,137 @@ fn health_is_visible_before_unavailable_message_bodies_and_wait_records_only_wha
             }),
         )
         .unwrap();
-    assert!(text(&parts).contains("report expired; current health unknown"));
+    assert!(text(&parts).contains("report exceeds reader maximum age; current health unknown"));
     assert_eq!(f.presented(), std::collections::BTreeSet::from([report]));
     assert!(!f.presented().contains(&message));
+}
+
+#[test]
+fn health_max_age_is_reader_owned_across_native_cli_mcp_and_baseline() {
+    let f = Fixture::new();
+    let mut recorder = f.health_recorder();
+    let facts = f.health(
+        &mut recorder,
+        faculties::clock::now().unwrap() + -600.0,
+        State::Current,
+        false,
+    );
+    let report = facts.root().unwrap();
+
+    assert!(f
+        .cli(&[
+            "--persona",
+            &f.who(),
+            "poll",
+            "--peek",
+            "--health-max-age",
+            "3600",
+        ])
+        .is_empty());
+    assert!(text(&f.cli(&[
+        "--persona",
+        &f.who(),
+        "--health-max-age",
+        "60",
+        "poll",
+        "--peek",
+    ]))
+    .contains("report exceeds reader maximum age"));
+    assert!(f
+        .call(
+            "orient_poll",
+            json!({
+                "persona": f.who(), "health_max_age_secs": 3600,
+            })
+        )
+        .is_empty());
+    assert!(text(&f.call(
+        "orient_poll",
+        json!({
+            "persona": f.who(), "health_max_age_secs": 60,
+        })
+    ))
+    .contains("report exceeds reader maximum age"));
+    assert!(
+        text(&f.call("orient_show", json!({"health_max_age_secs": 60})))
+            .contains("unknown (report too old)")
+    );
+    assert!(
+        !text(&f.call("orient_show", json!({"health_max_age_secs": 3600})))
+            .contains("report too old")
+    );
+
+    let mut parts = Vec::new();
+    f.orient()
+        .with_health_max_age(Duration::from_secs(3600))
+        .poll(
+            &f.who(),
+            true,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(parts.is_empty());
+    assert!(f.presented().is_empty());
+    f.call(
+        "orient_baseline",
+        json!({"persona": f.who(), "health_max_age_secs": 3600}),
+    );
+    assert!(!f.presented().contains(&report));
+    f.call(
+        "orient_baseline",
+        json!({"persona": f.who(), "health_max_age_secs": 60}),
+    );
+    assert!(f.presented().contains(&report));
+}
+
+#[test]
+fn wait_uses_the_same_reader_max_age_as_poll_and_show() {
+    let f = Fixture::new();
+    let mut recorder = f.health_recorder();
+    let report = f
+        .health(
+            &mut recorder,
+            faculties::clock::now().unwrap() + -600.0,
+            State::Current,
+            false,
+        )
+        .root()
+        .unwrap();
+    let options = WaitOptions {
+        timeout: Some(Duration::ZERO),
+        poll_interval: Duration::from_millis(1),
+    };
+    let mut parts = Vec::new();
+    f.orient()
+        .with_health_max_age(Duration::from_secs(3600))
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(!text(&parts).contains("News:"));
+    assert!(f.presented().is_empty());
+    parts.clear();
+    f.orient()
+        .with_health_max_age(Duration::from_secs(60))
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("report exceeds reader maximum age"));
+    assert_eq!(f.presented(), std::collections::BTreeSet::from([report]));
 }
 
 #[test]

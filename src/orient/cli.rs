@@ -26,6 +26,15 @@ pub struct Cli {
     /// Durable collection signing key. Defaults to the pile-adjacent key.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// Maximum age of a current local health report, in seconds (reader policy).
+    #[arg(
+        long,
+        global = true,
+        env = "TRIBLESPACE_HEALTH_MAX_AGE_SECS",
+        default_value_t = crate::schemas::swarm_health::DEFAULT_MAX_AGE.as_secs(),
+        value_name = "SECONDS"
+    )]
+    health_max_age: u64,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -78,7 +87,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Wait for directed news or a local health alert/recovery/report expiry
+    /// Wait for directed news, a local health alert/recovery, or a stale report
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,
@@ -231,7 +240,8 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
         out.line(Cli::command().render_help().to_string())?;
         return Ok(());
     };
-    let orient = Orient::new(cli.pile, cli.key);
+    let orient =
+        Orient::new(cli.pile, cli.key).with_health_max_age(Duration::from_secs(cli.health_max_age));
     match command {
         Command::Show {
             message_limit,

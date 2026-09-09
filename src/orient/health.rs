@@ -12,10 +12,15 @@ pub(super) struct HealthSources {
     latest: Collection<LwwRegisterBlob>,
     relations: OrientSource,
     presentations: OrientSource,
+    max_age: Duration,
 }
 
 impl HealthSources {
-    pub(super) fn open(pile: &FacultyStore, signer: &SigningKey) -> Result<Self> {
+    pub(super) fn open(
+        pile: &FacultyStore,
+        signer: &SigningKey,
+        max_age: Duration,
+    ) -> Result<Self> {
         let mut local = pile.store();
         let mut open = |scope, label| {
             let source = open_configured(&mut *local, scope, signer.verifying_key())?;
@@ -35,6 +40,7 @@ impl HealthSources {
             latest,
             relations,
             presentations,
+            max_age,
         })
     }
 
@@ -97,6 +103,7 @@ impl HealthSources {
             latest,
             relations,
             presentations,
+            max_age: self.max_age,
         })
     }
 }
@@ -108,7 +115,7 @@ pub(super) fn until(deadline: Option<Epoch>, now: Epoch) -> Option<Duration> {
     })
 }
 
-/// A semantic report deadline, not a retry timeout. Dropping ordinary reads at
+/// The reader's freshness deadline, not a retry timeout. Dropping ordinary reads at
 /// this boundary lets the caller refresh local health before trying them again.
 pub(super) async fn deadline(deadline: Option<Epoch>) -> Result<()> {
     match until(deadline, clock::now()?) {
@@ -124,6 +131,7 @@ pub(super) struct HealthObservation {
     latest: LwwIndex,
     relations: OrientFact,
     presentations: OrientFact,
+    max_age: Duration,
 }
 
 pub(super) struct HealthReport {
@@ -134,7 +142,12 @@ pub(super) struct HealthReport {
 
 impl HealthObservation {
     pub(super) fn report(&self) -> HealthReport {
-        render_health(self.facts.view(), &self.latest, &self.snapshot)
+        render_health(
+            self.facts.view(),
+            &self.latest,
+            &self.snapshot,
+            self.max_age,
+        )
     }
 
     pub(super) fn persona(&self, input: &str) -> Result<Id> {
@@ -206,6 +219,7 @@ fn render_health(
     facts: &FactArchive,
     latest: &LwwIndex,
     snapshot: &FacultySnapshot,
+    max_age: Duration,
 ) -> HealthReport {
     use std::fmt::Write as _;
 
@@ -215,13 +229,12 @@ fn render_health(
     let mut attention = AttentionView::default();
     let mut next_change: Option<Epoch> = None;
     let mut observed = false;
-    for (report, node, session, endpoint, created, expires) in find!(
+    for (report, node, session, endpoint, created) in find!(
         (report: Id, node: Id, session: Id, endpoint: ed25519_dalek::VerifyingKey,
-         created: (Epoch, Epoch), expires: (Epoch, Epoch)),
+         created: (Epoch, Epoch)),
         and!(latest.has(report), pattern!(facts, [
             { ?report @ metadata::tag: &schema::KIND_REPORT, attrs::node: ?node,
-              attrs::session: ?session, metadata::created_at: ?created,
-              metadata::expires_at: ?expires },
+              attrs::session: ?session, metadata::created_at: ?created },
             { ?node @ attrs::endpoint: ?endpoint },
         ]))
     ) {
@@ -229,23 +242,25 @@ fn render_health(
         let endpoint = hex::encode(endpoint.to_bytes());
         let observer = &endpoint[..12];
         let age = format_age(now_key, created.1.to_tai_duration().total_nanoseconds());
-        let fresh = created.1 <= now && now < expires.0 && created.1 < expires.0;
+        let stale_at =
+            created.1 + hifitime::Duration::from_total_nanoseconds(max_age.as_nanos() as i128);
+        let fresh = created.1 <= now && now < stale_at;
         let timing = if now < created.1 {
             "unknown (sample is in the future)"
         } else if !fresh {
-            "unknown (report expired)"
+            "unknown (report too old)"
         } else {
             "fresh"
         };
         writeln!(text, "- observer [{observer}], sample {age} ago: {timing}").unwrap();
         if fresh {
-            next_change = Some(next_change.map_or(expires.0, |seen| seen.min(expires.0)));
+            next_change = Some(next_change.map_or(stale_at, |seen| seen.min(stale_at)));
         } else if now < created.1 {
             next_change = Some(next_change.map_or(created.1, |seen| seen.min(created.1)));
         } else {
             attention.insert(AttentionEvent::Health {
                 event: report,
-                detail: format!("observer [{observer}] report expired; current health unknown (last sample {age} ago)"),
+                detail: format!("observer [{observer}] report exceeds reader maximum age; current health unknown (last sample {age} ago)"),
             });
         }
         let mut conditions = BTreeSet::new();
@@ -337,7 +352,7 @@ mod tests {
             // Test-only author, never a live transport or pile identity.
             let signer = SigningKey::from_bytes(&[71; 32]);
             let store = open_store(&path).unwrap();
-            let sources = HealthSources::open(&store, &signer).unwrap();
+            let sources = HealthSources::open(&store, &signer, Duration::from_secs(60)).unwrap();
             Self {
                 store,
                 sources,
@@ -375,15 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn expiry_changes_attention_without_new_records_and_never_repeats_when_presented() {
+    fn reader_age_deadline_changes_attention_without_new_records_and_never_repeats() {
         let mut f = Fixture::new();
         let mut recorder = Recorder::new(f.signer.verifying_key());
         let heartbeat = recorder
-            .record(
-                at(0.0),
-                Duration::from_secs(60),
-                [condition(State::Current, false)],
-            )
+            .record(at(0.0), [condition(State::Current, false)])
             .unwrap();
         let report_id = heartbeat.root().unwrap();
         f.publish(heartbeat);
@@ -405,7 +416,7 @@ mod tests {
         assert!(expired.snapshot.changes_since(&fresh.snapshot).is_empty());
         let after = expired.report();
         assert_eq!(after.attention.ids().collect::<Vec<_>>(), vec![report_id]);
-        assert!(after.text.contains("unknown (report expired)"));
+        assert!(after.text.contains("unknown (report too old)"));
         assert!(after.text.contains("last sample only"));
         assert_eq!(after.next_change, None);
         let persona = *fucid();
@@ -420,35 +431,23 @@ mod tests {
         let mut f = Fixture::new();
         let mut recorder = Recorder::new(f.signer.verifying_key());
         let old = recorder
-            .record(
-                at(0.0),
-                Duration::from_secs(5),
-                [condition(State::Unknown, false)],
-            )
+            .record(at(0.0), [condition(State::Unknown, false)])
             .unwrap();
         let first = recorder
-            .record(
-                at(10.0),
-                Duration::from_secs(60),
-                [condition(State::Current, false)],
-            )
+            .record(at(10.0), [condition(State::Current, false)])
             .unwrap();
         let next = recorder
-            .record(
-                at(20.0),
-                Duration::from_secs(60),
-                [condition(State::Current, false)],
-            )
+            .record(at(20.0), [condition(State::Current, false)])
             .unwrap();
         f.publish(next);
         f.publish(old);
         f.publish(first);
-        let report = f.observe_at(at(30.0)).report();
+        let report = f.observe_at(at(70.0)).report();
         assert!(report.attention.is_empty());
         assert_eq!(report.next_change, Some(at(80.0)));
         assert_eq!(report.text.matches("- observer").count(), 1);
         assert!(report.text.contains("converged at observed pairwise roots"));
-        assert!(!report.text.contains("report expired"));
+        assert!(!report.text.contains("report too old"));
     }
 
     #[test]
@@ -458,11 +457,7 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(
-                    at(0.0),
-                    Duration::from_secs(60),
-                    [condition(State::Stalled, true)],
-                )
+                .record(at(0.0), [condition(State::Stalled, true)])
                 .unwrap(),
         );
         let failure = f.observe_at(at(1.0)).report();
@@ -470,11 +465,7 @@ mod tests {
         save_presentations(&mut f.store, &f.signer, persona, failure.attention.ids()).unwrap();
         f.publish(
             recorder
-                .record(
-                    at(10.0),
-                    Duration::from_secs(60),
-                    [condition(State::Stalled, true)],
-                )
+                .record(at(10.0), [condition(State::Stalled, true)])
                 .unwrap(),
         );
         let heartbeat = f.observe_at(at(11.0));
@@ -486,11 +477,7 @@ mod tests {
 
         f.publish(
             recorder
-                .record(
-                    at(20.0),
-                    Duration::from_secs(60),
-                    [condition(State::Current, false)],
-                )
+                .record(at(20.0), [condition(State::Current, false)])
                 .unwrap(),
         );
         let recovered = f.observe_at(at(21.0)).report();
@@ -510,11 +497,7 @@ mod tests {
         save_presentations(&mut f.store, &f.signer, persona, recovered.attention.ids()).unwrap();
         f.publish(
             recorder
-                .record(
-                    at(30.0),
-                    Duration::from_secs(60),
-                    [condition(State::Current, false)],
-                )
+                .record(at(30.0), [condition(State::Current, false)])
                 .unwrap(),
         );
         let heartbeat = f.observe_at(at(31.0));
@@ -526,11 +509,7 @@ mod tests {
         let mut restarted = Recorder::new(f.signer.verifying_key());
         f.publish(
             restarted
-                .record(
-                    at(40.0),
-                    Duration::from_secs(60),
-                    [condition(State::Current, false)],
-                )
+                .record(at(40.0), [condition(State::Current, false)])
                 .unwrap(),
         );
         assert!(f.observe_at(at(41.0)).report().attention.is_empty());
@@ -580,21 +559,13 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(
-                    at(0.0),
-                    Duration::from_secs(60),
-                    [condition(State::Stalled, true)],
-                )
+                .record(at(0.0), [condition(State::Stalled, true)])
                 .unwrap(),
         );
         let first = f.observe_at(at(1.0)).report();
         f.publish(
             recorder
-                .record(
-                    at(10.0),
-                    Duration::from_secs(60),
-                    [condition(State::Current, false)],
-                )
+                .record(at(10.0), [condition(State::Current, false)])
                 .unwrap(),
         );
         {
@@ -622,6 +593,51 @@ mod tests {
             .report()
             .text
             .contains("converged at observed pairwise roots"));
+    }
+
+    #[test]
+    fn reader_policy_controls_freshness_and_ignores_legacy_expiry_annotations() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        let mut report = recorder
+            .record(at(0.0), [condition(State::Current, false)])
+            .unwrap();
+        let id = report.root().unwrap();
+        assert!(!exists!(
+            pattern!(report.facts(), [{ id @ metadata::expires_at: _?expiry }])
+        ));
+        // Historical annotations are ordinary extra facts, not reader policy.
+        // Neither an already-past nor a far-future expiry can alter the deadline.
+        report += entity! { ExclusiveId::force_ref(&id) @ metadata::expires_at*: [
+            clock::point(at(-100.0)).unwrap(),
+            clock::point(at(1_000_000.0)).unwrap(),
+        ] };
+        f.publish(report);
+        let short = f.observe_at(at(90.0));
+        assert_eq!(short.report().attention.ids().collect::<Vec<_>>(), vec![id]);
+
+        f.sources.max_age = Duration::from_secs(120);
+        let long = f.sources.at(short.snapshot.clone()).unwrap();
+        assert!(long.report().attention.is_empty());
+        assert_eq!(long.report().next_change, Some(at(120.0)));
+        assert!(long.snapshot.changes_since(&short.snapshot).is_empty());
+        assert_eq!(long.report().text.matches("- observer").count(), 1);
+    }
+
+    #[test]
+    fn future_observation_waits_for_its_timestamp_before_becoming_current() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(at(10.0), [condition(State::Current, false)])
+                .unwrap(),
+        );
+        let future = f.observe_at(at(0.0)).report();
+        assert!(future.text.contains("sample is in the future"));
+        assert!(future.attention.is_empty());
+        assert_eq!(future.next_change, Some(at(10.0)));
+        assert_eq!(f.observe_at(at(10.0)).report().next_change, Some(at(70.0)));
     }
 
     #[test]

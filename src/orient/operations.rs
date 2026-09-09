@@ -12,6 +12,7 @@ use health::HealthSources;
 pub struct Orient {
     pile: PathBuf,
     key: Option<PathBuf>,
+    health_max_age: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +68,17 @@ pub struct BaselineReceipt {
 
 impl Orient {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self {
+            pile,
+            key,
+            health_max_age: crate::schemas::swarm_health::DEFAULT_MAX_AGE,
+        }
+    }
+    /// Choose how long this reader treats the latest health observation as current.
+    /// This does not change the report facts or the reporting daemon.
+    pub fn with_health_max_age(mut self, max_age: Duration) -> Self {
+        self.health_max_age = max_age;
+        self
     }
     /// Situational overview. Evaluates stored Habit conditions: trusted local execution.
     pub fn show(
@@ -84,6 +95,7 @@ impl Orient {
             options.doing_limit,
             options.todo_limit,
             options.evaluate_habits,
+            self.health_max_age,
             out,
         ))
     }
@@ -109,11 +121,17 @@ impl Orient {
             self.key.as_deref(),
             Some(persona),
             peek,
+            self.health_max_age,
             out,
         ))
     }
     pub fn baseline(&self, persona: &str) -> Result<BaselineReceipt> {
-        runtime()?.block_on(cmd_baseline(&self.pile, self.key.as_deref(), Some(persona)))
+        runtime()?.block_on(cmd_baseline(
+            &self.pile,
+            self.key.as_deref(),
+            Some(persona),
+            self.health_max_age,
+        ))
     }
     /// One-shot wait. It returns after the first complete news report or timeout.
     /// No permanent process or competing observer is started by constructing Orient.
@@ -123,6 +141,7 @@ impl Orient {
             self.key.as_deref(),
             Some(persona),
             options,
+            self.health_max_age,
             out,
         ))
     }
@@ -2205,6 +2224,7 @@ async fn cmd_baseline(
     pile_path: &Path,
     key: Option<&Path>,
     persona: Option<&str>,
+    health_max_age: Duration,
 ) -> Result<BaselineReceipt> {
     let Some(input) = persona else {
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
@@ -2212,7 +2232,7 @@ async fn cmd_baseline(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
-        let health = HealthSources::open(&pile, &signer)?.observe(&mut pile)?;
+        let health = HealthSources::open(&pile, &signer, health_max_age)?.observe(&mut pile)?;
         let health_events = health.report().attention;
         let sources = OrientSources::open(&mut pile, &signer, false).await?;
         let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
@@ -2248,6 +2268,7 @@ async fn cmd_show(
     doing_limit: usize,
     todo_limit: usize,
     evaluate_habits: bool,
+    health_max_age: Duration,
     output: &mut Out<'_>,
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -2255,7 +2276,7 @@ async fn cmd_show(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
-        let health = HealthSources::open(&pile, &signer)?.observe(&mut pile)?;
+        let health = HealthSources::open(&pile, &signer, health_max_age)?.observe(&mut pile)?;
         let health_report = health.report();
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
@@ -2519,6 +2540,7 @@ async fn cmd_poll(
     key: Option<&Path>,
     persona: Option<&str>,
     peek: bool,
+    health_max_age: Duration,
     output: &mut Out<'_>,
 ) -> Result<()> {
     let Some(input) = persona else {
@@ -2527,7 +2549,7 @@ async fn cmd_poll(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
-        let health = HealthSources::open(&pile, &signer)?;
+        let health = HealthSources::open(&pile, &signer, health_max_age)?;
         if health.poll(&mut pile, &signer, input, peek, output)?.0 {
             return Ok(());
         }
@@ -2757,6 +2779,7 @@ async fn cmd_wait(
     key: Option<&Path>,
     persona: Option<&str>,
     options: &WaitOptions,
+    health_max_age: Duration,
     output: &mut Out<'_>,
 ) -> Result<()> {
     let Some(persona_input) = persona else {
@@ -2766,7 +2789,7 @@ async fn cmd_wait(
     let signer = load_signer(pile_path, key)?;
     let mut pile = open_store(pile_path)?;
     let result = async {
-        let health = HealthSources::open(&pile, &signer)?;
+        let health = HealthSources::open(&pile, &signer, health_max_age)?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let mut view_pending;

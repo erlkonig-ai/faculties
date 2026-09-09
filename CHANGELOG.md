@@ -4,9 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Health freshness is reader policy over `created_at`, not producer-declared
+  expiry. Orient accepts `--health-max-age SECONDS` (or
+  `TRIBLESPACE_HEALTH_MAX_AGE_SECS`), native `with_health_max_age(Duration)`,
+  and explicit MCP `health_max_age_secs`; all default to 180 seconds. The same
+  limit drives show, poll, baseline, and wait's stale-report deadline. Historical
+  expiry annotations are ignored and healthy heartbeats remain quiet; no migration.
+
 - Orient shows resident local daemon health before ordinary source acquisition.
   Poll and one-shot wait surface stable alert/recovery episodes through the
-  existing presentation ledger; healthy heartbeats stay quiet and an expired
+  existing presentation ledger; healthy heartbeats stay quiet and a stale
   latest report wakes wait without a new append. Health reads maintain local
   fact and LWW targets only, never probe the network, and distinguish reported
   pairwise record convergence from DHT publication and blob availability.
