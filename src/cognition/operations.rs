@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -12,12 +12,11 @@ use triblespace::core::repo::SnapshotSource;
 
 use crate::collection_names::open_configured;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::{FactArchive, Storage};
 
 #[derive(Clone, Debug)]
 pub struct Cognition {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,14 +36,16 @@ impl CheckReport {
 impl Cognition {
     /// Trusted launcher-owned configuration, not caller-selected tool fields.
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
 
     pub fn check(&self) -> Result<CheckReport> {
-        let signer = load_signer(&self.pile, self.key.as_deref())?;
-        let mut pile = open_pile_strict(&self.pile)?;
-        let result = (|| {
-            let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        self.storage.with_pile(|pile, signer| {
+            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let descriptor_snapshot = pile.snapshot()?;
             let policy = source.policy(&descriptor_snapshot)?;
             drop(descriptor_snapshot);
@@ -65,14 +66,6 @@ impl Cognition {
             Ok(CheckReport {
                 facts: facts.iter().count(),
             })
-        })();
-        match (result, pile.close()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow!("close Cognition pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing Cognition pile also failed: {close_error}")))
-            }
-        }
+        })
     }
 }

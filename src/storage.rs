@@ -20,7 +20,9 @@
 //! `faculties-migrations` crate and depends on this module rather than the
 //! other way round.
 
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -36,8 +38,8 @@ use triblespace::core::id::Id;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StoreRead,
-    StoreSnapshot,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StorageClose,
+    StoreRead, StoreSnapshot,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
@@ -52,6 +54,218 @@ pub type FacultyStore = triblespace_net::peer::Peer<Pile>;
 
 /// The live store's frozen observation with an async exact-blob reader.
 pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
+
+/// Explicit storage ownership for native faculty operations.
+///
+/// A one-shot caller uses [`Self::new`]: each operation opens and closes its
+/// pile, reporting close errors before returning. A long-lived application
+/// uses [`Self::shared`] and passes clones to its faculties. Those clones
+/// share one lazy peer, pile indexes and I/O runtime, not collection views or
+/// snapshots. Construction and tool discovery perform no I/O in either case.
+///
+/// A shared owner must call [`Self::close`] (or [`Self::finish`]) at shutdown
+/// to report persistence errors. Like any long-lived store, its successful
+/// appends are not implicitly flushed after each operation. The last owner's
+/// drop is a cleanup fallback, not a substitute for checking close errors.
+#[derive(Clone)]
+pub struct Storage {
+    pile: PathBuf,
+    key: Option<PathBuf>,
+    shared: Option<Arc<Mutex<Option<Session>>>>,
+}
+
+struct Session {
+    store: Option<FacultyStore>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl Session {
+    fn close(mut self) -> Result<()> {
+        self.store
+            .take()
+            .expect("an open session owns its store")
+            .close()
+            .context("close shared faculty store")
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            if let Err(error) = store.close() {
+                eprintln!("closing shared faculty store failed: {error}");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Storage")
+            .field("pile", &self.pile)
+            .field("key", &self.key)
+            .field("shared", &self.shared.is_some())
+            .finish()
+    }
+}
+
+impl Storage {
+    /// Configure operation-scoped storage, suitable for a short-lived CLI.
+    pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self {
+            pile,
+            key,
+            shared: None,
+        }
+    }
+
+    /// Configure one application-owned store. Clones share this owner even
+    /// when passed to different faculty adapters or MCP protocol sessions.
+    /// Independently constructed owners never share implicitly by path.
+    pub fn shared(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self {
+            pile,
+            key,
+            shared: Some(Arc::new(Mutex::new(None))),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.pile
+    }
+
+    pub fn key_path(&self) -> Option<&Path> {
+        self.key.as_deref()
+    }
+
+    /// Retain one store across a compound operation without holding a borrow
+    /// over parsing, external I/O or output. A CLI creates and closes a local
+    /// owner for this scope; an already-shared application owner is reused and
+    /// remains open afterward. Nested scopes therefore preserve ownership.
+    pub fn scope<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if self.shared.is_some() {
+            return operation(self);
+        }
+        let storage = Self::shared(self.pile.clone(), self.key.clone());
+        let result = operation(&storage);
+        storage.finish(result)
+    }
+
+    fn with_session<T>(&self, operation: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+        let mut session = self
+            .shared
+            .as_ref()
+            .expect("shared storage owner")
+            .lock()
+            .map_err(|_| anyhow!("shared faculty store is poisoned"))?;
+        if session.is_none() {
+            let runtime = Arc::new(runtime()?);
+            let store = open_store(&self.pile)?;
+            *session = Some(Session {
+                store: Some(store),
+                runtime,
+            });
+        }
+        // MCP reports a handler panic and keeps serving. Drop the ownership
+        // guard normally before resuming that panic so a failed handler does
+        // not poison the connection for every later tool call.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            operation(session.as_mut().expect("initialized above"))
+        }));
+        drop(session);
+        match result {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+
+    /// Borrow the live lazy-fetch store and its runtime for one operation.
+    /// Take fresh snapshots at the point of use; never retain a selected view
+    /// here. Do not recursively enter this owner from the callback.
+    pub fn with_store<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut FacultyStore,
+            &SigningKey,
+            &Arc<tokio::runtime::Runtime>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(&self.pile, self.key.as_deref())?;
+        if self.shared.is_some() {
+            return self.with_session(|session| {
+                operation(
+                    session.store.as_mut().expect("open store"),
+                    &signer,
+                    &session.runtime,
+                )
+            });
+        }
+        let runtime = Arc::new(runtime()?);
+        let mut store = open_store(&self.pile)?;
+        let result = operation(&mut store, &signer, &runtime);
+        finish_close(result, store.close().context("close faculty store"))
+    }
+
+    /// Borrow the same local backend for operations which use resident-only
+    /// Pile/PileSnapshot APIs. This does not start the peer or silently add
+    /// network acquisition to such operations. Do not re-enter the peer while
+    /// its local-backend guard is held.
+    pub fn with_pile<T>(
+        &self,
+        operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
+    ) -> Result<T> {
+        let signer = load_signer(&self.pile, self.key.as_deref())?;
+        if self.shared.is_some() {
+            return self.with_session(|session| {
+                let mut pile = session.store.as_ref().expect("open store").store();
+                pile.refresh()
+                    .map_err(|error| pile_read_error(&self.pile, error))?;
+                let result = catch_unwind(AssertUnwindSafe(|| operation(&mut pile, &signer)));
+                drop(pile);
+                match result {
+                    Ok(result) => result,
+                    Err(panic) => resume_unwind(panic),
+                }
+            });
+        }
+        let mut pile = open_pile_strict(&self.pile)?;
+        let result = operation(&mut pile, &signer);
+        finish_pile(pile, result)
+    }
+
+    /// Close an initialized shared store once, leaving unopened configuration
+    /// untouched. One-shot operations already report their own close errors.
+    pub fn close(&self) -> Result<()> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        // A failed/panicking handler must not prevent shutdown from attempting
+        // to close the owned file and report a persistence error.
+        let session = shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        match session {
+            Some(session) => session.close(),
+            None => Ok(()),
+        }
+    }
+
+    /// Preserve both a transport/operation failure and any shutdown failure.
+    pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        finish_close(result, self.close())
+    }
+}
+
+fn finish_close<T>(result: Result<T>, close: Result<()>) -> Result<T> {
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            Err(error.context(format!("closing storage also failed: {close_error:#}")))
+        }
+    }
+}
 
 /// Enter the async I/O boundary of a foreground command.
 pub fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -514,6 +728,169 @@ mod tests {
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn shared_configuration_is_inert_and_thread_shareable() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Storage>();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-opened.pile");
+        let storage = Storage::shared(path.clone(), Some(dir.path().join("missing.key")));
+        let clone = storage.clone();
+        assert_eq!(storage.path(), path);
+        clone.close().unwrap();
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shared_operations_keep_the_peer_runtime_and_local_backend() {
+        use triblespace::core::repo::BlobStorePut;
+
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let storage = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let clone = storage.clone();
+        let (peer, runtime) = storage
+            .with_store(|store, _, runtime| Ok((store.id(), Arc::clone(runtime))))
+            .unwrap();
+        // A reopen would create a different file and lose the original index.
+        let moved = files.directory.join("still-open.pile");
+        fs::rename(&files.pile, &moved).unwrap();
+        let handle = clone
+            .with_pile(|pile, _| Ok(pile.put::<UTF8String, _>("shared resident bytes")?))
+            .unwrap();
+        storage
+            .scope(|storage| {
+                storage.with_store(|store, _, current_runtime| {
+                    assert_eq!(store.id(), peer);
+                    assert!(Arc::ptr_eq(current_runtime, &runtime));
+                    let snapshot = store.snapshot()?;
+                    let text: View<str> = current_runtime.block_on(snapshot.get(handle))?;
+                    assert_eq!(&*text, "shared resident bytes");
+                    Ok(())
+                })
+            })
+            .unwrap();
+        clone
+            .with_store(|store, _, _| {
+                assert_eq!(
+                    store.id(),
+                    peer,
+                    "nested scope must not close its application owner"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !files.pile.exists(),
+            "no operation may reopen the configured pathname"
+        );
+        storage.close().unwrap();
+        clone.close().unwrap();
+        let mut reopened = open_pile_strict(&moved).unwrap();
+        assert!(reopened.snapshot().unwrap().contains_blob(handle).unwrap());
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn retained_store_observes_external_appends_without_changing_old_snapshots() {
+        use triblespace::core::repo::BlobStorePut;
+
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let storage = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let before = storage
+            .with_store(|store, _, _| Ok(store.snapshot()?))
+            .unwrap();
+        let mut other = open_pile_strict(&files.pile).unwrap();
+        let handle = other
+            .put::<UTF8String, _>("appended by another process")
+            .unwrap();
+        other.close().unwrap();
+        let after = storage
+            .with_store(|store, _, _| Ok(store.snapshot()?))
+            .unwrap();
+        assert!(!before.contains_blob(handle).unwrap());
+        assert!(after.contains_blob(handle).unwrap());
+        assert!(
+            !before.contains_blob(handle).unwrap(),
+            "refresh must not mutate an earlier observation"
+        );
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn shared_operation_errors_do_not_discard_the_connection() {
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let storage = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let peer = storage.with_store(|store, _, _| Ok(store.id())).unwrap();
+        let error = storage
+            .with_store::<()>(|_, _, _| anyhow::bail!("operation failed"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "operation failed");
+        storage
+            .with_store(|store, _, _| {
+                assert_eq!(store.id(), peer);
+                Ok(())
+            })
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn panicking_local_handler_does_not_poison_shared_storage() {
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let storage = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let peer = storage.with_store(|store, _, _| Ok(store.id())).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            storage.with_pile::<()>(|_, _| panic!("handler panic"))
+        }));
+        assert!(result.is_err());
+        storage
+            .with_store(|store, _, _| {
+                assert_eq!(store.id(), peer);
+                Ok(())
+            })
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn independent_owners_do_not_share_by_path() {
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let first = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let second = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let first_peer = first.with_store(|store, _, _| Ok(store.id())).unwrap();
+        let second_peer = second.with_store(|store, _, _| Ok(store.id())).unwrap();
+        assert_ne!(
+            first_peer, second_peer,
+            "sharing is explicit, never an ambient path cache"
+        );
+        first.close().unwrap();
+        second.close().unwrap();
+    }
+
+    #[test]
+    fn compound_cli_scope_reuses_and_closes_its_own_store() {
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let cli = Storage::new(files.pile.clone(), Some(files.key.clone()));
+        let owner = cli
+            .scope(|storage| {
+                let peer = storage.with_store(|store, _, _| Ok(store.id()))?;
+                storage.with_store(|store, _, _| {
+                    assert_eq!(store.id(), peer);
+                    Ok(())
+                })?;
+                Ok(storage.clone())
+            })
+            .unwrap();
+        assert!(owner.shared.as_ref().unwrap().lock().unwrap().is_none());
+        assert!(cli.shared.is_none());
     }
 
     #[test]

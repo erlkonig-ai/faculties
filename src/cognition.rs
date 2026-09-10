@@ -20,7 +20,7 @@ use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
@@ -30,7 +30,7 @@ use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
 use crate::schemas::triage::{cog, context, exec, model_chat, KIND_EXEC_RESULT_ID};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::{FactArchive, Storage};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -109,6 +109,17 @@ pub fn publish_event(
         .expect("one Cognition event produces one collection commit"))
 }
 
+/// Publish one event through an explicitly owned storage lifetime.
+pub fn publish_event_with_storage(
+    storage: &Storage,
+    fragment: Fragment,
+) -> Result<CollectionCommit> {
+    let mut commits = publish_events_with_storage(storage, [fragment])?;
+    Ok(commits
+        .pop()
+        .expect("one Cognition event produces one collection commit"))
+}
+
 /// Publish a command's complete event sequence with one pile lifetime.
 ///
 /// Each event remains its own independently transferable commit. Every event
@@ -120,21 +131,31 @@ pub fn publish_events(
     key_path: Option<&Path>,
     fragments: impl IntoIterator<Item = Fragment>,
 ) -> Result<Vec<CollectionCommit>> {
+    publish_events_with_storage(
+        &Storage::new(pile_path.to_owned(), key_path.map(Path::to_owned)),
+        fragments,
+    )
+}
+
+/// Validate the complete event sequence, then borrow its publication store.
+pub fn publish_events_with_storage(
+    storage: &Storage,
+    fragments: impl IntoIterator<Item = Fragment>,
+) -> Result<Vec<CollectionCommit>> {
     let fragments: Vec<_> = fragments.into_iter().collect();
     for fragment in &fragments {
         validate_fragment(fragment).context("validate self-contained Cognition event")?;
     }
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let result = fragments
-        .into_iter()
-        .map(|fragment| {
-            pile.commit(collection, &signer, fragment)
-                .context("commit authored Cognition event")
-        })
-        .collect();
-    finish_pile(pile, result)
+    storage.with_pile(|pile, signer| {
+        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        fragments
+            .into_iter()
+            .map(|fragment| {
+                pile.commit(collection, signer, fragment)
+                    .context("commit authored Cognition event")
+            })
+            .collect()
+    })
 }
 
 /// Verify that one authored event is structurally valid and carries every
@@ -471,22 +492,11 @@ where
     reader.get(handle).map_err(Into::into)
 }
 
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    match (result, pile.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow!("close Cognition pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Cognition pile also failed: {close_error}")))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::File;
 
-    use crate::storage::load_signer;
+    use crate::storage::{load_signer, open_pile_strict};
     use crate::test_support::initialize_open_collection_fixture;
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,

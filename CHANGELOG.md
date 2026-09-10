@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The aggregate MCP catalogue now retains one explicitly shared pile, I/O
+  runtime and lazy-fetch peer across tools, adapters and protocol sessions.
+  Native operations accept the same storage owner while preserving fresh
+  snapshots and one-shot CLI lifetimes. Tool discovery remains I/O-free;
+  graceful server shutdown closes the store and reports flush errors. No
+  global path cache, IPC fetch service, schema change or migration is added.
+
 - Health freshness is reader policy over `created_at`, not producer-declared
   expiry. Orient accepts `--health-max-age SECONDS` (or
   `TRIBLESPACE_HEALTH_MAX_AGE_SECS`), native `with_health_max_age(Duration)`,

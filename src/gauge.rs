@@ -3,45 +3,44 @@ pub mod cli;
 pub mod mcp;
 pub mod presentation;
 
+#[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
 use crate::wiki::{self as wiki_model, FrontierModel, LinkResolution};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::prelude::Id;
 
 type GaugeModel = FrontierModel;
 
 #[derive(Clone, Debug)]
 pub struct Gauge {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 impl Gauge {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     pub fn health(&self) -> Result<Health> {
-        with_model(&self.pile, self.key.as_deref(), |model| Ok(health(model)))
+        with_model(&self.storage, |model| Ok(health(model)))
     }
     pub fn tags(&self) -> Result<Vec<TagCount>> {
-        with_model(&self.pile, self.key.as_deref(), |model| Ok(tags(model)))
+        with_model(&self.storage, |model| Ok(tags(model)))
     }
     pub fn quality(&self) -> Result<Vec<QualityState>> {
-        with_model(&self.pile, self.key.as_deref(), |model| Ok(quality(model)))
+        with_model(&self.storage, |model| Ok(quality(model)))
     }
     pub fn hubs(&self, top: usize) -> Result<Hubs> {
-        with_model(&self.pile, self.key.as_deref(), |model| {
-            Ok(hubs(model, top))
-        })
+        with_model(&self.storage, |model| Ok(hubs(model, top)))
     }
     pub fn risk(&self) -> Result<RiskReport> {
-        with_model(&self.pile, self.key.as_deref(), |model| Ok(risk(model)))
+        with_model(&self.storage, |model| Ok(risk(model)))
     }
     pub fn orphans(&self, top: usize) -> Result<Orphans> {
-        with_model(&self.pile, self.key.as_deref(), |model| {
-            Ok(orphans(model, top))
-        })
+        with_model(&self.storage, |model| Ok(orphans(model, top)))
     }
 }
 
@@ -316,14 +315,11 @@ pub fn orphans(model: &FrontierModel, top: usize) -> Orphans {
 }
 
 fn with_model<T>(
-    pile_path: &Path,
-    key_path: Option<&Path>,
+    storage: &crate::storage::Storage,
     operation: impl FnOnce(&GaugeModel) -> Result<T>,
 ) -> Result<T> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
-        let snapshot = pollster::block_on(wiki_model::query_snapshot(&mut pile, &signer))
+    storage.with_pile(|pile, signer| {
+        let snapshot = pollster::block_on(wiki_model::query_snapshot(pile, signer))
             .context("query maintained Wiki collection")?;
         let model = GaugeModel::load(
             snapshot.store_snapshot(),
@@ -331,16 +327,7 @@ fn with_model<T>(
             snapshot.latest(),
         )?;
         operation(&model)
-    })();
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Gauge pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Gauge pile also failed: {close_error}")))
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -389,7 +376,8 @@ mod tests {
         }
 
         fn with_model(&self, operation: impl FnOnce(&GaugeModel)) {
-            super::with_model(&self.pile, Some(&self.key), |model| {
+            let storage = crate::storage::Storage::new(self.pile.clone(), Some(self.key.clone()));
+            super::with_model(&storage, |model| {
                 operation(model);
                 Ok(())
             })

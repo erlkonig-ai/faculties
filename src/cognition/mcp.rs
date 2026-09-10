@@ -12,8 +12,11 @@ pub struct Cognition {
 }
 impl Cognition {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Cognition::new(pile, key),
+            operations: super::Cognition::with_storage(storage),
         }
     }
 }

@@ -66,7 +66,7 @@ fn collect_text(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<St
 #[test]
 fn direct_store_reads_owned_variants_and_refreshes_between_operations() {
     let (_directory, pile, key, expected) = fixture();
-    let mut store = Store::open(&pile, Some(&key)).unwrap();
+    let store = Store::open(&pile, Some(&key)).unwrap();
     let before = store.list().unwrap();
     assert_eq!(before, [expected.clone()]);
     assert_eq!(

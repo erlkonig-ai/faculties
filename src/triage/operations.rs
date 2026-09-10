@@ -4,8 +4,7 @@ use crate::out::Out;
 
 #[derive(Clone, Debug)]
 pub struct Triage {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct InspectOptions {
@@ -24,17 +23,20 @@ impl Default for InspectOptions {
 }
 impl Triage {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn with_snapshot(&self, operation: impl FnOnce(&TriageSnapshot) -> Result<()>) -> Result<()> {
-        let snapshot = TriageSnapshot::open(&self.pile, self.key.as_deref())?;
-        let result = operation(&snapshot);
-        snapshot.close(result)
+        let snapshot = self.storage.with_pile(TriageSnapshot::load)?;
+        operation(&snapshot)
     }
     pub fn scan(&self, options: &InspectOptions, out: &mut Out<'_>) -> Result<()> {
         self.with_snapshot(|snapshot| {
             scan(
                 snapshot,
+                self.storage.path(),
                 options.recent,
                 options.loop_min,
                 options.stale_min,
@@ -80,7 +82,9 @@ use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::triage::cog;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{load_signer, open_pile_strict, open_secrets_collection_read, FactArchive};
+#[cfg(test)]
+use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{open_secrets_collection_read, FactArchive};
 use crate::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -121,19 +125,15 @@ impl CollectionView {
 
 /// One immutable pile world plus one explicit local signing identity.
 struct TriageSnapshot {
-    pile_path: PathBuf,
-    pile: Option<Pile>,
     store_snapshot: PileSnapshot,
     collections: BTreeMap<Id, FactArchive>,
     secrets: SecretsSnapshot<PileSnapshot>,
 }
 
 impl TriageSnapshot {
-    fn open(pile_path: &Path, key: Option<&Path>) -> Result<Self> {
+    fn load(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<Self> {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
-        let signer = load_signer(pile_path, key)?;
-        let mut pile = open_pile_strict(pile_path)?;
         let mut registered = Vec::new();
         let mut sources = Vec::new();
         let mut succinct = Vec::new();
@@ -146,7 +146,7 @@ impl TriageSnapshot {
             (MESSAGE_SCOPE_ID, "Message"),
         ] {
             let source =
-                crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+                crate::collection_names::open_configured(pile, scope, signer.verifying_key())
                     .with_context(|| format!("register {label} collection"))?;
             let descriptor_snapshot = pile.snapshot()?;
             let policy = source.policy(&descriptor_snapshot)?;
@@ -163,7 +163,7 @@ impl TriageSnapshot {
             rank9.push(rank9_collection);
         }
 
-        let secrets_collection = open_secrets_collection_read(&mut pile, signer.verifying_key())?;
+        let secrets_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
         let secrets = pollster::block_on(async {
             for ((_, label), source) in registered.iter().zip(&sources) {
                 drop(
@@ -199,7 +199,7 @@ impl TriageSnapshot {
                 );
             }
             let store_snapshot = secrets_collection
-                .ensure_exact(&mut pile, &secrets_support)
+                .ensure_exact(pile, &secrets_support)
                 .await
                 .context("ensure configured Secrets collection")?;
             let secrets =
@@ -223,12 +223,16 @@ impl TriageSnapshot {
         }
 
         Ok(Self {
-            pile_path: pile_path.to_owned(),
-            pile: Some(pile),
             store_snapshot,
             collections,
             secrets,
         })
+    }
+
+    #[cfg(test)]
+    fn open(pile_path: &Path, key: Option<&Path>) -> Result<Self> {
+        crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
+            .with_pile(Self::load)
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
@@ -268,31 +272,6 @@ impl TriageSnapshot {
 
     fn messages(&self) -> Result<CollectionView> {
         self.view(MESSAGE_SCOPE_ID, "Message")
-    }
-
-    fn close(mut self, result: Result<()>) -> Result<()> {
-        let close = self.close_inner();
-        match (result, close) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("also failed to close Triage pile: {close_error}")))
-            }
-        }
-    }
-
-    fn close_inner(&mut self) -> Result<()> {
-        let Some(pile) = self.pile.take() else {
-            return Ok(());
-        };
-        pile.close()
-            .with_context(|| format!("close Triage pile {}", self.pile_path.display()))
-    }
-}
-
-impl Drop for TriageSnapshot {
-    fn drop(&mut self) {
-        let _ = self.close_inner();
     }
 }
 
@@ -412,6 +391,7 @@ fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 
 fn scan(
     snapshot: &TriageSnapshot,
+    pile_path: &Path,
     recent: usize,
     loop_min: usize,
     stale_min: i64,
@@ -441,7 +421,7 @@ fn scan(
     )?;
 
     out.line(format!("Triage scan"))?;
-    out.line(format!("- pile: {}", snapshot.pile_path.display()))?;
+    out.line(format!("- pile: {}", pile_path.display()))?;
     let config_heads = report.headspace.config_heads();
     let active_profile_heads = report.headspace.active_profile_heads();
     if let Some(error) = report.headspace.unsettled_reason() {
@@ -1452,12 +1432,12 @@ mod tests {
             snapshot.store_snapshot.instant(),
             snapshot.secrets.instant()
         );
-        snapshot.close(Ok(())).unwrap();
+        drop(snapshot);
         let maintained = std::fs::metadata(&fixture.pile).unwrap().len();
 
         let snapshot = fixture.snapshot();
         snapshot.cognition().unwrap();
-        snapshot.close(Ok(())).unwrap();
+        drop(snapshot);
         let reopened = std::fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(reopened, maintained);
     }

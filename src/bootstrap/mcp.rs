@@ -20,13 +20,15 @@ const TOOLS: &[Tool] = &[Tool {
 struct Empty {}
 
 pub struct Bootstrap {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 
 impl Bootstrap {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
 }
 
@@ -39,7 +41,7 @@ impl Faculty for Bootstrap {
         match name {
             "bootstrap_import" => {
                 let _: Empty = decode_arguments(arguments)?;
-                let report = pollster::block_on(super::import(&self.pile, self.key.as_deref()))?;
+                let report = super::import_with_storage(&self.storage)?;
                 super::render_import(&report, out)
             }
             _ => bail!("Bootstrap MCP has no tool {name:?}"),

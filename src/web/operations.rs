@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
@@ -8,7 +8,9 @@ use crate::schemas::headspace::{
 };
 use crate::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{load_signer, open_pile_strict, open_secrets_collection_read, FactArchive};
+#[cfg(test)]
+use crate::storage::load_signer;
+use crate::storage::{open_secrets_collection_read, FactArchive};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use reqwest::blocking::Client;
@@ -21,7 +23,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
@@ -101,16 +102,17 @@ impl std::fmt::Debug for ApiKeys {
 /// issue the HTTP request again or publish a second observation.
 #[derive(Clone, Debug)]
 pub struct Web {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
     keys: ApiKeys,
     endpoints: Endpoints,
 }
 impl Web {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            pile,
-            key,
+            storage,
             keys: ApiKeys::default(),
             endpoints: Endpoints::default(),
         }
@@ -125,8 +127,7 @@ impl Web {
     }
     fn storage(&self) -> WebStorage<'_> {
         WebStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     fn resolve_keys(&self, provider: Provider) -> Result<ApiKeys> {
@@ -290,94 +291,99 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
 
 #[derive(Clone, Copy)]
 struct WebStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 impl WebStorage<'_> {
     /// Resolve Headspace once and decrypt exactly the credential versions it
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let source = open_configured(&mut pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let headspace_succinct =
-                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let headspace_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(headspace_succinct, (), policy)?;
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let source = open_configured(pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = source.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let headspace_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let headspace_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    headspace_succinct,
+                    (),
+                    policy,
+                )?;
 
-            let secrets_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-            for (label, source) in [
-                ("Headspace", source),
-                ("Secrets", secrets_collection.source()),
-            ] {
+                let secrets_collection =
+                    open_secrets_collection_read(pile, signer.verifying_key())?;
+                for (label, source) in [
+                    ("Headspace", source),
+                    ("Secrets", secrets_collection.source()),
+                ] {
+                    drop(
+                        pile.ensure(source)
+                            .await
+                            .with_context(|| format!("ensure {label} source collection"))?,
+                    );
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Web credential support snapshot")?;
+                let secrets_support = secrets_collection
+                    .source()
+                    .admitted(&before)
+                    .context("admit Secrets collection support")?;
+                drop(before);
                 drop(
-                    pile.ensure(source)
+                    pile.maintain(headspace_succinct)
                         .await
-                        .with_context(|| format!("ensure {label} source collection"))?,
+                        .context("maintain Headspace fact collection")?,
                 );
-            }
-            let before = pile
-                .snapshot()
-                .context("freeze shared Web credential support snapshot")?;
-            let secrets_support = secrets_collection
-                .source()
-                .admitted(&before)
-                .context("admit Secrets collection support")?;
-            drop(before);
-            drop(
-                pile.maintain(headspace_succinct)
+                drop(
+                    pile.maintain(headspace_rank9)
+                        .await
+                        .context("maintain Headspace fact collection")?,
+                );
+
+                let store_snapshot = secrets_collection
+                    .ensure_exact(pile, &secrets_support)
                     .await
-                    .context("maintain Headspace fact collection")?,
-            );
-            drop(
-                pile.maintain(headspace_rank9)
-                    .await
-                    .context("maintain Headspace fact collection")?,
-            );
+                    .context("ensure configured Secrets collection")?;
+                let secrets = secret_storage::snapshot_exact(
+                    store_snapshot,
+                    secrets_collection,
+                    secrets_support,
+                )
+                .context("attach exact Secrets collection")?;
 
-            let store_snapshot = secrets_collection
-                .ensure_exact(&mut pile, &secrets_support)
-                .await
-                .context("ensure configured Secrets collection")?;
-            let secrets =
-                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
-                    .context("attach exact Secrets collection")?;
+                // Observe Headspace and Secrets through one final immutable pile
+                // snapshot, then project only the facts Web actually consumes.
+                let reader = secrets.store_snapshot();
+                let facts = reader
+                    .collection(headspace_rank9)
+                    .context("attach maintained Headspace collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Headspace collection")?;
+                let versions = web_secret_versions(&facts)?;
 
-            // Observe Headspace and Secrets through one final immutable pile
-            // snapshot, then project only the facts Web actually consumes.
-            let reader = secrets.store_snapshot();
-            let facts = reader
-                .collection(headspace_rank9)
-                .context("attach maintained Headspace collection")?
-                .view::<FactArchive>()
-                .context("read maintained Headspace collection")?;
-            let versions = web_secret_versions(&facts)?;
-
-            Ok(ApiKeys {
-                tavily: open_web_secret(&secrets, &signer, &versions.tavily, "Tavily")?,
-                exa: open_web_secret(&secrets, &signer, &versions.exa, "Exa")?,
-            })
-        });
-        finish_pile(pile, result, "credential read")
+                Ok(ApiKeys {
+                    tavily: open_web_secret(&secrets, signer, &versions.tavily, "Tavily")?,
+                    exa: open_web_secret(&secrets, signer, &versions.exa, "Exa")?,
+                })
+            });
+            result
+        })
     }
 
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        fragment.describe_with(entity! { metadata::description: description });
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            pile.commit(collection, &signer, fragment)
-                .context("commit Web observation")
-                .map(|_| ())
-        })();
-        finish_pile(pile, result, "observation write")
+        self.storage.with_pile(|pile, signer| {
+            fragment.describe_with(entity! { metadata::description: description });
+            let result = (|| {
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                pile.commit(collection, signer, fragment)
+                    .context("commit Web observation")
+                    .map(|_| ())
+            })();
+            result
+        })
     }
 }
 
@@ -474,18 +480,6 @@ fn open_web_secret(
             "no referenced {role} Secrets version is locally usable: {}",
             failures.join("; ")
         )
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context(format!("close Web pile after {operation}"))),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing Web pile after {operation} also failed: {close_error}"
-        ))),
     }
 }
 
@@ -905,8 +899,7 @@ mod tests {
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
 
         WebStorage {
-            pile: &pile_path,
-            key: Some(&key_path),
+            storage: &crate::storage::Storage::new(pile_path.clone(), Some(key_path.clone())),
         }
         .store(
             fetch_fragment(

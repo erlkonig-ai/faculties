@@ -7,6 +7,7 @@
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
+use std::borrow::BorrowMut;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::Bytes;
@@ -51,8 +52,8 @@ type RawHandle = Inline<Handle<RawBytes>>;
 ///
 /// Supplied facts remain open-world relations, including opaque ids and further
 /// annotations. Publication does not require a closed-world catalog decode.
-pub struct ArchiveImportWriter {
-    pile: Pile,
+pub struct ArchiveImportWriter<P = Pile> {
+    pile: P,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
     current: FactArchive,
@@ -101,6 +102,30 @@ impl ArchiveImportWriter {
             ),
         }
     }
+}
+
+impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
+    /// Stage against a caller-owned pile. The caller controls its lifetime and close.
+    pub async fn from_pile(mut pile: P, signer: &SigningKey) -> Result<Self> {
+        let source = open_configured(
+            pile.borrow_mut(),
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )?;
+        let observed = ensure_facts(pile.borrow_mut(), source).await?;
+        let current = observed
+            .view::<FactArchive>()
+            .context("read Archive facts")?;
+        let mut writer = Self {
+            pile,
+            collection: source,
+            signer: signer.clone(),
+            current,
+            delta: Fragment::empty(),
+        };
+        writer.stage_fragment(blockdag::vocabulary_fragment())?;
+        Ok(writer)
+    }
 
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
         // A Fragment is the independently derivable source unit. A wholly
@@ -123,7 +148,7 @@ impl ArchiveImportWriter {
         // remain semantically unreachable until a signed COMMIT names the
         // facts which reference them.
         let embedded = embedded_blobs(blobs);
-        stage_embedded_blobs(&mut self.pile, embedded)?;
+        stage_embedded_blobs(self.pile.borrow_mut(), embedded)?;
 
         // Only the lightweight logical delta remains resident between source
         // fragments. Data and metadata archives are constructed once at the
@@ -158,12 +183,15 @@ impl ArchiveImportWriter {
         let published = fragment.facts().clone();
         let commit = self
             .pile
+            .borrow_mut()
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
         Ok(Some(commit))
     }
+}
 
+impl ArchiveImportWriter {
     /// Close the pile, publishing any still-staged delta first.
     pub fn close<T>(mut self, surrounding: Result<T>) -> Result<T> {
         let result = surrounding.and_then(|value| {
@@ -267,22 +295,19 @@ pub async fn ensure_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    let (mut pile, source, _signer) = open_local(pile_path, key_path)?;
-    let result = ensure_facts(&mut pile, source).await;
-    close_pile(pile, result, "closing Archive pile")
+    ensure_local_with_storage(&crate::storage::Storage::new(
+        pile_path.to_owned(),
+        key_path.map(std::path::Path::to_owned),
+    ))
 }
 
-fn open_local(
-    pile_path: &std::path::Path,
-    key_path: Option<&std::path::Path>,
-) -> Result<(Pile, Collection<SimpleArchive>, SigningKey)> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key());
-    match result {
-        Ok(source) => Ok((pile, source, signer)),
-        Err(error) => close_pile(pile, Err(error), "closing Archive pile after failed open"),
-    }
+pub fn ensure_local_with_storage(
+    storage: &crate::storage::Storage,
+) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+    storage.with_pile(|pile, signer| {
+        let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        pollster::block_on(ensure_facts(pile, source))
+    })
 }
 
 async fn ensure_facts(
@@ -395,17 +420,26 @@ pub async fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<Bm25IndexReport> {
-    let (mut pile, source, signer) = open_local(pile_path, key_path)?;
-    let result = async {
-        let observed = ensure_facts(&mut pile, source).await?;
-        Ok(
-            ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key())
-                .await?
-                .report,
-        )
-    }
-    .await;
-    close_pile(pile, result, "closing Archive pile after BM25 derivation")
+    ensure_bm25_index_with_storage(&crate::storage::Storage::new(
+        pile_path.to_owned(),
+        key_path.map(std::path::Path::to_owned),
+    ))
+}
+
+pub fn ensure_bm25_index_with_storage(
+    storage: &crate::storage::Storage,
+) -> Result<Bm25IndexReport> {
+    storage.with_pile(|pile, signer| {
+        pollster::block_on(async {
+            let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let observed = ensure_facts(pile, source).await?;
+            Ok(
+                ensure_bm25_exact(pile, observed.support(), signer.verifying_key())
+                    .await?
+                    .report,
+            )
+        })
+    })
 }
 
 /// Prepare fact and search values for the same exact support. The returned
@@ -418,27 +452,35 @@ pub async fn ensure_search_local(
     CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     archive_bm25::ArchiveBM25Index,
 )> {
-    let (mut pile, source, signer) = open_local(pile_path, key_path)?;
-    let result = async {
-        let observed = ensure_facts(&mut pile, source).await?;
-        let ensured =
-            ensure_bm25_exact(&mut pile, observed.support(), signer.verifying_key()).await?;
-        // Search maintenance may have acquired referenced text payloads. Attach
-        // the fact view through the final reader while retaining exact support.
-        let after = pile
-            .snapshot()
-            .context("freeze prepared Archive search snapshot")?;
-        let observed = after
-            .collection_exact(observed.cover().collection(), observed.support())
-            .context("reattach exact Archive search facts")?;
-        Ok((observed, ensured.index))
-    }
-    .await;
-    close_pile(
-        pile,
-        result,
-        "closing Archive pile after BM25 search preparation",
-    )
+    ensure_search_local_with_storage(&crate::storage::Storage::new(
+        pile_path.to_owned(),
+        key_path.map(std::path::Path::to_owned),
+    ))
+}
+
+pub fn ensure_search_local_with_storage(
+    storage: &crate::storage::Storage,
+) -> Result<(
+    CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    archive_bm25::ArchiveBM25Index,
+)> {
+    storage.with_pile(|pile, signer| {
+        pollster::block_on(async {
+            let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let observed = ensure_facts(pile, source).await?;
+            let ensured =
+                ensure_bm25_exact(pile, observed.support(), signer.verifying_key()).await?;
+            // Search maintenance may have acquired referenced text payloads. Attach
+            // the fact view through the final reader while retaining exact support.
+            let after = pile
+                .snapshot()
+                .context("freeze prepared Archive search snapshot")?;
+            let observed = after
+                .collection_exact(observed.cover().collection(), observed.support())
+                .context("reattach exact Archive search facts")?;
+            Ok((observed, ensured.index))
+        })
+    })
 }
 
 /// Stream the byte geometry selected by one source snapshot. Only lightweight

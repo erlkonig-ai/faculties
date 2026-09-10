@@ -5,7 +5,7 @@
 //! complete event set. Relations is a separate native collection used only to
 //! resolve human selectors and render labels.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
@@ -13,8 +13,10 @@ use crate::relations::{self, Head, SelectorOutcome};
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID;
 use crate::status;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::storage::FactArchive;
+#[cfg(test)]
+use crate::storage::{load_signer, open_pile_strict};
+use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -29,8 +31,7 @@ use triblespace::prelude::*;
 /// process persona or file/stdin expansion is consulted.
 #[derive(Clone, Debug)]
 pub struct Status {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 
 /// One authored intrinsic event, including its exact publication receipt.
@@ -68,13 +69,15 @@ pub struct StatusHistory {
 
 impl Status {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
 
     fn storage(&self) -> StatusStorage<'_> {
         StatusStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
 
@@ -173,8 +176,7 @@ impl Status {
 
 #[derive(Clone, Copy)]
 struct StatusStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 /// One immutable observation over two separately admitted Rank9 relations.
@@ -191,29 +193,10 @@ struct RelationsObservation {
 }
 
 impl StatusStorage<'_> {
-    fn with_loaded_pile<T>(
-        &self,
-        signer: &SigningKey,
-        f: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
-    ) -> Result<T> {
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = f(&mut pile, signer);
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
-    }
-
     fn with_pile<T>(&self, f: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>) -> Result<T> {
         // Authority is loaded before storage is touched. No ordinary command
         // mints an identity or substitutes an ephemeral signer.
-        let signer = load_signer(self.pile, self.key)?;
-        self.with_loaded_pile(&signer, f)
+        self.storage.with_pile(f)
     }
 }
 
@@ -420,6 +403,7 @@ mod tests {
         _directory: tempfile::TempDir,
         pile: PathBuf,
         key: PathBuf,
+        storage: crate::storage::Storage,
     }
 
     fn fixture() -> Fixture {
@@ -430,6 +414,7 @@ mod tests {
         initialize_signer(&pile, Some(&key)).unwrap();
         Fixture {
             _directory: directory,
+            storage: crate::storage::Storage::new(pile.clone(), Some(key.clone())),
             pile,
             key,
         }
@@ -442,8 +427,7 @@ mod tests {
 
     fn storage(fixture: &Fixture) -> StatusStorage<'_> {
         StatusStorage {
-            pile: &fixture.pile,
-            key: Some(&fixture.key),
+            storage: &fixture.storage,
         }
     }
 

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::clock;
@@ -19,9 +19,7 @@ use crate::collection_names::{configured_handle, open_configured, open_exact_in}
 use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use crate::schemas::wiki::{self as schema, extract_link_targets};
-use crate::storage::{
-    load_signer, open_store, read, runtime, FactArchive, FacultySnapshot, FacultyStore,
-};
+use crate::storage::{read, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use crate::wiki::{
     self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
     RevisionRecord,
@@ -37,7 +35,7 @@ use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, Col
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{SnapshotSource, StorageClose};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[cfg(feature = "local-embed")]
@@ -50,8 +48,7 @@ use crate::out::Out;
 /// Trusted storage configuration, supplied by the application/launcher.
 #[derive(Clone, Debug)]
 pub struct Wiki {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 /// An exact stored UTF-8 revision export, not a sensory presentation.
@@ -85,12 +82,14 @@ pub struct ImportDocument {
 
 impl Wiki {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> WikiStorage<'_> {
         WikiStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     pub fn create(&self, title: &str, content: &str, tags: &[String], force: bool) -> Result<Id> {
@@ -200,8 +199,7 @@ impl Wiki {
 
 #[derive(Clone, Copy)]
 struct WikiStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a Storage,
 }
 
 #[derive(Clone)]
@@ -220,19 +218,8 @@ impl WikiStorage<'_> {
             &tokio::runtime::Runtime,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let runtime = runtime()?;
-        let mut pile = open_store(self.pile)?;
-        let result = f(&mut pile, &signer, &runtime);
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow!("close Wiki pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing Wiki pile also failed: {close_error}")))
-            }
-        }
+        self.storage
+            .with_store(|pile, signer, runtime| f(pile, signer, runtime))
     }
 
     /// Freeze the query relations once, then acquire only selected payloads
@@ -400,8 +387,8 @@ impl WikiStorage<'_> {
     }
 
     fn author_fragment(&self) -> Result<(Fragment, Id)> {
-        let signer = load_signer(self.pile, self.key)?;
-        Ok(wiki_model::author_record(&signer.verifying_key()))
+        self.storage
+            .with_store(|_, signer, _| Ok(wiki_model::author_record(&signer.verifying_key())))
     }
 }
 
@@ -2100,6 +2087,7 @@ mod typst_validate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::load_signer;
     use anybytes::Bytes;
     use std::fs::File;
     use triblespace::core::blob::MemoryBlobStoreSnapshot;
@@ -2123,6 +2111,7 @@ mod tests {
         _directory: tempfile::TempDir,
         pile: PathBuf,
         key: PathBuf,
+        storage: Storage,
     }
 
     impl Fixture {
@@ -2134,6 +2123,7 @@ mod tests {
             crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
+                storage: Storage::new(pile.clone(), Some(key.clone())),
                 pile,
                 key,
             }
@@ -2141,8 +2131,7 @@ mod tests {
 
         fn storage(&self) -> WikiStorage<'_> {
             WikiStorage {
-                pile: &self.pile,
-                key: Some(&self.key),
+                storage: &self.storage,
             }
         }
     }

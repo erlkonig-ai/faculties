@@ -42,10 +42,10 @@ use crate::schemas::linkedin;
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use crate::storage;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::FactArchive;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -144,24 +144,24 @@ pub struct ResolutionReceipt {
 /// a tool argument, ambient environment lookup, or persisted Relations datum.
 #[derive(Clone)]
 pub struct LinkedIn {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
     token: Option<String>,
 }
 impl std::fmt::Debug for LinkedIn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkedIn")
-            .field("pile", &self.pile)
-            .field("key", &self.key)
+            .field("storage", &self.storage)
             .field("token_configured", &self.token.is_some())
             .finish()
     }
 }
 impl LinkedIn {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            pile,
-            key,
+            storage,
             token: None,
         }
     }
@@ -171,8 +171,7 @@ impl LinkedIn {
     }
     fn storage(&self) -> RelationsStorage<'_> {
         RelationsStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     pub fn import(&self, connections: &[Connection], dry_run: bool) -> Result<ImportReport> {
@@ -285,8 +284,7 @@ fn name_key(name: &str) -> Option<String> {
 
 #[derive(Clone, Copy)]
 struct RelationsStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 #[derive(Clone)]
@@ -308,47 +306,47 @@ impl RelationsStorage<'_> {
             &RelationsView,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let maintained_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                maintained_succinct,
-                (),
-                policy,
-            )?;
-            drop(pile.ensure(collection).await?);
-            drop(
-                pile.maintain(maintained_succinct)
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let maintained_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    maintained_succinct,
+                    (),
+                    policy,
+                )?;
+                drop(pile.ensure(collection).await?);
+                drop(
+                    pile.maintain(maintained_succinct)
+                        .await
+                        .context("maintain Relations fact collection")?,
+                );
+                let store_snapshot = pile
+                    .maintain(maintained_rank9)
                     .await
-                    .context("maintain Relations fact collection")?,
-            );
-            let store_snapshot = pile
-                .maintain(maintained_rank9)
-                .await
-                .context("maintain Relations fact collection")?;
-            let observed = store_snapshot
-                .collection(maintained_rank9)
-                .context("observe Relations Rank9 projection")?;
-            let facts = observed
-                .view::<FactArchive>()
-                .context("read Relations Rank9 projection")?;
-            operation(
-                &mut pile,
-                collection,
-                &signer,
-                &RelationsView {
-                    facts,
-                    reader: store_snapshot,
-                },
-            )
-        });
-        finish_pile(pile, result)
+                    .context("maintain Relations fact collection")?;
+                let observed = store_snapshot
+                    .collection(maintained_rank9)
+                    .context("observe Relations Rank9 projection")?;
+                let facts = observed
+                    .view::<FactArchive>()
+                    .context("read Relations Rank9 projection")?;
+                operation(
+                    pile,
+                    collection,
+                    signer,
+                    &RelationsView {
+                        facts,
+                        reader: store_snapshot,
+                    },
+                )
+            });
+            result
+        })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
@@ -384,32 +382,20 @@ impl RelationsStorage<'_> {
 
     #[cfg(test)]
     fn commit_count(&self) -> Result<usize> {
-        let signer = load_signer(self.pile, self.key)?;
-        let author = signer.verifying_key().to_bytes();
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let store_snapshot = pile.snapshot()?;
-            let cover = collection.admitted(&store_snapshot)?;
-            Ok(cover
-                .commits(&store_snapshot)?
-                .iter()
-                .filter(|commit| commit.public_key().raw == author)
-                .count())
-        })();
-        finish_pile(pile, result)
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close LinkedIn Relations pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing LinkedIn Relations pile also failed: {close_error}"
-        ))),
+        self.storage.with_pile(|pile, signer| {
+            let author = signer.verifying_key().to_bytes();
+            let result = (|| {
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let store_snapshot = pile.snapshot()?;
+                let cover = collection.admitted(&store_snapshot)?;
+                Ok(cover
+                    .commits(&store_snapshot)?
+                    .iter()
+                    .filter(|commit| commit.public_key().raw == author)
+                    .count())
+            })();
+            result
+        })
     }
 }
 
@@ -1315,8 +1301,7 @@ mod tests {
 
     struct Fixture {
         _directory: tempfile::TempDir,
-        pile: PathBuf,
-        key: PathBuf,
+        storage: crate::storage::Storage,
     }
 
     impl Fixture {
@@ -1328,15 +1313,13 @@ mod tests {
             storage::initialize_signer(&pile, Some(&key)).unwrap();
             Self {
                 _directory: directory,
-                pile,
-                key,
+                storage: crate::storage::Storage::new(pile, Some(key)),
             }
         }
 
         fn storage(&self) -> RelationsStorage<'_> {
             RelationsStorage {
-                pile: &self.pile,
-                key: Some(&self.key),
+                storage: &self.storage,
             }
         }
 

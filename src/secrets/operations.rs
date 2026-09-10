@@ -1,20 +1,17 @@
 //! Configured native operations over the standalone encrypted Secrets core.
 use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
-use crate::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-};
+use crate::storage::{open_secrets_collection, open_secrets_collection_read};
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Debug)]
 pub struct Secrets {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretMetadata {
@@ -23,12 +20,14 @@ pub struct SecretMetadata {
 }
 impl Secrets {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> SecretsStorage<'_> {
         SecretsStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     /// Encrypt resident bytes once, returning the exact newly authored version.
@@ -89,8 +88,7 @@ impl Secrets {
 
 #[derive(Clone, Copy)]
 struct SecretsStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 impl SecretsStorage<'_> {
@@ -98,21 +96,6 @@ impl SecretsStorage<'_> {
         self,
         operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = operation(&mut pile, &signer);
-        finish_pile(pile, result)
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Secrets pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Secrets pile also failed: {close_error}")))
-        }
+        self.storage.with_pile(operation)
     }
 }

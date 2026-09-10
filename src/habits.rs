@@ -25,7 +25,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
@@ -35,7 +35,7 @@ use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
     MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
 };
-use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::Storage;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -56,24 +56,18 @@ pub fn collection_handle(
     pile: &Path,
     key: Option<&Path>,
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
-    let signer = load_signer(pile, key)?;
-    let mut store = open_pile_strict(pile)?;
-    let result = crate::collection_names::open_configured(
-        &mut store,
-        DEFAULT_SCOPE_ID,
-        signer.verifying_key(),
-    )
-    .map(|collection| collection.handle())
-    .context("open Habit collection");
-    let close = store.close().context("close Habit pile");
-    match (result, close) {
-        (Ok(handle), Ok(())) => Ok(handle),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(close)) => {
-            Err(error.context(format!("closing pile also failed: {close}")))
-        }
-    }
+    collection_handle_with_storage(&Storage::new(pile.to_owned(), key.map(Path::to_owned)))
+}
+
+/// Select the collection through an explicitly owned storage lifetime.
+pub fn collection_handle_with_storage(
+    storage: &Storage,
+) -> Result<triblespace::core::collection::records::CollectionHandle> {
+    storage.with_pile(|pile, signer| {
+        open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+            .map(|collection| collection.handle())
+            .context("open Habit collection")
+    })
 }
 
 /// One pile-resident executable carried by a standing intention.
@@ -1590,13 +1584,19 @@ pub fn publish(
     key_path: Option<&Path>,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let result = pile
-        .commit(collection, &signer, fragment)
-        .context("commit Habit fragment");
-    finish_pile(pile, result)
+    publish_with_storage(
+        &Storage::new(pile_path.to_owned(), key_path.map(Path::to_owned)),
+        fragment,
+    )
+}
+
+/// Publish one Habit fragment through an explicitly owned storage lifetime.
+pub fn publish_with_storage(storage: &Storage, fragment: Fragment) -> Result<CollectionCommit> {
+    storage.with_pile(|pile, signer| {
+        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        pile.commit(collection, signer, fragment)
+            .context("commit Habit fragment")
+    })
 }
 
 /// Materialize and validate the entire foundational collection.
@@ -1605,29 +1605,23 @@ pub fn publish(
 /// Ordinary reads use the maintained Succinct relation and the direct query
 /// functions above.
 pub fn read_catalog_strict(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let result = (|| {
+    read_catalog_strict_with_storage(&Storage::new(
+        pile_path.to_owned(),
+        key_path.map(Path::to_owned),
+    ))
+}
+
+/// Run the explicit whole-collection audit without reopening a shared store.
+pub fn read_catalog_strict_with_storage(storage: &Storage) -> Result<Catalog> {
+    storage.with_pile(|pile, signer| {
+        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         let store_snapshot = pile
             .snapshot()
             .context("freeze native Habit store snapshot")?;
         let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
             .context("read native Habit collection")?;
         load_catalog(&store_snapshot, &facts).context("strictly validate native Habit catalog")
-    })();
-    finish_pile(pile, result)
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    match (result, pile.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow!("close Habit pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Habit pile also failed: {close_error}")))
-        }
-    }
+    })
 }
 
 /// Local cache root holding materialized habit scripts.
@@ -1819,7 +1813,7 @@ mod tests {
 
     use hifitime::Epoch;
 
-    use crate::storage::load_signer;
+    use crate::storage::{load_signer, open_pile_strict};
     use crate::test_support::initialize_open_collection_fixture;
 
     use super::*;

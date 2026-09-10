@@ -101,7 +101,7 @@ fn main() -> Result<()> {
                 hear,
             });
             let registrations = catalog.registrations();
-            match http_listen {
+            let result = match http_listen {
                 Some(bind) => {
                     let token_file = http_token_file
                         .as_deref()
@@ -113,7 +113,8 @@ fn main() -> Result<()> {
                     http::serve(&registrations, config)
                 }
                 None => serve_stdio(&registrations),
-            }
+            };
+            catalog.finish(result)
         }
     }
 }

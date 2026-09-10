@@ -12,8 +12,11 @@ pub struct Triage {
 }
 impl Triage {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Triage::new(pile, key),
+            operations: super::Triage::with_storage(storage),
         }
     }
 }

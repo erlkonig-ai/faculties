@@ -35,7 +35,7 @@ use crate::discord as discord_model;
 use crate::files as file_capability;
 use crate::schemas::archive::archive;
 use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::FactArchive;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -167,24 +167,24 @@ pub struct ChannelListing {
 /// Resident reads require no token. Neither configuration nor commands consult the environment.
 #[derive(Clone)]
 pub struct Discord {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
     token: Option<String>,
 }
 impl std::fmt::Debug for Discord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Discord")
-            .field("pile", &self.pile)
-            .field("key", &self.key)
+            .field("storage", &self.storage)
             .field("token_configured", &self.token.is_some())
             .finish()
     }
 }
 impl Discord {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            pile,
-            key,
+            storage,
             token: None,
         }
     }
@@ -195,8 +195,7 @@ impl Discord {
     }
     fn storage(&self) -> DiscordStorage<'_> {
         DiscordStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
             collection: None,
         }
     }
@@ -242,8 +241,7 @@ impl Discord {
 
 #[derive(Clone, Copy)]
 struct DiscordStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
     collection: Option<CollectionHandle>,
 }
 
@@ -311,64 +309,64 @@ impl DiscordStorage<'_> {
     /// Prove that this process can publish to the selected collection before
     /// an outbound Discord side effect occurs.
     fn preflight_write(&self) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = self.open_collection(&mut pile, signer.verifying_key())?;
-            let snapshot = pile
-                .snapshot()
-                .context("freeze Discord WRITE-admission preflight")?;
-            if !collection
-                .writer_is_admitted(&snapshot, signer.verifying_key())
-                .context("check Discord collection WRITE admission")?
-            {
-                bail!("durable signer is not admitted to WRITE the Discord collection");
-            }
-            Ok(())
-        })();
-        finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                let collection = self.open_collection(pile, signer.verifying_key())?;
+                let snapshot = pile
+                    .snapshot()
+                    .context("freeze Discord WRITE-admission preflight")?;
+                if !collection
+                    .writer_is_admitted(&snapshot, signer.verifying_key())
+                    .context("check Discord collection WRITE admission")?
+                {
+                    bail!("durable signer is not admitted to WRITE the Discord collection");
+                }
+                Ok(())
+            })();
+            result
+        })
     }
 
     fn with_session<T>(
         &self,
         operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = self.open_collection(&mut pile, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let maintained_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                maintained_succinct,
-                (),
-                policy,
-            )?;
-            let store_snapshot = pollster::block_on(async {
-                drop(pile.ensure(collection).await?);
-                drop(pile.maintain(maintained_succinct).await?);
-                pile.maintain(maintained_rank9).await
-            })
-            .context("maintain Discord fact collection")?;
-            let facts = store_snapshot
-                .collection(maintained_rank9)
-                .context("observe maintained Discord fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Discord fact collection")?;
-            operation(&mut DiscordSession {
-                pile: &mut pile,
-                collection,
-                succinct: maintained_succinct,
-                rank9: maintained_rank9,
-                signer,
-                facts,
-                reader: store_snapshot,
-            })
-        })();
-        finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                let collection = self.open_collection(pile, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let maintained_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    maintained_succinct,
+                    (),
+                    policy,
+                )?;
+                let store_snapshot = pollster::block_on(async {
+                    drop(pile.ensure(collection).await?);
+                    drop(pile.maintain(maintained_succinct).await?);
+                    pile.maintain(maintained_rank9).await
+                })
+                .context("maintain Discord fact collection")?;
+                let facts = store_snapshot
+                    .collection(maintained_rank9)
+                    .context("observe maintained Discord fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Discord fact collection")?;
+                operation(&mut DiscordSession {
+                    pile,
+                    collection,
+                    succinct: maintained_succinct,
+                    rank9: maintained_rank9,
+                    signer: signer.clone(),
+                    facts,
+                    reader: store_snapshot,
+                })
+            })();
+            result
+        })
     }
 
     #[cfg(test)]
@@ -378,18 +376,6 @@ impl DiscordStorage<'_> {
 
     fn publish(&self, fragment: Fragment, description: String) -> Result<CollectionCommit> {
         self.with_session(|session| session.commit(fragment, description))
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Discord pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Discord pile also failed: {close_error}")))
-        }
     }
 }
 
@@ -453,7 +439,12 @@ pub struct ReadOptions {
 }
 
 fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Result<PullReport> {
-    storage.with_session(|session| {
+    storage.storage.scope(|owner| {
+        let storage = DiscordStorage {
+            storage: owner,
+            collection: storage.collection,
+        };
+        let mut view = storage.with_session(|session| Ok(session.view()))?;
         let Some(channel_id) = options.channel_id.as_deref() else {
             let channels = list_visible_text_channels(token)?;
             let mut report = PullReport {
@@ -467,7 +458,8 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
             };
             for channel in channels {
                 let result = pull_channel(
-                    session,
+                    storage,
+                    &mut view,
                     token,
                     &channel.id,
                     options.fetch_limit,
@@ -483,7 +475,8 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
             return Ok(report);
         };
         let result = pull_channel(
-            session,
+            storage,
+            &mut view,
             token,
             channel_id,
             options.fetch_limit,
@@ -505,7 +498,8 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
 /// window. The interval is appended only after every semantic payload and file
 /// has been staged successfully.
 fn pull_channel(
-    session: &mut DiscordSession<'_>,
+    storage: DiscordStorage<'_>,
+    view: &mut CollectionView,
     token: &str,
     channel_id: &str,
     fetch_limit: u32,
@@ -515,7 +509,7 @@ fn pull_channel(
     let channel = discord_model::channel_fragment(channel_id)?
         .root()
         .expect("intrinsic channel has one root");
-    let prior = discord_model::channel_coverage(&session.facts, channel)?;
+    let prior = discord_model::channel_coverage(&view.facts, channel)?;
     let forward = fetch_complete_forward(
         prior.map(|coverage| coverage.through_inclusive),
         fetch_limit,
@@ -565,7 +559,13 @@ fn pull_channel(
             messages.len()
         ),
     };
-    let commit = session.commit(fragment, description)?;
+    // The selected coverage remains frozen while REST payloads and attachments
+    // are fetched. Reenter the local owner only after the fragment is complete.
+    let (commit, after) = storage.with_session(|session| {
+        let commit = session.commit(fragment, description)?;
+        Ok((commit, session.view()))
+    })?;
+    *view = after;
     Ok(ChannelReceipt {
         channel_id: channel_id.to_owned(),
         observations: messages.len(),
@@ -1326,10 +1326,9 @@ mod tests {
         (pile, key)
     }
 
-    fn test_storage<'a>(pile: &'a Path, key: &'a Path) -> DiscordStorage<'a> {
+    fn test_storage(storage: &crate::storage::Storage) -> DiscordStorage<'_> {
         DiscordStorage {
-            pile,
-            key: Some(key),
+            storage,
             collection: None,
         }
     }
@@ -1338,7 +1337,8 @@ mod tests {
     fn direct_send_keeps_literal_body_and_returns_the_stored_remote_id() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
-        let storage = test_storage(&pile, &key);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
         let channel = "100000000000000002";
         let receipt = send_with(
             storage,
@@ -1382,8 +1382,7 @@ mod tests {
         let mut posts = 0;
         let result = send_with(
             DiscordStorage {
-                pile: &pile_path,
-                key: Some(&key),
+                storage: &crate::storage::Storage::new(pile_path.clone(), Some(key.clone())),
                 collection: Some(collection.handle()),
             },
             "unused-token",
@@ -1426,7 +1425,8 @@ mod tests {
     fn volatile_payload_and_profile_changes_do_not_fork_message_semantics() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
-        let storage = test_storage(&pile, &key);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
         let channel = "100000000000000004";
         let first = message_json(
             "100000000000000003",
@@ -1499,7 +1499,8 @@ mod tests {
     fn refreshed_signed_attachment_urls_are_retryable_transport_only() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
-        let storage = test_storage(&pile, &key);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
         let channel = "100000000000000006";
         let mut old = message_json(
             "100000000000000005",
@@ -1572,7 +1573,8 @@ mod tests {
     fn attachment_failure_cannot_publish_coverage() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
-        let storage = test_storage(&pile, &key);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
         let channel = "100000000000000009";
         let payload = message_json(
             "100000000000000008",
@@ -1671,7 +1673,8 @@ mod tests {
     fn latest_official_edit_wins_and_divergent_maxima_are_exposed() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
-        let storage = test_storage(&pile, &key);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
         let channel = "100000000000000007";
         let original = message_json("100000000000000008", channel, "original", None, json!([]));
         let edited = message_json(

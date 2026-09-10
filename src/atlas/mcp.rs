@@ -35,13 +35,18 @@ struct ShowArguments {
 }
 
 pub struct Atlas {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    operations: Store,
 }
 
 impl Atlas {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self {
+            operations: Store::with_storage(storage),
+        }
     }
 }
 
@@ -54,25 +59,21 @@ impl Faculty for Atlas {
         match name {
             "atlas_list" => {
                 let _: ListArguments = decode_arguments(arguments)?;
-                let mut store = Store::open(&self.pile, self.key.as_deref())?;
-                let result = store.list().and_then(|rows| {
+                self.operations.list().and_then(|rows| {
                     for row in rows {
                         output.line(render::list_line(&row))?;
                     }
                     Ok(())
-                });
-                store.finish(result)
+                })
             }
             "atlas_show" => {
                 let arguments: ShowArguments = decode_arguments(arguments)?;
-                let mut store = Store::open(&self.pile, self.key.as_deref())?;
-                let result = store.show(&arguments.id).and_then(|row| {
+                self.operations.show(&arguments.id).and_then(|row| {
                     for line in render::show_lines(&row) {
                         output.line(line)?;
                     }
                     Ok(())
-                });
-                store.finish(result)
+                })
             }
             other => bail!("Atlas MCP has no tool {other:?}"),
         }

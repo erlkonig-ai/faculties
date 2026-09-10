@@ -18,7 +18,7 @@ use crate::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
-use crate::storage::{load_signer, open_store, runtime, FactArchive, FacultyStore};
+use crate::storage::{FactArchive, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -27,7 +27,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::repo::async_store::Blocking;
-use triblespace::core::repo::{SnapshotSource, StorageClose};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 type RelationsReader = Blocking<<FacultyStore as SnapshotSource>::Snapshot>;
@@ -896,28 +896,28 @@ fn list_identities(storage: &mut RelationsStorage<'_>) -> Result<String> {
 /// collection then observes one immutable fact/payload boundary.
 #[derive(Clone, Debug)]
 pub struct Relations {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 impl Relations {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
     }
 
-    fn with_storage<T>(
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
+    }
+
+    fn with_relations<T>(
         &self,
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(&self.pile, self.key.as_deref())?;
-        let runtime = Arc::new(runtime()?);
-        let mut pile = open_store(&self.pile)?;
-        let result = (|| {
+        self.storage.with_store(|pile, signer, runtime| {
             let collection = if let Some(handle) = configured_handle(DEFAULT_SCOPE_ID)? {
-                let reader = Blocking::with_runtime(pile.snapshot()?, Arc::clone(&runtime));
+                let reader = Blocking::with_runtime(pile.snapshot()?, Arc::clone(runtime));
                 open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)?
             } else {
-                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?
+                open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?
             };
             let descriptor_snapshot = pile.snapshot()?;
             let policy = collection.policy(&descriptor_snapshot)?;
@@ -942,26 +942,17 @@ impl Relations {
             // Only exact payload gets may acquire here. Facts, records, proofs,
             // and their interpretation instant remain those of this observation.
             // Dispatch stays outside block_on: Blocking owns the one CLI boundary.
-            let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(&runtime));
+            let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(runtime));
             let mut storage = RelationsStorage {
-                pile: &mut pile,
-                signer: &signer,
+                pile,
+                signer,
                 collection,
                 facts: &view,
                 reader: &payload_reader,
             };
 
             execute(&mut storage)
-        })();
-        let close = pile.close().map_err(anyhow::Error::from);
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(error.context("close Relations pile")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing Relations pile also failed: {close_error}")))
-            }
-        }
+        })
     }
 
     pub fn add(
@@ -970,7 +961,7 @@ impl Relations {
         id: Option<Id>,
         sources: &[String],
     ) -> Result<AddedPerson> {
-        self.with_storage(|storage| add_person(storage, profile, id, sources.to_vec()))
+        self.with_relations(|storage| add_person(storage, profile, id, sources.to_vec()))
     }
     pub fn set(
         &self,
@@ -978,7 +969,7 @@ impl Relations {
         patch: ProfilePatch,
         sources: &[String],
     ) -> Result<ProfileUpdate> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             set_profile(storage, person.to_owned(), sources.to_vec(), patch)
         })
     }
@@ -988,12 +979,12 @@ impl Relations {
         base: Option<&str>,
         patch: ProfilePatch,
     ) -> Result<ProfileReconciliation> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             reconcile_profile(storage, person.to_owned(), base.map(str::to_owned), patch)
         })
     }
     pub fn list(&self, limit: usize, filter: PeopleFilter) -> Result<String> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             list_people(
                 storage,
                 limit,
@@ -1003,38 +994,40 @@ impl Relations {
         })
     }
     pub fn show(&self, person: &str) -> Result<String> {
-        self.with_storage(|storage| show_person(storage, person.to_owned()))
+        self.with_relations(|storage| show_person(storage, person.to_owned()))
     }
     pub fn retire(&self, person: &str) -> Result<LifecycleChange> {
-        self.with_storage(|storage| set_retired(storage, person.to_owned(), true))
+        self.with_relations(|storage| set_retired(storage, person.to_owned(), true))
     }
     pub fn unretire(&self, person: &str) -> Result<LifecycleChange> {
-        self.with_storage(|storage| set_retired(storage, person.to_owned(), false))
+        self.with_relations(|storage| set_retired(storage, person.to_owned(), false))
     }
     pub fn group_create(&self, name: &str) -> Result<AddedGroup> {
-        self.with_storage(|storage| create_group(storage, name.to_owned()))
+        self.with_relations(|storage| create_group(storage, name.to_owned()))
     }
     pub fn group_add(&self, group: &str, person: &str) -> Result<GroupAddition> {
-        self.with_storage(|storage| add_group_member(storage, group.to_owned(), person.to_owned()))
+        self.with_relations(|storage| {
+            add_group_member(storage, group.to_owned(), person.to_owned())
+        })
     }
     pub fn group_remove(&self, group: &str, person: &str) -> Result<GroupRemoval> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             remove_group_member(storage, group.to_owned(), person.to_owned())
         })
     }
     pub fn group_rename(&self, group: &str, name: &str) -> Result<GroupRename> {
-        self.with_storage(|storage| rename_group(storage, group.to_owned(), name.to_owned()))
+        self.with_relations(|storage| rename_group(storage, group.to_owned(), name.to_owned()))
     }
     pub fn group_reconcile(&self, group: &str, name: Option<&str>) -> Result<GroupReconciliation> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             reconcile_group(storage, group.to_owned(), name.map(str::to_owned))
         })
     }
     pub fn group_list(&self) -> Result<String> {
-        self.with_storage(list_groups)
+        self.with_relations(list_groups)
     }
     pub fn group_show(&self, group: &str) -> Result<String> {
-        self.with_storage(|storage| show_group(storage, group.to_owned()))
+        self.with_relations(|storage| show_group(storage, group.to_owned()))
     }
     pub fn identity_resolve(
         &self,
@@ -1042,24 +1035,25 @@ impl Relations {
         second: &str,
         same: bool,
     ) -> Result<IdentityChange> {
-        self.with_storage(|storage| {
+        self.with_relations(|storage| {
             resolve_identity(storage, first.to_owned(), second.to_owned(), same)
         })
     }
     pub fn identity_list(&self) -> Result<String> {
-        self.with_storage(list_identities)
+        self.with_relations(list_identities)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{initialize_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, load_signer, open_pile_strict, open_store, runtime};
     use std::fs;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Bytes;
     use triblespace::core::collection::{
         CollectionRead, CollectionRecord, CollectionRecordSelector,
     };
+    use triblespace::core::repo::StorageClose;
 
     fn profile(label: &str) -> ProfileInput {
         ProfileInput {

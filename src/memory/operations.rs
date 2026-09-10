@@ -9,8 +9,7 @@ use crate::out::Out;
 
 #[derive(Clone, Debug)]
 pub struct Memory {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,12 +63,14 @@ impl Default for ChurnOptions {
 impl Memory {
     /// Pile/key paths belong to the trusted launcher, never an MCP tool caller.
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> MemoryStorage<'_> {
         MemoryStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
 
@@ -309,7 +310,9 @@ fn emit_image(
 }
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::schemas::embeddings::DEFAULT_SCOPE_ID as EMBEDDINGS_SCOPE_ID;
 #[cfg(feature = "local-embed")]
@@ -319,7 +322,7 @@ use crate::schemas::memory::{
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
 use crate::schemas::{blockdag as archive_schema, cognition as cognition_schema};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::FactArchive;
 use anyhow::{anyhow, bail, Context, Result};
 // The shared recollection renderer and accessors also serve Orient in-process.
 use crate::collection_names::open_configured;
@@ -341,7 +344,7 @@ use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -350,8 +353,7 @@ use triblespace::prelude::*;
 
 #[derive(Clone, Copy)]
 struct MemoryStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 struct CollectionView {
@@ -396,18 +398,6 @@ impl MemoryStorage<'_> {
         })
     }
 
-    fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
-    }
-
     fn load_memory_from_snapshot(
         collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
@@ -418,314 +408,331 @@ impl MemoryStorage<'_> {
 
     /// Freeze maintained Memory alone for ordinary commands.
     fn load(&self) -> Result<LoadedMemory> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let source = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let policy = source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Memory descriptor snapshot")?,
-                )
-                .context("read Memory collection policy")?;
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .context("register Succinct Memory collection")?;
-            let collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-                .context("register Rank9 Memory collection")?;
-            drop(pile.ensure(source).await.context("ensure Memory source")?);
-            drop(
-                pile.maintain(succinct)
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let policy = source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Memory descriptor snapshot")?,
+                    )
+                    .context("read Memory collection policy")?;
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .context("register Succinct Memory collection")?;
+                let collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .context("register Rank9 Memory collection")?;
+                drop(pile.ensure(source).await.context("ensure Memory source")?);
+                drop(
+                    pile.maintain(succinct)
+                        .await
+                        .context("maintain Succinct Memory collection")?,
+                );
+                let store_snapshot = pile
+                    .maintain(collection)
                     .await
-                    .context("maintain Succinct Memory collection")?,
-            );
-            let store_snapshot = pile
-                .maintain(collection)
-                .await
-                .context("maintain Rank9 Memory collection")?;
-            Self::load_memory_from_snapshot(collection, &store_snapshot)
-        });
-        Self::finish_pile(pile, result)
+                    .context("maintain Rank9 Memory collection")?;
+                Self::load_memory_from_snapshot(collection, &store_snapshot)
+            });
+            result
+        })
     }
 
     /// Freeze Memory and shared Embeddings from one snapshot for semantic or
     /// context-cover reads.
     fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let memory_source =
-                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let memory_policy = memory_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Memory descriptor snapshot")?,
-                )
-                .context("read Memory collection policy")?;
-            let memory_succinct = pile
-                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
-                .context("register Succinct Memory collection")?;
-            let memory_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
-                .context("register Rank9 Memory collection")?;
-            let embeddings_collections = if with_embeddings {
-                let source =
-                    open_configured(&mut pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-                let policy = source
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let memory_policy = memory_source
                     .policy(
                         &pile
                             .snapshot()
-                            .context("freeze shared Embeddings descriptor snapshot")?,
+                            .context("freeze Memory descriptor snapshot")?,
                     )
-                    .context("read shared Embeddings collection policy")?;
-                let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                    .context("register Succinct shared Embeddings collection")?;
-                let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-                    .context("register Rank9 shared Embeddings collection")?;
-                Some((source, succinct, rank9))
-            } else {
-                None
-            };
-            drop(pile.ensure(memory_source).await?);
-            if let Some((source, _, _)) = embeddings_collections {
-                drop(pile.ensure(source).await?);
-            }
-            drop(
-                pile.maintain(memory_succinct)
-                    .await
-                    .context("maintain Succinct Memory collection")?,
-            );
-            drop(
-                pile.maintain(memory_collection)
-                    .await
-                    .context("maintain Rank9 Memory collection")?,
-            );
-            if let Some((_, succinct, rank9)) = embeddings_collections {
+                    .context("read Memory collection policy")?;
+                let memory_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .context("register Succinct Memory collection")?;
+                let memory_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        memory_succinct,
+                        (),
+                        memory_policy,
+                    )
+                    .context("register Rank9 Memory collection")?;
+                let embeddings_collections = if with_embeddings {
+                    let source =
+                        open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
+                    let policy = source
+                        .policy(
+                            &pile
+                                .snapshot()
+                                .context("freeze shared Embeddings descriptor snapshot")?,
+                        )
+                        .context("read shared Embeddings collection policy")?;
+                    let succinct = pile
+                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                        .context("register Succinct shared Embeddings collection")?;
+                    let rank9 = pile
+                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                        .context("register Rank9 shared Embeddings collection")?;
+                    Some((source, succinct, rank9))
+                } else {
+                    None
+                };
+                drop(pile.ensure(memory_source).await?);
+                if let Some((source, _, _)) = embeddings_collections {
+                    drop(pile.ensure(source).await?);
+                }
                 drop(
-                    pile.maintain(succinct)
+                    pile.maintain(memory_succinct)
                         .await
-                        .context("maintain Succinct shared Embeddings collection")?,
+                        .context("maintain Succinct Memory collection")?,
                 );
                 drop(
-                    pile.maintain(rank9)
+                    pile.maintain(memory_collection)
                         .await
-                        .context("maintain Rank9 shared Embeddings collection")?,
+                        .context("maintain Rank9 Memory collection")?,
                 );
-            }
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze maintained Memory/Embeddings snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            let embeddings = match embeddings_collections {
-                Some((_, _, collection)) => Some(Self::attach_collection(
-                    collection,
-                    &store_snapshot,
-                    "shared Embeddings",
-                )?),
-                None => None,
-            };
-            Ok(LoadedContext { memory, embeddings })
-        });
-        Self::finish_pile(pile, result)
+                if let Some((_, succinct, rank9)) = embeddings_collections {
+                    drop(
+                        pile.maintain(succinct)
+                            .await
+                            .context("maintain Succinct shared Embeddings collection")?,
+                    );
+                    drop(
+                        pile.maintain(rank9)
+                            .await
+                            .context("maintain Rank9 shared Embeddings collection")?,
+                    );
+                }
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Memory/Embeddings snapshot")?;
+                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+                let embeddings = match embeddings_collections {
+                    Some((_, _, collection)) => Some(Self::attach_collection(
+                        collection,
+                        &store_snapshot,
+                        "shared Embeddings",
+                    )?),
+                    None => None,
+                };
+                Ok(LoadedContext { memory, embeddings })
+            });
+            result
+        })
     }
 
     /// Freeze Memory and Comb together for cursor transitions.
     fn load_comb(&self) -> Result<LoadedComb> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let memory_source =
-                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let memory_policy = memory_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Memory descriptor snapshot")?,
-                )
-                .context("read Memory collection policy")?;
-            let memory_succinct = pile
-                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
-                .context("register Succinct Memory collection")?;
-            let memory_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
-                .context("register Rank9 Memory collection")?;
-            let comb_source =
-                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let comb_policy = comb_source
-                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                .context("read Comb collection policy")?;
-            let comb_succinct = pile
-                .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
-                .context("register Succinct Comb collection")?;
-            let comb_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
-                .context("register Rank9 Comb collection")?;
-            drop(pile.ensure(memory_source).await?);
-            drop(pile.ensure(comb_source).await?);
-            drop(
-                pile.maintain(memory_succinct)
-                    .await
-                    .context("maintain Succinct Memory collection")?,
-            );
-            drop(
-                pile.maintain(memory_collection)
-                    .await
-                    .context("maintain Rank9 Memory collection")?,
-            );
-            drop(
-                pile.maintain(comb_succinct)
-                    .await
-                    .context("maintain Succinct Comb collection")?,
-            );
-            drop(
-                pile.maintain(comb_collection)
-                    .await
-                    .context("maintain Rank9 Comb collection")?,
-            );
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze maintained Memory/Comb snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            let comb = Self::attach_collection(comb_collection, &store_snapshot, "Comb")?;
-            Ok(LoadedComb { memory, comb })
-        });
-        Self::finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let memory_policy = memory_source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Memory descriptor snapshot")?,
+                    )
+                    .context("read Memory collection policy")?;
+                let memory_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .context("register Succinct Memory collection")?;
+                let memory_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        memory_succinct,
+                        (),
+                        memory_policy,
+                    )
+                    .context("register Rank9 Memory collection")?;
+                let comb_source =
+                    open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+                let comb_policy = comb_source
+                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                    .context("read Comb collection policy")?;
+                let comb_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
+                    .context("register Succinct Comb collection")?;
+                let comb_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
+                    .context("register Rank9 Comb collection")?;
+                drop(pile.ensure(memory_source).await?);
+                drop(pile.ensure(comb_source).await?);
+                drop(
+                    pile.maintain(memory_succinct)
+                        .await
+                        .context("maintain Succinct Memory collection")?,
+                );
+                drop(
+                    pile.maintain(memory_collection)
+                        .await
+                        .context("maintain Rank9 Memory collection")?,
+                );
+                drop(
+                    pile.maintain(comb_succinct)
+                        .await
+                        .context("maintain Succinct Comb collection")?,
+                );
+                drop(
+                    pile.maintain(comb_collection)
+                        .await
+                        .context("maintain Rank9 Comb collection")?,
+                );
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Memory/Comb snapshot")?;
+                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+                let comb = Self::attach_collection(comb_collection, &store_snapshot, "Comb")?;
+                Ok(LoadedComb { memory, comb })
+            });
+            result
+        })
     }
 
     /// Freeze Memory, Cognition, and Archive from exactly one pile snapshot
     /// for a coherent cross-scope provenance read.
     fn load_provenance(&self) -> Result<LoadedProvenance> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let memory_source =
-                open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let cognition_source = open_configured(
-                &mut pile,
-                cognition_schema::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            )?;
-            let archive_source = open_configured(
-                &mut pile,
-                archive_schema::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            )?;
-            let memory_policy = memory_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Memory descriptor snapshot")?,
-                )
-                .context("read Memory collection policy")?;
-            let memory_succinct = pile
-                .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
-                .context("register Succinct Memory collection")?;
-            let memory_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(memory_succinct, (), memory_policy)
-                .context("register Rank9 Memory collection")?;
-            let cognition_policy = cognition_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Cognition descriptor snapshot")?,
-                )
-                .context("read Cognition collection policy")?;
-            let cognition_succinct = pile
-                .derive::<SuccinctArchiveBlob>(cognition_source, (), cognition_policy.clone())
-                .context("register Succinct Cognition collection")?;
-            let cognition_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    cognition_succinct,
-                    (),
-                    cognition_policy,
-                )
-                .context("register Rank9 Cognition collection")?;
-            let archive_policy = archive_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Archive descriptor snapshot")?,
-                )
-                .context("read Archive collection policy")?;
-            let archive_succinct = pile
-                .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
-                .context("register Succinct Archive collection")?;
-            let archive_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(archive_succinct, (), archive_policy)
-                .context("register Rank9 Archive collection")?;
-            for source in [memory_source, cognition_source, archive_source] {
-                drop(pile.ensure(source).await?);
-            }
-            for (succinct, collection, label) in [
-                (memory_succinct, memory_collection, "Memory"),
-                (cognition_succinct, cognition_collection, "Cognition"),
-                (archive_succinct, archive_collection, "Archive"),
-            ] {
-                drop(
-                    pile.maintain(succinct)
-                        .await
-                        .with_context(|| format!("maintain Succinct {label} collection"))?,
-                );
-                drop(
-                    pile.maintain(collection)
-                        .await
-                        .with_context(|| format!("maintain Rank9 {label} collection"))?,
-                );
-            }
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze maintained Memory/Cognition/Archive snapshot")?;
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            Ok(LoadedProvenance {
-                memory,
-                cognition: Self::attach_collection(
-                    cognition_collection,
-                    &store_snapshot,
-                    "Cognition",
-                )?,
-                archive: Self::attach_collection(archive_collection, &store_snapshot, "Archive")?,
-            })
-        });
-        Self::finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let cognition_source = open_configured(
+                    pile,
+                    cognition_schema::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let archive_source = open_configured(
+                    pile,
+                    archive_schema::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let memory_policy = memory_source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Memory descriptor snapshot")?,
+                    )
+                    .context("read Memory collection policy")?;
+                let memory_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .context("register Succinct Memory collection")?;
+                let memory_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        memory_succinct,
+                        (),
+                        memory_policy,
+                    )
+                    .context("register Rank9 Memory collection")?;
+                let cognition_policy = cognition_source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Cognition descriptor snapshot")?,
+                    )
+                    .context("read Cognition collection policy")?;
+                let cognition_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(cognition_source, (), cognition_policy.clone())
+                    .context("register Succinct Cognition collection")?;
+                let cognition_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        cognition_succinct,
+                        (),
+                        cognition_policy,
+                    )
+                    .context("register Rank9 Cognition collection")?;
+                let archive_policy = archive_source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Archive descriptor snapshot")?,
+                    )
+                    .context("read Archive collection policy")?;
+                let archive_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                    .context("register Succinct Archive collection")?;
+                let archive_collection = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        archive_succinct,
+                        (),
+                        archive_policy,
+                    )
+                    .context("register Rank9 Archive collection")?;
+                for source in [memory_source, cognition_source, archive_source] {
+                    drop(pile.ensure(source).await?);
+                }
+                for (succinct, collection, label) in [
+                    (memory_succinct, memory_collection, "Memory"),
+                    (cognition_succinct, cognition_collection, "Cognition"),
+                    (archive_succinct, archive_collection, "Archive"),
+                ] {
+                    drop(
+                        pile.maintain(succinct)
+                            .await
+                            .with_context(|| format!("maintain Succinct {label} collection"))?,
+                    );
+                    drop(
+                        pile.maintain(collection)
+                            .await
+                            .with_context(|| format!("maintain Rank9 {label} collection"))?,
+                    );
+                }
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Memory/Cognition/Archive snapshot")?;
+                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+                Ok(LoadedProvenance {
+                    memory,
+                    cognition: Self::attach_collection(
+                        cognition_collection,
+                        &store_snapshot,
+                        "Cognition",
+                    )?,
+                    archive: Self::attach_collection(
+                        archive_collection,
+                        &store_snapshot,
+                        "Archive",
+                    )?,
+                })
+            });
+            result
+        })
     }
 
     fn publish_memory(&self, fragment: Fragment) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_configured(&mut pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-        let result = pile
-            .commit(collection, &signer, fragment)
-            .context("commit authored Memory fragment")
-            .map(|_| ());
-        Self::finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+            let result = pile
+                .commit(collection, signer, fragment)
+                .context("commit authored Memory fragment")
+                .map(|_| ());
+            result
+        })
     }
 
     #[cfg(feature = "local-embed")]
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_configured(&mut pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-        let result = pile
-            .commit(collection, &signer, fragment)
-            .context("commit authored embedding observations")
-            .map(|_| ());
-        Self::finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
+            let result = pile
+                .commit(collection, signer, fragment)
+                .context("commit authored embedding observations")
+                .map(|_| ());
+            result
+        })
     }
 
     fn publish_comb(&self, fragment: Fragment) -> Result<()> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let collection = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-        let result = pile
-            .commit(collection, &signer, fragment)
-            .context("commit authored Comb cursor")
-            .map(|_| ());
-        Self::finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            let result = pile
+                .commit(collection, signer, fragment)
+                .context("commit authored Comb cursor")
+                .map(|_| ());
+            result
+        })
     }
 }
 
@@ -2782,6 +2789,7 @@ mod tests {
     struct TestPile {
         pile: PathBuf,
         key: PathBuf,
+        storage: crate::storage::Storage,
     }
 
     impl TestPile {
@@ -2791,13 +2799,16 @@ mod tests {
             let key = pile.with_extension("key");
             File::create(&pile).expect("create test pile");
             crate::storage::initialize_signer(&pile, Some(&key)).expect("initialize test signer");
-            Self { pile, key }
+            Self {
+                storage: crate::storage::Storage::new(pile.clone(), Some(key.clone())),
+                pile,
+                key,
+            }
         }
 
         fn storage(&self) -> MemoryStorage<'_> {
             MemoryStorage {
-                pile: &self.pile,
-                key: Some(&self.key),
+                storage: &self.storage,
             }
         }
     }

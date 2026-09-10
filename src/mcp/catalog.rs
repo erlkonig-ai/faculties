@@ -4,9 +4,11 @@
 //! discovery do not read environment variables, open a pile or signing key,
 //! load a model, or contact an external service.
 
+use anyhow::Result;
 use std::path::PathBuf;
 
 use super::Faculty;
+use crate::storage::Storage;
 use crate::{
     archive, atlas, body, bootstrap, cognition, compass, decide, discord, duplex, files, gauge,
     habits, headspace, hear, imagine, linkedin, mail, memory, message, orient, patience, planner,
@@ -43,6 +45,7 @@ impl Config {
 /// Protocol/session state belongs to a transport's [`super::Server`], not here.
 pub struct Catalog {
     faculties: Vec<Box<dyn Faculty>>,
+    storage: Storage,
 }
 
 impl Catalog {
@@ -55,52 +58,64 @@ impl Catalog {
             duplex_session,
             hear: hear_config,
         } = config;
-        let discord = discord::mcp::Discord::new(pile.clone(), key.clone());
+        let storage = Storage::shared(pile, key);
+        let discord = discord::mcp::Discord::with_storage(storage.clone());
         let discord = match discord_token {
             Some(token) => discord.with_token(token),
             None => discord,
         };
-        let linkedin = linkedin::mcp::LinkedIn::new(pile.clone(), key.clone());
+        let linkedin = linkedin::mcp::LinkedIn::with_storage(storage.clone());
         let linkedin = match linkedin_token {
             Some(token) => linkedin.with_token(token),
             None => linkedin,
         };
         let faculties: Vec<Box<dyn Faculty>> = vec![
-            Box::new(archive::mcp::Archive::new(pile.clone(), key.clone())),
-            Box::new(atlas::mcp::Atlas::new(pile.clone(), key.clone())),
-            Box::new(body::mcp::Body::new(pile.clone(), key.clone())),
-            Box::new(bootstrap::mcp::Bootstrap::new(pile.clone(), key.clone())),
-            Box::new(cognition::mcp::Cognition::new(pile.clone(), key.clone())),
-            Box::new(compass::mcp::Compass::new(pile.clone(), key.clone())),
-            Box::new(decide::mcp::Decide::new(pile.clone(), key.clone())),
+            Box::new(archive::mcp::Archive::with_storage(storage.clone())),
+            Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
+            Box::new(body::mcp::Body::with_storage(storage.clone())),
+            Box::new(bootstrap::mcp::Bootstrap::with_storage(storage.clone())),
+            Box::new(cognition::mcp::Cognition::with_storage(storage.clone())),
+            Box::new(compass::mcp::Compass::with_storage(storage.clone())),
+            Box::new(decide::mcp::Decide::with_storage(storage.clone())),
             Box::new(discord),
             Box::new(duplex::mcp::Duplex::new(duplex_session)),
-            Box::new(files::mcp::Files::new(pile.clone(), key.clone())),
-            Box::new(gauge::mcp::Gauge::new(pile.clone(), key.clone())),
-            Box::new(habits::mcp::Habits::new(pile.clone(), key.clone())),
-            Box::new(headspace::mcp::Headspace::new(pile.clone(), key.clone())),
+            Box::new(files::mcp::Files::with_storage(storage.clone())),
+            Box::new(gauge::mcp::Gauge::with_storage(storage.clone())),
+            Box::new(habits::mcp::Habits::with_storage(storage.clone())),
+            Box::new(headspace::mcp::Headspace::with_storage(storage.clone())),
             Box::new(hear::mcp::Hear::new(hear_config)),
-            Box::new(imagine::mcp::Imagine::new(pile.clone(), key.clone())),
+            Box::new(imagine::mcp::Imagine::with_storage(storage.clone())),
             Box::new(linkedin),
-            Box::new(mail::mcp::Mail::new(pile.clone(), key.clone())),
-            Box::new(memory::mcp::Memory::new(pile.clone(), key.clone())),
-            Box::new(message::mcp::Message::new(pile.clone(), key.clone())),
-            Box::new(orient::mcp::Orient::new(pile.clone(), key.clone())),
-            Box::new(patience::mcp::Patience::new(pile.clone(), key.clone())),
-            Box::new(planner::mcp::Planner::new(pile.clone(), key.clone())),
-            Box::new(posture::mcp::Posture::new(pile.clone(), key.clone())),
-            Box::new(reason::mcp::Reason::new(pile.clone(), key.clone())),
-            Box::new(relations::mcp::Relations::new(pile.clone(), key.clone())),
-            Box::new(secrets::mcp::Secrets::new(pile.clone(), key.clone())),
-            Box::new(status::mcp::Status::new(pile.clone(), key.clone())),
-            Box::new(teams::mcp::Teams::new(pile.clone(), key.clone())),
-            Box::new(triage::mcp::Triage::new(pile.clone(), key.clone())),
-            Box::new(viewer::mcp::Viewer::new(pile.clone(), key.clone())),
-            Box::new(voice::mcp::Voice::new(pile.clone(), key.clone())),
-            Box::new(web::mcp::Web::new(pile.clone(), key.clone())),
-            Box::new(wiki::mcp::Wiki::new(pile, key)),
+            Box::new(mail::mcp::Mail::with_storage(storage.clone())),
+            Box::new(memory::mcp::Memory::with_storage(storage.clone())),
+            Box::new(message::mcp::Message::with_storage(storage.clone())),
+            Box::new(orient::mcp::Orient::with_storage(storage.clone())),
+            Box::new(patience::mcp::Patience::with_storage(storage.clone())),
+            Box::new(planner::mcp::Planner::with_storage(storage.clone())),
+            Box::new(posture::mcp::Posture::with_storage(storage.clone())),
+            Box::new(reason::mcp::Reason::with_storage(storage.clone())),
+            Box::new(relations::mcp::Relations::with_storage(storage.clone())),
+            Box::new(secrets::mcp::Secrets::with_storage(storage.clone())),
+            Box::new(status::mcp::Status::with_storage(storage.clone())),
+            Box::new(teams::mcp::Teams::with_storage(storage.clone())),
+            Box::new(triage::mcp::Triage::with_storage(storage.clone())),
+            Box::new(viewer::mcp::Viewer::with_storage(storage.clone())),
+            Box::new(voice::mcp::Voice::with_storage(storage.clone())),
+            Box::new(web::mcp::Web::with_storage(storage.clone())),
+            Box::new(wiki::mcp::Wiki::with_storage(storage.clone())),
         ];
-        Self { faculties }
+        Self { faculties, storage }
+    }
+
+    /// Flush and close the application-owned store after transport shutdown.
+    /// Protocol session expiry does not close this shared owner.
+    pub fn close(&self) -> Result<()> {
+        self.storage.close()
+    }
+
+    /// Close storage without losing a transport's error, if it also failed.
+    pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        self.storage.finish(result)
     }
 
     /// Borrow the same adapters for a stdio connection or an HTTP listener.

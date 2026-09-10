@@ -20,7 +20,6 @@ use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
 
-use crate::storage::{load_signer, open_pile_strict};
 use crate::wiki::{self, RevisionDraft};
 use crate::{compass, wiki as wiki_model};
 
@@ -504,53 +503,51 @@ pub fn generation() -> [u8; 32] {
 /// completely before publication. Replaying with the same key yields the same
 /// two exact signed COMMIT records.
 pub async fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = async {
-        let wiki_before = wiki_model::materialize_indexed_collection(&mut pile, &signer)
-            .await
-            .context("materialize Wiki before bootstrap import")?;
-        let (wiki, wiki_roots) = wiki_fragment(
-            &signer.verifying_key(),
-            Some((wiki_before.catalog(), wiki_before.store_snapshot())),
-        )?;
-        let seed = PortableSeed {
-            wiki,
-            compass: compass_fragment()?,
-            wiki_roots,
-        };
+    import_with_storage(&crate::storage::Storage::new(
+        pile_path.to_owned(),
+        key_path.map(Path::to_owned),
+    ))
+}
 
-        let expected_wiki = seed.wiki.facts().clone();
-        let expected_compass = seed.compass.facts().clone();
-        let wiki_commit = wiki_model::commit_collection(&mut pile, &signer, seed.wiki)?;
-        let compass_commit = compass::commit_collection(&mut pile, &signer, seed.compass)?;
+/// Import using the caller's explicit store owner, without reopening a shared pile.
+pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportReport> {
+    storage.with_pile(|pile, signer| {
+        pollster::block_on(async {
+            let wiki_before = wiki_model::materialize_indexed_collection(pile, signer)
+                .await
+                .context("materialize Wiki before bootstrap import")?;
+            let (wiki, wiki_roots) = wiki_fragment(
+                &signer.verifying_key(),
+                Some((wiki_before.catalog(), wiki_before.store_snapshot())),
+            )?;
+            let seed = PortableSeed {
+                wiki,
+                compass: compass_fragment()?,
+                wiki_roots,
+            };
 
-        let wiki_after = wiki_model::materialize_indexed_collection(&mut pile, &signer).await?;
-        if !expected_wiki.difference(wiki_after.facts()).is_empty() {
-            bail!("Wiki collection omitted portable bootstrap facts after publication");
-        }
-        let (compass_after, reader) = compass::materialize_collection(&mut pile, &signer)?;
-        compass::validate_known_payloads(&reader, &compass_after)?;
-        if !expected_compass.difference(&compass_after).is_empty() {
-            bail!("Compass collection omitted portable bootstrap facts after publication");
-        }
+            let expected_wiki = seed.wiki.facts().clone();
+            let expected_compass = seed.compass.facts().clone();
+            let wiki_commit = wiki_model::commit_collection(pile, signer, seed.wiki)?;
+            let compass_commit = compass::commit_collection(pile, signer, seed.compass)?;
 
-        Ok(ImportReport {
-            generation: generation(),
-            wiki_commit,
-            compass_commit,
+            let wiki_after = wiki_model::materialize_indexed_collection(pile, signer).await?;
+            if !expected_wiki.difference(wiki_after.facts()).is_empty() {
+                bail!("Wiki collection omitted portable bootstrap facts after publication");
+            }
+            let (compass_after, reader) = compass::materialize_collection(pile, signer)?;
+            compass::validate_known_payloads(&reader, &compass_after)?;
+            if !expected_compass.difference(&compass_after).is_empty() {
+                bail!("Compass collection omitted portable bootstrap facts after publication");
+            }
+
+            Ok(ImportReport {
+                generation: generation(),
+                wiki_commit,
+                compass_commit,
+            })
         })
-    }
-    .await;
-    let close = pile.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow::anyhow!("close bootstrap pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing bootstrap pile also failed: {close_error}")))
-        }
-    }
+    })
 }
 
 #[cfg(test)]

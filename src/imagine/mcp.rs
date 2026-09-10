@@ -42,12 +42,21 @@ pub struct Imagine {
 }
 impl Imagine {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self::with_sources(pile, key, ModelSources::from_environment())
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self::with_storage_and_sources(storage, ModelSources::from_environment())
     }
     pub fn with_sources(pile: PathBuf, key: Option<PathBuf>, sources: ModelSources) -> Self {
+        Self::with_storage_and_sources(crate::storage::Storage::new(pile, key), sources)
+    }
+    pub fn with_storage_and_sources(
+        storage: crate::storage::Storage,
+        sources: ModelSources,
+    ) -> Self {
         Self {
             operations: Operations::new(sources),
-            memory: crate::memory::Memory::new(pile, key),
+            memory: crate::memory::Memory::with_storage(storage),
         }
     }
 }

@@ -16,8 +16,11 @@ pub struct Memory {
 }
 impl Memory {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Memory::new(pile, key),
+            operations: super::Memory::with_storage(storage),
         }
     }
 }

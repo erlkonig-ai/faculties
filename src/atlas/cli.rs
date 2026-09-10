@@ -41,7 +41,7 @@ pub static SPEC: Spec = Spec {
 
 /// Execute a parsed CLI request. Output routing belongs to `crate::cli`.
 pub fn execute(invocation: &Invocation, output: &mut Out<'_>) -> Result<()> {
-    let mut store = Store::open(invocation.require_path("pile")?, invocation.path("key"))?;
+    let store = Store::open(invocation.require_path("pile")?, invocation.path("key"))?;
     let result = (|| {
         match invocation.verb().name {
             "list" => {

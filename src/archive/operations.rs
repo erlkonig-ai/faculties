@@ -3,8 +3,7 @@
 
 #[derive(Clone, Debug)]
 pub struct Archive {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportSource {
@@ -50,12 +49,14 @@ impl ImportSummary {
 }
 impl Archive {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> ArchiveStorage<'_> {
         ArchiveStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     /// Publish one resident source atomically after complete successful scanning.
@@ -76,46 +77,50 @@ impl Archive {
         {
             bail!("this Archive format accepts embedded assets, not an external attachment map");
         }
-        let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&self.pile, self.key.as_deref()))?;
-        let projection = match source {
-            ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
-                writer.stage_fragment(p.fragment)
-            })
-            .map(ImportSummary::Agy),
-            ImportSource::ChatGpt => {
-                archive_chatgpt::project_bytes(source_name, bytes, attachments, |p| {
+        self.storage.with_pile(|pile, signer| {
+            let mut writer = pollster::block_on(ArchiveImportWriter::from_pile(pile, signer))?;
+            let projection = match source {
+                ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
                     writer.stage_fragment(p.fragment)
                 })
-                .map(ImportSummary::ChatGpt)
-            }
-            ImportSource::ClaudeCode => {
-                archive_claude_code::project_bytes(source_name, bytes, |p| {
+                .map(ImportSummary::Agy),
+                ImportSource::ChatGpt => {
+                    archive_chatgpt::project_bytes(source_name, bytes, attachments, |p| {
+                        writer.stage_fragment(p.fragment)
+                    })
+                    .map(ImportSummary::ChatGpt)
+                }
+                ImportSource::ClaudeCode => {
+                    archive_claude_code::project_bytes(source_name, bytes, |p| {
+                        writer.stage_fragment(p.fragment)
+                    })
+                    .map(ImportSummary::ClaudeCode)
+                }
+                ImportSource::ClaudeWeb => {
+                    archive_claude_web::project_bytes(source_name, bytes, |p| {
+                        writer.stage_fragment(p.fragment)
+                    })
+                    .map(ImportSummary::ClaudeWeb)
+                }
+                ImportSource::Codex => archive_codex::project_bytes(source_name, bytes, |p| {
                     writer.stage_fragment(p.fragment)
                 })
-                .map(ImportSummary::ClaudeCode)
-            }
-            ImportSource::ClaudeWeb => archive_claude_web::project_bytes(source_name, bytes, |p| {
-                writer.stage_fragment(p.fragment)
-            })
-            .map(ImportSummary::ClaudeWeb),
-            ImportSource::Codex => archive_codex::project_bytes(source_name, bytes, |p| {
-                writer.stage_fragment(p.fragment)
-            })
-            .map(ImportSummary::Codex),
-            ImportSource::Copilot => archive_copilot::project_bytes(source_name, bytes, |p| {
-                writer.stage_fragment(p.fragment)
-            })
-            .map(ImportSummary::Copilot),
-            ImportSource::Gemini => {
-                archive_gemini::project_bytes(source_name, bytes, attachments, |p| {
+                .map(ImportSummary::Codex),
+                ImportSource::Copilot => archive_copilot::project_bytes(source_name, bytes, |p| {
                     writer.stage_fragment(p.fragment)
                 })
-                .map(ImportSummary::Gemini)
-            }
-        };
-        let (summary, commit) = writer.finish(projection)?;
-        Ok(ImportReceipt { summary, commit })
+                .map(ImportSummary::Copilot),
+                ImportSource::Gemini => {
+                    archive_gemini::project_bytes(source_name, bytes, attachments, |p| {
+                        writer.stage_fragment(p.fragment)
+                    })
+                    .map(ImportSummary::Gemini)
+                }
+            };
+            let summary = projection?;
+            let commit = writer.commit_unit()?;
+            Ok(ImportReceipt { summary, commit })
+        })
     }
     pub fn list(&self, limit: usize, out: &mut Out<'_>) -> Result<()> {
         run_list(self.storage(), limit, out)
@@ -172,7 +177,9 @@ fn validate_persona(persona: &str) -> Result<()> {
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::archive_agy::{self, ProjectionSummary as AgyProjectionSummary};
 use crate::archive_chatgpt::{self, ProjectionSummary as ChatGptProjectionSummary};
@@ -188,7 +195,9 @@ use crate::collection_names::open_configured;
 use crate::comb::{self as comb_model, CursorDraft, CursorResolution, CursorState};
 use crate::schemas::blockdag as archive_schema;
 use crate::schemas::memory::DEFAULT_COMB_SCOPE_ID;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::FactArchive;
+#[cfg(test)]
+use crate::storage::{load_signer, open_pile_strict};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{
@@ -196,7 +205,7 @@ use triblespace::core::collection::{
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::{Inline, TryFromInline, TryToInline};
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
 
@@ -219,8 +228,7 @@ use anybytes::Bytes;
 use triblespace::core::collection::CollectionCommit;
 #[derive(Clone, Copy)]
 struct ArchiveStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 struct ReplayView {
@@ -230,44 +238,44 @@ struct ReplayView {
 
 impl ArchiveStorage<'_> {
     fn load(&self) -> Result<FactSnapshot> {
-        pollster::block_on(archive_collection::ensure_local(self.pile, self.key))
+        archive_collection::ensure_local_with_storage(self.storage)
     }
 
     fn load_comb(&self) -> Result<FactArchive> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let source = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let policy = source
-                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                .context("read Comb collection policy")?;
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .context("register Succinct Comb cursor collection")?;
-            let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-                .context("register Rank9 Comb cursor collection")?;
-            drop(
-                pile.ensure(source)
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let source = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+                let policy = source
+                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                    .context("read Comb collection policy")?;
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .context("register Succinct Comb cursor collection")?;
+                let rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .context("register Rank9 Comb cursor collection")?;
+                drop(
+                    pile.ensure(source)
+                        .await
+                        .context("ensure Comb source dependencies")?,
+                );
+                drop(
+                    pile.maintain(succinct)
+                        .await
+                        .context("maintain Succinct Comb cursor collection")?,
+                );
+                let after = pile
+                    .maintain(rank9)
                     .await
-                    .context("ensure Comb source dependencies")?,
-            );
-            drop(
-                pile.maintain(succinct)
-                    .await
-                    .context("maintain Succinct Comb cursor collection")?,
-            );
-            let after = pile
-                .maintain(rank9)
-                .await
-                .context("maintain Rank9 Comb cursor collection")?;
-            after
-                .collection(rank9)
-                .context("attach Comb cursor collection")?
-                .view::<FactArchive>()
-                .context("read Comb cursor collection")
-        });
-        finish_pile(pile, result)
+                    .context("maintain Rank9 Comb cursor collection")?;
+                after
+                    .collection(rank9)
+                    .context("attach Comb cursor collection")?
+                    .view::<FactArchive>()
+                    .context("read Comb cursor collection")
+            });
+            result
+        })
     }
 
     /// Attach Archive and its separate Comb cursor collection at one watermark.
@@ -275,96 +283,88 @@ impl ArchiveStorage<'_> {
     /// Both maintained views are observed through Archive's final immutable
     /// store snapshot. Later payload reads keep that same boundary.
     fn load_replay(&self) -> Result<ReplayView> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = pollster::block_on(async {
-            let archive_source = open_configured(
-                &mut pile,
-                archive_schema::DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-            )?;
-            let archive_policy = archive_source
-                .policy(
-                    &pile
-                        .snapshot()
-                        .context("freeze Archive descriptor snapshot")?,
-                )
-                .context("read Archive collection policy")?;
-            let archive_succinct = pile
-                .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
-                .context("register Succinct Archive fact collection")?;
-            let archive_rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(archive_succinct, (), archive_policy)
-                .context("register Rank9 Archive fact collection")?;
-            let comb_source =
-                open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let comb_policy = comb_source
-                .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                .context("read Comb collection policy")?;
-            let comb_succinct = pile
-                .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
-                .context("register Succinct Comb cursor collection")?;
-            let comb_rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
-                .context("register Rank9 Comb cursor collection")?;
+        self.storage.with_pile(|pile, signer| {
+            let result = pollster::block_on(async {
+                let archive_source = open_configured(
+                    pile,
+                    archive_schema::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let archive_policy = archive_source
+                    .policy(
+                        &pile
+                            .snapshot()
+                            .context("freeze Archive descriptor snapshot")?,
+                    )
+                    .context("read Archive collection policy")?;
+                let archive_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                    .context("register Succinct Archive fact collection")?;
+                let archive_rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        archive_succinct,
+                        (),
+                        archive_policy,
+                    )
+                    .context("register Rank9 Archive fact collection")?;
+                let comb_source =
+                    open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+                let comb_policy = comb_source
+                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
+                    .context("read Comb collection policy")?;
+                let comb_succinct = pile
+                    .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
+                    .context("register Succinct Comb cursor collection")?;
+                let comb_rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
+                    .context("register Rank9 Comb cursor collection")?;
 
-            // Acquire the roots, maintain each immediate derivation, then
-            // observe both representations through one final snapshot.
-            drop(
-                pile.ensure(archive_source)
+                // Acquire the roots, maintain each immediate derivation, then
+                // observe both representations through one final snapshot.
+                drop(
+                    pile.ensure(archive_source)
+                        .await
+                        .context("ensure Archive source dependencies")?,
+                );
+                drop(
+                    pile.ensure(comb_source)
+                        .await
+                        .context("ensure Comb cursor dependencies")?,
+                );
+                drop(
+                    pile.maintain(comb_succinct)
+                        .await
+                        .context("maintain Succinct Comb cursor collection")?,
+                );
+                drop(
+                    pile.maintain(comb_rank9)
+                        .await
+                        .context("maintain Rank9 Comb cursor collection")?,
+                );
+                drop(
+                    pile.maintain(archive_succinct)
+                        .await
+                        .context("maintain Succinct Archive replay facts")?,
+                );
+                let after = pile
+                    .maintain(archive_rank9)
                     .await
-                    .context("ensure Archive source dependencies")?,
-            );
-            drop(
-                pile.ensure(comb_source)
-                    .await
-                    .context("ensure Comb cursor dependencies")?,
-            );
-            drop(
-                pile.maintain(comb_succinct)
-                    .await
-                    .context("maintain Succinct Comb cursor collection")?,
-            );
-            drop(
-                pile.maintain(comb_rank9)
-                    .await
-                    .context("maintain Rank9 Comb cursor collection")?,
-            );
-            drop(
-                pile.maintain(archive_succinct)
-                    .await
-                    .context("maintain Succinct Archive replay facts")?,
-            );
-            let after = pile
-                .maintain(archive_rank9)
-                .await
-                .context("maintain Rank9 Archive replay facts")?;
-            let archive = after
-                .collection(archive_rank9)
-                .context("attach Archive replay facts")?;
-            let comb_facts = after
-                .collection(comb_rank9)
-                .context("attach Comb cursor collection")?
-                .view::<FactArchive>()
-                .context("read Comb cursor collection")?;
-            Ok(ReplayView {
-                archive,
-                comb_facts,
-            })
-        });
-        finish_pile(pile, result)
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(close_error)) => Err(anyhow!("close Archive pile: {close_error}")),
-        (Err(error), Err(close_error)) => Err(error.context(format!(
-            "closing Archive pile after failure also failed: {close_error}"
-        ))),
+                    .context("maintain Rank9 Archive replay facts")?;
+                let archive = after
+                    .collection(archive_rank9)
+                    .context("attach Archive replay facts")?;
+                let comb_facts = after
+                    .collection(comb_rank9)
+                    .context("attach Comb cursor collection")?
+                    .view::<FactArchive>()
+                    .context("read Comb cursor collection")?;
+                Ok(ReplayView {
+                    archive,
+                    comb_facts,
+                })
+            });
+            result
+        })
     }
 }
 
@@ -1101,10 +1101,7 @@ fn run_search(
     limit: usize,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let (observed, index) = pollster::block_on(archive_collection::ensure_search_local(
-        storage.pile,
-        storage.key,
-    ))?;
+    let (observed, index) = archive_collection::ensure_search_local_with_storage(storage.storage)?;
     let facts = observed.view::<FactArchive>()?;
     for (document, score) in index
         .query_multi(&hash_tokens(&text))
@@ -1131,14 +1128,12 @@ fn run_search(
 }
 
 fn run_index(storage: ArchiveStorage<'_>, out: &mut Out<'_>) -> Result<()> {
-    let (succinct, bm25) = pollster::block_on(async {
-        let succinct = archive_collection::ensure_succinct_index(storage.pile, storage.key).await?;
-        let bm25 = archive_collection::ensure_bm25_index(storage.pile, storage.key).await?;
-        Ok::<_, anyhow::Error>((succinct, bm25))
-    })?;
+    let observed = archive_collection::ensure_local_with_storage(storage.storage)?;
+    let source_elements = observed.support().len();
+    let bm25 = archive_collection::ensure_bm25_index_with_storage(storage.storage)?;
     out.line(format!(
         "Archive: {} distinct source element(s) covered by accelerated-Succinct",
-        succinct.source_elements,
+        source_elements,
     ))?;
     out.line(format!(
         "Archive BM25: {} distinct source element(s), {} resident cover segment(s)",
@@ -1231,15 +1226,15 @@ fn active_archive_cursor(
 }
 
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
-    let signer = load_signer(storage.pile, storage.key)?;
-    let mut pile = open_pile_strict(storage.pile)?;
-    let result = (|| {
-        let collection = open_configured(&mut pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-        pile.commit(collection, &signer, fragment)
-            .context("publish archive replay cursor")?;
-        Ok(())
-    })();
-    finish_pile(pile, result)
+    storage.storage.with_pile(|pile, signer| {
+        let result = (|| {
+            let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+            pile.commit(collection, signer, fragment)
+                .context("publish archive replay cursor")?;
+            Ok(())
+        })();
+        result
+    })
 }
 
 const REPLAY_STREAM: &str = "archive-replay";
@@ -1327,6 +1322,7 @@ mod tests {
         _directory: tempfile::TempDir,
         pile: PathBuf,
         key: PathBuf,
+        storage: crate::storage::Storage,
     }
 
     fn fixture() -> Fixture {
@@ -1337,6 +1333,7 @@ mod tests {
         initialize_signer(&pile, Some(&key)).unwrap();
         Fixture {
             _directory: directory,
+            storage: crate::storage::Storage::new(pile.clone(), Some(key.clone())),
             pile,
             key,
         }
@@ -1344,15 +1341,14 @@ mod tests {
 
     fn storage(fixture: &Fixture) -> ArchiveStorage<'_> {
         ArchiveStorage {
-            pile: &fixture.pile,
-            key: Some(&fixture.key),
+            storage: &fixture.storage,
         }
     }
 
     fn run_import(storage: ArchiveStorage<'_>, path: &Path, source: CliImportSource) -> Result<()> {
         super::super::cli::import_paths(
-            storage.pile,
-            storage.key,
+            storage.storage.path(),
+            storage.storage.key_path(),
             &[path.to_path_buf()],
             source,
             &mut Out::new(&mut |_| Ok(())),
@@ -1458,6 +1454,68 @@ mod tests {
                 Some(Command::Import { source, .. }) if source == expected
             ));
         }
+    }
+
+    #[test]
+    fn native_import_borrows_shared_owner_without_closing_or_reopening_it() {
+        let fixture = fixture();
+        let owner =
+            crate::storage::Storage::shared(fixture.pile.clone(), Some(fixture.key.clone()));
+        let archive = Archive::with_storage(owner.clone());
+        let first: Bytes = br#"[{"id":"shared-chatgpt","mapping":{"node":{"id":"node","parent":null,"message":{"id":"message","author":{"role":"user"},"content":{"content_type":"text","parts":["first"]}}}}}]"#
+            .to_vec().into();
+        let receipt = archive
+            .import(
+                ImportSource::ChatGpt,
+                "conversations.json",
+                first.clone(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(receipt.commit.is_some());
+        let before = archive.storage().load().unwrap();
+        assert_eq!(before.support().len(), 1);
+
+        // A later operation cannot reopen this pathname, but it can borrow the
+        // retained owner. Its explicit key remains at the configured location.
+        let renamed = fixture._directory.path().join("still-open.pile");
+        fs::rename(&fixture.pile, &renamed).unwrap();
+        let retry = archive
+            .clone()
+            .import(
+                ImportSource::ChatGpt,
+                "conversations.json",
+                first,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(retry.commit.is_none());
+        assert!(archive
+            .import(
+                ImportSource::ChatGpt,
+                "invalid.json",
+                b"not JSON".to_vec().into(),
+                &BTreeMap::new(),
+            )
+            .is_err());
+        assert_eq!(archive.storage().load().unwrap().support().len(), 1);
+
+        let second = archive.import(
+            ImportSource::ClaudeWeb,
+            "claude.json",
+            br#"[{"uuid":"shared-claude","chat_messages":[{"uuid":"message","sender":"human","text":"second"}]}]"#.to_vec().into(),
+            &BTreeMap::new(),
+        ).unwrap();
+        assert!(second.commit.is_some());
+        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
+        assert_eq!(
+            before.support().len(),
+            1,
+            "the earlier observation stays frozen"
+        );
+        assert!(!fixture.pile.exists());
+        owner.close().unwrap();
+        assert!(renamed.exists());
     }
 
     #[test]

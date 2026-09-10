@@ -155,6 +155,23 @@ Ordinary handler unwinds also become tool errors, retaining already accepted
 output. This is not backend-state repair or recovery from aborts, GPU failures,
 or out-of-memory termination.
 
+The aggregate catalogue owns one lazily opened store for its configured pile.
+All pile-backed adapters share its indexes, I/O runtime and lazy-fetch peer;
+tool calls and HTTP protocol sessions do not reopen the pile or restart that
+peer. Each operation still takes fresh snapshots, including newly appended
+records from other processes. Collection views are never cached in this owner.
+Discovery remains I/O-free, and resident reads do not start the network host.
+
+Native applications can opt into the same lifetime with
+`storage::Storage::shared(pile, key)` and the faculties' `with_storage`
+constructors. Independent owners never share implicitly by pathname. Existing
+`new(pile, key)` constructors retain operation-scoped CLI storage. Compound
+operations can use `Storage::scope` to retain a store while releasing its
+borrow across external work. The aggregate executable explicitly closes storage
+after transport shutdown; embedders should call `Catalog::finish(result)` or
+`close()` to report persistence errors. Shared appends are visible immediately
+but are not implicitly flushed at the end of each tool call.
+
 #### Streamable HTTP and existing hosting infrastructure
 
 Provision an independent random bearer token (32..=1024 bearer-token characters)

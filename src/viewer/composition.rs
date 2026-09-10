@@ -34,8 +34,7 @@ impl Target {
 pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     let storage = nb.state(
         "storage",
-        StorageState::for_sources(&viewer.pile, target.sources().iter().copied())
-            .with_key_path(viewer.key.clone()),
+        StorageState::with_storage(viewer.storage.clone(), target.sources().iter().copied()),
         move |ctx, st| {
             if target == Target::Dashboard {
                 ctx.set_default_section_open(false);

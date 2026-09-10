@@ -3,10 +3,12 @@
 use crate::clock;
 use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+#[cfg(test)]
+use crate::storage::open_pile_strict;
+use crate::storage::FactArchive;
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -85,17 +87,18 @@ impl RouteReceipt {
 }
 #[derive(Clone, Debug)]
 pub struct Voice {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 impl Voice {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> VoiceStorage<'_> {
         VoiceStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     pub fn routes(&self) -> Result<Vec<RoutePolicy>> {
@@ -177,8 +180,7 @@ fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
 
 #[derive(Clone, Copy)]
 struct VoiceStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 struct VoiceSession<'a> {
@@ -209,54 +211,42 @@ impl VoiceStorage<'_> {
         &self,
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection =
-                open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let maintained_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                maintained_succinct,
-                (),
-                policy,
-            )?;
-            let store_snapshot = pollster::block_on(async {
-                drop(pile.ensure(collection).await?);
-                drop(pile.maintain(maintained_succinct).await?);
-                pile.maintain(maintained_rank9).await
-            })
-            .context("maintain Voice fact collection")?;
-            let facts = store_snapshot
-                .collection(maintained_rank9)
-                .context("observe maintained Voice fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Voice fact collection")?;
-            operation(&mut VoiceSession {
-                pile: &mut pile,
-                collection,
-                signer: &signer,
-                facts,
-                #[cfg(test)]
-                reader: store_snapshot,
-            })
-        })();
-        finish_pile(pile, result)
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Voice pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Voice pile also failed: {close_error}")))
-        }
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                let collection =
+                    open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let maintained_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    maintained_succinct,
+                    (),
+                    policy,
+                )?;
+                let store_snapshot = pollster::block_on(async {
+                    drop(pile.ensure(collection).await?);
+                    drop(pile.maintain(maintained_succinct).await?);
+                    pile.maintain(maintained_rank9).await
+                })
+                .context("maintain Voice fact collection")?;
+                let facts = store_snapshot
+                    .collection(maintained_rank9)
+                    .context("observe maintained Voice fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Voice fact collection")?;
+                operation(&mut VoiceSession {
+                    pile,
+                    collection,
+                    signer,
+                    facts,
+                    #[cfg(test)]
+                    reader: store_snapshot,
+                })
+            })();
+            result
+        })
     }
 }
 
@@ -345,8 +335,7 @@ mod tests {
         File::create(&pile).unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
         let storage = VoiceStorage {
-            pile: &pile,
-            key: Some(&key),
+            storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
         };
 
         let route = vec!["AirPods Max".to_owned(), "AirPods Pro".to_owned()];

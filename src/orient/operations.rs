@@ -10,8 +10,7 @@ use health::HealthSources;
 
 #[derive(Clone, Debug)]
 pub struct Orient {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
     health_max_age: Duration,
 }
 
@@ -68,9 +67,11 @@ pub struct BaselineReceipt {
 
 impl Orient {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
         Self {
-            pile,
-            key,
+            storage,
             health_max_age: crate::schemas::swarm_health::DEFAULT_MAX_AGE,
         }
     }
@@ -87,17 +88,20 @@ impl Orient {
         options: &ShowOptions,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        runtime()?.block_on(cmd_show(
-            &self.pile,
-            self.key.as_deref(),
-            persona,
-            options.message_limit,
-            options.doing_limit,
-            options.todo_limit,
-            options.evaluate_habits,
-            self.health_max_age,
-            out,
-        ))
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_show(
+                pile,
+                signer,
+                self.storage.path(),
+                persona,
+                options.message_limit,
+                options.doing_limit,
+                options.todo_limit,
+                options.evaluate_habits,
+                self.health_max_age,
+                out,
+            ))
+        })
     }
     pub fn wake(
         &self,
@@ -105,45 +109,54 @@ impl Orient {
         options: &WakeOptions,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        runtime()?.block_on(cmd_wake(
-            &self.pile,
-            self.key.as_deref(),
-            persona,
-            options.chars,
-            options.doing_limit,
-            options.todo_limit,
-            out,
-        ))
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_wake(
+                pile,
+                signer,
+                persona,
+                options.chars,
+                options.doing_limit,
+                options.todo_limit,
+                out,
+            ))
+        })
     }
     pub fn poll(&self, persona: &str, peek: bool, out: &mut Out<'_>) -> Result<()> {
-        runtime()?.block_on(cmd_poll(
-            &self.pile,
-            self.key.as_deref(),
-            Some(persona),
-            peek,
-            self.health_max_age,
-            out,
-        ))
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_poll(
+                pile,
+                signer,
+                Some(persona),
+                peek,
+                self.health_max_age,
+                out,
+            ))
+        })
     }
     pub fn baseline(&self, persona: &str) -> Result<BaselineReceipt> {
-        runtime()?.block_on(cmd_baseline(
-            &self.pile,
-            self.key.as_deref(),
-            Some(persona),
-            self.health_max_age,
-        ))
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_baseline(
+                pile,
+                signer,
+                Some(persona),
+                self.health_max_age,
+            ))
+        })
     }
     /// One-shot wait. It returns after the first complete news report or timeout.
     /// No permanent process or competing observer is started by constructing Orient.
     pub fn wait(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
-        runtime()?.block_on(cmd_wait(
-            &self.pile,
-            self.key.as_deref(),
-            Some(persona),
-            options,
-            self.health_max_age,
-            out,
-        ))
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_wait(
+                pile,
+                signer,
+                self.storage.path(),
+                Some(persona),
+                options,
+                self.health_max_age,
+                out,
+            ))
+        })
     }
 }
 
@@ -180,7 +193,9 @@ use crate::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::storage::FacultySnapshot;
-use crate::storage::{load_signer, open_store, read, runtime, FactArchive, FacultyStore};
+#[cfg(test)]
+use crate::storage::{open_store, runtime};
+use crate::storage::{read, FactArchive, FacultyStore, Storage};
 use crate::{
     clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
     teams as teams_model, wiki as wiki_model,
@@ -204,7 +219,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, StorageClose, StoreSnapshot,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, StoreSnapshot,
 };
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
@@ -2221,22 +2236,20 @@ fn save_presentations(
 }
 
 async fn cmd_baseline(
-    pile_path: &Path,
-    key: Option<&Path>,
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
     persona: Option<&str>,
     health_max_age: Duration,
 ) -> Result<BaselineReceipt> {
     let Some(input) = persona else {
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
-    let signer = load_signer(pile_path, key)?;
-    let mut pile = open_store(pile_path)?;
-    let result = async {
-        let health = HealthSources::open(&pile, &signer, health_max_age)?.observe(&mut pile)?;
+    async {
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
         let health_events = health.report().attention;
-        let sources = OrientSources::open(&mut pile, &signer, false).await?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
-        let (persona, events) = read(&mut pile, &observation.snapshot, |reader| {
+        let sources = OrientSources::open(pile, signer, false).await?;
+        let observation = maintain_and_observe_sources(pile, &sources).await?;
+        let (persona, events) = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
             let view = load_attention_view(&query, persona)?;
@@ -2250,19 +2263,19 @@ async fn cmd_baseline(
             ))
         })
         .await?;
-        save_presentations(&mut pile, &signer, persona, events.iter().copied())?;
+        save_presentations(pile, signer, persona, events.iter().copied())?;
         Ok(BaselineReceipt {
             persona,
             events: events.len(),
         })
     }
-    .await;
-    close_pile(pile, result)
+    .await
 }
 
 async fn cmd_show(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
     pile_path: &Path,
-    key: Option<&Path>,
     persona: Option<&str>,
     message_limit: usize,
     doing_limit: usize,
@@ -2273,26 +2286,24 @@ async fn cmd_show(
 ) -> Result<()> {
     use std::fmt::Write as _;
 
-    let signer = load_signer(pile_path, key)?;
-    let mut pile = open_store(pile_path)?;
-    let result = async {
-        let health = HealthSources::open(&pile, &signer, health_max_age)?.observe(&mut pile)?;
+    async {
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
         let health_report = health.report();
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
             match health.persona(input) {
                 Ok(persona) => {
-                    save_presentations(&mut pile, &signer, persona, health_report.attention.ids())?
+                    save_presentations(pile, signer, persona, health_report.attention.ids())?
                 }
                 Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {}
                 Err(error) => return Err(error),
             }
         }
-        let sources = OrientSources::open(&mut pile, &signer, true).await?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
+        let sources = OrientSources::open(pile, signer, true).await?;
+        let observation = maintain_and_observe_sources(pile, &sources).await?;
         let instant = observation.snapshot.instant();
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
-            read(&mut pile, &observation.snapshot, |reader| {
+            read(pile, &observation.snapshot, |reader| {
                 let query = observation.query(reader);
                 let persona_id = persona
                     .map(|input| resolve_native_persona(&query, input))
@@ -2364,12 +2375,11 @@ async fn cmd_show(
         write_complete_report(output, &report, "Orient overview")?;
 
         if let Some(persona_id) = persona_id {
-            save_presentations(&mut pile, &signer, persona_id, shown)?;
+            save_presentations(pile, signer, persona_id, shown)?;
         }
         Ok(())
     }
-    .await;
-    close_pile(pile, result)
+    .await
 }
 
 /// Render only the *novel* content behind the news — new peer messages, Mail
@@ -2521,23 +2531,12 @@ fn apply_prepared_news(
     Ok(())
 }
 
-fn close_pile<T>(pile: FacultyStore, result: Result<T>) -> Result<T> {
-    match (result, pile.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow!("close pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing pile also failed: {close_error}")))
-        }
-    }
-}
-
 /// One-shot `wait`: acquire selected payloads, report pending attention
 /// tersely, and only then record presentation. No provider means quiet pending,
 /// not acknowledgment of a body the recipient never saw.
 async fn cmd_poll(
-    pile_path: &Path,
-    key: Option<&Path>,
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
     persona: Option<&str>,
     peek: bool,
     health_max_age: Duration,
@@ -2546,16 +2545,14 @@ async fn cmd_poll(
     let Some(input) = persona else {
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
-    let signer = load_signer(pile_path, key)?;
-    let mut pile = open_store(pile_path)?;
-    let result = async {
-        let health = HealthSources::open(&pile, &signer, health_max_age)?;
-        if health.poll(&mut pile, &signer, input, peek, output)?.0 {
+    async {
+        let health = HealthSources::open(pile, signer, health_max_age)?;
+        if health.poll(pile, signer, input, peek, output)?.0 {
             return Ok(());
         }
-        let sources = OrientSources::open(&mut pile, &signer, false).await?;
-        let observation = maintain_and_observe_sources(&mut pile, &sources).await?;
-        let prepared = read(&mut pile, &observation.snapshot, |reader| {
+        let sources = OrientSources::open(pile, signer, false).await?;
+        let observation = maintain_and_observe_sources(pile, &sources).await?;
+        let prepared = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
             Ok((persona, prepare_news_once(&query, persona)?))
@@ -2568,11 +2565,10 @@ async fn cmd_poll(
             }
             Err(error) => return Err(error),
         };
-        apply_prepared_news(&mut pile, &signer, persona, peek, &news, "", output)?;
+        apply_prepared_news(pile, signer, persona, peek, &news, "", output)?;
         Ok(())
     }
-    .await;
-    close_pile(pile, result)
+    .await
 }
 
 struct WaitOutcome {
@@ -2775,8 +2771,9 @@ async fn ensure_sources_before_health_deadline(
 }
 
 async fn cmd_wait(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
     pile_path: &Path,
-    key: Option<&Path>,
     persona: Option<&str>,
     options: &WaitOptions,
     health_max_age: Duration,
@@ -2786,18 +2783,15 @@ async fn cmd_wait(
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let timeout = options.timeout;
-    let signer = load_signer(pile_path, key)?;
-    let mut pile = open_store(pile_path)?;
-    let result = async {
-        let health = HealthSources::open(&pile, &signer, health_max_age)?;
+    let result: Result<WaitOutcome> = async {
+        let health = HealthSources::open(pile, signer, health_max_age)?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let mut view_pending;
         let mut next_health_change;
 
         let sources = loop {
-            let (fired, deadline) =
-                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
             if fired {
                 return Ok(WaitOutcome {
@@ -2808,7 +2802,7 @@ async fn cmd_wait(
             }
             tokio::select! {
                 boundary = health::deadline(next_health_change) => { boundary?; }
-                sources = OrientSources::open(&mut pile, &signer, true) => break sources?,
+                sources = OrientSources::open(pile, signer, true) => break sources?,
             }
         };
 
@@ -2816,8 +2810,7 @@ async fn cmd_wait(
         // deliberately remains the polling watermark after derived writes so
         // a concurrent source append cannot be swallowed by those writes.
         let initial = loop {
-            let (fired, deadline) =
-                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
             if fired {
                 return Ok(WaitOutcome {
@@ -2826,14 +2819,12 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
-            if !ensure_sources_before_health_deadline(&mut pile, &sources, next_health_change)
-                .await?
-            {
+            if !ensure_sources_before_health_deadline(pile, &sources, next_health_change).await? {
                 continue;
             }
             let sampled = pile.snapshot()?;
             if let Some(attempt) = load_wait_frame_before_health_deadline(
-                &mut pile,
+                pile,
                 &sources,
                 sampled,
                 pile_path,
@@ -2880,7 +2871,7 @@ async fn cmd_wait(
         let mut current_habit_context_valid = true;
 
         let initial_report = matches!(news, News::Report { .. });
-        apply_prepared_news(&mut pile, &signer, persona_id, false, &news, "", output)?;
+        apply_prepared_news(pile, signer, persona_id, false, &news, "", output)?;
         if initial_report {
             return Ok(WaitOutcome {
                 news_printed: true,
@@ -2902,8 +2893,7 @@ async fn cmd_wait(
             let sleep = health::until(next_health_change, clock::now()?)
                 .map_or(poll, |delay| delay.min(poll));
             tokio::time::sleep(sleep).await;
-            let (fired, deadline) =
-                health.poll(&mut pile, &signer, persona_input, false, output)?;
+            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
             if fired {
                 return Ok(WaitOutcome {
@@ -2912,9 +2902,7 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
-            if !ensure_sources_before_health_deadline(&mut pile, &sources, next_health_change)
-                .await?
-            {
+            if !ensure_sources_before_health_deadline(pile, &sources, next_health_change).await? {
                 view_pending = true;
                 continue;
             }
@@ -2941,7 +2929,7 @@ async fn cmd_wait(
 
             if storage_changed || authorization_changed || view_pending {
                 let Some(attempt) = load_wait_frame_before_health_deadline(
-                    &mut pile,
+                    pile,
                     &sources,
                     sampled,
                     pile_path,
@@ -2964,8 +2952,8 @@ async fn cmd_wait(
                         let habit_fired = !habit_report.is_empty();
                         let ordinary_fired = matches!(candidate.news, News::Report { .. });
                         apply_prepared_news(
-                            &mut pile,
-                            &signer,
+                            pile,
+                            signer,
                             candidate.persona,
                             false,
                             &candidate.news,
@@ -3035,7 +3023,7 @@ async fn cmd_wait(
         }
     }
     .await;
-    let outcome = close_pile(pile, result)?;
+    let outcome = result?;
     if outcome.news_printed {
         // Terse path: the News: reasons and the novel detail were already
         // printed inside the wait loop — don't re-dump the full snapshot.
@@ -3086,8 +3074,8 @@ fn render_tags(tags: &[String]) -> String {
 /// goals. Semantically read-only: it publishes no authoritative collection
 /// commits, though derived indexes may be maintained as cache exhaust.
 async fn cmd_wake(
-    pile_path: &Path,
-    key: Option<&Path>,
+    storage: &mut FacultyStore,
+    signer: &SigningKey,
     persona: Option<&str>,
     chars: usize,
     doing_limit: usize,
@@ -3096,34 +3084,31 @@ async fn cmd_wake(
 ) -> Result<()> {
     use std::fmt::Write as _;
 
-    let signer = load_signer(pile_path, key)?;
-    let mut storage = open_store(pile_path)?;
-    let result = async {
+    async {
         // Register every descriptor before choosing the authorization instant.
         // Maintenance may append derived lattice nodes; all reads attach only
         // after that work, from one later immutable pile snapshot.
-        let sources = OrientSources::open(&mut storage, &signer, false).await?;
+        let sources = OrientSources::open(storage, signer, false).await?;
         let memory_collection =
-            OrientSource::open(&mut storage, &signer, MEMORY_SCOPE_ID, "Memory").await?;
-        let wiki_collection =
-            OrientSource::open(&mut storage, &signer, WIKI_SCOPE_ID, "Wiki").await?;
-        let wiki_latest = wiki_model::latest_collection(&mut storage, signer.verifying_key())
+            OrientSource::open(storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
+        let wiki_collection = OrientSource::open(storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
+        let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
-        sources.ensure(&mut storage).await?;
+        sources.ensure(storage).await?;
         drop(storage.ensure(memory_collection.source).await?);
         drop(storage.ensure(wiki_collection.source).await?);
         let watermark = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake authorization instant: {error}"))?;
-        memory_collection.maintain(&mut storage).await?;
-        wiki_collection.maintain(&mut storage).await?;
+        memory_collection.maintain(storage).await?;
+        wiki_collection.maintain(storage).await?;
         drop(
             storage
                 .maintain(wiki_latest)
                 .await
                 .context("maintain Wiki supersession index")?,
         );
-        let observation = maintain_and_observe_snapshot(&mut storage, &watermark, &sources).await?;
+        let observation = maintain_and_observe_snapshot(storage, &watermark, &sources).await?;
         drop(watermark);
         let memory_facts = observation
             .snapshot
@@ -3143,7 +3128,7 @@ async fn cmd_wake(
             .context("observe maintained Wiki supersession index")?
             .view::<triblespace::core::collection::latest::LatestIndex>()
             .context("attach maintained Wiki supersession index")?;
-        let persona_id = read(&mut storage, &observation.snapshot, |reader| {
+        let persona_id = read(storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             persona
                 .map(|input| resolve_native_persona(&query, input))
@@ -3153,7 +3138,7 @@ async fn cmd_wake(
         // Prepare each independent section separately. A missing Wiki or
         // Compass attachment must not repeat memory-cover planning/diagnostics.
         // Plain wake never consults Embeddings; these facts stay shard-backed.
-        let cover = read(&mut storage, &observation.snapshot, |reader| {
+        let cover = read(storage, &observation.snapshot, |reader| {
             render_cover_report(
                 &memory_facts,
                 &TribleSet::new(),
@@ -3162,11 +3147,11 @@ async fn cmd_wake(
             )
         })
         .await?;
-        let beliefs = read(&mut storage, &observation.snapshot, |reader| {
+        let beliefs = read(storage, &observation.snapshot, |reader| {
             wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order)
         })
         .await?;
-        let (goals, shown) = read(&mut storage, &observation.snapshot, |reader| {
+        let (goals, shown) = read(storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
             let shown = match persona_id {
@@ -3210,12 +3195,11 @@ async fn cmd_wake(
         }
 
         if let Some(persona_id) = persona_id {
-            save_presentations(&mut storage, &signer, persona_id, shown)?;
+            save_presentations(storage, signer, persona_id, shown)?;
         }
         Ok(())
     }
-    .await;
-    close_pile(storage, result)
+    .await
 }
 
 #[cfg(test)]
@@ -3229,6 +3213,7 @@ mod tests {
     use triblespace::core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchive, UnionArchive,
     };
+    use triblespace::core::repo::StorageClose;
 
     fn write_report_to_writer(
         writer: &mut impl Write,

@@ -1,5 +1,5 @@
 //! Configured operations over one frozen authorized Decide observation.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
@@ -7,7 +7,7 @@ use crate::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
 use crate::schemas::decide::DEFAULT_SCOPE_ID;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::FactArchive;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -22,8 +22,7 @@ use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct Decide {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ProposedDecision {
@@ -105,12 +104,14 @@ pub fn result_id(raw: &str) -> Result<Id> {
 
 impl Decide {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> DecideStorage<'_> {
         DecideStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     pub fn propose(
@@ -317,8 +318,7 @@ impl Decide {
 
 #[derive(Clone, Copy)]
 struct DecideStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 struct CollectionView {
@@ -336,42 +336,42 @@ impl DecideStorage<'_> {
             &CollectionView,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let maintained_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                maintained_succinct,
-                (),
-                policy,
-            )?;
-            let store_snapshot = pollster::block_on(async {
-                drop(pile.ensure(collection).await?);
-                drop(pile.maintain(maintained_succinct).await?);
-                pile.maintain(maintained_rank9).await
-            })
-            .context("maintain Decide fact collection")?;
-            let facts = store_snapshot
-                .collection(maintained_rank9)
-                .context("observe maintained Decide fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Decide fact collection")?;
-            operation(
-                &mut pile,
-                collection,
-                &signer,
-                &CollectionView {
-                    facts,
-                    reader: store_snapshot,
-                },
-            )
-        })();
-        finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let maintained_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    maintained_succinct,
+                    (),
+                    policy,
+                )?;
+                let store_snapshot = pollster::block_on(async {
+                    drop(pile.ensure(collection).await?);
+                    drop(pile.maintain(maintained_succinct).await?);
+                    pile.maintain(maintained_rank9).await
+                })
+                .context("maintain Decide fact collection")?;
+                let facts = store_snapshot
+                    .collection(maintained_rank9)
+                    .context("observe maintained Decide fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Decide fact collection")?;
+                operation(
+                    pile,
+                    collection,
+                    signer,
+                    &CollectionView {
+                        facts,
+                        reader: store_snapshot,
+                    },
+                )
+            })();
+            result
+        })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
@@ -390,18 +390,6 @@ impl DecideStorage<'_> {
                 .context("commit authored Decide fragment")?;
             Ok(value)
         })
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Decide pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Decide pile also failed: {close_error}")))
-        }
     }
 }
 

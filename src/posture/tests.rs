@@ -41,6 +41,7 @@ struct TestStore {
     _directory: tempfile::TempDir,
     pile: PathBuf,
     key: PathBuf,
+    storage: crate::storage::Storage,
 }
 
 impl TestStore {
@@ -52,6 +53,7 @@ impl TestStore {
         crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
         Self {
             _directory: directory,
+            storage: crate::storage::Storage::new(pile.clone(), Some(key.clone())),
             pile,
             key,
         }
@@ -59,8 +61,7 @@ impl TestStore {
 
     fn storage(&self) -> PostureStorage<'_> {
         PostureStorage {
-            pile: &self.pile,
-            key: Some(&self.key),
+            storage: &self.storage,
         }
     }
 
@@ -299,8 +300,7 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
 
     let missing_key = store._directory.path().join("missing.key");
     let unavailable = PostureStorage {
-        key: Some(&missing_key),
-        ..storage
+        storage: &crate::storage::Storage::new(store.pile.clone(), Some(missing_key.clone())),
     };
     assert!(unavailable.policy_view().is_err());
     assert!(!missing_key.exists(), "a read must never mint a signer");

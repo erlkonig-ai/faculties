@@ -1,17 +1,17 @@
 //! Direct Reason publication operations; no argv, output, or child processes.
+use crate::storage::Storage;
 use crate::{clock, cognition};
 use anyhow::Result;
 #[cfg(test)]
 use hifitime::Epoch;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct Reason {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,12 +22,14 @@ pub struct ReasonAction {
 
 impl Reason {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> ReasonStorage<'_> {
         ReasonStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     /// Record literal prose. Environment and command execution are not consulted.
@@ -50,11 +52,7 @@ impl Reason {
         let (reason, reason_event) = described_reason_fragment(turn, worker, text, None, created);
         let (action, action_event) =
             described_reason_fragment(turn, worker, command, Some(command), created);
-        cognition::publish_events(
-            &self.pile,
-            self.key.as_deref(),
-            [reason_event, action_event],
-        )?;
+        cognition::publish_events_with_storage(&self.storage, [reason_event, action_event])?;
         Ok(ReasonAction { reason, action })
     }
 }
@@ -66,8 +64,7 @@ fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
 
 #[derive(Clone, Copy)]
 struct ReasonStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a Storage,
 }
 
 fn publish_reason(
@@ -80,7 +77,7 @@ fn publish_reason(
 ) -> Result<(Id, CollectionCommit)> {
     let (event_id, event) =
         described_reason_fragment(turn_id, worker_id, text, command_text, created_at);
-    let commit = cognition::publish_event(storage.pile, storage.key, event)?;
+    let commit = cognition::publish_event_with_storage(storage.storage, event)?;
     Ok((event_id, commit))
 }
 
@@ -150,10 +147,8 @@ mod tests {
         File::create(&pile_path).unwrap();
 
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let storage = ReasonStorage {
-            pile: &pile_path,
-            key: Some(&key_path),
-        };
+        let storage = Storage::new(pile_path.clone(), Some(key_path.clone()));
+        let storage = ReasonStorage { storage: &storage };
         let turn = test_id(0x72);
         let worker = test_id(0x73);
         let created = at_unix(42.0);
@@ -238,8 +233,7 @@ mod tests {
 
         let error = publish_reason(
             ReasonStorage {
-                pile: &pile_path,
-                key: Some(&key_path),
+                storage: &Storage::new(pile_path.clone(), Some(key_path.clone())),
             },
             None,
             None,

@@ -30,7 +30,7 @@ where
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::storage::initialize_signer;
+use crate::storage::{initialize_signer, load_signer, open_pile_strict};
 
 use super::*;
 
@@ -69,10 +69,8 @@ fn equal_time_intents_coexist_and_higher_event_id_wins() {
     let key = directory.0.join("body.key");
     File::create(&pile).unwrap();
     initialize_signer(&pile, Some(&key)).unwrap();
-    let storage = BodyStorage {
-        pile: &pile,
-        key: Some(&key),
-    };
+    let storage = Storage::new(pile.clone(), Some(key.clone()));
+    let storage = BodyStorage { storage: &storage };
 
     let created = at_unix(1_750_000_000.0);
     let first = intent_fragment("first", created);

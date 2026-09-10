@@ -22,7 +22,9 @@ use crate::schemas::posture::{
 use crate::schemas::posture::{CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT};
 #[cfg(any(feature = "local-embed", test))]
 use crate::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+#[cfg(test)]
+use crate::storage::open_pile_strict;
+use crate::storage::FactArchive;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
@@ -255,17 +257,18 @@ enum SemanticDocument {
 /// collections; this value is not a second catalog or a mutable policy head.
 #[derive(Clone, Debug)]
 pub struct Posture {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 impl Posture {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> PostureStorage<'_> {
         PostureStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
     /// Deterministic resident scan. No model, filesystem input, or stdin access.
@@ -2079,8 +2082,7 @@ fn walk(root: &Path, out: &mut Vec<PathBuf>, omissions: &mut Vec<WalkOmission>) 
 
 #[derive(Clone, Copy)]
 struct PostureStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a crate::storage::Storage,
 }
 
 struct CollectionView {
@@ -2098,71 +2100,77 @@ impl PostureStorage<'_> {
     fn load_scopes(&self, scopes: &[(Id, &str)]) -> Result<Vec<CollectionView>> {
         // Authority is loaded before storage is touched. Ordinary reads and
         // writes never mint an identity or substitute an ephemeral signer.
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            // Register every descriptor before advancing the fact chains.
-            let mut sources = Vec::with_capacity(scopes.len());
-            let mut succinct = Vec::with_capacity(scopes.len());
-            let mut rank9 = Vec::with_capacity(scopes.len());
-            for (scope, label) in scopes {
-                let collection = open_configured(&mut pile, *scope, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let succinct_collection = pile
-                    .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
-                    .with_context(|| format!("register succinct Posture {label} collection"))?;
-                let rank9_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
-                    .with_context(|| format!("register Rank9 Posture {label} collection"))?;
-                sources.push(collection);
-                succinct.push(succinct_collection);
-                rank9.push(rank9_collection);
-            }
-            pollster::block_on(async {
-                for ((_, label), collection) in scopes.iter().zip(&sources) {
-                    drop(
-                        pile.ensure(*collection)
-                            .await
-                            .with_context(|| format!("ensure Posture {label} source collection"))?,
-                    );
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                // Register every descriptor before advancing the fact chains.
+                let mut sources = Vec::with_capacity(scopes.len());
+                let mut succinct = Vec::with_capacity(scopes.len());
+                let mut rank9 = Vec::with_capacity(scopes.len());
+                for (scope, label) in scopes {
+                    let collection = open_configured(pile, *scope, signer.verifying_key())?;
+                    let descriptor_snapshot = pile.snapshot()?;
+                    let policy = collection.policy(&descriptor_snapshot)?;
+                    drop(descriptor_snapshot);
+                    let succinct_collection = pile
+                        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+                        .with_context(|| format!("register succinct Posture {label} collection"))?;
+                    let rank9_collection = pile
+                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                            succinct_collection,
+                            (),
+                            policy,
+                        )
+                        .with_context(|| format!("register Rank9 Posture {label} collection"))?;
+                    sources.push(collection);
+                    succinct.push(succinct_collection);
+                    rank9.push(rank9_collection);
                 }
-                for (index, (_, label)) in scopes.iter().enumerate() {
-                    drop(pile.maintain(succinct[index]).await.with_context(|| {
-                        format!("maintain succinct Posture {label} collection")
-                    })?);
-                    drop(
-                        pile.maintain(rank9[index])
-                            .await
-                            .with_context(|| format!("maintain Posture {label} collection"))?,
-                    );
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
+                pollster::block_on(async {
+                    for ((_, label), collection) in scopes.iter().zip(&sources) {
+                        drop(pile.ensure(*collection).await.with_context(|| {
+                            format!("ensure Posture {label} source collection")
+                        })?);
+                    }
+                    for (index, (_, label)) in scopes.iter().enumerate() {
+                        drop(pile.maintain(succinct[index]).await.with_context(|| {
+                            format!("maintain succinct Posture {label} collection")
+                        })?);
+                        drop(
+                            pile.maintain(rank9[index])
+                                .await
+                                .with_context(|| format!("maintain Posture {label} collection"))?,
+                        );
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })?;
 
-            // Every logical view is attached through this one immutable
-            // post-maintenance watermark.
-            let reader = pile
-                .snapshot()
-                .context("freeze maintained Posture store snapshot")?;
-            scopes
-                .iter()
-                .zip(rank9)
-                .map(|((_, label), collection)| {
-                    let facts = reader
-                        .collection(collection)
-                        .with_context(|| format!("observe maintained Posture {label} collection"))?
-                        .view::<FactArchive>()
-                        .with_context(|| format!("read maintained Posture {label} collection"))?;
-                    Ok(CollectionView {
-                        facts,
-                        reader: reader.clone(),
+                // Every logical view is attached through this one immutable
+                // post-maintenance watermark.
+                let reader = pile
+                    .snapshot()
+                    .context("freeze maintained Posture store snapshot")?;
+                scopes
+                    .iter()
+                    .zip(rank9)
+                    .map(|((_, label), collection)| {
+                        let facts = reader
+                            .collection(collection)
+                            .with_context(|| {
+                                format!("observe maintained Posture {label} collection")
+                            })?
+                            .view::<FactArchive>()
+                            .with_context(|| {
+                                format!("read maintained Posture {label} collection")
+                            })?;
+                        Ok(CollectionView {
+                            facts,
+                            reader: reader.clone(),
+                        })
                     })
-                })
-                .collect()
-        })();
-        finish_pile(pile, result)
+                    .collect()
+            })();
+            result
+        })
     }
 
     fn scan_and_decide_views(&self) -> Result<(CollectionView, CollectionView)> {
@@ -2193,26 +2201,26 @@ impl PostureStorage<'_> {
     /// that one scan is one atomic COMMIT; ordinary reads never need it.
     #[cfg(test)]
     fn authored_commits(&self, scope: Id, label: &str) -> Result<Vec<CollectionCommit>> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let author = signer.verifying_key().to_bytes();
-        let result = (|| {
-            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
-            let store_snapshot = pile
-                .snapshot()
-                .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
-            let commits = collection
-                .admitted(&store_snapshot)
-                .with_context(|| format!("admit Posture {label} collection"))?
-                .commits(&store_snapshot)
-                .with_context(|| format!("read admitted Posture {label} commits"))?;
-            Ok(commits
-                .iter()
-                .copied()
-                .filter(|commit| commit.public_key().raw == author)
-                .collect())
-        })();
-        finish_pile(pile, result)
+        self.storage.with_pile(|pile, signer| {
+            let author = signer.verifying_key().to_bytes();
+            let result = (|| {
+                let collection = open_configured(pile, scope, signer.verifying_key())?;
+                let store_snapshot = pile
+                    .snapshot()
+                    .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
+                let commits = collection
+                    .admitted(&store_snapshot)
+                    .with_context(|| format!("admit Posture {label} collection"))?
+                    .commits(&store_snapshot)
+                    .with_context(|| format!("read admitted Posture {label} commits"))?;
+                Ok(commits
+                    .iter()
+                    .copied()
+                    .filter(|commit| commit.public_key().raw == author)
+                    .collect())
+            })();
+            result
+        })
     }
 
     fn policy_view(&self) -> Result<CollectionView> {
@@ -2264,26 +2272,14 @@ impl PostureStorage<'_> {
             &ed25519_dalek::SigningKey,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, scope, signer.verifying_key())?;
-            operation(&mut pile, collection, &signer)
-                .with_context(|| format!("publish Posture {label} fragment"))
-        })();
-        finish_pile(pile, result)
-    }
-}
-
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Posture pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Posture pile also failed: {close_error}")))
-        }
+        self.storage.with_pile(|pile, signer| {
+            let result = (|| {
+                let collection = open_configured(pile, scope, signer.verifying_key())?;
+                operation(pile, collection, signer)
+                    .with_context(|| format!("publish Posture {label} fragment"))
+            })();
+            result
+        })
     }
 }
 
@@ -4906,9 +4902,10 @@ fn install_hooks(
     std::fs::create_dir_all(&hooks).map_err(|e| anyhow!("create {}: {e}", hooks.display()))?;
 
     let exe = executable.display().to_string();
-    let pile = storage.pile.display().to_string();
+    let pile = storage.storage.path().display().to_string();
     let key = storage
-        .key
+        .storage
+        .key_path()
         .map(Path::display)
         .map(|path| path.to_string())
         .unwrap_or_default();
@@ -5154,7 +5151,7 @@ exit 0
         installed,
         channel: channel.to_owned(),
         remote_match: remote_match.map(str::to_owned),
-        pile: storage.pile.to_owned(),
+        pile: storage.storage.path().to_owned(),
         pre_push: want_pre_push,
         post_commit: want_post_commit,
     })

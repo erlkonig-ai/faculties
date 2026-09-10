@@ -2,7 +2,9 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
@@ -15,10 +17,9 @@ use crate::schemas::{
     relations as relations_schema,
 };
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-    FactArchive,
-};
+#[cfg(test)]
+use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -31,7 +32,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -143,30 +144,25 @@ pub struct AccountFetched {
 /// Text and attachments are resident values; no argv, host-path expansion, or ambient persona.
 #[derive(Clone, Debug)]
 pub struct Mail {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 impl Mail {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
     }
-    fn with_storage<T>(&self, execute: impl FnOnce(&Storage<'_>) -> Result<T>) -> Result<T> {
-        let storage = Storage::open(&self.pile, self.key.as_deref(), Scopes::FIXED)?;
-        let result = execute(&storage);
-        let notices = storage.notices.take();
-        let close = storage.close();
-        let result = match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing Mail pile also failed: {close_error:#}")))
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
+    }
+    fn with_operation<T>(&self, execute: impl FnOnce(&Storage) -> Result<T>) -> Result<T> {
+        self.storage.scope(|storage| {
+            let context = Storage::from_storage(storage.clone(), Scopes::FIXED)?;
+            let result = execute(&context);
+            let notices = context.notices.take();
+            match result {
+                Err(error) if !notices.is_empty() => Err(error.context(notices.join("\n"))),
+                other => other,
             }
-        };
-        match result {
-            Err(error) if !notices.is_empty() => Err(error.context(notices.join("\n"))),
-            other => other,
-        }
+        })
     }
     pub fn account_set(&self, input: AccountOptions) -> Result<AccountSetReceipt> {
         self.update_account(input, None)
@@ -184,7 +180,7 @@ impl Mail {
         input: AccountOptions,
         password: Option<String>,
     ) -> Result<AccountSetReceipt> {
-        self.with_storage(|storage| {
+        self.with_operation(|storage| {
             account_set(
                 storage,
                 input.account,
@@ -200,40 +196,40 @@ impl Mail {
         })
     }
     pub fn account_list(&self) -> Result<Vec<AccountSummary>> {
-        self.with_storage(account_list)
+        self.with_operation(account_list)
     }
     /// Drain every enabled POP account: publish exact evidence before DELE and QUIT.
     /// A failed QUIT after DELE leaves remote deletion uncertain and is never hidden.
     pub fn fetch(&self) -> Result<Vec<AccountFetched>> {
-        self.with_storage(cmd_fetch)
+        self.with_operation(cmd_fetch)
     }
     pub fn draft(&self, input: DraftRequest) -> Result<DraftReceipt> {
-        self.with_storage(|storage| cmd_draft(storage, input))
+        self.with_operation(|storage| cmd_draft(storage, input))
     }
     pub fn reply(&self, input: ReplyRequest) -> Result<DraftReceipt> {
-        self.with_storage(|storage| cmd_reply(storage, input))
+        self.with_operation(|storage| cmd_reply(storage, input))
     }
     /// Submit one authorized immutable draft. Deployments MUST externally serialize
     /// SMTP execution per account, including other processes/replicas. An uncertain
     /// durable attempt is never retried automatically.
     pub fn send(&self, draft: &str) -> Result<SendReceipt> {
-        self.with_storage(|storage| cmd_send(storage, draft))
+        self.with_operation(|storage| cmd_send(storage, draft))
     }
     pub fn outbox(&self) -> Result<Vec<DraftStatus>> {
-        self.with_storage(cmd_outbox)
+        self.with_operation(cmd_outbox)
     }
     pub fn list(&self, persona: &str, unread: bool, spam: bool) -> Result<Vec<InboxMessage>> {
-        self.with_storage(|storage| cmd_list(storage, persona, unread, spam))
+        self.with_operation(|storage| cmd_list(storage, persona, unread, spam))
     }
     /// Add intrinsic seen evidence; this does not display the message.
     pub fn read(&self, persona: &str, message: &str) -> Result<ReadReceipt> {
-        self.with_storage(|storage| cmd_read(storage, message, persona))
+        self.with_operation(|storage| cmd_read(storage, message, persona))
     }
     pub fn show(&self, message: &str) -> Result<Vec<mail::ProjectionView>> {
-        self.with_storage(|storage| cmd_show(storage, message))
+        self.with_operation(|storage| cmd_show(storage, message))
     }
     pub fn search(&self, query: &str) -> Result<Vec<mail::ProjectionView>> {
-        self.with_storage(|storage| cmd_search(storage, query))
+        self.with_operation(|storage| cmd_search(storage, query))
     }
 }
 
@@ -267,253 +263,236 @@ struct Views {
     secrets: SecretsSnapshot<PileSnapshot>,
 }
 
-struct Storage<'a> {
-    pile_path: &'a Path,
-    pile: RefCell<Option<Pile>>,
+struct Storage {
+    storage: crate::storage::Storage,
     signer: SigningKey,
     scopes: Scopes,
     notices: RefCell<Vec<String>>,
 }
 
-impl Storage<'_> {
-    fn open<'a>(pile_path: &'a Path, key: Option<&Path>, scopes: Scopes) -> Result<Storage<'a>> {
-        let signer = load_signer(pile_path, key)?;
-        let pile = open_pile_strict(pile_path)?;
-        Ok(Storage {
-            pile_path,
-            pile: RefCell::new(Some(pile)),
+impl Storage {
+    fn from_storage(storage: crate::storage::Storage, scopes: Scopes) -> Result<Self> {
+        let signer = storage.with_pile(|_, signer| Ok(signer.clone()))?;
+        Ok(Self {
+            storage,
             signer,
             scopes,
             notices: RefCell::new(Vec::new()),
         })
     }
 
+    #[cfg(test)]
+    fn open(pile: &Path, key: Option<&Path>, scopes: Scopes) -> Result<Self> {
+        Self::from_storage(
+            crate::storage::Storage::shared(pile.to_owned(), key.map(Path::to_owned)),
+            scopes,
+        )
+    }
+
     fn views(&self) -> Result<Views> {
-        let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
-            let mut pile = self.pile.borrow_mut();
-            let pile = pile
-                .as_mut()
-                .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-            let mail_collection =
-                open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
-            let files_collection =
-                open_configured(pile, self.scopes.files, self.signer.verifying_key())?;
-            let decide_collection =
-                open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
-            let relations_collection =
-                open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
-            let secrets_collection =
-                open_secrets_collection_read(pile, self.signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = mail_collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let mail_succinct =
-                pile.derive::<SuccinctArchiveBlob>(mail_collection, (), policy.clone())?;
-            let mail_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(mail_succinct, (), policy)?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = files_collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let files_succinct =
-                pile.derive::<SuccinctArchiveBlob>(files_collection, (), policy.clone())?;
-            let files_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(files_succinct, (), policy)?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = decide_collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let decide_succinct =
-                pile.derive::<SuccinctArchiveBlob>(decide_collection, (), policy.clone())?;
-            let decide_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(decide_succinct, (), policy)?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = relations_collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let relations_succinct =
-                pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
-            let relations_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
-            // Ensure every root, then advance each ordinary fact chain before
-            // observing the views through one final snapshot.
-            let secrets = pollster::block_on(async {
-                for (label, source) in [
-                    ("Mail", mail_collection),
-                    ("Files", files_collection),
-                    ("Decide", decide_collection),
-                    ("Relations", relations_collection),
-                    ("Secrets", secrets_collection.source()),
-                ] {
+        self.storage.with_pile(|pile, _| {
+            let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
+                let mail_collection =
+                    open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
+                let files_collection =
+                    open_configured(pile, self.scopes.files, self.signer.verifying_key())?;
+                let decide_collection =
+                    open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
+                let relations_collection =
+                    open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
+                let secrets_collection =
+                    open_secrets_collection_read(pile, self.signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = mail_collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let mail_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(mail_collection, (), policy.clone())?;
+                let mail_rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(mail_succinct, (), policy)?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = files_collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let files_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(files_collection, (), policy.clone())?;
+                let files_rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(files_succinct, (), policy)?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = decide_collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let decide_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(decide_collection, (), policy.clone())?;
+                let decide_rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(decide_succinct, (), policy)?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = relations_collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let relations_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
+                let relations_rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
+                // Ensure every root, then advance each ordinary fact chain before
+                // observing the views through one final snapshot.
+                let secrets = pollster::block_on(async {
+                    for (label, source) in [
+                        ("Mail", mail_collection),
+                        ("Files", files_collection),
+                        ("Decide", decide_collection),
+                        ("Relations", relations_collection),
+                        ("Secrets", secrets_collection.source()),
+                    ] {
+                        drop(
+                            pile.ensure(source)
+                                .await
+                                .with_context(|| format!("ensure {label} source collection"))?,
+                        );
+                    }
+                    let before = pile
+                        .snapshot()
+                        .context("freeze shared Mail support snapshot")?;
+                    let secrets_support = secrets_collection
+                        .source()
+                        .admitted(&before)
+                        .context("admit Secrets collection support")?;
+                    drop(before);
+
                     drop(
-                        pile.ensure(source)
+                        pile.maintain(mail_succinct)
                             .await
-                            .with_context(|| format!("ensure {label} source collection"))?,
+                            .context("maintain Mail fact collection")?,
                     );
-                }
-                let before = pile
-                    .snapshot()
-                    .context("freeze shared Mail support snapshot")?;
-                let secrets_support = secrets_collection
-                    .source()
-                    .admitted(&before)
-                    .context("admit Secrets collection support")?;
-                drop(before);
+                    drop(
+                        pile.maintain(mail_rank9)
+                            .await
+                            .context("maintain Mail fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(files_succinct)
+                            .await
+                            .context("maintain Files fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(files_rank9)
+                            .await
+                            .context("maintain Files fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(decide_succinct)
+                            .await
+                            .context("maintain Decide fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(decide_rank9)
+                            .await
+                            .context("maintain Decide fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(relations_succinct)
+                            .await
+                            .context("maintain Relations fact collection")?,
+                    );
+                    drop(
+                        pile.maintain(relations_rank9)
+                            .await
+                            .context("maintain Relations fact collection")?,
+                    );
 
-                drop(
-                    pile.maintain(mail_succinct)
+                    let store_snapshot = secrets_collection
+                        .ensure_exact(pile, &secrets_support)
                         .await
-                        .context("maintain Mail fact collection")?,
-                );
-                drop(
-                    pile.maintain(mail_rank9)
-                        .await
-                        .context("maintain Mail fact collection")?,
-                );
-                drop(
-                    pile.maintain(files_succinct)
-                        .await
-                        .context("maintain Files fact collection")?,
-                );
-                drop(
-                    pile.maintain(files_rank9)
-                        .await
-                        .context("maintain Files fact collection")?,
-                );
-                drop(
-                    pile.maintain(decide_succinct)
-                        .await
-                        .context("maintain Decide fact collection")?,
-                );
-                drop(
-                    pile.maintain(decide_rank9)
-                        .await
-                        .context("maintain Decide fact collection")?,
-                );
-                drop(
-                    pile.maintain(relations_succinct)
-                        .await
-                        .context("maintain Relations fact collection")?,
-                );
-                drop(
-                    pile.maintain(relations_rank9)
-                        .await
-                        .context("maintain Relations fact collection")?,
-                );
-
-                let store_snapshot = secrets_collection
-                    .ensure_exact(pile, &secrets_support)
-                    .await
-                    .context("ensure configured Secrets collection")?;
-                let secrets = secret_storage::snapshot_exact(
+                        .context("ensure configured Secrets collection")?;
+                    let secrets = secret_storage::snapshot_exact(
+                        store_snapshot,
+                        secrets_collection,
+                        secrets_support,
+                    )
+                    .context("attach exact Secrets collection")?;
+                    Ok::<_, anyhow::Error>(secrets)
+                })?;
+                // Secrets attachment owns the final immutable pile snapshot. Attach
+                // every maintained view through that same world so Mail
+                // facts, file payloads, decisions, relations, and credentials can
+                // never be assembled from different store prefixes.
+                let store_snapshot = secrets.store_snapshot().clone();
+                let mail_facts = store_snapshot
+                    .collection(mail_rank9)
+                    .context("attach maintained Mail fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Mail fact collection")?;
+                let files_facts = store_snapshot
+                    .collection(files_rank9)
+                    .context("attach maintained Files fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Files fact collection")?;
+                let decide_facts = store_snapshot
+                    .collection(decide_rank9)
+                    .context("attach maintained Decide fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Decide fact collection")?;
+                let relations_facts = store_snapshot
+                    .collection(relations_rank9)
+                    .context("attach maintained Relations fact collection")?
+                    .view::<FactArchive>()
+                    .context("read maintained Relations fact collection")?;
+                (
+                    mail_facts,
+                    files_facts,
+                    decide_facts,
+                    relations_facts,
                     store_snapshot,
-                    secrets_collection,
-                    secrets_support,
+                    secrets,
                 )
-                .context("attach exact Secrets collection")?;
-                Ok::<_, anyhow::Error>(secrets)
-            })?;
-            // Secrets attachment owns the final immutable pile snapshot. Attach
-            // every maintained view through that same world so Mail
-            // facts, file payloads, decisions, relations, and credentials can
-            // never be assembled from different store prefixes.
-            let store_snapshot = secrets.store_snapshot().clone();
-            let mail_facts = store_snapshot
-                .collection(mail_rank9)
-                .context("attach maintained Mail fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Mail fact collection")?;
-            let files_facts = store_snapshot
-                .collection(files_rank9)
-                .context("attach maintained Files fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Files fact collection")?;
-            let decide_facts = store_snapshot
-                .collection(decide_rank9)
-                .context("attach maintained Decide fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Decide fact collection")?;
-            let relations_facts = store_snapshot
-                .collection(relations_rank9)
-                .context("attach maintained Relations fact collection")?
-                .view::<FactArchive>()
-                .context("read maintained Relations fact collection")?;
-            (
-                mail_facts,
-                files_facts,
-                decide_facts,
-                relations_facts,
-                store_snapshot,
+            };
+            Ok(Views {
+                mail: CollectionView {
+                    facts: mail_facts,
+                    reader: store_snapshot.clone(),
+                },
+                files: CollectionView {
+                    facts: files_facts,
+                    reader: store_snapshot.clone(),
+                },
+                decide: CollectionView {
+                    facts: decide_facts,
+                    reader: store_snapshot.clone(),
+                },
+                relations: CollectionView {
+                    facts: relations_facts,
+                    reader: store_snapshot,
+                },
                 secrets,
-            )
-        };
-        Ok(Views {
-            mail: CollectionView {
-                facts: mail_facts,
-                reader: store_snapshot.clone(),
-            },
-            files: CollectionView {
-                facts: files_facts,
-                reader: store_snapshot.clone(),
-            },
-            decide: CollectionView {
-                facts: decide_facts,
-                reader: store_snapshot.clone(),
-            },
-            relations: CollectionView {
-                facts: relations_facts,
-                reader: store_snapshot,
-            },
-            secrets,
+            })
         })
     }
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
-        secret_storage::add_secret(
-            &mut *pile,
-            &self.signer,
-            collection,
-            name,
-            plaintext,
-            point_now()?,
-        )
-        .context("publish mailbox credential to configured Secrets collection")
+        self.storage.with_pile(|pile, _| {
+            let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
+            secret_storage::add_secret(
+                &mut *pile,
+                &self.signer,
+                collection,
+                name,
+                plaintext,
+                point_now()?,
+            )
+            .context("publish mailbox credential to configured Secrets collection")
+        })
     }
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
-        let mut fragment = fragment;
-        fragment.describe_with(entity! { metadata::description: description.to_owned() });
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Mail storage is already closed"))?;
-        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
-        pile.commit(collection, &self.signer, fragment)
-            .with_context(|| format!("commit collection {scope:x}"))?;
-        Ok(())
+        self.storage.with_pile(|pile, _| {
+            let mut fragment = fragment;
+            fragment.describe_with(entity! { metadata::description: description.to_owned() });
+            let collection = open_configured(pile, scope, self.signer.verifying_key())?;
+            pile.commit(collection, &self.signer, fragment)
+                .with_context(|| format!("commit collection {scope:x}"))?;
+            Ok(())
+        })
     }
 
+    #[cfg(test)]
     fn close(self) -> Result<()> {
-        self.close_inner()
-    }
-
-    fn close_inner(&self) -> Result<()> {
-        let Some(pile) = self.pile.borrow_mut().take() else {
-            return Ok(());
-        };
-        pile.close()
-            .with_context(|| format!("close Mail pile {}", self.pile_path.display()))
-    }
-}
-
-impl Drop for Storage<'_> {
-    fn drop(&mut self) {
-        // Command dispatch reports close failures explicitly through `close`.
-        // This fallback keeps early-returning tests and callers from silently
-        // abandoning a live Pile handle.
-        let _ = self.close_inner();
+        self.storage.close()
     }
 }
 
@@ -592,7 +571,7 @@ where
 }
 
 fn account_set(
-    storage: &Storage<'_>,
+    storage: &Storage,
     account_selector: Option<String>,
     address: String,
     display_name: String,
@@ -705,7 +684,7 @@ fn account_set(
     })
 }
 
-fn account_list(storage: &Storage<'_>) -> Result<Vec<AccountSummary>> {
+fn account_list(storage: &Storage) -> Result<Vec<AccountSummary>> {
     let views = storage.views()?;
     let mut result = Vec::new();
     for account in mail::account_anchors(&views.mail.facts) {
@@ -760,7 +739,7 @@ fn stage_attachments(
 
 #[allow(clippy::too_many_arguments)]
 fn create_draft(
-    storage: &Storage<'_>,
+    storage: &Storage,
     views: &Views,
     account_selector: &str,
     to: Vec<String>,
@@ -820,7 +799,7 @@ fn create_draft(
     })
 }
 
-fn cmd_draft(storage: &Storage<'_>, args: DraftRequest) -> Result<DraftReceipt> {
+fn cmd_draft(storage: &Storage, args: DraftRequest) -> Result<DraftReceipt> {
     let views = storage.views()?;
     create_draft(
         storage,
@@ -880,7 +859,7 @@ fn projection_for_wire(views: &Views, wire_id: Id) -> Result<mail::ProjectionVie
     }
 }
 
-fn cmd_reply(storage: &Storage<'_>, args: ReplyRequest) -> Result<DraftReceipt> {
+fn cmd_reply(storage: &Storage, args: ReplyRequest) -> Result<DraftReceipt> {
     let views = storage.views()?;
     let wire_id = resolve_wire(&views.mail.facts, &args.message)?;
     let parent = projection_for_wire(&views, wire_id)?;
@@ -966,7 +945,7 @@ fn endpoint<'a>(value: &'a str, label: &str) -> Result<(&'a str, u16)> {
     ))
 }
 
-fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<SendReceipt> {
+fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
     let views = storage.views()?;
     let draft_id = resolve_draft(&views.mail.facts, selector)?;
     let existing = mail::attempts_for_draft(&views.mail.facts, draft_id);
@@ -1070,7 +1049,7 @@ fn cmd_send(storage: &Storage<'_>, selector: &str) -> Result<SendReceipt> {
     })
 }
 
-fn cmd_outbox(storage: &Storage<'_>) -> Result<Vec<DraftStatus>> {
+fn cmd_outbox(storage: &Storage) -> Result<Vec<DraftStatus>> {
     let views = storage.views()?;
     let drafts: BTreeSet<Id> = find!(
         id: Id,
@@ -1104,7 +1083,7 @@ fn cmd_outbox(storage: &Storage<'_>) -> Result<Vec<DraftStatus>> {
 }
 
 fn cmd_list(
-    storage: &Storage<'_>,
+    storage: &Storage,
     persona: &str,
     unread_only: bool,
     spam_only: bool,
@@ -1128,7 +1107,7 @@ fn cmd_list(
     Ok(result)
 }
 
-fn cmd_read(storage: &Storage<'_>, selector: &str, persona: &str) -> Result<ReadReceipt> {
+fn cmd_read(storage: &Storage, selector: &str, persona: &str) -> Result<ReadReceipt> {
     let views = storage.views()?;
     let wire = resolve_wire(&views.mail.facts, selector)?;
     let reader = relation_persona(&views, persona)?;
@@ -1141,7 +1120,7 @@ fn cmd_read(storage: &Storage<'_>, selector: &str, persona: &str) -> Result<Read
     })
 }
 
-fn cmd_show(storage: &Storage<'_>, selector: &str) -> Result<Vec<mail::ProjectionView>> {
+fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionView>> {
     let views = storage.views()?;
     let wire = resolve_wire(&views.mail.facts, selector)?;
     let projections: BTreeSet<Id> = find!(
@@ -1161,7 +1140,7 @@ fn cmd_show(storage: &Storage<'_>, selector: &str) -> Result<Vec<mail::Projectio
         .collect()
 }
 
-fn cmd_search(storage: &Storage<'_>, query: &str) -> Result<Vec<mail::ProjectionView>> {
+fn cmd_search(storage: &Storage, query: &str) -> Result<Vec<mail::ProjectionView>> {
     let views = storage.views()?;
     let needle = query.to_lowercase();
     let projections: BTreeSet<Id> = find!(
@@ -1218,7 +1197,7 @@ where
     Ok(())
 }
 
-fn cmd_fetch(storage: &Storage<'_>) -> Result<Vec<AccountFetched>> {
+fn cmd_fetch(storage: &Storage) -> Result<Vec<AccountFetched>> {
     let views = storage.views()?;
     let mut enabled_anchors = Vec::new();
     for anchor in mail::account_anchors(&views.mail.facts) {
@@ -1377,7 +1356,7 @@ mod tests {
             fixture
         }
 
-        fn storage(&self) -> Storage<'_> {
+        fn storage(&self) -> Storage {
             Storage::open(&self.pile, Some(&self.key), scopes()).unwrap()
         }
     }
@@ -1767,7 +1746,7 @@ mod tests {
     }
 
     fn publish_recording(
-        storage: &Storage<'_>,
+        storage: &Storage,
         state: &Rc<RefCell<PopState>>,
         publication: &mail::SourcePublication,
         fail_scope: Option<Id>,

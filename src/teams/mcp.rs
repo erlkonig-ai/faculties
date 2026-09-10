@@ -216,8 +216,11 @@ pub struct Teams {
 }
 impl Teams {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::operations::Teams::new(pile, key),
+            operations: super::operations::Teams::with_storage(storage),
         }
     }
     pub fn with_tenant(mut self, tenant: Option<String>) -> Self {

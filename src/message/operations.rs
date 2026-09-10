@@ -9,9 +9,7 @@ use crate::message::{self, IntervalValue, MessageRow};
 use crate::relations::{self, IdentityComponents, TextHandle};
 use crate::schemas::message::DEFAULT_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
-use crate::storage::{
-    self, load_signer, open_store, runtime, FactArchive, FacultySnapshot, FacultyStore,
-};
+use crate::storage::{self, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -22,16 +20,14 @@ use triblespace::core::collection::{Collection, CollectionSnapshotExt, Collectio
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
-use triblespace::core::repo::StorageClose;
 use triblespace::prelude::*;
 
 /// A configured Message capability. Every call observes one newly maintained,
-/// frozen Message/Relations view and closes storage before returning its value.
+/// frozen Message/Relations view through its storage handle.
 /// No transport, sender environment, or text-file convention is consulted.
 #[derive(Clone, Debug)]
 pub struct Message {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -126,7 +122,11 @@ pub struct AcknowledgedMessages {
 
 impl Message {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
 
     pub fn send(&self, options: &SendOptions<'_>) -> Result<SentMessage> {
@@ -179,18 +179,6 @@ impl MessageStorage<'_> {
                 .context("commit authored Message fragment")?;
         }
         Ok(value)
-    }
-}
-
-fn finish_pile<T>(pile: FacultyStore, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Message pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Message pile also failed: {close_error}")))
-        }
     }
 }
 
@@ -436,10 +424,7 @@ fn with_storage<T>(
     capability: &Message,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
-    let signer = load_signer(&capability.pile, capability.key.as_deref())?;
-    let runtime = runtime()?;
-    let mut pile = open_store(&capability.pile)?;
-    let result = (|| {
+    capability.storage.with_store(|pile, signer, runtime| {
         let (message_source, reader, relation_facts, message_facts) = runtime.block_on(async {
             // An explicit descriptor may itself have arrived as only an exact
             // handle. Acquire it and the name needed by open_configured, not its
@@ -449,21 +434,15 @@ fn with_storage<T>(
                     let reader = pile
                         .snapshot()
                         .context("freeze configured Message collection descriptor")?;
-                    storage::read(&mut pile, &reader, |reader| {
-                        open_exact_in(reader, scope, handle)
-                    })
-                    .await?;
+                    storage::read(pile, &reader, |reader| open_exact_in(reader, scope, handle))
+                        .await?;
                 }
             }
             // Register the representations, then maintain each edge from its
             // realized immediate source. Both reads use one final snapshot.
-            let relations_source = open_configured(
-                &mut pile,
-                DEFAULT_RELATIONS_SCOPE_ID,
-                signer.verifying_key(),
-            )?;
-            let message_source =
-                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let relations_source =
+                open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
+            let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let descriptors = pile.snapshot().context("freeze Message source policies")?;
             let relations_policy = relations_source
                 .policy(&descriptors)
@@ -540,16 +519,15 @@ fn with_storage<T>(
             Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
         })?;
         let mut storage = MessageStorage {
-            pile: &mut pile,
-            signer: &signer,
+            pile,
+            signer,
             collection: message_source,
             reader: &reader,
             messages: &message_facts,
             relations: &relation_facts,
         };
-        operation(&mut storage, &runtime)
-    })();
-    finish_pile(pile, result)
+        operation(&mut storage, runtime)
+    })
 }
 
 #[cfg(test)]

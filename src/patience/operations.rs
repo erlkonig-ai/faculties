@@ -1,22 +1,25 @@
 //! Direct Patience publication operations; no argv, output, or child processes.
+use crate::storage::Storage;
 use crate::{clock, cognition};
 use anyhow::Result;
 #[cfg(test)]
 use hifitime::Epoch;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct Patience {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 impl Patience {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
     /// Publish an extension request. Its receipt does not promise a runtime
     /// has observed or accepted the requested timeout.
@@ -24,8 +27,7 @@ impl Patience {
         anyhow::ensure!(timeout_ms > 0, "duration must be greater than zero");
         append_timeout_extension(
             PatienceStorage {
-                pile: &self.pile,
-                key: self.key.as_deref(),
+                storage: &self.storage,
             },
             request,
             worker,
@@ -41,8 +43,7 @@ fn epoch_interval(epoch: Epoch) -> Inline<inlineencodings::NsTAIInterval> {
 
 #[derive(Clone, Copy)]
 struct PatienceStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a Storage,
 }
 
 fn publish_timeout_extension(
@@ -60,7 +61,7 @@ fn publish_timeout_extension(
     event.describe_with(
         entity! { metadata::description: "playground_exec timeout_extension".to_owned() },
     );
-    let commit = cognition::publish_event(storage.pile, storage.key, event)?;
+    let commit = cognition::publish_event_with_storage(storage.storage, event)?;
     Ok((event_id, commit))
 }
 
@@ -119,10 +120,8 @@ mod tests {
         File::create(&pile_path).unwrap();
 
         initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let storage = PatienceStorage {
-            pile: &pile_path,
-            key: Some(&key_path),
-        };
+        let storage = Storage::new(pile_path.clone(), Some(key_path.clone()));
+        let storage = PatienceStorage { storage: &storage };
         let request = test_id(0x62);
         let worker = test_id(0x63);
         let requested_at = at_unix(42.0);
@@ -181,8 +180,7 @@ mod tests {
 
         let error = publish_timeout_extension(
             PatienceStorage {
-                pile: &pile_path,
-                key: Some(&key_path),
+                storage: &Storage::new(pile_path.clone(), Some(key_path.clone())),
             },
             test_id(0x65),
             test_id(0x66),

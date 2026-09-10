@@ -15,7 +15,10 @@ use crate::out::Out;
 pub struct Viewer(super::Viewer);
 impl Viewer {
     pub fn new(pile: impl Into<PathBuf>, key: Option<PathBuf>) -> Self {
-        Self(super::Viewer::new(pile, key))
+        Self::with_storage(crate::storage::Storage::new(pile.into(), key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self(super::Viewer::with_storage(storage))
     }
 }
 

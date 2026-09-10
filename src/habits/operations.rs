@@ -1,13 +1,13 @@
 //! Work with pull-based standing intentions in one fixed native collection.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
 use crate::habits::{self, DeclaredState, Habit, State};
 use crate::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::{FactArchive, Storage};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -23,8 +23,7 @@ use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct Habits {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Debug)]
@@ -69,7 +68,10 @@ pub struct HabitStateChange {
 
 impl Habits {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
     /// Literal resident definition inputs. This stores but never runs a script.
     pub fn add(
@@ -84,7 +86,7 @@ impl Habits {
             .map_err(anyhow::Error::msg)?
             .cooldown_secs;
         let carried = script.map(|bytes| (habits::script_digest(bytes), bytes.len()));
-        with_habits(&self.pile, self.key.as_deref(), |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let mut retiring = supersedes
@@ -127,7 +129,7 @@ impl Habits {
     }
     /// Inspect one exact definition or unambiguous label; history stays readable.
     pub fn show(&self, selector: &str) -> Result<HabitObservation> {
-        with_habits(&self.pile, self.key.as_deref(), |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let definition = select_habit(&definitions, selector)?.clone();
             Ok(HabitObservation {
@@ -140,14 +142,14 @@ impl Habits {
     /// true, stored predicates run in the pile directory after the frozen
     /// observation has been acquired and storage closed.
     pub fn list(&self, evaluate_conditions: bool) -> Result<HabitList> {
-        let (rows, superseded) = with_habits(&self.pile, self.key.as_deref(), |session| {
+        let (rows, superseded) = with_habits(&self.storage, |session| {
             let rows = habits::rows(&session.reader, &session.facts)?;
             let ids = habits::definition_ids(&session.facts);
             let superseded = habits::superseded_definition_ids(&session.facts);
             Ok((rows, ids.intersection(&superseded).count()))
         })?;
         let observed_seconds = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
-        let at = habits::evaluation_dir(&self.pile);
+        let at = habits::evaluation_dir(self.storage.path());
         let entries = rows
             .into_iter()
             .map(|row| {
@@ -163,7 +165,7 @@ impl Habits {
         })
     }
     pub fn done(&self, selector: &str) -> Result<HabitOccurrence> {
-        with_habits(&self.pile, self.key.as_deref(), |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let habit = select_live_habit(&definitions, &superseded, selector)?.clone();
@@ -177,7 +179,7 @@ impl Habits {
         })
     }
     pub fn set_state(&self, selector: &str, state: DeclaredState) -> Result<HabitStateChange> {
-        with_habits(&self.pile, self.key.as_deref(), |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let habit = select_live_habit(&definitions, &superseded, selector)?.clone();
@@ -204,10 +206,10 @@ impl Habits {
     }
     /// Explicit whole-collection audit; ordinary reads do not build a catalog.
     pub fn check(&self) -> Result<String> {
-        let catalog = habits::read_catalog_strict(&self.pile, self.key.as_deref())?;
+        let catalog = habits::read_catalog_strict_with_storage(&self.storage)?;
         Ok(format!(
             "Habit collection {} (scope {DEFAULT_SCOPE_ID:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions validated",
-            hex::encode_upper(habits::collection_handle(&self.pile, self.key.as_deref())?.raw),
+            hex::encode_upper(habits::collection_handle_with_storage(&self.storage)?.raw),
             catalog.habits().count(), catalog.live().len(),
             catalog.habits().filter(|habit| habit.script.is_some()).count(),
             catalog.completions().count(), catalog.assertions().count()
@@ -233,14 +235,11 @@ impl HabitSession<'_> {
 }
 
 fn with_habits<T>(
-    pile_path: &Path,
-    key_path: Option<&Path>,
+    storage: &Storage,
     operation: impl FnOnce(&mut HabitSession<'_>) -> Result<T>,
 ) -> Result<T> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
-    let result = (|| {
-        let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    storage.with_pile(|pile, signer| {
+        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         let descriptor_snapshot = pile.snapshot()?;
         let policy = collection.policy(&descriptor_snapshot)?;
         drop(descriptor_snapshot);
@@ -260,21 +259,13 @@ fn with_habits<T>(
             .view::<FactArchive>()
             .context("read maintained Habit fact collection")?;
         operation(&mut HabitSession {
-            pile: &mut pile,
+            pile,
             collection,
-            signer: &signer,
+            signer,
             facts,
             reader,
         })
-    })();
-    match (result, pile.close()) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow!("close Habit pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Habit pile also failed: {close_error}")))
-        }
-    }
+    })
 }
 
 fn id_list(habits: &[&Habit]) -> String {
@@ -410,7 +401,8 @@ mod tests {
             habits::habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
         habits::publish(&pile, Some(&key), successor).unwrap();
 
-        let (definitions, superseded) = with_habits(&pile, Some(&key), |session| {
+        let storage = Storage::new(pile.clone(), Some(key.clone()));
+        let (definitions, superseded) = with_habits(&storage, |session| {
             Ok((
                 habits::definitions(&session.reader, &session.facts)?,
                 habits::superseded_definition_ids(&session.facts),

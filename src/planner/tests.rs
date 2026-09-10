@@ -58,8 +58,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
     let directory = TestDirectory::new();
     let (pile, key) = fresh_storage(&directory);
     let storage = PlannerStorage {
-        pile: &pile,
-        key: Some(&key),
+        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
     };
     let mut fragment = event_fragment(&fixture_draft("one@example", "meeting")).unwrap();
     let event = fragment.root().unwrap();
@@ -101,8 +100,7 @@ fn same_batch_duplicate_uid_collapses_but_conflict_is_rejected() {
     let directory = TestDirectory::new();
     let (pile, key) = fresh_storage(&directory);
     let storage = PlannerStorage {
-        pile: &pile,
-        key: Some(&key),
+        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
     };
     storage
         .with_view(|loaded| {
@@ -147,8 +145,7 @@ fn exact_reingest_does_not_publish_another_authored_commit() {
     )
     .unwrap();
     let storage = PlannerStorage {
-        pile: &pile,
-        key: Some(&key),
+        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
     };
 
     let text = fs::read_to_string(&ics).unwrap();
@@ -173,8 +170,7 @@ fn conflicting_same_batch_uid_fails_before_any_signed_commit() {
     )
     .unwrap();
     let storage = PlannerStorage {
-        pile: &pile,
-        key: Some(&key),
+        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
     };
 
     let text = fs::read_to_string(&ics).unwrap();
@@ -202,8 +198,7 @@ fn cancel_adds_one_assertion_without_mutating_baseline_status() {
     let directory = TestDirectory::new();
     let (pile, key) = fresh_storage(&directory);
     let storage = PlannerStorage {
-        pile: &pile,
-        key: Some(&key),
+        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
     };
     let event = event_fragment(&fixture_draft("cancel@example", "meeting")).unwrap();
     let event_id = event.root().unwrap();

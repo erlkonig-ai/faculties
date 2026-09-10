@@ -10,9 +10,7 @@ use crate::schemas::embeddings;
 use crate::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
-use crate::storage::{
-    load_signer, open_store, read, runtime, FactArchive, FacultySnapshot, FacultyStore,
-};
+use crate::storage::{read, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::efmt::consts::ISO8601_DATE;
@@ -33,7 +31,7 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 #[cfg(test)]
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource, StorageClose};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
@@ -220,48 +218,40 @@ fn tags_of<P: TriblePattern>(space: &P, eid: Id) -> Vec<String> {
 
 // ── native collection boundary ───────────────────────────────────────────
 
-/// Register the Files collection for append-only work, then close its pile
-/// exactly once. Commands that construct a complete fragment locally do not
+/// Register the Files collection for append-only work through its storage
+/// handle. Commands that construct a complete fragment locally do not
 /// pay to reconstruct the existing collection value.
 fn with_files_store<T>(
-    pile: &Path,
-    key: Option<&Path>,
-    f: impl FnOnce(&mut FacultyStore, Collection<SimpleArchive>, &SigningKey) -> Result<T>,
+    storage: &Storage,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &tokio::runtime::Runtime,
+    ) -> Result<T>,
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
-    let signer = load_signer(pile, key)?;
-    let mut storage = open_store(pile)?;
-    let result = (|| {
+    storage.with_store(|store, signer, runtime| {
         let collection = if let Some(handle) = configured_handle(DEFAULT_SCOPE_ID)? {
-            let snapshot = storage
+            let snapshot = store
                 .snapshot()
                 .context("snapshot configured Files descriptor")?;
-            runtime()?.block_on(read(&mut storage, &snapshot, |reader| {
+            runtime.block_on(read(store, &snapshot, |reader| {
                 open_exact_in(reader, DEFAULT_SCOPE_ID, handle)
             }))?
         } else {
-            open(&mut storage, DEFAULT_SCOPE_ID, signer.verifying_key())
+            open(store, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .context("register signer-private Files descriptor")?
         };
-        f(&mut storage, collection, &signer)
-    })();
-    let close = storage.close();
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing pile also failed: {close_error}")))
-        }
-    }
+        f(store, collection, signer, runtime)
+    })
 }
 
 /// Maintain and attach one immutable shard-preserving Files view for commands
 /// whose result or mutation depends on facts already present in the collection.
 fn with_files_view<T>(
-    pile: &Path,
-    key: Option<&Path>,
+    storage: &Storage,
     f: impl FnOnce(
         &mut FacultyStore,
         Collection<SimpleArchive>,
@@ -271,8 +261,7 @@ fn with_files_view<T>(
         &tokio::runtime::Runtime,
     ) -> Result<T>,
 ) -> Result<T> {
-    with_files_store(pile, key, |store, collection, signer| {
-        let runtime = runtime()?;
+    with_files_store(storage, |store, collection, signer, runtime| {
         let descriptors = store
             .snapshot()
             .context("freeze Files source policy snapshot")?;
@@ -309,7 +298,7 @@ fn with_files_view<T>(
             .context("observe Files fact collection")?
             .view::<FactArchive>()
             .context("read Files fact collection")?;
-        f(store, collection, signer, &space, &reader, &runtime)
+        f(store, collection, signer, &space, &reader, runtime)
     })
 }
 
@@ -1968,11 +1957,10 @@ fn cmd_similar_mm7b<P: TriblePattern>(
 }
 
 /// A configured Files capability. Constructing it performs no I/O; each operation
-/// opens and closes its own store and observes one maintained collection view.
+/// observes one fresh maintained collection view through its storage handle.
 #[derive(Clone, Debug)]
 pub struct Files {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Debug)]
@@ -2042,16 +2030,18 @@ pub struct EmbeddingOptions {
 
 impl Files {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
 
     /// Original payload only: neither MIME nor filename is needed for export.
     pub fn get(&self, id: &str) -> Result<Export> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| load_export(store, rt, facts, snapshot, id),
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            load_export(store, rt, facts, snapshot, id)
+        })
     }
 
     pub fn view(
@@ -2060,22 +2050,16 @@ impl Files {
         options: &super::presentation::ViewOptions,
     ) -> Result<crate::out::Part> {
         options.validate()?;
-        let selected = with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| load_view(store, rt, facts, snapshot, id),
-        )?;
+        let selected = with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            load_view(store, rt, facts, snapshot, id)
+        })?;
         super::presentation::present(selected.bytes, &selected.mime_type, options)
     }
 
     pub fn extract(&self, id: &str, destination: Option<&Path>) -> Result<Extraction> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                prepare_extraction(store, rt, facts, snapshot, id, destination)
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            prepare_extraction(store, rt, facts, snapshot, id, destination)
+        })
     }
 
     pub fn add_path(
@@ -2089,11 +2073,9 @@ impl Files {
         if dry_run {
             return cmd_add_dry_run(path, tags, out);
         }
-        with_files_store(
-            &self.pile,
-            self.key.as_deref(),
-            |store, collection, signer| cmd_add(store, collection, signer, path, mime, tags, out),
-        )
+        with_files_store(&self.storage, |store, collection, signer, _| {
+            cmd_add(store, collection, signer, path, mime, tags, out)
+        })
     }
 
     /// Import resident bytes without manufacturing a temporary filesystem path.
@@ -2108,44 +2090,31 @@ impl Files {
         tags: &[String],
     ) -> Result<Id> {
         let (change, file_id, _) = stage_byte_import(bytes, name, mime, tags, "resident bytes")?;
-        with_files_store(
-            &self.pile,
-            self.key.as_deref(),
-            |store, collection, signer| {
-                store
-                    .commit(collection, signer, change)
-                    .context("commit Files byte import")?;
-                Ok(file_id)
-            },
-        )
+        with_files_store(&self.storage, |store, collection, signer, _| {
+            store
+                .commit(collection, signer, change)
+                .context("commit Files byte import")?;
+            Ok(file_id)
+        })
     }
 
     pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| {
-                    cmd_list(facts, reader, tags, mime)
-                }))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| {
+                cmd_list(facts, reader, tags, mime)
+            }))
+        })
     }
 
     pub fn show(&self, id: &str) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| cmd_show(facts, reader, id)))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| cmd_show(facts, reader, id)))
+        })
     }
 
     pub fn tag(&self, id: &str, name: &str, out: &mut Out<'_>) -> Result<()> {
         with_files_view(
-            &self.pile,
-            self.key.as_deref(),
+            &self.storage,
             |store, collection, signer, facts, snapshot, rt| {
                 cmd_tag(
                     store, rt, collection, signer, facts, snapshot, id, name, out,
@@ -2156,35 +2125,27 @@ impl Files {
 
     pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
         anyhow::ensure!(options.max_bytes > 0, "max_bytes must be positive");
-        with_files_store(
-            &self.pile,
-            self.key.as_deref(),
-            |store, collection, signer| {
-                cmd_fetch(
-                    store,
-                    collection,
-                    signer,
-                    options.url,
-                    options.mime,
-                    options.name,
-                    options.tags,
-                    options.max_bytes,
-                    out,
-                )
-            },
-        )
+        with_files_store(&self.storage, |store, collection, signer, _| {
+            cmd_fetch(
+                store,
+                collection,
+                signer,
+                options.url,
+                options.mime,
+                options.name,
+                options.tags,
+                options.max_bytes,
+                out,
+            )
+        })
     }
 
     pub fn search(&self, query: &str) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| {
-                    cmd_search(facts, reader, query)
-                }))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| {
+                cmd_search(facts, reader, query)
+            }))
+        })
     }
 
     pub fn similar(&self, options: &SimilarityOptions<'_>, out: &mut Out<'_>) -> Result<()> {
@@ -2196,23 +2157,19 @@ impl Files {
             options.floor.is_finite() && (0.0..=1.0).contains(&options.floor),
             "floor must be between 0 and 1"
         );
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |_, _, _, facts, snapshot, _| {
-                cmd_similar(
-                    facts,
-                    snapshot,
-                    options.id,
-                    options.text,
-                    options.floor,
-                    options.limit,
-                    options.tags,
-                    options.mm7b,
-                    out,
-                )
-            },
-        )
+        with_files_view(&self.storage, |_, _, _, facts, snapshot, _| {
+            cmd_similar(
+                facts,
+                snapshot,
+                options.id,
+                options.text,
+                options.floor,
+                options.limit,
+                options.tags,
+                options.mm7b,
+                out,
+            )
+        })
     }
 
     pub fn embed7b(&self, options: &EmbeddingOptions, out: &mut Out<'_>) -> Result<()> {
@@ -2220,8 +2177,7 @@ impl Files {
         // Model-backed operations retain their separate inference/acquisition
         // boundaries; never retry the whole operation after partial publication.
         with_files_view(
-            &self.pile,
-            self.key.as_deref(),
+            &self.storage,
             |store, collection, signer, facts, snapshot, _| {
                 if options.pdf {
                     cmd_embed7b_pdf(
@@ -2252,25 +2208,17 @@ impl Files {
     }
 
     pub fn imports(&self) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| cmd_imports(facts, reader)))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| cmd_imports(facts, reader)))
+        })
     }
 
     pub fn tree(&self, id: &str, depth: Option<usize>) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| {
-                    cmd_tree(facts, reader, id, depth)
-                }))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| {
+                cmd_tree(facts, reader, id, depth)
+            }))
+        })
     }
 
     /// Resolve a batch in one view. Individual misses remain individual results;
@@ -2279,7 +2227,7 @@ impl Files {
         &self,
         selectors: &[String],
     ) -> Result<Vec<Result<file_capability::FileReference>>> {
-        with_files_view(&self.pile, self.key.as_deref(), |_, _, _, facts, _, _| {
+        with_files_view(&self.storage, |_, _, _, facts, _, _| {
             Ok(selectors
                 .iter()
                 .map(|selector| file_capability::resolve_reference(facts, selector))
@@ -2288,15 +2236,11 @@ impl Files {
     }
 
     pub fn diff(&self, left: &str, right: &str) -> Result<String> {
-        with_files_view(
-            &self.pile,
-            self.key.as_deref(),
-            |store, _, _, facts, snapshot, rt| {
-                rt.block_on(read(store, snapshot, |reader| {
-                    cmd_diff(facts, reader, left, right)
-                }))
-            },
-        )
+        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| {
+                cmd_diff(facts, reader, left, right)
+            }))
+        })
     }
 }
 
@@ -2412,7 +2356,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::initialize_signer;
+    use crate::storage::{initialize_signer, load_signer, runtime};
     #[cfg(feature = "local-embed")]
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
@@ -3015,7 +2959,8 @@ mod tests {
     #[test]
     fn empty_native_collection_opens_as_an_empty_catalog() {
         let test_pile = TestPile::new();
-        with_files_view(&test_pile.path, None, |_, _, _, space, _reader, _rt| {
+        let storage = Storage::new(test_pile.path.clone(), None);
+        with_files_view(&storage, |_, _, _, space, _reader, _rt| {
             assert!(find!(
                 id: Id,
                 pattern!(space, [{ ?id @ metadata::tag: _?kind }])
@@ -3030,6 +2975,7 @@ mod tests {
     #[test]
     fn independent_commits_materialize_for_list_show_and_get() {
         let test_pile = TestPile::new();
+        let storage = Storage::new(test_pile.path.clone(), None);
         let first =
             file_capability::stage(b"first file".to_vec(), "first.png", "image/png").unwrap();
         let second =
@@ -3037,7 +2983,7 @@ mod tests {
         let first_id = first.root().unwrap();
         let second_id = second.root().unwrap();
 
-        with_files_store(&test_pile.path, None, |store, collection, signer| {
+        with_files_store(&storage, |store, collection, signer, _| {
             store
                 .commit(collection, signer, first)
                 .context("commit first fixture")?;
@@ -3050,7 +2996,7 @@ mod tests {
 
         let first_out = test_pile.dir.join("first.png");
         let second_out = test_pile.dir.join("second.txt");
-        with_files_view(&test_pile.path, None, |store, _, _, space, reader, rt| {
+        with_files_view(&storage, |store, _, _, space, reader, rt| {
             assert_eq!(
                 find!(
                     entity: Id,
@@ -3091,10 +3037,11 @@ mod tests {
     #[test]
     fn replaying_one_complete_fragment_is_idempotent() {
         let test_pile = TestPile::new();
+        let storage = Storage::new(test_pile.path.clone(), None);
         let file = file_capability::stage(b"same".to_vec(), "same.txt", "text/plain").unwrap();
         let file_id = file.root().unwrap();
 
-        with_files_store(&test_pile.path, None, |store, collection, signer| {
+        with_files_store(&storage, |store, collection, signer, _| {
             let first = store
                 .commit(collection, signer, file.clone())
                 .context("first replay")?;
@@ -3106,7 +3053,7 @@ mod tests {
         })
         .unwrap();
 
-        with_files_view(&test_pile.path, None, |_, _, _, space, _reader, _rt| {
+        with_files_view(&storage, |_, _, _, space, _reader, _rt| {
             assert_eq!(
                 file_capability::resolve_selector(space, &format!("{file_id:x}"))?,
                 file_id

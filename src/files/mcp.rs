@@ -17,8 +17,12 @@ pub struct Files {
 
 impl Files {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: Operations::new(pile, key),
+            operations: Operations::with_storage(storage),
         }
     }
 }

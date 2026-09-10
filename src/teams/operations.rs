@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -12,7 +12,9 @@ use std::time::Duration as StdDuration;
 use crate::storage::initialize_signer;
 #[cfg(test)]
 use crate::storage::open_secrets_collection;
-use crate::storage::{load_signer, open_pile_strict, open_secrets_collection_read, FactArchive};
+#[cfg(test)]
+use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{open_secrets_collection_read, FactArchive, Storage};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -242,10 +244,13 @@ pub struct Teams {
 }
 impl Teams {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
         Self {
             config: TeamsCommandConfig {
-                pile_path: pile,
-                key_path: key,
+                storage,
                 tenant_selector: None,
                 delta_url: DEFAULT_DELTA_URL.to_owned(),
             },
@@ -266,7 +271,7 @@ impl Teams {
     fn archive<T>(
         &self,
         access: ArchiveAccess,
-        operation: impl FnOnce(Id, &mut TeamsSession<'_>) -> Result<T>,
+        operation: impl FnOnce(Id, &mut TeamsSession) -> Result<T>,
     ) -> Result<Activity<T>> {
         if access == ArchiveAccess::Synchronize {
             return with_teams_context(&self.config, None, false, |runtime, session| {
@@ -503,8 +508,7 @@ pub fn validate_presence(
 
 #[derive(Clone, Debug)]
 struct TeamsCommandConfig {
-    pile_path: PathBuf,
-    key_path: Option<PathBuf>,
+    storage: Storage,
     tenant_selector: Option<String>,
     delta_url: String,
 }
@@ -531,10 +535,9 @@ struct DelegatedTokenBundle {
     scope: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-struct TeamsStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+#[derive(Clone)]
+struct TeamsStorage {
+    storage: Storage,
 }
 
 #[derive(Clone)]
@@ -543,8 +546,8 @@ struct CollectionView {
     reader: PileSnapshot,
 }
 
-struct TeamsSession<'a> {
-    pile: &'a mut Pile,
+struct TeamsSession {
+    storage: Storage,
     collection: Collection<SimpleArchive>,
     succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -557,7 +560,7 @@ struct TeamsSession<'a> {
     notices: Vec<String>,
 }
 
-impl TeamsSession<'_> {
+impl TeamsSession {
     fn view(&self) -> CollectionView {
         CollectionView {
             facts: self.facts.clone(),
@@ -630,78 +633,80 @@ impl TeamsSession<'_> {
         }
 
         fragment.describe_with(entity! { metadata::description: description });
-        let commit = self
-            .pile
-            .commit(self.collection, &self.signer, fragment)
-            .context("commit Teams fragment")?;
-        pollster::block_on(async {
-            for (label, source) in [
-                ("Teams", self.collection),
-                ("Secrets", self.secret_collection.source()),
-            ] {
+        let storage = self.storage.clone();
+        storage.with_pile(|pile, _| {
+            let commit = pile
+                .commit(self.collection, &self.signer, fragment)
+                .context("commit Teams fragment")?;
+            pollster::block_on(async {
+                for (label, source) in [
+                    ("Teams", self.collection),
+                    ("Secrets", self.secret_collection.source()),
+                ] {
+                    drop(
+                        pile.ensure(source)
+                            .await
+                            .with_context(|| format!("ensure {label} source after Teams commit"))?,
+                    );
+                }
+                let shared_control = pile
+                    .snapshot()
+                    .context("freeze shared Teams post-commit support snapshot")?;
+                let secrets_support = self
+                    .secret_collection
+                    .source()
+                    .admitted(&shared_control)
+                    .context("admit Secrets support after Teams commit")?;
+                drop(shared_control);
                 drop(
-                    self.pile
-                        .ensure(source)
+                    pile.maintain(self.succinct)
                         .await
-                        .with_context(|| format!("ensure {label} source after Teams commit"))?,
+                        .context("maintain Teams succinct fact collection after commit")?,
                 );
-            }
-            let shared_control = self
-                .pile
-                .snapshot()
-                .context("freeze shared Teams post-commit support snapshot")?;
-            let secrets_support = self
-                .secret_collection
-                .source()
-                .admitted(&shared_control)
-                .context("admit Secrets support after Teams commit")?;
-            drop(shared_control);
-            drop(
-                self.pile
-                    .maintain(self.succinct)
+                drop(
+                    pile.maintain(self.rank9)
+                        .await
+                        .context("maintain Teams fact collection after commit")?,
+                );
+                self.refresh_secrets_for_async(pile, None, secrets_support)
                     .await
-                    .context("maintain Teams succinct fact collection after commit")?,
-            );
-            drop(
-                self.pile
-                    .maintain(self.rank9)
-                    .await
-                    .context("maintain Teams fact collection after commit")?,
-            );
-            self.refresh_secrets_for_async(None, secrets_support).await
-        })?;
-        Ok(Some(commit))
+            })?;
+            Ok(Some(commit))
+        })
     }
 
     fn refresh_secrets(&mut self) -> Result<()> {
         // A credential publication does not reselect the session's Teams
         // support. Only Secrets gets a new observation here.
         let support = self.support.clone();
-        pollster::block_on(async {
-            let ready = self
-                .pile
-                .ensure(self.secret_collection.source())
-                .await
-                .context("ensure Secrets source after credential publication")?;
-            let secrets_support = self
-                .secret_collection
-                .source()
-                .admitted(&ready)
-                .context("admit Secrets support after credential publication")?;
-            drop(ready);
-            self.refresh_secrets_for_async(Some(support), secrets_support)
-                .await
+        let storage = self.storage.clone();
+        storage.with_pile(|pile, _| {
+            pollster::block_on(async {
+                let ready = pile
+                    .ensure(self.secret_collection.source())
+                    .await
+                    .context("ensure Secrets source after credential publication")?;
+                let secrets_support = self
+                    .secret_collection
+                    .source()
+                    .admitted(&ready)
+                    .context("admit Secrets support after credential publication")?;
+                drop(ready);
+                self.refresh_secrets_for_async(pile, Some(support), secrets_support)
+                    .await
+            })
         })
     }
 
     async fn refresh_secrets_for_async(
         &mut self,
+        pile: &mut Pile,
         support: Option<Support>,
         secrets_support: Support,
     ) -> Result<()> {
         let store_snapshot = self
             .secret_collection
-            .ensure_exact(self.pile, &secrets_support)
+            .ensure_exact(pile, &secrets_support)
             .await
             .context("refresh configured Secrets collection for Teams")?;
         let secrets =
@@ -733,15 +738,19 @@ impl TeamsSession<'_> {
         plaintext: &[u8],
         observed_at: Inline<NsTAIInterval>,
     ) -> Result<Id> {
-        let secret = secret_storage::add_secret(
-            self.pile,
-            &self.signer,
-            self.secret_collection,
-            name,
-            plaintext,
-            observed_at,
-        )
-        .context("publish Teams credential in configured Secrets collection")?;
+        let secret = self
+            .storage
+            .with_pile(|pile, _| {
+                secret_storage::add_secret(
+                    pile,
+                    &self.signer,
+                    self.secret_collection,
+                    name,
+                    plaintext,
+                    observed_at,
+                )
+            })
+            .context("publish Teams credential in configured Secrets collection")?;
         self.refresh_secrets()?;
         if !self.secrets.contains(secret) {
             bail!("published Teams Secrets version {secret} was not rediscovered");
@@ -750,97 +759,95 @@ impl TeamsSession<'_> {
     }
 }
 
-impl TeamsStorage<'_> {
-    fn with_session<T>(
-        &self,
-        operation: impl FnOnce(&mut TeamsSession<'_>) -> Result<T>,
-    ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = (|| {
-            let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let maintained_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                maintained_succinct,
-                (),
-                policy,
-            )?;
-            let secret_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key())?;
-            let secrets = pollster::block_on(async {
-                for (label, source) in [
-                    ("Teams", collection),
-                    ("Secrets", secret_collection.source()),
-                ] {
+impl TeamsStorage {
+    fn with_session<T>(&self, operation: impl FnOnce(&mut TeamsSession) -> Result<T>) -> Result<T> {
+        self.storage.scope(|storage| {
+            let mut session = storage.with_pile(|pile, signer| {
+                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let descriptor_snapshot = pile.snapshot()?;
+                let policy = collection.policy(&descriptor_snapshot)?;
+                drop(descriptor_snapshot);
+                let maintained_succinct =
+                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    maintained_succinct,
+                    (),
+                    policy,
+                )?;
+                let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+                let secrets = pollster::block_on(async {
+                    for (label, source) in [
+                        ("Teams", collection),
+                        ("Secrets", secret_collection.source()),
+                    ] {
+                        drop(
+                            pile.ensure(source)
+                                .await
+                                .with_context(|| format!("ensure {label} source collection"))?,
+                        );
+                    }
+                    let shared_control = pile
+                        .snapshot()
+                        .context("freeze shared Teams support snapshot")?;
+                    let secrets_support = secret_collection
+                        .source()
+                        .admitted(&shared_control)
+                        .context("admit Secrets support before Teams maintenance")?;
+                    drop(shared_control);
                     drop(
-                        pile.ensure(source)
+                        pile.maintain(maintained_succinct)
                             .await
-                            .with_context(|| format!("ensure {label} source collection"))?,
+                            .context("maintain Teams fact collection")?,
                     );
-                }
-                let shared_control = pile
-                    .snapshot()
-                    .context("freeze shared Teams support snapshot")?;
-                let secrets_support = secret_collection
-                    .source()
-                    .admitted(&shared_control)
-                    .context("admit Secrets support before Teams maintenance")?;
-                drop(shared_control);
-                drop(
-                    pile.maintain(maintained_succinct)
+                    drop(
+                        pile.maintain(maintained_rank9)
+                            .await
+                            .context("maintain Teams fact collection")?,
+                    );
+                    let store_snapshot = secret_collection
+                        .ensure_exact(pile, &secrets_support)
                         .await
-                        .context("maintain Teams fact collection")?,
-                );
-                drop(
-                    pile.maintain(maintained_rank9)
-                        .await
-                        .context("maintain Teams fact collection")?,
-                );
-                let store_snapshot = secret_collection
-                    .ensure_exact(&mut pile, &secrets_support)
-                    .await
-                    .context("ensure configured Secrets collection for Teams")?;
-                let secrets = secret_storage::snapshot_exact(
-                    store_snapshot,
+                        .context("ensure configured Secrets collection for Teams")?;
+                    let secrets = secret_storage::snapshot_exact(
+                        store_snapshot,
+                        secret_collection,
+                        secrets_support,
+                    )
+                    .context("attach exact Secrets collection for Teams")?;
+                    Ok::<_, anyhow::Error>(secrets)
+                })?;
+                let reader = secrets.store_snapshot().clone();
+                let observed = reader
+                    .collection(maintained_rank9)
+                    .context("observe Teams through Secrets snapshot")?;
+                let support = observed.support().clone();
+                let facts = observed
+                    .view::<FactArchive>()
+                    .context("read Teams through Secrets snapshot")?;
+                drop(observed);
+                Ok(TeamsSession {
+                    storage: storage.clone(),
+                    collection,
+                    succinct: maintained_succinct,
+                    rank9: maintained_rank9,
+                    support,
+                    facts,
+                    reader,
+                    signer: signer.clone(),
                     secret_collection,
-                    secrets_support,
-                )
-                .context("attach exact Secrets collection for Teams")?;
-                Ok::<_, anyhow::Error>(secrets)
+                    secrets,
+                    notices: Vec::new(),
+                })
             })?;
-            let reader = secrets.store_snapshot().clone();
-            let observed = reader
-                .collection(maintained_rank9)
-                .context("observe Teams through Secrets snapshot")?;
-            let support = observed.support().clone();
-            let facts = observed
-                .view::<FactArchive>()
-                .context("read Teams through Secrets snapshot")?;
-            drop(observed);
-            let mut session = TeamsSession {
-                pile: &mut pile,
-                collection,
-                succinct: maintained_succinct,
-                rank9: maintained_rank9,
-                support,
-                facts,
-                reader,
-                signer,
-                secret_collection,
-                secrets,
-                notices: Vec::new(),
-            };
+            // Graph/OAuth requests run with frozen observations and no
+            // borrowed backend. Publication reacquires the same store only
+            // for its append/maintenance step.
             match operation(&mut session) {
                 Ok(value) => Ok(value),
                 Err(error) if session.notices.is_empty() => Err(error),
                 Err(error) => Err(error.context(session.notices.join("\n"))),
             }
-        })();
-        finish_pile(pile, result)
+        })
     }
 
     #[cfg(test)]
@@ -858,18 +865,6 @@ impl TeamsStorage<'_> {
     }
 }
 
-fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error.context("close Teams pile")),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(close_error)) => {
-            Err(error.context(format!("closing Teams pile also failed: {close_error}")))
-        }
-    }
-}
-
 fn source_fragment(tenant: &str) -> Fragment {
     teams_core::source_fragment(tenant)
 }
@@ -884,7 +879,7 @@ fn source_id_for_tenant(tenant: &str) -> Result<Id> {
         .expect("Teams source fragment has one root"))
 }
 
-fn selected_source(session: &TeamsSession<'_>, tenant_selector: Option<&str>) -> Result<Id> {
+fn selected_source(session: &TeamsSession, tenant_selector: Option<&str>) -> Result<Id> {
     if let Some(tenant) = tenant_selector {
         return source_id_for_tenant(tenant);
     }
@@ -895,7 +890,7 @@ fn selected_source(session: &TeamsSession<'_>, tenant_selector: Option<&str>) ->
 }
 
 fn resolve_auth_config(
-    session: &TeamsSession<'_>,
+    session: &TeamsSession,
     config: &TeamsCommandConfig,
     source_id: Id,
 ) -> Result<TeamsBridgeConfig> {
@@ -923,14 +918,14 @@ fn resolve_auth_config(
     })
 }
 
-fn require_exact_secret(session: &TeamsSession<'_>, id: Id, label: &str) -> Result<Id> {
+fn require_exact_secret(session: &TeamsSession, id: Id, label: &str) -> Result<Id> {
     if !session.secrets.contains(id) {
         bail!("unknown {label} {id:x}");
     }
     Ok(id)
 }
 
-fn open_exact_secret(session: &TeamsSession<'_>, secret: Id) -> Result<Vec<u8>> {
+fn open_exact_secret(session: &TeamsSession, secret: Id) -> Result<Vec<u8>> {
     session
         .secrets
         .open(secret, &session.signer)
@@ -944,10 +939,9 @@ fn teams_secret_name(source: Id, kind: &str) -> String {
     )
 }
 
-fn storage(config: &TeamsCommandConfig) -> TeamsStorage<'_> {
+fn storage(config: &TeamsCommandConfig) -> TeamsStorage {
     TeamsStorage {
-        pile: &config.pile_path,
-        key: config.key_path.as_deref(),
+        storage: config.storage.clone(),
     }
 }
 
@@ -955,7 +949,7 @@ fn with_teams_context<T>(
     config: &TeamsCommandConfig,
     requested_as: Option<&str>,
     require_explicit_identity: bool,
-    operation: impl FnOnce(&TeamsBridgeConfig, &mut TeamsSession<'_>) -> Result<T>,
+    operation: impl FnOnce(&TeamsBridgeConfig, &mut TeamsSession) -> Result<T>,
 ) -> Result<Activity<T>> {
     storage(config).with_session(|session| {
         let source_id = selected_source(session, config.tenant_selector.as_deref())?;
@@ -1034,7 +1028,7 @@ fn resolve_source_tenant(
 fn pull_once_with_cache(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
 ) -> Result<PullReceipt> {
     let mut receipt = PullReceipt::default();
     let (token, app_config) = get_app_token(config, app_token_cache, session)?;
@@ -1135,7 +1129,7 @@ pub struct PresentationContext {
 fn get_app_token(
     config: &TeamsBridgeConfig,
     app_token_cache: &mut Option<AppTokenCache>,
-    session: &TeamsSession<'_>,
+    session: &TeamsSession,
 ) -> Result<(String, AppConfig)> {
     let app_config = app_config(config, session)?;
     let now = clock::now()?;
@@ -1162,7 +1156,7 @@ fn get_app_token(
     Ok((access_token, app_config))
 }
 
-fn app_config(config: &TeamsBridgeConfig, session: &TeamsSession<'_>) -> Result<AppConfig> {
+fn app_config(config: &TeamsBridgeConfig, session: &TeamsSession) -> Result<AppConfig> {
     let secret = config.client_secret_version.ok_or_else(|| {
         anyhow::anyhow!(
             "Teams auth profile {} has no app client-secret version; rotate with `teams login --client-secret ...` or `teams auth set`",
@@ -1190,10 +1184,7 @@ fn resolve_delta_url(template: &str, user_id: &str) -> Result<String> {
     Ok(template.to_owned())
 }
 
-fn get_delegated_token(
-    config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
-) -> Result<String> {
+fn get_delegated_token(config: &TeamsBridgeConfig, session: &mut TeamsSession) -> Result<String> {
     let secret = config.delegated_token_version.ok_or_else(|| {
         anyhow::anyhow!(
             "Teams auth profile {} has no delegated-token version; run `teams login`",
@@ -1333,7 +1324,7 @@ where
 }
 
 fn store_context(
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     source_id: Id,
     tenant: &str,
     presentation_name: &str,
@@ -1411,7 +1402,7 @@ fn prepare_teams_context(
     Ok(context)
 }
 
-fn show_auth_status(session: &TeamsSession<'_>, tenant: Option<&str>) -> Result<String> {
+fn show_auth_status(session: &TeamsSession, tenant: Option<&str>) -> Result<String> {
     let mut output = String::new();
     let sources = match tenant {
         Some(tenant) => BTreeSet::from([source_id_for_tenant(tenant)?]),
@@ -1472,7 +1463,7 @@ fn show_auth_status(session: &TeamsSession<'_>, tenant: Option<&str>) -> Result<
 
 #[allow(clippy::too_many_arguments)]
 fn set_auth_profile(
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     tenant: &str,
     client_id: &str,
     user_id: &str,
@@ -1655,7 +1646,7 @@ fn epoch_after_seconds(base: Epoch, seconds: i64) -> Epoch {
 }
 
 fn login_device_code_collection(
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     tenant: &str,
     client_id: &str,
     client_secret: Option<&str>,
@@ -2011,7 +2002,7 @@ fn url_without_query(url: &str) -> &str {
 
 fn send_message(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     chat_id: &str,
     text: &str,
 ) -> Result<SentMessage> {
@@ -2052,7 +2043,7 @@ fn send_message(
 
 fn list_users(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     prefix: Option<&str>,
     limit: usize,
 ) -> Result<Vec<DirectoryUser>> {
@@ -2116,7 +2107,7 @@ fn list_users(
 
 fn set_presence_status(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     availability: PresenceAvailability,
     activity: Option<PresenceActivity>,
     duration_mins: u32,
@@ -2167,7 +2158,7 @@ fn set_presence_status(
 
 fn get_presence(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     user_ids: Vec<String>,
 ) -> Result<Vec<Presence>> {
     if user_ids.is_empty() {
@@ -2252,7 +2243,7 @@ fn ensure_presence_combo(availability: &str, activity: &str) -> Result<()> {
 
 fn invite_to_chat(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     chat_id: &str,
     user_id: &str,
     owner: bool,
@@ -2287,7 +2278,7 @@ fn invite_to_chat(
 
 fn create_chat(
     config: &TeamsBridgeConfig,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     mut user_ids: Vec<String>,
     force_group: bool,
     topic: Option<String>,
@@ -2547,7 +2538,7 @@ where
 
 fn read_messages(
     source_id: Id,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     options: ReadOptions,
 ) -> Result<Vec<ArchivedMessage>> {
     let view = session.view();
@@ -2669,7 +2660,7 @@ struct AttachmentSource {
 
 fn list_attachments(
     source_id: Id,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     options: AttachmentListOptions,
 ) -> Result<Vec<AttachmentInfo>> {
     let view = session.view();
@@ -2841,7 +2832,7 @@ where
 
 fn get_attachment(
     source_id: Id,
-    session: &mut TeamsSession<'_>,
+    session: &mut TeamsSession,
     options: AttachmentGetOptions,
 ) -> Result<AttachmentLookup> {
     let view = session.view();
@@ -3681,10 +3672,9 @@ mod tests {
             Self { dir, pile, key }
         }
 
-        fn storage(&self) -> TeamsStorage<'_> {
+        fn storage(&self) -> TeamsStorage {
             TeamsStorage {
-                pile: &self.pile,
-                key: Some(&self.key),
+                storage: Storage::new(self.pile.clone(), Some(self.key.clone())),
             }
         }
 
@@ -3760,7 +3750,7 @@ mod tests {
         fixture.storage().view().unwrap()
     }
 
-    fn assert_session_has_one_store_watermark(session: &TeamsSession<'_>) {
+    fn assert_session_has_one_store_watermark(session: &TeamsSession) {
         let secrets_reader = session.secrets.store_snapshot();
         assert!(session.reader.changes_since(secrets_reader).is_empty());
         assert!(secrets_reader.changes_since(&session.reader).is_empty());
@@ -3854,15 +3844,17 @@ mod tests {
             .with_session(|session| {
                 assert_session_has_one_store_watermark(session);
                 let support = session.support.clone();
-                session.pile.commit(
-                    session.collection,
-                    &session.signer,
-                    source_fragment("newer-session-input.example"),
-                )?;
-                let later = pollster::block_on(async {
-                    drop(session.pile.ensure(session.collection).await?);
-                    drop(session.pile.maintain(session.succinct).await?);
-                    session.pile.maintain(session.rank9).await
+                let later = session.storage.with_pile(|pile, signer| {
+                    pile.commit(
+                        session.collection,
+                        signer,
+                        source_fragment("newer-session-input.example"),
+                    )?;
+                    pollster::block_on(async {
+                        drop(pile.ensure(session.collection).await?);
+                        drop(pile.maintain(session.succinct).await?);
+                        pile.maintain(session.rank9).await.map_err(Into::into)
+                    })
                 })?;
                 assert_ne!(later.collection(session.rank9)?.support(), &support);
                 drop(later);

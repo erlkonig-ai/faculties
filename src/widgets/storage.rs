@@ -28,7 +28,7 @@ use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::collection::{
     Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
-use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
@@ -51,7 +51,7 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{load_signer, open_pile_strict, open_secrets_collection_read, FactArchive};
+use crate::storage::{open_secrets_collection_read, FactArchive, Storage};
 
 /// Stable logical input requested by a widget.
 ///
@@ -418,8 +418,7 @@ pub struct StorageState {
     datasets: Option<BTreeMap<SourceKey, LoadedDataset>>,
     secrets: Option<LoadedSecrets>,
     sources: BTreeSet<SourceKey>,
-    pile_path: PathBuf,
-    key_path: Option<PathBuf>,
+    storage: Storage,
     pile_path_text: String,
     stamp: Option<FileStamp>,
     error: Option<String>,
@@ -449,14 +448,18 @@ impl StorageState {
         pile_path: impl Into<PathBuf>,
         sources: impl IntoIterator<Item = SourceKey>,
     ) -> Self {
-        let pile_path = pile_path.into();
-        let pile_path_text = pile_path.to_string_lossy().into_owned();
+        Self::with_storage(Storage::new(pile_path.into(), None), sources)
+    }
+
+    /// Share an explicit store while retaining operation-local dataset views.
+    /// Construction and source dependency selection perform no storage I/O.
+    pub fn with_storage(storage: Storage, sources: impl IntoIterator<Item = SourceKey>) -> Self {
+        let pile_path_text = storage.path().to_string_lossy().into_owned();
         Self {
             datasets: None,
             secrets: None,
             sources: source_closure(sources),
-            pile_path,
-            key_path: None,
+            storage,
             pile_path_text,
             stamp: None,
             error: None,
@@ -468,8 +471,8 @@ impl StorageState {
     /// default by leaving it unset; changing the pile does not change an
     /// explicitly configured key.
     pub fn with_key_path(mut self, key_path: Option<PathBuf>) -> Self {
-        if self.key_path != key_path {
-            self.key_path = key_path;
+        if self.storage.key_path() != key_path.as_deref() {
+            self.storage = Storage::new(self.storage.path().to_owned(), key_path);
             self.datasets = None;
             self.secrets = None;
             self.stamp = None;
@@ -495,11 +498,11 @@ impl StorageState {
     /// which is the behavior of the top-bar OPEN action.
     pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
         let path = path.into();
-        let changed = path != self.pile_path;
-        self.pile_path = path;
-        self.pile_path_text = self.pile_path.to_string_lossy().into_owned();
+        let changed = path != self.storage.path();
+        self.pile_path_text = path.to_string_lossy().into_owned();
         self.error = None;
         if changed {
+            self.storage = Storage::new(path, self.storage.key_path().map(Path::to_owned));
             self.datasets = None;
             self.secrets = None;
             self.stamp = None;
@@ -517,7 +520,7 @@ impl StorageState {
         if self.error.is_some() {
             return;
         }
-        match file_stamp(&self.pile_path) {
+        match file_stamp(self.storage.path()) {
             Ok(stamp) if Some(stamp) != self.stamp => self.reload_current_path(),
             Ok(_) => {}
             Err(error) => self.error = Some(error),
@@ -525,11 +528,7 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match pollster::block_on(load_consistent_inputs(
-            &self.pile_path,
-            self.key_path.as_deref(),
-            &self.sources,
-        )) {
+        match load_consistent_inputs(&self.storage, &self.sources) {
             Ok((inputs, stamp)) => {
                 self.datasets = Some(inputs.datasets);
                 self.secrets = inputs.secrets;
@@ -637,14 +636,14 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     })
 }
 
-async fn load_consistent_inputs(
-    path: &Path,
-    key_path: Option<&Path>,
+fn load_consistent_inputs(
+    storage: &Storage,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<(LoadedInputs, FileStamp), String> {
+    let path = storage.path();
     for _ in 0..2 {
         let before = file_stamp(path)?;
-        let inputs = load_inputs(path, key_path, sources).await?;
+        let inputs = load_inputs(storage, sources)?;
         let after = file_stamp(path)?;
         if before == after {
             return Ok((inputs, after));
@@ -656,15 +655,20 @@ async fn load_consistent_inputs(
     ))
 }
 
-async fn load_inputs(
-    path: &Path,
-    key_path: Option<&Path>,
+fn load_inputs(storage: &Storage, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
+    storage
+        .with_pile(|pile, signer| {
+            pollster::block_on(load_inputs_from_pile(pile, signer, sources))
+                .map_err(anyhow::Error::msg)
+        })
+        .map_err(|error| format!("load viewer storage: {error:#}"))
+}
+
+async fn load_inputs_from_pile(
+    pile: &mut Pile,
+    signer: &ed25519_dalek::SigningKey,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<LoadedInputs, String> {
-    let signer = load_signer(path, key_path)
-        .map_err(|error| format!("load durable collection signer: {error:#}"))?;
-    let mut pile = open_pile_strict(path).map_err(|error| format!("open pile: {error:#}"))?;
-
     let loaded = async {
         let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
@@ -672,7 +676,7 @@ async fn load_inputs(
 
         let mut collections = Vec::new();
         for (scope, label) in collection_scopes(sources) {
-            let source = open_configured(&mut pile, scope, signer.verifying_key())
+            let source = open_configured(pile, scope, signer.verifying_key())
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
             let descriptor_snapshot = pile
                 .snapshot()
@@ -693,14 +697,14 @@ async fn load_inputs(
         let compass_register = sources
             .contains(&SourceKey::Compass)
             .then(|| {
-                crate::compass::status_register_collection(&mut pile, signer.verifying_key())
+                crate::compass::status_register_collection(pile, signer.verifying_key())
                     .map_err(|error| format!("register Compass status collection: {error:#}"))
             })
             .transpose()?;
         let wiki_latest = sources
             .contains(&SourceKey::Wiki)
             .then(|| {
-                crate::wiki::latest_collection(&mut pile, signer.verifying_key())
+                crate::wiki::latest_collection(pile, signer.verifying_key())
                     .map_err(|error| format!("register Wiki observation collection: {error:#}"))
             })
             .transpose()?;
@@ -708,7 +712,7 @@ async fn load_inputs(
         let secrets_collection = sources
             .contains(&SourceKey::Secrets)
             .then(|| {
-                open_secrets_collection_read(&mut pile, signer.verifying_key())
+                open_secrets_collection_read(pile, signer.verifying_key())
                     .map_err(|error| format!("open configured Secrets collection: {error:#}"))
             })
             .transpose()?;
@@ -781,7 +785,7 @@ async fn load_inputs(
 
         let secrets = if let Some((collection, support)) = secrets_support {
             let store_snapshot = collection
-                .ensure_exact(&mut pile, &support)
+                .ensure_exact(pile, &support)
                 .await
                 .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?;
             let snapshot = secret_storage::snapshot_exact(store_snapshot, collection, support)
@@ -891,13 +895,7 @@ async fn load_inputs(
     }
     .await;
 
-    let closed = pile.close().map_err(|error| format!("close pile: {error}"));
-    match (loaded, closed) {
-        (Ok(datasets), Ok(())) => Ok(datasets),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(close_error)) => Err(format!("{error}; {close_error}")),
-    }
+    loaded
 }
 
 fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, message: &str, color: egui::Color32) {
@@ -942,6 +940,7 @@ mod tests {
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
+    use crate::storage::{load_signer, open_pile_strict};
     use crate::test_support::initialize_open_collection_fixture;
 
     fn create_pile(path: &Path) {
@@ -1002,8 +1001,8 @@ mod tests {
         let key = directory.path().join("launcher.key");
         std::fs::rename(crate::storage::signer_path(&path, None), &key).unwrap();
         let before = std::fs::metadata(&path).unwrap().len();
-        let mut storage = StorageState::for_sources(&path, [SourceKey::Teams])
-            .with_key_path(Some(key));
+        let mut storage =
+            StorageState::for_sources(&path, [SourceKey::Teams]).with_key_path(Some(key));
         assert!(storage.datasets.is_none());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
         assert!(storage.context().contains(SourceKey::Teams));

@@ -7,11 +7,11 @@ use crate::collection_names::open_configured;
 use crate::files::presentation::{present, ViewOptions};
 use crate::out::Part;
 use crate::schemas::body::{capture, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
-use crate::storage::{load_signer, open_pile_strict, publish_fragment, FactArchive};
+use crate::storage::{FactArchive, Storage};
 use anybytes::Bytes;
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -113,17 +113,18 @@ pub struct IntentObservation {
 
 #[derive(Clone, Debug)]
 pub struct Body {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 impl Body {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
     fn storage(&self) -> BodyStorage<'_> {
         BodyStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
 
@@ -313,32 +314,24 @@ fn latest_intent(snapshot: &super::BodySnapshot) -> Result<Option<IntentObservat
 
 #[derive(Clone, Copy)]
 struct BodyStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a Storage,
 }
 
 impl BodyStorage<'_> {
     fn publish(&self, fragment: Fragment) -> Result<()> {
-        publish_fragment(self.pile, self.key, DEFAULT_SCOPE_ID, fragment)?;
-        Ok(())
+        self.with_pile(|pile, signer| {
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            pile.commit(collection, signer, fragment)
+                .context("publish native Body collection fragment")?;
+            Ok(())
+        })
     }
 
     fn with_pile<T>(
         &self,
         f: impl FnOnce(&mut Pile, &ed25519_dalek::SigningKey) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let mut pile = open_pile_strict(self.pile)?;
-        let result = f(&mut pile, &signer);
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
+        self.storage.with_pile(f)
     }
 
     fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {

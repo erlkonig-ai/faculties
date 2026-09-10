@@ -39,8 +39,11 @@ pub struct Reason {
 
 impl Reason {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Reason::new(pile, key),
+            operations: super::Reason::with_storage(storage),
         }
     }
 }

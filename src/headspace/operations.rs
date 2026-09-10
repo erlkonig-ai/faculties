@@ -5,8 +5,7 @@ use crate::out::Out;
 
 #[derive(Clone, Debug)]
 pub struct Headspace {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 #[derive(Clone, Debug, Default)]
 pub struct AddProfileOptions {
@@ -72,21 +71,19 @@ impl std::error::Error for CredentialUpdateError {
 
 impl Headspace {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(crate::storage::Storage::new(pile, key))
     }
-    fn with_storage<T>(&self, operation: impl FnOnce(&Storage<'_>) -> Result<T>) -> Result<T> {
-        let storage = Storage::open(&self.pile, self.key.as_deref())?;
-        let result = operation(&storage);
-        match (result, storage.close()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => Err(error.context(format!(
-                "closing Headspace storage also failed: {close_error}"
-            ))),
-        }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
+    }
+    fn with_operation<T>(&self, operation: impl FnOnce(&Storage) -> Result<T>) -> Result<T> {
+        self.storage.scope(|storage| {
+            let context = Storage::from_storage(storage.clone())?;
+            operation(&context)
+        })
     }
     pub fn show(&self, show_secrets: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| {
+        self.with_operation(|storage| {
             let views = storage.views()?;
             let opened = if show_secrets {
                 open_display_secrets(storage, &views)?
@@ -97,19 +94,19 @@ impl Headspace {
         })
     }
     pub fn list(&self, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| print_profile_list(&storage.views()?, out))
+        self.with_operation(|storage| print_profile_list(&storage.views()?, out))
     }
     pub fn use_profile(&self, selector: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| use_profile(storage, selector, out))
+        self.with_operation(|storage| use_profile(storage, selector, out))
     }
     pub fn add(&self, options: &AddProfileOptions, out: &mut Out<'_>) -> Result<Id> {
-        self.with_storage(|storage| add_profile(storage, options, out))
+        self.with_operation(|storage| add_profile(storage, options, out))
     }
     pub fn set(&self, edit: &ProfileEdit, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| set_profile_field(storage, edit, out))
+        self.with_operation(|storage| set_profile_field(storage, edit, out))
     }
     pub fn unset(&self, field: OptionalProfileField, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| unset_profile_field(storage, field, out))
+        self.with_operation(|storage| unset_profile_field(storage, field, out))
     }
     pub fn secret_set(
         &self,
@@ -117,29 +114,29 @@ impl Headspace {
         credential: Credential,
         out: &mut Out<'_>,
     ) -> Result<Id> {
-        self.with_storage(|storage| set_secret(storage, role, credential, out))
+        self.with_operation(|storage| set_secret(storage, role, credential, out))
     }
     pub fn secret_unset(&self, role: SecretRole, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| unset_secret(storage, role, out))
+        self.with_operation(|storage| unset_secret(storage, role, out))
     }
     pub fn reconcile(&self, snapshot: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_storage(|storage| reconcile(storage, snapshot, out))
+        self.with_operation(|storage| reconcile(storage, snapshot, out))
     }
 }
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::open_configured;
 use crate::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use crate::schemas::headspace::DEFAULT_SCOPE_ID;
 use crate::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
-use crate::storage::{
-    load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-    FactArchive,
-};
+#[cfg(test)]
+use crate::storage::load_signer;
+use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -148,7 +145,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
@@ -163,133 +160,122 @@ struct Views {
     secrets: SecretsSnapshot<PileSnapshot>,
 }
 
-struct Storage<'a> {
-    pile_path: &'a Path,
-    pile: RefCell<Option<Pile>>,
+struct Storage {
+    storage: crate::storage::Storage,
     signer: SigningKey,
 }
 
-impl Storage<'_> {
-    fn open<'a>(pile_path: &'a Path, key: Option<&Path>) -> Result<Storage<'a>> {
-        // Authority is resolved before touching storage. A missing signer can
-        // neither create a pile nor append a descriptor.
-        let signer = load_signer(pile_path, key)?;
-        let pile = open_pile_strict(pile_path)?;
-        Ok(Storage {
-            pile_path,
-            pile: RefCell::new(Some(pile)),
-            signer,
-        })
+impl Storage {
+    fn from_storage(storage: crate::storage::Storage) -> Result<Self> {
+        let signer = storage.with_pile(|_, signer| Ok(signer.clone()))?;
+        Ok(Self { storage, signer })
+    }
+
+    #[cfg(test)]
+    fn open(pile: &Path, key: Option<&Path>) -> Result<Self> {
+        Self::from_storage(crate::storage::Storage::shared(
+            pile.to_owned(),
+            key.map(Path::to_owned),
+        ))
     }
 
     fn views(&self) -> Result<Views> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
-        let descriptor_snapshot = pile.snapshot()?;
-        let policy = source.policy(&descriptor_snapshot)?;
-        drop(descriptor_snapshot);
-        let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-        let collection_rank9 =
-            pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
-        let secrets_collection = open_secrets_collection_read(pile, self.signer.verifying_key())?;
-        let secrets = pollster::block_on(async {
-            for (label, source) in [
-                ("Headspace", source),
-                ("Secrets", secrets_collection.source()),
-            ] {
+        self.storage.with_pile(|pile, _| {
+            let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
+            let descriptor_snapshot = pile.snapshot()?;
+            let policy = source.policy(&descriptor_snapshot)?;
+            drop(descriptor_snapshot);
+            let collection_succinct =
+                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+            let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                collection_succinct,
+                (),
+                policy,
+            )?;
+            let secrets_collection =
+                open_secrets_collection_read(pile, self.signer.verifying_key())?;
+            let secrets = pollster::block_on(async {
+                for (label, source) in [
+                    ("Headspace", source),
+                    ("Secrets", secrets_collection.source()),
+                ] {
+                    drop(
+                        pile.ensure(source)
+                            .await
+                            .with_context(|| format!("ensure {label} source collection"))?,
+                    );
+                }
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Headspace support snapshot")?;
+                let secrets_support = secrets_collection
+                    .source()
+                    .admitted(&before)
+                    .context("admit Secrets collection support")?;
+                drop(before);
                 drop(
-                    pile.ensure(source)
+                    pile.maintain(collection_succinct)
                         .await
-                        .with_context(|| format!("ensure {label} source collection"))?,
+                        .context("maintain Headspace fact collection")?,
                 );
-            }
-            let before = pile
-                .snapshot()
-                .context("freeze shared Headspace support snapshot")?;
-            let secrets_support = secrets_collection
-                .source()
-                .admitted(&before)
-                .context("admit Secrets collection support")?;
-            drop(before);
-            drop(
-                pile.maintain(collection_succinct)
+                drop(
+                    pile.maintain(collection_rank9)
+                        .await
+                        .context("maintain Headspace fact collection")?,
+                );
+                let store_snapshot = secrets_collection
+                    .ensure_exact(pile, &secrets_support)
                     .await
-                    .context("maintain Headspace fact collection")?,
-            );
-            drop(
-                pile.maintain(collection_rank9)
-                    .await
-                    .context("maintain Headspace fact collection")?,
-            );
-            let store_snapshot = secrets_collection
-                .ensure_exact(pile, &secrets_support)
-                .await
-                .context("ensure configured Secrets collection")?;
-            let secrets =
-                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
-                    .context("attach exact Secrets collection")?;
-            Ok::<_, anyhow::Error>(secrets)
-        })?;
-        // Attach Headspace through the same final immutable physical snapshot
-        // that backs every Secrets lookup in this view.
-        let reader = secrets.store_snapshot().clone();
-        let facts = reader
-            .collection(collection_rank9)
-            .context("attach maintained Headspace collection")?
-            .view::<FactArchive>()
-            .context("read maintained Headspace collection")?;
-        let headspace = CollectionView { facts, reader };
-        Ok(Views { headspace, secrets })
+                    .context("ensure configured Secrets collection")?;
+                let secrets = secret_storage::snapshot_exact(
+                    store_snapshot,
+                    secrets_collection,
+                    secrets_support,
+                )
+                .context("attach exact Secrets collection")?;
+                Ok::<_, anyhow::Error>(secrets)
+            })?;
+            // Attach Headspace through the same final immutable physical snapshot
+            // that backs every Secrets lookup in this view.
+            let reader = secrets.store_snapshot().clone();
+            let facts = reader
+                .collection(collection_rank9)
+                .context("attach maintained Headspace collection")?
+                .view::<FactArchive>()
+                .context("read maintained Headspace collection")?;
+            let headspace = CollectionView { facts, reader };
+            Ok(Views { headspace, secrets })
+        })
     }
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let collection = open_secrets_collection(pile, self.signer.verifying_key())?;
-        secret_storage::add_secret(
-            pile,
-            &self.signer,
-            collection,
-            name,
-            plaintext,
-            point_now()?,
-        )
-        .context("seal and publish Headspace credential version")
+        self.storage.with_pile(|pile, _| {
+            let collection = open_secrets_collection(pile, self.signer.verifying_key())?;
+            secret_storage::add_secret(
+                pile,
+                &self.signer,
+                collection,
+                name,
+                plaintext,
+                point_now()?,
+            )
+            .context("seal and publish Headspace credential version")
+        })
     }
 
     fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
-        fragment.describe_with(entity! { metadata::description: description.to_owned() });
-        let mut pile = self.pile.borrow_mut();
-        let pile = pile
-            .as_mut()
-            .ok_or_else(|| anyhow!("Headspace storage is already closed"))?;
-        let collection = open_configured(pile, scope, self.signer.verifying_key())?;
-        pile.commit(collection, &self.signer, fragment)
-            .with_context(|| format!("commit collection {scope:x}"))?;
-        Ok(())
+        self.storage.with_pile(|pile, _| {
+            fragment.describe_with(entity! { metadata::description: description.to_owned() });
+            let collection = open_configured(pile, scope, self.signer.verifying_key())?;
+            pile.commit(collection, &self.signer, fragment)
+                .with_context(|| format!("commit collection {scope:x}"))?;
+            Ok(())
+        })
     }
 
+    #[cfg(test)]
     fn close(self) -> Result<()> {
-        self.close_inner()
-    }
-
-    fn close_inner(&self) -> Result<()> {
-        let Some(pile) = self.pile.borrow_mut().take() else {
-            return Ok(());
-        };
-        pile.close()
-            .with_context(|| format!("close Headspace pile {}", self.pile_path.display()))
-    }
-}
-
-impl Drop for Storage<'_> {
-    fn drop(&mut self) {
-        let _ = self.close_inner();
+        self.storage.close()
     }
 }
 
@@ -342,11 +328,11 @@ fn parse_exact_secret(views: &Views, raw: &str, label: &str) -> Result<Id> {
     Ok(id)
 }
 
-fn publish_headspace(storage: &Storage<'_>, fragment: Fragment, description: &str) -> Result<()> {
+fn publish_headspace(storage: &Storage, fragment: Fragment, description: &str) -> Result<()> {
     storage.publish(DEFAULT_SCOPE_ID, fragment, description)
 }
 
-fn use_profile(storage: &Storage<'_>, selector: &str, out: &mut Out<'_>) -> Result<()> {
+fn use_profile(storage: &Storage, selector: &str, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     let anchor = resolve_profile_selector(&views, selector)?;
     let profile =
@@ -367,7 +353,7 @@ fn use_profile(storage: &Storage<'_>, selector: &str, out: &mut Out<'_>) -> Resu
     print_reloaded(storage, out)
 }
 
-fn add_profile(storage: &Storage<'_>, args: &AddProfileOptions, out: &mut Out<'_>) -> Result<Id> {
+fn add_profile(storage: &Storage, args: &AddProfileOptions, out: &mut Out<'_>) -> Result<Id> {
     let views = storage.views()?;
     let config = headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
     let anchor = genid().id;
@@ -423,7 +409,7 @@ fn add_profile(storage: &Storage<'_>, args: &AddProfileOptions, out: &mut Out<'_
     Ok(anchor)
 }
 
-fn set_profile_field(storage: &Storage<'_>, field: &ProfileEdit, out: &mut Out<'_>) -> Result<()> {
+fn set_profile_field(storage: &Storage, field: &ProfileEdit, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     let config_resolution =
         headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
@@ -459,7 +445,7 @@ fn set_profile_field(storage: &Storage<'_>, field: &ProfileEdit, out: &mut Out<'
 }
 
 fn unset_profile_field(
-    storage: &Storage<'_>,
+    storage: &Storage,
     field: OptionalProfileField,
     out: &mut Out<'_>,
 ) -> Result<()> {
@@ -556,7 +542,7 @@ fn secret_successor(
     }
 }
 
-fn unset_secret(storage: &Storage<'_>, role: SecretRole, out: &mut Out<'_>) -> Result<()> {
+fn unset_secret(storage: &Storage, role: SecretRole, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     let successor = secret_successor(&views, role, None)?;
     if successor.current.is_none() {
@@ -580,7 +566,7 @@ fn role_name(role: SecretRole) -> &'static str {
     }
 }
 
-fn reconcile(storage: &Storage<'_>, raw: &str, out: &mut Out<'_>) -> Result<()> {
+fn reconcile(storage: &Storage, raw: &str, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     // Reconciliation alone explicitly projects arbitrary retained history;
     // every ordinary read above asks only for its current typed frontier.
@@ -595,7 +581,7 @@ fn reconcile(storage: &Storage<'_>, raw: &str, out: &mut Out<'_>) -> Result<()> 
 }
 
 fn open_secret_text(
-    storage: &Storage<'_>,
+    storage: &Storage,
     views: &Views,
     secret: Option<Id>,
     role: &str,
@@ -612,7 +598,7 @@ fn open_secret_text(
         .map(Some)
 }
 
-fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<OpenedSecrets>> {
+fn open_display_secrets(storage: &Storage, views: &Views) -> Result<Option<OpenedSecrets>> {
     let config_resolution =
         headspace::current_config(&views.headspace.reader, &views.headspace.facts)?;
     let Some(config) = settled_config(&config_resolution)? else {
@@ -637,7 +623,7 @@ fn open_display_secrets(storage: &Storage<'_>, views: &Views) -> Result<Option<O
     }))
 }
 
-fn print_reloaded(storage: &Storage<'_>, out: &mut Out<'_>) -> Result<()> {
+fn print_reloaded(storage: &Storage, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     print_headspace(&views, None, out)
 }
@@ -853,7 +839,7 @@ fn format_snapshot_ids(ids: impl IntoIterator<Item = Id>) -> String {
 }
 
 fn set_secret(
-    storage: &Storage<'_>,
+    storage: &Storage,
     role: SecretRole,
     credential: Credential,
     out: &mut Out<'_>,
@@ -972,7 +958,7 @@ mod tests {
         (directory, pile, key)
     }
 
-    fn views<'a>(pile: &'a Path, key: &'a Path) -> (Storage<'a>, Views) {
+    fn views<'a>(pile: &'a Path, key: &'a Path) -> (Storage, Views) {
         let storage = Storage::open(pile, Some(key)).unwrap();
         let views = storage.views().unwrap();
         (storage, views)

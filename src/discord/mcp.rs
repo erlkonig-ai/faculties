@@ -63,8 +63,11 @@ pub struct Discord {
 }
 impl Discord {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::operations::Discord::new(pile, key),
+            operations: super::operations::Discord::with_storage(storage),
         }
     }
     /// Trusted launcher-only configuration; this is deliberately not an MCP argument.

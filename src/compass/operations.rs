@@ -9,31 +9,29 @@ use crate::schemas::compass::{
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use crate::storage::{self, load_signer, open_store, runtime, FactArchive, FacultyStore};
+use crate::storage::{self, FactArchive, FacultyStore, Storage};
 use crate::{clock, compass, relations};
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::LwwIndex;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::StorageClose;
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 /// Pile-backed Compass functionality, independent of either frontend.
-/// Each operation observes a fresh maintained snapshot and closes its store.
+/// Each operation observes a fresh maintained snapshot through its storage handle.
 #[derive(Clone, Debug)]
 pub struct Compass {
-    pile: PathBuf,
-    key: Option<PathBuf>,
+    storage: Storage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,13 +105,16 @@ pub struct PriorityChange {
 
 impl Compass {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        Self { pile, key }
+        Self::with_storage(Storage::new(pile, key))
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
+        Self { storage }
     }
 
     fn storage(&self) -> CompassStorage<'_> {
         CompassStorage {
-            pile: &self.pile,
-            key: self.key.as_deref(),
+            storage: &self.storage,
         }
     }
 
@@ -251,8 +252,7 @@ fn extract_reference_values(text: &str) -> Vec<String> {
 
 #[derive(Clone, Copy)]
 struct CompassStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
+    storage: &'a Storage,
 }
 
 impl CompassStorage<'_> {
@@ -264,29 +264,17 @@ impl CompassStorage<'_> {
             &tokio::runtime::Runtime,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(self.pile, self.key)?;
-        let runtime = runtime()?;
-        let mut pile = open_store(self.pile)?;
-        let result = (|| {
+        self.storage.with_store(|pile, signer, runtime| {
             if let Some(handle) = configured_handle(COMPASS_SCOPE_ID)? {
                 let reader = pile
                     .snapshot()
                     .context("freeze configured Compass descriptor")?;
-                runtime.block_on(storage::read(&mut pile, &reader, |reader| {
+                runtime.block_on(storage::read(pile, &reader, |reader| {
                     open_exact_in(reader, COMPASS_SCOPE_ID, handle)
                 }))?;
             }
-            f(&mut pile, &signer, &runtime)
-        })();
-        let close = pile.close();
-        match (result, close) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(anyhow::anyhow!("close pile: {error}")),
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(close_error)) => {
-                Err(error.context(format!("closing pile also failed: {close_error}")))
-            }
-        }
+            f(pile, signer, runtime)
+        })
     }
 
     /// Prepare a pure read against fixed facts/status and an acquiring blob
@@ -1673,9 +1661,9 @@ mod tests {
         let key = directory.path().join("compass.key");
         std::fs::File::create(&pile).unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
+        let storage_handle = Storage::new(pile.clone(), Some(key.clone()));
         let storage = CompassStorage {
-            pile: &pile,
-            key: Some(&key),
+            storage: &storage_handle,
         };
 
         add_goal(

@@ -172,15 +172,15 @@ pub struct CaptureSummary {
 /// Launcher-owned storage configuration. Constructing a Viewer does no I/O.
 #[derive(Clone, Debug)]
 pub struct Viewer {
-    pub(crate) pile: PathBuf,
-    pub(crate) key: Option<PathBuf>,
+    pub(crate) storage: crate::storage::Storage,
 }
 impl Viewer {
     pub fn new(pile: impl Into<PathBuf>, key: Option<PathBuf>) -> Self {
-        Self {
-            pile: pile.into(),
-            key,
-        }
+        Self::with_storage(crate::storage::Storage::new(pile.into(), key))
+    }
+
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
     }
 
     pub fn capture(
@@ -233,7 +233,7 @@ impl Viewer {
         }
         #[cfg(not(all(feature = "widgets", not(target_arch = "wasm32"))))]
         {
-            let _ = (target, &mut emit, &self.pile, &self.key);
+            let _ = (target, &mut emit, &self.storage);
             bail!("resident notebook capture requires the native `widgets` feature; no GPU or pile was opened")
         }
     }
