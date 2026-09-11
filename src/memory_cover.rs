@@ -56,6 +56,27 @@ pub fn chunk_image_handle<P: TriblePattern>(space: &P, id: Id) -> Option<Inline<
     find!(h: Inline<Handle<RawBytes>>, pattern!(space, [{ id @ ctx::image: ?h }])).min()
 }
 
+/// Every chunk's summary handle in one query, the least handle per chunk (the
+/// choice `chunk_summary_handle` makes), so residency can be checked for all
+/// candidates without a query per chunk.
+pub fn summary_handles<P: TriblePattern>(space: &P) -> HashMap<Id, Inline<Handle<UTF8String>>> {
+    let mut handles: HashMap<Id, Inline<Handle<UTF8String>>> = HashMap::new();
+    for (id, handle) in find!(
+        (id: Id, handle: Inline<Handle<UTF8String>>),
+        pattern!(space, [{ ?id @ ctx::summary: ?handle }])
+    ) {
+        handles
+            .entry(id)
+            .and_modify(|current| {
+                if handle < *current {
+                    *current = handle;
+                }
+            })
+            .or_insert(handle);
+    }
+    handles
+}
+
 /// A chunk's `from..to` span as a string (or `?` if missing) — used to render
 /// a wordless image memory as `[image memory @ <span>]` everywhere a summary
 /// would otherwise print.
@@ -1073,7 +1094,36 @@ where
 
     let mut diagnostics = Vec::new();
     let mut out = String::new();
-    let raw_spans = collect_chunk_spans(space);
+    let mut raw_spans = collect_chunk_spans(space);
+    // A memory whose summary bytes have not arrived is not a candidate. Commit
+    // records travel ahead of their member blobs, so a chunk written on another
+    // machine is visible here while its summary is still in flight (the standing
+    // belief on physical residency versus semantic validity). The open-world
+    // rule applies: skip what cannot be read, say so, and render the rest. The
+    // chunk stays in the journal and answers by range once its bytes land;
+    // seven of them must not refuse a whole wake.
+    let handles = summary_handles(space);
+    let mut unreadable: Vec<String> = Vec::new();
+    raw_spans.retain(|&(start, end, id)| match handles.get(&id) {
+        Some(&handle) => match reader.get::<View<str>, UTF8String>(handle) {
+            Ok(_) => true,
+            Err(error) => {
+                unreadable.push(format!(
+                    "{} ({error})",
+                    format_time_range(key_to_epoch(start), key_to_epoch(end))
+                ));
+                false
+            }
+        },
+        None => true,
+    });
+    if !unreadable.is_empty() {
+        diagnostics.push(format!(
+            "memory context — {} memory(ies) skipped, summary not readable in this snapshot (usually still replicating from the machine that wrote it): {}",
+            unreadable.len(),
+            unreadable.join(", ")
+        ));
+    }
     if raw_spans.is_empty() {
         writeln!(out, "no memory chunks")?;
         return Ok(CoverReport {
@@ -1277,6 +1327,62 @@ mod recollection_tests {
                 format!("memory: 2 unembedded chunk(s) not scorable for {gate} — kept (fail-open); run `memory embed` to make them filterable: {B:x}, {A:x}")
             );
         }
+    }
+
+    #[test]
+    fn a_memory_whose_summary_has_not_arrived_is_skipped_and_named() {
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::repo::SnapshotSource;
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let mut blobs = MemoryBlobStore::new();
+        let here = blobs.insert("the summary that arrived".to_owned().to_blob());
+        let elsewhere = "a summary still in flight"
+            .to_owned()
+            .to_blob()
+            .get_handle();
+        let mut facts = entity! {
+            ExclusiveId::force_ref(&A) @
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::summary: here,
+            ctx::start_at: point(0.0),
+            ctx::end_at: point(100.0),
+        };
+        facts += entity! {
+            ExclusiveId::force_ref(&B) @
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::summary: elsewhere,
+            ctx::start_at: point(100.0),
+            ctx::end_at: point(200.0),
+        };
+        let reader = blobs
+            .snapshot_at(Epoch::from_tai_seconds(300.0))
+            .expect("in-memory snapshot is infallible");
+        let report = render_cover_report(
+            facts.facts(),
+            &TribleSet::new(),
+            &reader,
+            &CoverOpts::plain(10_000),
+        )
+        .expect("a missing summary must not fail the render");
+        assert!(report.text.contains("the summary that arrived"));
+        let skipped = format_time_range(
+            key_to_epoch(interval_key(point(100.0))),
+            key_to_epoch(interval_key(point(200.0))),
+        );
+        assert!(
+            !report.text.contains(&skipped),
+            "the unreadable memory must not be emitted: {}",
+            report.text
+        );
+        let named = report.diagnostics.iter().any(|line| {
+            // The store names the cause in its own words (a pile says "not resident",
+            // the in-memory store "not found"); the count and the range are ours.
+            line.contains("1 memory(ies) skipped") && line.contains(&skipped)
+        });
+        assert!(named, "diagnostics: {:?}", report.diagnostics);
     }
 
     #[test]
