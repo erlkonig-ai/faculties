@@ -56,6 +56,56 @@ fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
     Ok(snapshot)
 }
 
+/// The weight roots a nomic pile may carry for one source, most wanted first:
+/// the calibrated packed NVFP4 model (`mary::calibrate`, label
+/// `nvfp4-calibrated`) when the pile has one, else the native f32 import.
+/// Both decode to the same f32 keymap for the embedder; the packed one is a
+/// seventh of the bytes on disk.
+const NOMIC_QUANTIZATIONS: [&str; 2] = ["nvfp4-calibrated", mary::persist::QUANTIZATION_NATIVE];
+
+/// The first root of `source` in the pile, in [`NOMIC_QUANTIZATIONS`] order.
+fn select_weights(
+    snapshot: &ModelPileSnapshot,
+    source: &str,
+    pile: &Path,
+) -> Result<std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>> {
+    let quantization = NOMIC_QUANTIZATIONS
+        .iter()
+        .copied()
+        .find(|quantization| {
+            mary::selection::select_model_roots(
+                snapshot.facts(),
+                snapshot.store(),
+                ModelSelector::Source {
+                    source,
+                    quantization,
+                },
+            )
+            .is_ok()
+        })
+        .with_context(|| {
+            format!(
+                "{} carries no {source} root labelled {}",
+                pile.display(),
+                NOMIC_QUANTIZATIONS.join(" or ")
+            )
+        })?;
+    mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.store(),
+        ModelSelector::Source {
+            source,
+            quantization,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "select {quantization} {source} weights from {}",
+            pile.display()
+        )
+    })
+}
+
 /// Load nomic-embed-text-v1.5 entirely from one canonical collection snapshot.
 ///
 /// Absence or ambiguity of either the native weight graph or tokenizer graph
@@ -64,15 +114,7 @@ fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let pile = text_pile();
     let snapshot = load_model_snapshot(&pile, NOMIC_TEXT_MODEL)?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
-            source: NOMIC_TEXT_MODEL,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
-    )
-    .with_context(|| format!("select native Nomic text weights from {}", pile.display()))?;
+    let keymap = select_weights(&snapshot, NOMIC_TEXT_MODEL, &pile)?;
     let tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
         snapshot.store(),
@@ -93,15 +135,7 @@ pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::b
 pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
     let pile = vision_pile();
     let snapshot = load_model_snapshot(&pile, NOMIC_VISION_MODEL)?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
-            source: NOMIC_VISION_MODEL,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
-    )
-    .with_context(|| format!("select native Nomic vision weights from {}", pile.display()))?;
+    let keymap = select_weights(&snapshot, NOMIC_VISION_MODEL, &pile)?;
 
     mary::embed::load_nomic_vision_from_keymap(keymap, mary::embed::default_device()).with_context(
         || {

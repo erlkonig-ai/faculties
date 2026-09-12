@@ -636,7 +636,7 @@ pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -
             let handle = *fact.v::<Handle<Embedding>>();
             let _: anybytes::View<[f32]> = reader.get(handle).map_err(|error| {
                 anyhow!(
-                    "strictly read Files CLIP embedding {}: {error:?}",
+                    "strictly read legacy Files embedding (CLIP era) {}: {error:?}",
                     hex::encode(handle.raw)
                 )
             })?;

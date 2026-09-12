@@ -33,14 +33,14 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::*;
-use triblespace_search::schemas::Embedding;
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
-type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
+/// A vector in the shared 768-d text and image space (`schemas::embeddings`).
+type SharedHandle = Inline<inlineencodings::Handle<embeddings::Embedding768>>;
 /// Handle into the nomic-embed-multimodal-7b dense space (3584-d). A distinct
-/// type from `EmbHandle` (CLIP-512) so the two spaces index independently and
+/// type from `SharedHandle` (nomic 768-d) so the two spaces index independently and
 /// can never collide in one HNSW.
 type Mm7bHandle = Inline<inlineencodings::Handle<embeddings::Embedding3584>>;
 
@@ -386,44 +386,22 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
     }
 }
 
-/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB) from its native model
-/// collection (`CLIP_PILE` overrides the path; import with source
-/// `openai/clip-vit-base-patch32` and quantization `native`). The weights and
-/// named tokenizer are selected from one frozen collection snapshot; no HF
-/// cache or side-file participates in runtime authority. SigLIP so400m swaps
-/// in behind this same trait later.
+/// The image side of the shared 768-d space: nomic-embed-vision-v1.5 from its
+/// native model pile (`NOMIC_VISION_PILE` overrides the path), the same
+/// coordinates nomic-embed-text-v1.5 puts prose into, so a text query finds an
+/// image by cosine alone (JP, 2026-09-12: "we shouldn't use nomic and clip
+/// because that prevents us from finding the images when searching for
+/// text"). Prefers a packed NVFP4 root when the pile carries one; see
+/// [`crate::nomic`].
 #[cfg(feature = "local-embed")]
-fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
-    const CLIP_MODEL: &str = "openai/clip-vit-base-patch32";
-    let pile = match std::env::var_os("CLIP_PILE") {
-        Some(p) => PathBuf::from(p),
-        None => crate::model_dir().join("clip.pile"),
-    };
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-        .context("discover and freeze the sole native Mary CLIP model collection")?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        mary::selection::ModelSelector::Source {
-            source: CLIP_MODEL,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
-        },
-    )
-    .context("select native CLIP weights")?;
-    let tokenizer = mary::selection::load_tokenizer_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        mary::selection::TokenizerSelector::Name(CLIP_MODEL),
-    )
-    .context("select native CLIP tokenizer")?;
-    let emb = mary::embed::clip_from_parts(keymap, tokenizer, mary::embed::default_device())?;
-    Ok(Box::new(emb))
+fn load_image_embedder() -> Result<Box<dyn ImageEmbedder>> {
+    Ok(Box::new(crate::nomic::load_vision_embedder()?))
 }
 
 /// Embed an image on `add` and stage it as `file::embedding` exhaust (stored
 /// under the file's intrinsic record id, so identity is unaffected). Lazy-loads
 /// the embedder on the first image. No-op without `local-embed` or for
-/// non-raster mimes (SVG isn't a bitmap CLIP can decode).
+/// non-raster mimes (SVG isn't a bitmap the vision tower can decode).
 #[allow(unused_variables)]
 fn embed_image_on_add(
     embedder: &mut Option<Box<dyn ImageEmbedder>>,
@@ -436,8 +414,8 @@ fn embed_image_on_add(
             return Ok(None);
         }
         if embedder.is_none() {
-            eprintln!("files: loading CLIP embedder (once)…");
-            *embedder = Some(load_clip_embedder()?);
+            eprintln!("files: loading nomic-vision embedder (once)…");
+            *embedder = Some(load_image_embedder()?);
         }
         return Ok(Some(embedder.as_ref().unwrap().embed_image(bytes)?));
     }
@@ -449,20 +427,20 @@ fn embed_image_on_add(
 }
 
 /// Embed a text query into the shared image+text space (for `files similar
-/// --text`). Loads the embedder fresh — a one-off query, no warm handle needed.
+/// --text`): nomic-embed-text-v1.5's query side, the coordinates the images
+/// were embedded into. Loads the embedder fresh — a one-off query.
 #[allow(unused_variables)]
 fn embed_text_query(text: &str) -> Result<Vec<f32>> {
     #[cfg(feature = "local-embed")]
     {
-        let emb = load_clip_embedder()?;
-        return emb.embed_text(text);
+        return crate::nomic::load_text_embedder()?.embed_query(text);
     }
     #[cfg(not(feature = "local-embed"))]
     bail!("`files similar --text` needs the embedder — rebuild with --features local-embed");
 }
 
 // ── nomic-embed-multimodal-7b seam (3584-d dense space) ───────────────────
-// A SEPARATE, additive path from the CLIP one above. The 7b model embeds both
+// A SEPARATE, additive path from the shared 768-d one above. The 7b model embeds both
 // images (`embed_image`, pure-Rust decode→preprocess→vision→backbone) and text
 // queries (`embed_query`) into one 3584-d space — strong text→image retrieval.
 // Loaded once per command (cold mmap ~20s, then ~0.5-1s/embed). macOS/Metal
@@ -580,8 +558,8 @@ fn build_tree(
         if let Some(vector) = embedding {
             // Exhaust: stored under the intrinsic record id, so identity holds.
             let fid = frag.root().expect("file entity has an intrinsic id");
-            let eh: EmbHandle = frag.put::<Embedding, _>(vector);
-            frag += entity! { ExclusiveId::force_ref(&fid) @ file::embedding: eh };
+            let eh: SharedHandle = frag.put::<embeddings::Embedding768, _>(vector);
+            frag += entity! { ExclusiveId::force_ref(&fid) @ embeddings::attr::embedding: eh };
         }
         Ok(frag)
     } else if meta.is_dir() {
@@ -816,8 +794,8 @@ fn stage_byte_import(
     let mut change = file_capability::stage(bytes, name, &mime)?;
     let file_id = change.root().expect("staged file has a root");
     if let Some(vector) = embedding {
-        let handle: EmbHandle = change.put::<Embedding, _>(vector);
-        change += entity! { ExclusiveId::force_ref(&file_id) @ file::embedding: handle };
+        let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(vector);
+        change += entity! { ExclusiveId::force_ref(&file_id) @ embeddings::attr::embedding: handle };
     }
     let import = entity! {
         metadata::tag: &KIND_IMPORT,
@@ -1381,14 +1359,113 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 // ── main ─────────────────────────────────────────────────────────────────
 
 /// Read a stored embedding blob back into a plain `Vec<f32>`.
-fn read_embedding<R: BlobStoreGet>(reader: &R, h: EmbHandle) -> Result<Vec<f32>> {
-    let v: anybytes::View<[f32]> = reader.get(h).context("read embedding blob")?;
+fn read_embedding_768<R: BlobStoreGet>(reader: &R, h: SharedHandle) -> Result<Vec<f32>> {
+    let v: anybytes::View<[f32]> = reader.get(h).context("read shared-space embedding blob")?;
     Ok(v.as_ref().to_vec())
+}
+
+/// Embed every image file into the shared 768-d space with nomic-embed-vision
+/// and store the vector on `embeddings::attr::embedding` under the file's
+/// intrinsic record id: exhaust, identity unaffected. Images embed on `add`
+/// since 2026-09-12; this is for the ones stored before that, and for a pile
+/// whose images were embedded by an earlier model. Idempotent: files already
+/// carrying a shared-space vector are skipped unless `force`. Identical bytes
+/// are embedded once and the vector fanned out to every entity sharing them.
+#[allow(unused_variables)]
+fn cmd_embed<P: TriblePattern>(
+    pile: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    space: &P,
+    reader: &PileSnapshot,
+    force: bool,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    #[cfg(not(feature = "local-embed"))]
+    bail!("`files embed` needs the embedder — rebuild with --features local-embed");
+    #[cfg(feature = "local-embed")]
+    {
+        let mut groups: BTreeMap<String, (FileHandle, Vec<(Id, bool)>)> = BTreeMap::new();
+        for (eid, h) in find!(
+            (eid: Id, h: FileHandle),
+            pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
+        ) {
+            let mime = read_mime(space, reader, eid)?.unwrap_or_default();
+            if !mime.starts_with("image/") || mime == "image/svg+xml" {
+                continue;
+            }
+            let has = exists!(
+                (e: SharedHandle),
+                pattern!(space, [{ eid @ embeddings::attr::embedding: ?e }])
+            );
+            groups
+                .entry(handle_hex(h))
+                .or_insert_with(|| (h, Vec::new()))
+                .1
+                .push((eid, has));
+        }
+        if groups.is_empty() {
+            out.line("(no image files to embed)".to_string())?;
+            return Ok(());
+        }
+        let pending: Vec<_> = groups
+            .into_iter()
+            .filter(|(_, (_, eids))| force || eids.iter().any(|(_, has)| !*has))
+            .collect();
+        let total_imgs: usize = pending.iter().map(|(_, (_, e))| e.len()).sum();
+        if pending.is_empty() {
+            out.line("All image files already have a shared-space embedding (use --force to re-embed).".to_string())?;
+            return Ok(());
+        }
+
+        let embedder = load_image_embedder()?;
+        let mut change = Fragment::empty();
+        let (mut embedded, mut assigned, mut failed) = (0usize, 0usize, 0usize);
+        for (hash, (content, eids)) in &pending {
+            let bytes: anybytes::Bytes = match reader.get::<anybytes::Bytes, _>(*content) {
+                Ok(b) => b,
+                Err(e) => {
+                    out.line(format!("  skip {hash}: read content failed: {e:?}"))?;
+                    failed += 1;
+                    continue;
+                }
+            };
+            let v = match embedder.embed_image(bytes.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.line(format!("  skip {hash}: embed failed: {e:#}"))?;
+                    failed += 1;
+                    continue;
+                }
+            };
+            embedded += 1;
+            for (eid, has) in eids {
+                if *has && !force {
+                    continue;
+                }
+                let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(v.clone());
+                change += entity! { ExclusiveId::force_ref(eid) @ embeddings::attr::embedding: handle };
+                assigned += 1;
+            }
+            out.line(format!("  embedded {hash}  ({} bytes → 768-d)", bytes.len()))?;
+        }
+        if change.is_empty() {
+            out.line(format!("Nothing to commit (embedded {embedded}, failed {failed})."))?;
+            return Ok(());
+        }
+        pile.commit(collection, signer, change)
+            .context("commit Files shared-space embeddings")?;
+        out.line(format!(
+            "embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
+            if failed > 0 { format!(", {failed} failed") } else { String::new() }
+        ))?;
+        Ok(())
+    }
 }
 
 /// Embed every image file with nomic-embed-multimodal-7b and store the 3584-d
 /// vector on `attr_mm7b::embedding` (under the file's intrinsic record id, so
-/// identity is unaffected — pure exhaust). Additive to the CLIP `file::embedding`
+/// identity is unaffected — pure exhaust). Additive to the shared-space `attr::embedding`
 /// path: both coexist. Idempotent — already-embedded files are skipped unless
 /// `--force`. Identical bytes (duplicate imports) are embedded once and the
 /// vector fanned out to every entity that shares the content.
@@ -1753,13 +1830,13 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
 
 /// Semantic nearest-neighbour search over image embeddings.
 ///
-/// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding>` per
+/// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding768>` per
 /// image file); the HNSW index itself is rebuilt on demand here — at this
 /// scale a build is sub-second, so there is no stale index to maintain. The
 /// query is pile-native: `candidates_above` walks the graph, and the optional
 /// `--tag` filter is the hybrid join that separates real forms from mascots.
 /// With `mm7b`, the query and candidates live in the 3584-d nomic-7b space
-/// (`attr_mm7b::embedding`, populated by `files embed-7b`) instead of CLIP-512.
+/// (`attr_mm7b::embedding`, populated by `files embed7b`) instead of the 768-d one.
 fn cmd_similar<P: TriblePattern>(
     space: &P,
     reader: &PileSnapshot,
@@ -1782,39 +1859,40 @@ fn cmd_similar<P: TriblePattern>(
         (Some(t), _) => (embed_text_query(t)?, None, format!("{t:?}")),
         (None, Some(idstr)) => {
             let eid = file_capability::resolve_selector(space, idstr)?;
-            let h: EmbHandle = find!(
-                (h: EmbHandle),
-                pattern!(space, [{ eid @ file::embedding: ?h }])
+            let h: SharedHandle = find!(
+                (h: SharedHandle),
+                pattern!(space, [{ eid @ embeddings::attr::embedding: ?h }])
             )
             .map(|(h,)| h)
             .next()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "that file has no embedding — only image/* files are embedded \
-                     on `add` (re-add it), or query with --text instead"
+                    "that file has no embedding in the shared space — images embed \
+                     on `add`; `files embed` embeds the ones already stored; or \
+                     query with --text instead"
                 )
             })?;
             let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-            (read_embedding(reader, h)?, Some(eid), name)
+            (read_embedding_768(reader, h)?, Some(eid), name)
         }
         (None, None) => bail!("give a file id/hash, or --text \"a query\""),
     };
 
     // Every embedded file: (entity, handle). Read each vector back from the
     // pile and stage it into a local store the HNSW can attach to.
-    let pairs: Vec<(Id, EmbHandle)> = find!(
-        (eid: Id, h: EmbHandle),
-        pattern!(space, [{ ?eid @ file::embedding: ?h }])
+    let pairs: Vec<(Id, SharedHandle)> = find!(
+        (eid: Id, h: SharedHandle),
+        pattern!(space, [{ ?eid @ embeddings::attr::embedding: ?h }])
     )
     .collect();
     if pairs.is_empty() {
-        bail!("no embedded files yet — add some images first");
+        bail!("no files in the shared space yet — `files embed` embeds every image already stored; new images embed on add");
     }
 
     // Read every embedding into a plain vector and run the pure NN core.
     let mut vec_pairs: Vec<(Id, Vec<f32>)> = Vec::with_capacity(pairs.len());
     for (eid, h) in &pairs {
-        vec_pairs.push((*eid, read_embedding(reader, *h)?));
+        vec_pairs.push((*eid, read_embedding_768(reader, *h)?));
     }
     let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
 
@@ -2080,7 +2158,7 @@ impl Files {
 
     /// Import resident bytes without manufacturing a temporary filesystem path.
     /// Returns the intrinsic file id; import provenance is exhaust of publication.
-    /// With `local-embed`, raster images also require the configured CLIP model
+    /// With `local-embed`, raster images also require the configured nomic-vision model
     /// and runtime for the same automatic embedding used by CLI image imports.
     pub fn add_bytes(
         &self,
@@ -2170,6 +2248,16 @@ impl Files {
                 out,
             )
         })
+    }
+
+    /// Embed every stored image into the shared 768-d space (see [`cmd_embed`]).
+    pub fn embed(&self, force: bool, out: &mut Out<'_>) -> Result<()> {
+        with_files_view(
+            &self.storage,
+            |store, collection, signer, facts, snapshot, _| {
+                cmd_embed(store, collection, signer, facts, snapshot, force, out)
+            },
+        )
     }
 
     pub fn embed7b(&self, options: &EmbeddingOptions, out: &mut Out<'_>) -> Result<()> {

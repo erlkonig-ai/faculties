@@ -32,7 +32,7 @@ const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProper
 const TOOLS: &[Tool] = &[
     Tool {
         name: "files_add",
-        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. With local-embed builds, raster images also compute CLIP embeddings and require the launcher-configured model/runtime.",
+        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. With local-embed builds, raster images also embed through nomic-vision into the shared 768-d text and image space and require the launcher-configured model/runtime.",
         input_schema: r#"{"type":"object","properties":{"data":{"type":"string","description":"Base64-encoded file bytes"},"name":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["data","name","mime"],"additionalProperties":false}"#,
     },
     Tool {
@@ -52,7 +52,7 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. With local-embed builds, raster images also compute CLIP embeddings and require the launcher-configured model/runtime.",
+        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. With local-embed builds, raster images also embed through nomic-vision into the shared 768-d text and image space and require the launcher-configured model/runtime.",
         input_schema: r#"{"type":"object","properties":{"url":{"type":"string"},"mime":{"type":"string"},"name":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"max_bytes":{"type":"integer","minimum":1,"default":8388608}},"required":["url"],"additionalProperties":false}"#,
     },
     Tool {

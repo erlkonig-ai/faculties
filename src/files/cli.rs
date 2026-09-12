@@ -129,6 +129,11 @@ const VERBS: &[Verb] = &[
         ],
     },
     Verb {
+        name: "embed",
+        about: "Embed every stored image into the shared text+image space with nomic-vision (requires local-embed)",
+        params: &[Param::caller("force", "Re-embed files already carrying a shared-space embedding").flag()],
+    },
+    Verb {
         name: "embed7b",
         about: "Embed images or PDF pages with nomic-embed-multimodal-7b (requires local-embed)",
         params: &[
@@ -292,6 +297,7 @@ fn execute_with_input(
             },
             out,
         ),
+        "embed" => files.embed(invocation.flag("force"), out),
         "embed7b" => files.embed7b(
             &EmbeddingOptions {
                 force: invocation.flag("force"),
