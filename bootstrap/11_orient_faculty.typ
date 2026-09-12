@@ -29,7 +29,7 @@ as presented, after the complete report has been flushed.
   - `orient wake` at session start and after compaction
   - `orient show` after a pause or before context-switching
   - `orient poll` from non-blocking per-turn hooks
-  - `orient wait` as the idle point of a self-paced loop
+  - `orient wait` with a harness delivery bridge for idle notifications
   - `orient baseline` for an explicit quiet starting point
 
 == `orient wait`
@@ -58,6 +58,19 @@ explicitly activated descriptor, but `orient wait` is still what turns newly
 arrived state into a local notification. `orient poll` performs that pile-backed
 news check without blocking; `--peek` reports without adding any `Presented`
 facts.
+
+Process wake and model-turn wake are separate. In Codex, launch the one-shot
+`faculties/hooks/codex/orient_wait.sh` wrapper from the owning window's
+long-running exec. It forwards the report with `codex queue` to the exact
+session, retries delivery failures without rereading Orient, then exits for
+the root to rearm. A bare background exec completing is not enough to promise
+an idle Codex turn will start. See
+[Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
+for the persona/session distinction and handover procedure.
+
+Current limitation: the Habit sweep is not persona-filtered. Due habits can
+therefore be broader than your directed inbox; do not complete another
+agent's habit just because it was included in your report.
 
 == When not to use it
 

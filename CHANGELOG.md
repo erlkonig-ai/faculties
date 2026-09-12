@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Portable bootstrap onboarding now distinguishes Orient notification from
+  Codex turn delivery, teaches the one-shot queue wrapper and per-window
+  persona/session ownership, and documents the current Habit filtering and
+  in-process retry limits. The scaffold exercise uses the atomic cohort
+  installer. Updated seed text ships when the bootstrap binary is rebuilt.
+
 - Codex Orient hooks launch a one-shot wait-to-queue wrapper: successful news
   wakes the same thread through `codex queue`, with sender provenance retained
   in the notification. Failed queue delivery retries the captured report;

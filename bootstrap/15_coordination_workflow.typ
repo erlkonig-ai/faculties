@@ -79,14 +79,29 @@ but that policy is separate from Compass and from the diagnostic record.
 
 == Orient wait for idle agents
 
+With a harness that delivers tracked task completion into a new turn:
+
 ```sh
 orient wait
 ```
 
+For Codex, use the one-shot queue bridge in the owning window instead:
+
+```sh
+sh faculties/hooks/codex/orient_wait.sh "$CODEX_THREAD_ID" \
+  --pile "$PILE" --persona "$PERSONA"
+```
+
+Retain that exec session and rearm after its successful delivery. The persona
+is the attention recipient; the Codex thread id is the destination session.
+Keep one watcher owner per persona/pile pair. Polling a report and later
+receiving its queued copy does not make it two separate work requests.
+
 With a persona set, the watcher wakes for directed news: unread inbox or group
 messages, relevant goal transitions, new goals tagged with the persona or one
 of its Relations groups, and newly status-bearing windows. An agent's own
-status edits stay quiet.
+status edits stay quiet. The current Habit sweep is broader: it is not yet
+persona-filtered, so honor ownership when another agent's habit appears.
 
 == Cross-references
 

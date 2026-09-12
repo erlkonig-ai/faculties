@@ -485,6 +485,15 @@ The bootstrap is ordinary source: edit `bootstrap/*.typ` and the
 declarative manifest in `src/bootstrap.rs`, then run
 `bootstrap/build.sh`. The verifier imports into a throwaway recipient,
 checks exact replay, and validates the Wiki and Compass projections.
+The prose is embedded at compile time: editing the sources does not update an
+already installed `bootstrap` binary. Include a rebuilt importer in the next
+tested native cohort before importing that generation. There is no pre-signed
+`bootstrap.pile` artifact to patch or concatenate into a recipient.
+
+The harness guide includes the [Codex Orient wake bridge](hooks/codex/README.md):
+one owned wait queues its report to the exact Codex session. `PERSONA` selects
+attention; the session id selects delivery. Set up and test both when adding a
+new agent window.
 
 ## Why
 

@@ -20,6 +20,11 @@ reconciled explicitly.
   + `compass list todo` (filter to a tag with `--tag bootstrap`
     if there are non-onboarding goals mixed in) — see your
     bootstrap tasks.
+  + If this is a collaborating agent window, set `PERSONA` to your own
+    Relations identity and install the
+    [harness delivery bridge](wiki:5c86df3dcd5994de2967483fca7170ac).
+    Codex needs the one-shot Orient-to-queue wrapper addressed to this exact
+    Codex session; a bare background wait does not establish idle delivery.
 
 == Step 2: project-specific context
 

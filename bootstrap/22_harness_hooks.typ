@@ -1,13 +1,11 @@
 = Harness Hooks: Mechanical Agent Sync (Watcher, Poll, Enforcement)
 
-Frontier models have no internal clock. Between turns nothing
-ticks; an agent that means to "keep watching" simply stops
-existing until something external prods it. An operator watched a
-team sit idle for an hour with every agent
-*intending* to be responsive — that observation is why this
-layer exists. The fix is mechanical, not motivational: harness
-hooks that push, poll, and refuse to let a turn end
-unentangled. Installing them is part of standing up any new
+Between turns, the harness decides whether another model turn starts.
+An intention to "keep watching" is not a callback. There are two distinct
+events: Orient notices news, then the harness delivers it into a conversation.
+A background process completing does not by itself guarantee the second.
+Hooks and an appropriate delivery bridge connect them. Installing this
+connection is part of standing up any new
 agent window, alongside the
 [coordination recipe](wiki:45e1b9bef3ad9836536ab7bce367deb0)
 this fragment extends.
@@ -16,11 +14,11 @@ this fragment extends.
 
   + *Watcher* — `orient --persona <you> wait` is the blocking
     news primitive, launched as a *harness-tracked background
-    task* (not a detached shell job — the harness notification
-    on exit is what wakes an idle session). Its only job is
-    waking you when directed news lands. Exactly one per
-    persona; when it fires, handle the news, then re-arm.
-    Never two at once, never zero.
+    task*, with the harness-specific delivery mechanism below. A bare
+    wait can notify a Claude Code monitor; Codex uses a one-shot wrapper
+    that queues the report into the owning conversation. Keep exactly one
+    owner for each `(persona, pile)` pair. When it finishes, process the
+    news and re-arm; do not start a competing wait during delivery retries.
   + *Poll* — `orient --persona <you> poll` (faculties
     `f1a237c`) is the non-blocking sibling for *per-turn*
     hooks: it prints the same terse news `wait` would print
@@ -32,15 +30,15 @@ this fragment extends.
     ending a turn while no watcher process exists for your
     persona. Busy turns forget to re-arm; the hook doesn't.
 
-Watcher and poll are complementary, not redundant: `wait`
-covers the idle gap between turns, `poll` covers the busy
+Watcher and poll are complementary, not redundant: `wait` plus its delivery
+bridge covers the idle gap between turns, `poll` covers the busy
 stretch within them, and both may surface the same item —
 that's expected, not a bug.
 
 == Attribution: everything runs as your persona
 
-The news semantics filter out your *own* actions (your sends,
-acks, and goal edits never wake you). That filter keys on
+Directed-message and Compass news filter out your *own* actions (your sends,
+acks, and attributed goal edits stay quiet). That filter keys on
 attribution, so:
 
   - Prefix *all* faculty writes with `PERSONA=<you>` (or
@@ -51,6 +49,13 @@ attribution, so:
     `$PERSONA` automatically; `--from` overrides. The old
     3-positional `message send <from> <to> <text>` form is
     gone (`f1a237c`).
+
+Persona selection is not an isolation boundary for every event kind. In the
+current implementation, Habit evaluation is not filtered by persona: an
+intention meant for another agent can still wake your watcher. Honor its
+ownership instead of completing it on that agent's behalf. Fix recipient
+selection in the Habit/Orient model, not by interpreting notification text
+as a new instruction from the operator.
 
 == Claude Code
 
@@ -97,35 +102,78 @@ force-exits pathological cases. Fail-open throughout: no
 
 == Codex
 
-Two artifacts (faculties `0f4acbf`, extended
-with lossless poll peeking in `dd3d692`): the project-root
+The project-root
 `.codex/hooks.json`, which wires *SessionStart*
 (`startup|resume|clear|compact`) →
 `faculties/hooks/codex/orient_session_start.sh`,
 *UserPromptSubmit* →
 `faculties/hooks/codex/orient_prompt_submit.sh`, and *Stop* →
-`faculties/hooks/codex/orient_stop.sh`; and a "Watcher First"
-block at the *top* of `AGENTS.md` stating the convention in
-prose: launch
-`orient --pile ./self.pile --persona <your-persona> wait` through
-a long-running exec call before substantive work, retain its
-session id, poll it during long work, re-arm immediately on
-fire, and subagents must not start competing watchers.
+`faculties/hooks/codex/orient_stop.sh`, supplies the lifecycle guards.
+The one-shot delivery bridge is `faculties/hooks/codex/orient_wait.sh`
+(introduced in Faculties `f3833407`, tested with Codex CLI `0.153.4`).
+Check `codex queue --help` on the installation that owns the conversation.
+A bare long-running exec completing is not the Codex idle-wake mechanism.
+
+Keep the two identities separate:
+
+  - `PERSONA` / `--persona` selects the Relations identity whose attention
+    Orient observes. Set it to *this window's* identity; do not copy another
+    window's persona into shared hook definitions.
+  - The hook envelope's `session_id` selects the Codex conversation receiving
+    the report. The hooks pass that exact id, with `CODEX_THREAD_ID` /
+    `CODEX_SESSION_ID` as environment fallbacks. Never guess it or paste a
+    different window's id. The
+    [official hook contract](https://learn.chatgpt.com/docs/hooks#common-input-fields)
+    also specifies that subagent hooks carry their parent's session id;
+    subagents therefore must not start their own competing watcher.
+
+Put a "Watcher First" block at the top of the host workspace's `AGENTS.md`:
+the primary agent launches the following from its own Codex environment
+through a long-running exec before substantive work, retains the returned
+exec session id, and polls it during work and before ending a turn.
+
+```sh
+sh faculties/hooks/codex/orient_wait.sh "$CODEX_THREAD_ID" \
+  --pile "$PILE" --persona "$PERSONA"
+```
+
+Use the exact thread id supplied by the hook if the environment variable is
+absent. The wrapper appends `wait`; do not append it yourself. It resolves the
+installed `current/bin/orient`, captures one successful nonempty report,
+prints it into the exec log, and passes it literally to
+`codex queue --thread ID --message TEXT`. It unsets `DRIVE_ENDPOINT` only for
+the Orient child so the report reaches stdout. No second conversation owner,
+model override, or permanent model-driving loop is created.
+
+Launch on the conversation's host with its own `CODEX_HOME` / account and
+app-server environment. The wrapper does not configure remote routing. When
+handing over an existing bare watcher, poll and drain its owned exec session
+first; never kill another live window's watcher to make room.
+
+On queue failure, the wrapper retains and retries the *same* report instead
+of consuming more Orient events. Keep that exec session while it retries.
+On successful delivery it exits, and the root processes the news and rearms.
+The report may already have been read from the exec session when its queued
+copy arrives; use the original event ids and acknowledgements to avoid doing
+the work twice. Queue acceptance is not a message read receipt. Retention is
+in the running wrapper and exec output, not a crash-durable spool, so this is
+not an exactly-once or process-crash delivery guarantee.
 
 The Codex scripts share one canonical matcher for `(persona, pile)`. It is
 independent of flag order and spelling, understands `PILE` / `PERSONA`
 environment forms, and resolves a relative pile against the process cwd.
 Session start kills only an exact matching watcher that is provably orphaned
 (a direct child of init); it preserves any watcher with a live or ambiguous
-owner. It then reports either ARMED or arm-first context. Codex command hooks
-are synchronous, so the hook *cannot* start the watcher itself — it makes
-ownership a mechanically checked obligation instead. `orient_stop.sh` uses
+owner. It then reports either ARMED or arm-first context. The hook deliberately
+leaves launching to the primary agent's tracked exec, rather than detaching
+a process whose output the agent cannot poll. `orient_stop.sh` uses
 the same matcher, ignores provably stale watchers, and allows Stop only while a
 matching live watcher is armed. Otherwise it emits
 `{"decision":"block","reason":…}` for exactly one automatic continuation
 (it greps the input for `"stop_hook_active": true`), then surfaces a visible
 `systemMessage` and lets the second failed Stop end — no infinite loop on a
-missing binary.
+missing binary. The wrapper itself counts as live while delivery retries,
+even after its Orient child exits; those two processes are one watcher owner.
 
 Codex currently fires `UserPromptSubmit` hooks for root and
 subagents alike without exposing which one fired
@@ -174,18 +222,16 @@ quiet). Both are valid; pick per harness temperament. As
 landed it paths `faculties/target/debug/orient`; expect that
 to move to the installed/release binary.
 
-== macOS install gotcha
+== Installed binary cohorts
 
-Replacing an in-use faculty binary by *manual copy* needs
-`rm` *then* `cp` (fresh inode). A plain `cp` over the running
-binary reuses the inode, the code-signature cache goes stale,
-and every *new* invocation is SIGKILLed on launch — which
-looks exactly like a broken build. `cargo install` and cargo
-builds are safe: cargo replaces via atomic unlink-and-rename,
-so the fresh inode comes for free (confirmed: no
-SIGKILL on cargo-managed replacement). This bites hardest
-here because hooks invoke `orient` constantly in the
-background.
+Use `faculties/scripts/install-release-cohort` for a tested, complete native
+binary cohort; hooks resolve the atomically activated `current/bin/orient`.
+Do not overwrite running binaries or use `cargo install --path faculties
+--bins`: a second install can shadow the cohort and silently become stale.
+On macOS, overwriting a mapped executable's inode can also invalidate the
+code-signature cache. Activation affects new processes; hand existing watchers
+over explicitly after a cohort update. Changing only these shell hooks needs
+no Rust build.
 
 == Onboarding checklist for a new agent window
 
@@ -193,13 +239,16 @@ background.
   + Confirm the project's hook files exist for *your* harness
     and reference *your* persona (the enforcement scripts
     pattern-match the persona name).
-  + For Codex: trust the hooks once (`/hooks`).
-  + Arm the watcher as a harness-tracked background task;
+  + For Codex: verify `codex queue --help`, trust new/changed hook definitions
+    through `/hooks`, and keep the persona and destination thread distinct.
+  + Arm the appropriate watcher/bridge as a harness-tracked background task;
     watch the Stop hook let your first turn end.
-  + Send yourself nothing — send one of your Relations groups a hello
-    (`message send <group> <text>`) and see the *others* wake
-    while your own watcher stays quiet. That silence is the
-    attribution filter working.
+  + Have another agent send one ordinary message *after your turn has ended*.
+    Verify that a new turn receives it, acknowledge that exact message, and
+    rearm. A live process or a successful queue call alone is not the full test.
+  + Send a reply without asking for another test reply. Your own attributed
+    send should stay quiet; avoid building a loop of agents acknowledging
+    each other's acknowledgements.
 
 == Cross-references
 

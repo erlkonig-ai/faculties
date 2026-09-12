@@ -213,7 +213,7 @@ const COMPASS_SEED: &[CompassSeed] = &[
         created_nanosecond: 137_024_000,
         title: "Scaffold a trivial faculty",
         tags: &["bootstrap", "faculties", "authoring"],
-        note: "Mint an id with `trible genid`, add `faculties/src/bin/echofact.rs`: a clap Cli with `#[arg(long, env = \"PILE\")] pile`, that opens the pile and prints one fact (e.g. the id you minted). `cargo install --path faculties --bins`, then run `echofact`. You've added a verb. See the 'Authoring a Faculty' fragment for the full skeleton.",
+        note: "Mint an id with `trible genid`, add `faculties/src/bin/echofact.rs`: a clap Cli with `#[arg(long, env = \"PILE\")] pile`, that opens the pile and prints one fact (e.g. the id you minted). Build the native cohort following the workspace build-placement rules and activate it with `faculties/scripts/install-release-cohort`, then run `echofact`. You've added a verb. See the 'Authoring a Faculty' fragment for the full skeleton.",
     },
     CompassSeed {
         created_nanosecond: 148_025_000,
