@@ -122,7 +122,9 @@ fn fetch_budget() -> usize {
     8 * 1024 * 1024
 }
 fn similarity_floor() -> f32 {
-    0.15
+    // Text-to-image matches in the nomic space sit near 0.06; a floor that
+    // hides them hides the reason the space is shared.
+    0.0
 }
 fn similarity_limit() -> usize {
     10

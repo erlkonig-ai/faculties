@@ -116,7 +116,7 @@ const VERBS: &[Verb] = &[
                 .positional()
                 .optional(),
             Param::caller("text", "Text query for cross-modal search").optional(),
-            Param::caller("floor", "Minimum cosine similarity, 0..1").default("0.15"),
+            Param::caller("floor", "Minimum cosine similarity, 0..1; text-to-image matches in the nomic space sit near 0.06").default("0"),
             Param::caller("limit", "Maximum results")
                 .default("10")
                 .short('n'),

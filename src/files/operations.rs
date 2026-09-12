@@ -795,7 +795,8 @@ fn stage_byte_import(
     let file_id = change.root().expect("staged file has a root");
     if let Some(vector) = embedding {
         let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(vector);
-        change += entity! { ExclusiveId::force_ref(&file_id) @ embeddings::attr::embedding: handle };
+        change +=
+            entity! { ExclusiveId::force_ref(&file_id) @ embeddings::attr::embedding: handle };
     }
     let import = entity! {
         metadata::tag: &KIND_IMPORT,
@@ -1414,7 +1415,10 @@ fn cmd_embed<P: TriblePattern>(
             .collect();
         let total_imgs: usize = pending.iter().map(|(_, (_, e))| e.len()).sum();
         if pending.is_empty() {
-            out.line("All image files already have a shared-space embedding (use --force to re-embed).".to_string())?;
+            out.line(
+                "All image files already have a shared-space embedding (use --force to re-embed)."
+                    .to_string(),
+            )?;
             return Ok(());
         }
 
@@ -1444,13 +1448,19 @@ fn cmd_embed<P: TriblePattern>(
                     continue;
                 }
                 let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(v.clone());
-                change += entity! { ExclusiveId::force_ref(eid) @ embeddings::attr::embedding: handle };
+                change +=
+                    entity! { ExclusiveId::force_ref(eid) @ embeddings::attr::embedding: handle };
                 assigned += 1;
             }
-            out.line(format!("  embedded {hash}  ({} bytes → 768-d)", bytes.len()))?;
+            out.line(format!(
+                "  embedded {hash}  ({} bytes → 768-d)",
+                bytes.len()
+            ))?;
         }
         if change.is_empty() {
-            out.line(format!("Nothing to commit (embedded {embedded}, failed {failed})."))?;
+            out.line(format!(
+                "Nothing to commit (embedded {embedded}, failed {failed})."
+            ))?;
             return Ok(());
         }
         pile.commit(collection, signer, change)
@@ -1896,10 +1906,14 @@ fn cmd_similar<P: TriblePattern>(
     }
     let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
 
-    // Drop self (file query only), apply the hybrid tag filter, truncate.
+    // Drop self (file query only), apply the hybrid tag filter, truncate. One
+    // row per entity: an entity re-embedded (`files embed --force`, or the
+    // same bytes imported twice) carries several vectors in the append-only
+    // pile, and the ranked list holds them all; the first hit is its best.
     let mut rows: Vec<(f32, Id)> = Vec::new();
+    let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
     for (cos, eid) in ranked {
-        if Some(eid) == query_eid {
+        if Some(eid) == query_eid || !seen.insert(eid) {
             continue;
         }
         if !filter_tags.is_empty() {
