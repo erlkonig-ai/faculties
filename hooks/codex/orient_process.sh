@@ -3,7 +3,9 @@
 # Shared process inspection for the Codex Orient hooks. This file is sourced by
 # the event scripts; invoking it directly intentionally does nothing.
 
-# Print "persona<TAB>pile" for an Orient wait command. Process listings do not
+# Print "persona<TAB>pile" for Orient wait or its one-shot Codex wrapper.
+# A wrapper remains a live owner while retrying queue delivery, even after its
+# Orient child exits. Process listings do not
 # preserve shell quoting, so persona labels and pile paths containing whitespace
 # cannot be reconstructed reliably and deliberately do not match.
 orient_parse_wait_command() {
@@ -12,6 +14,20 @@ orient_parse_wait_command() {
         first = 1
         while (first <= NF && $first == "") first++
         command = ""
+        n = split($first, parts, "/")
+        executable = parts[n]
+        if (executable == "sh" || executable == "bash" || executable == "dash" || executable == "zsh") {
+          if (++first > NF) exit 1
+          n = split($first, parts, "/")
+          executable = parts[n]
+          if (executable != "orient_wait.sh") exit 1
+        }
+        if (executable == "orient_wait.sh") {
+          command = "wait"
+          if (++first > NF) exit 1 # Skip the required Codex thread argument.
+        } else if (executable != "orient") {
+          exit 1
+        }
         persona = ""
         pile = ""
         for (i = first + 1; i <= NF; i++) {
@@ -124,19 +140,22 @@ orient_watcher_pids() {
     # the argv shape without relying on that field. A configured executable
     # that was launched through another spelling (relative path or symlink) is
     # still accepted; exact persona + canonical pile + wait subcommand are the
-    # semantic identity, and commands wrapped inside a shell are rejected.
+    # semantic identity. Generic shell commands are rejected; the named
+    # one-shot wrapper is the only accepted shell script.
     while IFS= read -r orient_line; do
         orient_pid=${orient_line%% *}
         orient_command=${orient_line#* }
         [ "$orient_command" != "$orient_line" ] || continue
+        orient_executable=${orient_command%% *}
+        case "${orient_executable##*/}" in
+            orient|orient_wait.sh|sh|bash|dash|zsh) ;;
+            *) continue ;;
+        esac
         orient_command=$(
             ps -ww -p "$orient_pid" -o command= 2>/dev/null |
                 sed 's/^[[:space:]]*//' || true
         )
         [ -n "$orient_command" ] || continue
-        orient_executable=${orient_command%% *}
-        orient_executable_name=${orient_executable##*/}
-        [ "$orient_executable_name" = orient ] || continue
         orient_fields=$(orient_parse_wait_command "$orient_command" 2>/dev/null) || continue
         orient_persona=${orient_fields%%"$orient_tab"*}
         orient_pile=${orient_fields#*"$orient_tab"}
@@ -162,6 +181,18 @@ orient_watcher_pids() {
     done <<EOF
 $(ps -ww -A -o pid=,command= 2>/dev/null | sed 's/^[[:space:]]*//')
 EOF
+}
+
+# Hook envelopes name the parent session even for subagents. This supplies a
+# launch instruction only; the primary agent still exclusively owns the wait.
+orient_hook_thread_id() {
+    orient_thread=''
+    if command -v jq >/dev/null 2>&1; then
+        orient_thread=$(jq -r '.session_id | select(type == "string" and length > 0)' 2>/dev/null || true)
+    else
+        cat >/dev/null
+    fi
+    printf '%s\n' "${orient_thread:-${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}}"
 }
 
 # A direct child of init has lost the harness process that owned its output.

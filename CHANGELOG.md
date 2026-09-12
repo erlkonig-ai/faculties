@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Codex Orient hooks launch a one-shot wait-to-queue wrapper: successful news
+  wakes the same thread through `codex queue`, with sender provenance retained
+  in the notification. Failed queue delivery retries the captured report;
+  lifecycle guards recognize the wrapper during retries. No new Orient flag,
+  schema, model loop or Rust binary rebuild is needed.
+
 - The aggregate MCP catalogue now retains one explicitly shared pile, I/O
   runtime and lazy-fetch peer across tools, adapters and protocol sessions.
   Native operations accept the same storage owner while preserving fresh

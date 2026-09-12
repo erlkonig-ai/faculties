@@ -35,6 +35,20 @@ assert_fields '/opt/faculties/orient --persona=agent --pile=/tmp/self.pile wait'
 assert_fields '/opt/faculties/orient wait --pile=/tmp/self.pile --persona agent' agent /tmp/self.pile
 assert_fields '/opt/faculties/orient --key /tmp/key --persona=agent wait' agent ''
 assert_rejected '/opt/faculties/orient --persona agent --pile /tmp/self.pile show'
+assert_fields '/repo/hooks/codex/orient_wait.sh thread-id --pile /tmp/self.pile --persona agent' agent /tmp/self.pile
+assert_fields '/bin/sh /repo/hooks/codex/orient_wait.sh thread-id --persona=agent --pile=/tmp/self.pile' agent /tmp/self.pile
+assert_fields '/bin/bash /repo/hooks/codex/orient_wait.sh thread-id --persona agent' agent ''
+assert_rejected '/bin/sh -c orient --persona agent --pile /tmp/self.pile wait'
+assert_rejected '/bin/sh /repo/something-else.sh thread-id --persona agent --pile /tmp/self.pile wait'
+assert_rejected '/repo/hooks/codex/orient_wait.sh'
+assert_rejected '/bin/echo orient --persona agent --pile /tmp/self.pile wait'
+
+thread=$(printf '%s' '{"session_id":"hook-thread"}' | CODEX_THREAD_ID=environment-thread orient_hook_thread_id)
+[ "$thread" = hook-thread ] || exit 1
+thread=$(printf '%s' '{}' | CODEX_THREAD_ID=environment-thread orient_hook_thread_id)
+[ "$thread" = environment-thread ] || exit 1
+thread=$(printf '%s' '{"session_id":false}' | CODEX_THREAD_ID=environment-thread orient_hook_thread_id)
+[ "$thread" = environment-thread ] || exit 1
 
 fixture_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 expected="$fixture_dir/Cargo.toml"

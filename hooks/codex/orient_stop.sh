@@ -13,14 +13,13 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/orient_process.sh"
 faculties_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 project_dir=$(CDPATH= cd -- "$faculties_dir/.." && pwd)
-release_root=${FACULTIES_RELEASE_ROOT:-"$HOME/.local/lib/faculties"}
-orient="$release_root/current/bin/orient"
+wrapper="$script_dir/orient_wait.sh"
+thread=$(printf '%s' "$input" | orient_hook_thread_id)
 pile=${ORIENT_PILE:-"$project_dir/self.pile"}
 case "$pile" in
     /*) ;;
     *) printf '%s\n' '{"continue":true,"systemMessage":"Orient hook disabled: ORIENT_PILE must be an absolute path."}'; exit 0 ;;
 esac
-orient=$(orient_canonical_path "$orient" "$(pwd -P)" 2>/dev/null || printf '%s\n' "$orient")
 
 watcher_pids=$(orient_live_watcher_pids "$pile" "$persona")
 if [ -n "$watcher_pids" ]; then
@@ -36,17 +35,18 @@ if printf '%s' "$input" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*t
     exit 0
 fi
 
-if command -v jq >/dev/null 2>&1; then
+if command -v jq >/dev/null 2>&1 && [ -n "$thread" ]; then
     jq -n \
       --arg persona "$persona" \
-      --arg orient_shell "$(printf '%s' "$orient" | sed "s/'/'\\\\''/g")" \
+      --arg wrapper_shell "$(printf '%s' "$wrapper" | sed "s/'/'\\\\''/g")" \
+      --arg thread_shell "$(printf '%s' "$thread" | sed "s/'/'\\\\''/g")" \
       --arg pile_shell "$(printf '%s' "$pile" | sed "s/'/'\\\\''/g")" \
       --arg persona_shell "$(printf '%s' "$persona" | sed "s/'/'\\\\''/g")" '{
       decision: "block",
       reason: (
-        "The " + $persona + " orient watcher is not armed. Poll the previous watcher session for pending news, process anything it reported, then launch \u0027" + $orient_shell + "\u0027 --pile \u0027" + $pile_shell + "\u0027 --persona \u0027" + $persona_shell + "\u0027 wait through a long-running exec call and retain its session id before finishing."
+        "The " + $persona + " orient watcher is not armed. Poll the previous watcher session for pending news, process anything it reported, then launch sh \u0027" + $wrapper_shell + "\u0027 \u0027" + $thread_shell + "\u0027 --pile \u0027" + $pile_shell + "\u0027 --persona \u0027" + $persona_shell + "\u0027 through a long-running exec call and retain its session id before finishing. The wrapper queues one notification to this thread; do not replace it while queue delivery is retrying."
       )
     }'
 else
-    printf '%s\n' '{"decision":"block","reason":"The configured Orient watcher is not armed. Poll pending news, process it, then launch Orient wait through a long-running exec call and retain its session id before finishing."}'
+    printf '%s\n' '{"decision":"block","reason":"The configured Orient watcher is not armed. Run the one-shot hooks/codex/orient_wait.sh wrapper with this exact Codex thread id and the configured pile/persona through a long-running exec call. Retain its session id. If the thread id is unavailable, report that instead of guessing another conversation."}'
 fi
