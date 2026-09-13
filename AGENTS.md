@@ -34,6 +34,14 @@ feature).
 
 ## Running locally
 
+On a Spark, take the shared GB10 reservation before compiling. Agent launchers
+should also set `CARGO_BUILD_JOBS=4` and
+`RUSTC_WRAPPER=$PWD/scripts/rustc-expendable`: the wrapper
+makes each Linux rustc/linker tree an `oom_score_adj=1000` victim instead of
+letting SSH's `-1000` protection propagate into memory-heavy linkers. A manual
+build must set the same two values explicitly. Do not rely on a filtered test
+selector to bound linking; Cargo can still construct every binary test target.
+
 ```sh
 # from the repo root
 cargo build --bin wiki --release

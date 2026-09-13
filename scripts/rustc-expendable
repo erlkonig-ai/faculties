@@ -1,0 +1,20 @@
+#!/bin/sh
+# Keep compiler/linker memory pressure expendable on Linux build hosts.
+#
+# ssh.service is intentionally OOM-protected on the Sparks. Interactive agent
+# processes used to inherit that protection all the way into rustc and GNU ld,
+# allowing a linker fan-out to exhaust unified memory while the kernel killed
+# custody and the user session instead. Cargo's RUSTC_WRAPPER contract passes
+# the real rustc executable as argv[1], so exec "$@" preserves the invocation
+# after changing only this compiler process tree's OOM preference.
+set -eu
+
+if [ "$(uname -s)" = Linux ]; then
+    if ! printf '%s\n' 1000 > /proc/self/oom_score_adj; then
+        printf '%s\n' \
+            'rustc-expendable: cannot set oom_score_adj=1000; refusing an OOM-immune compile' >&2
+        exit 125
+    fi
+fi
+
+exec "$@"
