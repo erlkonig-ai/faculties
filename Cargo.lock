@@ -11849,6 +11849,7 @@ dependencies = [
  "triblespace-core",
  "triblespace-core-macros",
  "triblespace-macros-common",
+ "triblespace-paths",
 ]
 
 [[package]]
