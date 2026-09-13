@@ -1,15 +1,32 @@
 use std::fmt::Write as _;
 
 use anyhow::Result;
+use triblespace::core::id::Id;
 
 use super::{
     Activation, AddedHabit, HabitList, HabitObservation, HabitOccurrence, HabitStateChange, State,
 };
 use crate::out::Out;
 
+fn persona_targets(personas: &[Id]) -> String {
+    if personas.is_empty() {
+        "everyone".into()
+    } else {
+        personas
+            .iter()
+            .map(|id| format!("{id:x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 pub fn added(receipt: &AddedHabit, out: &mut Out<'_>) -> Result<()> {
     if receipt.already_present {
-        return out.line(format!("Habit already present [{:x}]", receipt.id));
+        out.line(format!("Habit already present [{:x}]", receipt.id))?;
+        return out.line(format!(
+            "  personas: {}",
+            persona_targets(&receipt.personas)
+        ));
     }
     let carried = receipt
         .script
@@ -24,6 +41,10 @@ pub fn added(receipt: &AddedHabit, out: &mut Out<'_>) -> Result<()> {
     out.line(format!(
         "added {} [{:x}] · cooldown {}s{carried}",
         receipt.label, receipt.id, receipt.cooldown_secs
+    ))?;
+    out.line(format!(
+        "  personas: {}",
+        persona_targets(&receipt.personas)
     ))?;
     for id in &receipt.supersedes {
         out.line(format!("  supersedes [{id:x}]"))?;
@@ -48,6 +69,7 @@ pub fn shown(observation: &HabitObservation, out: &mut Out<'_>) -> Result<()> {
     let habit = &observation.definition;
     out.line(format!("label:       {}", habit.label))?;
     out.line(format!("id:          {:x}", habit.id))?;
+    out.line(format!("personas:    {}", persona_targets(&habit.personas)))?;
     out.line(format!(
         "definition:  {}",
         if observation.superseded {

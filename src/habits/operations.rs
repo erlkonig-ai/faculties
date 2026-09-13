@@ -33,6 +33,7 @@ pub struct AddedHabit {
     pub cooldown_secs: i64,
     pub script: Option<(String, usize)>,
     pub supersedes: Vec<Id>,
+    pub personas: Vec<Id>,
     pub sharing: Vec<Id>,
     pub already_present: bool,
 }
@@ -81,12 +82,58 @@ impl Habits {
         nudge: &str,
         script: Option<&[u8]>,
         supersedes: &[String],
+        personas: &[String],
     ) -> Result<AddedHabit> {
         let cooldown_secs = Condition::parse(condition.trim())
             .map_err(anyhow::Error::msg)?
             .cooldown_secs;
         let carried = script.map(|bytes| (habits::script_digest(bytes), bytes.len()));
         with_habits(&self.storage, |session| {
+            // Exact ids need no Relations membership. Resolve labels only when
+            // the caller supplied them; an omitted audience stays global.
+            let mut targets = Vec::new();
+            if personas
+                .iter()
+                .all(|input| Id::from_hex(input.trim()).is_some())
+            {
+                targets.extend(
+                    personas
+                        .iter()
+                        .filter_map(|input| Id::from_hex(input.trim())),
+                );
+            } else {
+                let source = open_configured(
+                    session.pile,
+                    crate::schemas::relations::DEFAULT_SCOPE_ID,
+                    session.signer.verifying_key(),
+                )?;
+                let policy = source.policy(&session.pile.snapshot()?)?;
+                let succinct =
+                    session
+                        .pile
+                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 = session.pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    succinct,
+                    (),
+                    policy,
+                )?;
+                let snapshot = pollster::block_on(async {
+                    drop(session.pile.ensure(source).await?);
+                    drop(session.pile.maintain(succinct).await?);
+                    session.pile.maintain(rank9).await
+                })?;
+                let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
+                for input in personas {
+                    let input = input.trim();
+                    targets.push(match Id::from_hex(input) {
+                        Some(id) => id,
+                        None => crate::relations::resolve_person(&snapshot, &facts, input, true)?
+                            .require_unique("persona", input)?,
+                    });
+                }
+            }
+            targets.sort_unstable();
+            targets.dedup();
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let mut retiring = supersedes
@@ -101,6 +148,7 @@ impl Habits {
                 nudge,
                 script.map(<[u8]>::to_vec),
                 &retiring,
+                &targets,
             )?;
             let already_present = definitions.iter().any(|habit| habit.id == id);
             let sharing = definitions
@@ -122,6 +170,7 @@ impl Habits {
                 cooldown_secs,
                 script: carried,
                 supersedes: retiring,
+                personas: targets,
                 sharing,
                 already_present,
             })
@@ -395,10 +444,11 @@ mod tests {
         initialize_signer(&pile, Some(&key)).unwrap();
 
         let (original, original_id) =
-            habits::habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+            habits::habit_fragment("sweep", "every 1h", "sweep", None, &[], &[]).unwrap();
         habits::publish(&pile, Some(&key), original).unwrap();
         let (successor, successor_id) =
-            habits::habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+            habits::habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[])
+                .unwrap();
         habits::publish(&pile, Some(&key), successor).unwrap();
 
         let storage = Storage::new(pile.clone(), Some(key.clone()));

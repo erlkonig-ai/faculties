@@ -100,8 +100,16 @@ receiving its queued copy does not make it two separate work requests.
 With a persona set, the watcher wakes for directed news: unread inbox or group
 messages, relevant goal transitions, new goals tagged with the persona or one
 of its Relations groups, and newly status-bearing windows. An agent's own
-status edits stay quiet. The current Habit sweep is broader: it is not yet
-persona-filtered, so honor ownership when another agent's habit appears.
+status edits stay quiet. Habit sweeps include global intentions and those
+explicitly addressed to this persona. Give a personal clock an explicit
+target when creating it:
+
+```sh
+habit add my-tick --when "every 20m" --nudge "Check my current work" --persona "$PERSONA"
+```
+
+Repeat `--persona` for several recipients. Omit it for a global intention;
+the authoring command never inherits `PERSONA` as a target implicitly.
 
 == Cross-references
 

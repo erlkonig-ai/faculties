@@ -50,6 +50,10 @@ enum Command {
         /// the retired revision stays in the collection as history.
         #[arg(long, value_name = "ID")]
         supersedes: Vec<String>,
+        /// Notify this persona, by label or exact id. Repeatable. Omit to
+        /// notify everyone; the PERSONA environment variable is not used.
+        #[arg(long = "persona", value_name = "LABEL_OR_ID")]
+        personas: Vec<String>,
     },
     /// List every standing intention and its current fork-visible state.
     List,
@@ -129,11 +133,19 @@ pub fn run() -> Result<()> {
                 nudge,
                 script,
                 supersedes,
+                personas,
             } => {
                 let nudge = crate::text_arg(&nudge, "Habit nudge")?;
                 let script = script.as_deref().map(script_arg).transpose()?;
                 render::added(
-                    &habits.add(&label, &when, &nudge, script.as_deref(), &supersedes)?,
+                    &habits.add(
+                        &label,
+                        &when,
+                        &nudge,
+                        script.as_deref(),
+                        &supersedes,
+                        &personas,
+                    )?,
                     out,
                 )
             }

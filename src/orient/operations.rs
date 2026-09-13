@@ -1584,6 +1584,7 @@ struct HabitObservation {
 fn prepare_habits(
     snapshot: &FacultySnapshot,
     facts: &FactArchive,
+    persona: Option<Id>,
 ) -> Result<(Vec<habits::HabitRow>, HabitObservation)> {
     let mut rows = Vec::new();
     let mut observation = HabitObservation::default();
@@ -1608,6 +1609,17 @@ fn prepare_habits(
 
     for (habit, label, condition_handle, nudge_handle) in definitions {
         if superseded.contains(&habit) {
+            continue;
+        }
+        // Attention routing is a fact on the intention, not its author. Check
+        // before fetching payloads or executing any predicate. Without an
+        // observer, only global intentions apply.
+        let targeted = exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]));
+        if targeted
+            && !persona.is_some_and(|persona| {
+                exists!(pattern!(facts, [{ habit @ habit_attrs::persona: &persona }]))
+            })
+        {
             continue;
         }
         let condition = read_utf8(snapshot, condition_handle, "Habit condition")?;
@@ -1773,13 +1785,21 @@ fn observe_habits(
     Ok(observation)
 }
 
-fn render_passive_habits(facts: &FactArchive) -> String {
+fn render_passive_habits(facts: &FactArchive, persona: Option<Id>) -> String {
     use std::fmt::Write as _;
     let superseded: BTreeSet<Id> = find!(old: Id, pattern!(facts, [{ _?new @ metadata::tag: &KIND_HABIT_ID, metadata::supersedes: ?old }])).collect();
     let mut text = String::from("Habits (passive; conditions not evaluated):\n");
     let mut count = 0;
     for (habit, label) in find!((habit: Id, label: String), pattern!(facts, [{ ?habit @ metadata::tag: &KIND_HABIT_ID, habit_attrs::label: ?label }]))
     {
+        let targeted = exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]));
+        if targeted
+            && !persona.is_some_and(|persona| {
+                exists!(pattern!(facts, [{ habit @ habit_attrs::persona: &persona }]))
+            })
+        {
+            continue;
+        }
         if !superseded.contains(&habit) {
             writeln!(text, "- [{}] {label} (not evaluated)", fmt_id(habit)).unwrap();
             count += 1;
@@ -2317,6 +2337,7 @@ async fn cmd_show(
                         query
                             .habits
                             .expect("Show opens the Habit source collection"),
+                        persona_id,
                     )?)
                 } else {
                     None
@@ -2360,6 +2381,7 @@ async fn cmd_show(
                     .as_ref()
                     .expect("Show opens Habits")
                     .view(),
+                persona_id,
             ),
         };
 
@@ -2670,6 +2692,7 @@ async fn load_wait_frame(
             query
                 .habits
                 .expect("Wait opens the Habit source collection"),
+            Some(persona),
         )?;
         let news = prepare_news_once(&query, persona)?;
         Ok((reader.clone(), habits, news))
@@ -2722,6 +2745,7 @@ fn observe_habits_in_observation(
     observation: &OrientObservation,
     pile_path: &Path,
     now_secs: i64,
+    persona: Id,
 ) -> Result<HabitObservation> {
     let facts = observation
         .facts
@@ -2729,7 +2753,7 @@ fn observe_habits_in_observation(
         .as_ref()
         .expect("a wait observation includes Habit");
     observe_habits(
-        prepare_habits(&observation.snapshot, facts.view())?,
+        prepare_habits(&observation.snapshot, facts.view(), Some(persona))?,
         pile_path,
         now_secs,
     )
@@ -2860,7 +2884,7 @@ async fn cmd_wait(
         let WaitFrame {
             watermark: _,
             observation: mut current,
-            persona: persona_id,
+            persona: mut persona_id,
             habits: mut habit_seen,
             news,
         } = initial;
@@ -2968,6 +2992,7 @@ async fn cmd_wait(
                             });
                         }
                         current = candidate.observation;
+                        persona_id = candidate.persona;
                         habit_seen = candidate.habits;
                         last_habit_sweep = Instant::now();
                         continue;
@@ -3004,7 +3029,8 @@ async fn cmd_wait(
             // A newer observation awaiting required view input never replaces
             // `current`. Time-driven Habit transitions therefore remain
             // observable from the last fully readable frame.
-            let current_habits = observe_habits_in_observation(&current, pile_path, now_secs)?;
+            let current_habits =
+                observe_habits_in_observation(&current, pile_path, now_secs, persona_id)?;
             let habit_report =
                 render_habit_transitions(&habit_seen, &current_habits).unwrap_or_default();
             let habit_fired = !habit_report.is_empty();
@@ -3298,6 +3324,149 @@ mod tests {
 
     fn archive(facts: &TribleSet) -> FactArchive {
         UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(facts)])
+    }
+
+    #[test]
+    fn habit_targets_select_before_loading_payloads() {
+        let fixture = TestPile::new();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let habit = id(11); // An opaque, not intrinsically derived entity id.
+        let owner = id(12);
+        let other = id(13);
+        let absent = habits::TextHandle::new([14; 32]);
+        let absent_script = habits::ScriptHandle::new([15; 32]);
+        let fragment = entity! { ExclusiveId::force_ref(&habit) @
+            metadata::tag: &KIND_HABIT_ID,
+            habit_attrs::label: "other-persona-clock",
+            habit_attrs::condition: absent,
+            habit_attrs::nudge: absent,
+            habit_attrs::script: absent_script,
+            habit_attrs::persona: &owner,
+        };
+        let facts = archive(fragment.facts());
+        for observer in [None, Some(other)] {
+            let (rows, attention) = prepare_habits(&snapshot, &facts, observer).unwrap();
+            assert!(rows.is_empty());
+            assert!(attention.attention.is_empty());
+            assert!(!render_passive_habits(&facts, observer).contains("other-persona-clock"));
+        }
+        assert!(prepare_habits(&snapshot, &facts, Some(owner)).is_err());
+        assert!(render_passive_habits(&facts, Some(owner)).contains("other-persona-clock"));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn habit_targets_are_exact_sets_and_omission_is_global() {
+        let fixture = TestPile::new();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let gpt = id(16);
+        let cc = id(17);
+        let mut fragment = Fragment::empty();
+        let mut ids = Vec::new();
+        for (label, targets) in [
+            ("global", vec![]),
+            ("gpt", vec![gpt]),
+            ("cc", vec![cc]),
+            ("both", vec![cc, gpt]),
+        ] {
+            let (definition, id) =
+                habits::habit_fragment(label, "every 1h", "do it", None, &[], &targets).unwrap();
+            fragment += definition;
+            ids.push(id);
+        }
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        for (observer, expected) in [
+            (None, BTreeSet::from([ids[0]])),
+            (Some(gpt), BTreeSet::from([ids[0], ids[1], ids[3]])),
+            (Some(cc), BTreeSet::from([ids[0], ids[2], ids[3]])),
+            (Some(id(18)), BTreeSet::from([ids[0]])),
+        ] {
+            let prepared = prepare_habits(&snapshot, &facts, observer).unwrap();
+            let observed = observe_habits(prepared, &fixture.path, 100).unwrap();
+            assert_eq!(
+                observed.due.keys().copied().collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn wait_initial_and_timer_paths_do_not_execute_other_personas_predicates() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+                .await
+                .unwrap();
+            let gpt = id(19);
+            let cc = id(20);
+            for (persona, label) in [(gpt, "gpt"), (cc, "cc")] {
+                let (person, _, _) = relations::person_fragment(
+                    persona,
+                    crate::relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                pile.commit(sources.relations.source, &fixture.signer, person)
+                    .unwrap();
+            }
+            let (clock, global) =
+                habits::habit_fragment("global-clock", "every 1h", "global due", None, &[], &[])
+                    .unwrap();
+            let (done, _) = habits::completion_fragment(
+                global,
+                clock::point(Epoch::from_tai_seconds(99.0)).unwrap(),
+            )
+            .unwrap();
+            let (other, cc_habit) = habits::habit_fragment(
+                "cc-clock",
+                "when printf x >> other-invocations",
+                "cc due",
+                None,
+                &[],
+                &[cc],
+            )
+            .unwrap();
+            pile.commit(
+                sources.habits.as_ref().unwrap().source,
+                &fixture.signer,
+                clock + done + other,
+            )
+            .unwrap();
+            let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
+            let WaitFrameLoad::Ready(frame) =
+                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
+                    .await
+                    .unwrap()
+            else {
+                panic!("complete local inputs must be ready")
+            };
+            assert_eq!(frame.persona, gpt);
+            assert!(frame.habits.due.is_empty());
+            let marker = fixture.dir.join("other-invocations");
+            assert!(!marker.exists());
+            let later = observe_habits_in_observation(&frame.observation, &fixture.path, 3700, gpt)
+                .unwrap();
+            assert_eq!(later.due.keys().copied().collect::<Vec<_>>(), vec![global]);
+            assert!(!marker.exists(), "the timer must retain persona selection");
+            let cc_observation =
+                observe_habits_in_observation(&frame.observation, &fixture.path, 3700, cc).unwrap();
+            assert!(cc_observation.due.contains_key(&cc_habit));
+            assert_eq!(fs::read(marker).unwrap(), b"x");
+            pile.close().unwrap();
+        });
     }
 
     fn stored_presentations(

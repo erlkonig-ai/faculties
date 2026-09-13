@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Habit definitions support repeated explicit persona targets through CLI
+  `habit add --persona LABEL_OR_ID` and MCP `habit_add.personas`. Omitted
+  targets stay global, independent of ambient `PERSONA`. Orient filters
+  before reading attachments or running conditions, both on initial reads
+  and timer sweeps; passive show follows the same selection. Existing global
+  definitions keep their identities and need no migration.
+
 - Portable bootstrap onboarding now distinguishes Orient notification from
   Codex turn delivery, teaches the one-shot queue wrapper and per-window
   persona/session ownership, and documents the current Habit filtering and

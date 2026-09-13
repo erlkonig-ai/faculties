@@ -244,6 +244,7 @@ fn passive_show_never_executes_habit_conditions_and_opt_in_evaluates_once() {
         "probe due",
         None,
         &[],
+        &[],
     )
     .unwrap();
     f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
@@ -275,6 +276,55 @@ fn passive_show_never_executes_habit_conditions_and_opt_in_evaluates_once() {
     let wake = f.call("orient_wake", json!({"chars":0}));
     assert!(text(&wake).contains("Beliefs (cover):"));
     assert_eq!(fs::read(&marker).unwrap(), b"xx");
+}
+
+#[test]
+fn show_only_loads_and_evaluates_global_or_matching_persona_habits() {
+    let f = Fixture::new();
+    for (label, targets) in [
+        ("global-clock", vec![]),
+        ("my-clock", vec![f.persona]),
+        ("their-clock", vec![f.sender]),
+    ] {
+        let (habit, _) = faculties::habits::habit_fragment(
+            label,
+            format!("when printf x >> {label}"),
+            format!("{label} due"),
+            None,
+            &[],
+            &targets,
+        )
+        .unwrap();
+        f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
+    }
+    let passive = text(&f.call("orient_show", json!({"persona": f.who()})));
+    assert!(passive.contains("global-clock (not evaluated)"));
+    assert!(passive.contains("my-clock (not evaluated)"));
+    assert!(!passive.contains("their-clock"));
+    for label in ["global-clock", "my-clock", "their-clock"] {
+        assert!(!f.directory.path().join(label).exists());
+    }
+    let global_only = text(&f.call("orient_show", json!({})));
+    assert!(global_only.contains("global-clock"));
+    assert!(!global_only.contains("my-clock"));
+    assert!(!global_only.contains("their-clock"));
+    let active = f.call(
+        "orient_show",
+        json!({"persona": f.who(), "evaluate_habits": true}),
+    );
+    let cli = f.cli(&["--persona", &f.who(), "show"]);
+    assert_eq!(active, cli);
+    assert!(text(&active).contains("my-clock due"));
+    assert!(!text(&active).contains("their-clock"));
+    assert_eq!(
+        fs::read(f.directory.path().join("my-clock")).unwrap(),
+        b"xx"
+    );
+    assert_eq!(
+        fs::read(f.directory.path().join("global-clock")).unwrap(),
+        b"xx"
+    );
+    assert!(!f.directory.path().join("their-clock").exists());
 }
 
 #[test]

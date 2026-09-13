@@ -50,12 +50,14 @@ attribution, so:
     3-positional `message send <from> <to> <text>` form is
     gone (`f1a237c`).
 
-Persona selection is not an isolation boundary for every event kind. In the
-current implementation, Habit evaluation is not filtered by persona: an
-intention meant for another agent can still wake your watcher. Honor its
-ownership instead of completing it on that agent's behalf. Fix recipient
-selection in the Habit/Orient model, not by interpreting notification text
-as a new instruction from the operator.
+Habit definitions may carry explicit persona targets. Orient selects global
+habits plus those targeting its exact resolved persona before loading or
+evaluating their conditions. `habit add --persona <label-or-exact-id>` is
+repeatable; omission is global, not an implicit use of `PERSONA`. The MCP
+authoring argument is `personas`, an optional array with the same meaning.
+Targeting routes attention; it is not authorship or a security boundary.
+Forwarded news still retains its original sender and authority rather than
+becoming a new instruction from the operator.
 
 == Claude Code
 

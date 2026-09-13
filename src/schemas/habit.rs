@@ -65,6 +65,13 @@ pub mod attrs {
         /// to preserve — the encoding therefore participates in its id.
         "96EC24A8226E9D848A4905D982485678" as script:
             inlineencodings::Handle<blobencodings::RawBytes>;
+
+        /// Persona to notify and evaluate this intention for. With no target
+        /// facts the intention is global; repeated targets address each named
+        /// persona. This is attention routing, not authorship or authority.
+        /// Anchor minted with `trible genid` on 2026-09-13:
+        /// `5EEEADCC6701778F3AF471D2E814ABC8`.
+        "5EEEADCC6701778F3AF471D2E814ABC8" as persona: inlineencodings::GenId;
     }
 }
 

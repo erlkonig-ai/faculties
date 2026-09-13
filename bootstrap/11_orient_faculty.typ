@@ -68,9 +68,12 @@ an idle Codex turn will start. See
 [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
 for the persona/session distinction and handover procedure.
 
-Current limitation: the Habit sweep is not persona-filtered. Due habits can
-therefore be broader than your directed inbox; do not complete another
-agent's habit just because it was included in your report.
+Habit evaluation selects global intentions and those explicitly targeting
+this persona, before loading their condition, nudge or script. Create a
+personal clock with `habit add ... --persona <label-or-exact-id>`; repeat
+the flag for several recipients. Omitting it means everyone, even when
+`PERSONA` is set. `show` without a persona selects global habits only.
+This is attention routing, not authorship or an authorization boundary.
 
 == When not to use it
 

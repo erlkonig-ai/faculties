@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use base64::Engine as _;
 use faculties::habits::{self, DeclaredState, Habits};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
+use faculties::relations::{ProfileInput, Relations};
 use faculties::storage::initialize_signer;
 use serde_json::json;
 
@@ -35,6 +36,150 @@ fn call(faculty: &dyn Faculty, name: &str, args: serde_json::Value) -> String {
     text
 }
 
+fn cli(pile: &Path, key: &Path, args: &[&str]) -> String {
+    let result = Command::new(env!("CARGO_BIN_EXE_habit"))
+        .arg("--pile")
+        .arg(pile)
+        .arg("--key")
+        .arg(key)
+        .args(args)
+        .env("PERSONA", "ambient-not-a-target")
+        .env_remove("DRIVE_ENDPOINT")
+        .env_remove("DRIVE_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
+}
+
+#[test]
+fn explicit_persona_targets_are_literal_and_shared_by_cli_and_mcp() {
+    let (_directory, pile, key) = fixture();
+    let relations = Relations::new(pile.clone(), Some(key.clone()));
+    let cc = relations
+        .add(
+            ProfileInput {
+                label: "@cc".into(),
+                ..Default::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap()
+        .person;
+    let gpt = relations
+        .add(
+            ProfileInput {
+                label: "gpt".into(),
+                ..Default::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap()
+        .person;
+    let cc_id = format!("{cc:x}");
+    let gpt_id = format!("{gpt:x}");
+    let added = cli(
+        &pile,
+        &key,
+        &[
+            "add",
+            "scoped",
+            "--when",
+            "every 1h",
+            "--nudge",
+            "inspect me",
+            "--persona",
+            "@cc",
+            "--persona",
+            &gpt_id,
+            "--persona",
+            "@cc",
+        ],
+    );
+    assert!(added.contains(&cc_id) && added.contains(&gpt_id), "{added}");
+    let operations = Habits::new(pile.clone(), Some(key.clone()));
+    let observed = operations.show("scoped").unwrap();
+    let mut expected = vec![cc, gpt];
+    expected.sort_unstable();
+    assert_eq!(observed.definition.personas, expected);
+
+    let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
+    let repeated = call(
+        &mcp,
+        "habit_add",
+        json!({
+            "label":"scoped", "when":"every 1h", "nudge":"inspect me",
+            "personas":["gpt", "@cc", cc_id],
+        }),
+    );
+    assert!(repeated.contains("already present"), "{repeated}");
+    assert!(
+        repeated.contains(&cc_id) && repeated.contains(&gpt_id),
+        "{repeated}"
+    );
+    assert_eq!(operations.list(false).unwrap().entries.len(), 1);
+    let shown = call(&mcp, "habit_show", json!({"habit":"scoped"}));
+    assert_eq!(shown, cli(&pile, &key, &["show", "scoped"]));
+    assert!(shown.contains("personas:") && shown.contains(&cc_id) && shown.contains(&gpt_id));
+}
+
+#[test]
+fn absent_or_empty_persona_targets_are_global_even_with_ambient_persona() {
+    let (_directory, pile, key) = fixture();
+    let added = cli(
+        &pile,
+        &key,
+        &[
+            "add",
+            "cli-global",
+            "--when",
+            "every 1h",
+            "--nudge",
+            "everyone",
+        ],
+    );
+    assert!(added.contains("personas: everyone"), "{added}");
+    let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
+    let omitted = call(
+        &mcp,
+        "habit_add",
+        json!({"label":"mcp-global", "when":"every 1h", "nudge":"everyone"}),
+    );
+    assert!(omitted.contains("personas: everyone"), "{omitted}");
+    let empty = call(
+        &mcp,
+        "habit_add",
+        json!({"label":"mcp-empty", "when":"every 1h", "nudge":"everyone", "personas":[]}),
+    );
+    assert!(empty.contains("personas: everyone"), "{empty}");
+    let operations = Habits::new(pile.clone(), Some(key.clone()));
+    for label in ["cli-global", "mcp-global", "mcp-empty"] {
+        assert!(operations
+            .show(label)
+            .unwrap()
+            .definition
+            .personas
+            .is_empty());
+        let shown = call(&mcp, "habit_show", json!({"habit":label}));
+        assert!(shown.contains("personas:    everyone"), "{shown}");
+    }
+    let schema: serde_json::Value = serde_json::from_str(
+        mcp.tools()
+            .iter()
+            .find(|tool| tool.name == "habit_add")
+            .unwrap()
+            .input_schema,
+    )
+    .unwrap();
+    assert_eq!(schema["properties"]["personas"]["default"], json!([]));
+}
+
 #[test]
 fn mcp_listing_is_passive_and_evaluation_is_explicit() {
     let (directory, pile, key) = fixture();
@@ -46,6 +191,7 @@ fn mcp_listing_is_passive_and_evaluation_is_explicit() {
             &format!("when printf x >> '{}'", marker.display()),
             "inspect me",
             None,
+            &[],
             &[],
         )
         .unwrap();
@@ -107,15 +253,15 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
     let (_directory, pile, key) = fixture();
     let operations = Habits::new(pile.clone(), Some(key.clone()));
     let first = operations
-        .add("repeat", "every 1h", "first", None, &[])
+        .add("repeat", "every 1h", "first", None, &[], &[])
         .unwrap();
     let duplicate = operations
-        .add("repeat", "every 1h", "first", None, &[])
+        .add("repeat", "every 1h", "first", None, &[], &[])
         .unwrap();
     assert_eq!(first.id, duplicate.id);
     assert!(duplicate.already_present);
     let second = operations
-        .add("repeat", "every 1h", "second", None, &[])
+        .add("repeat", "every 1h", "second", None, &[], &[])
         .unwrap();
     assert!(operations.show("repeat").is_err());
     let joined = operations
@@ -125,6 +271,7 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
             "joined",
             None,
             &[format!("{:x}", first.id), format!("{:x}", second.id)],
+            &[],
         )
         .unwrap();
     assert_eq!(operations.list(false).unwrap().entries.len(), 1);
@@ -186,6 +333,14 @@ fn invalid_transport_arguments_do_not_touch_absent_storage() {
             "habit_add",
             r#"{"label":"x","when":"every 1h","nudge":"n","script_path":"/host/path"}"#,
         ),
+        (
+            "habit_add",
+            r#"{"label":"x","when":"every 1h","nudge":"n","personas":"cc"}"#,
+        ),
+        (
+            "habit_add",
+            r#"{"label":"x","when":"every 1h","nudge":"n","personas":[42]}"#,
+        ),
         ("habit_due", r#"{"persona":"server"}"#),
         ("habit_show", r#"{}"#),
     ] {
@@ -222,7 +377,7 @@ fn delivery_failure_does_not_repeat_an_authored_definition() {
     let report = operations.list(false).unwrap();
     assert_eq!(report.entries.len(), 1);
     let repeated = operations
-        .add("one", "every 1h", "once", None, &[])
+        .add("one", "every 1h", "once", None, &[], &[])
         .unwrap();
     assert_eq!(repeated.id, report.entries[0].row.id);
     assert!(repeated.already_present);

@@ -128,6 +128,8 @@ pub struct Habit {
     pub script: Option<Script>,
     /// Definitions this one replaces, by intrinsic id.
     pub supersedes: Vec<Id>,
+    /// Exact notification targets. An empty set addresses everyone.
+    pub personas: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,6 +439,7 @@ fn habit_record(
     nudge: TextHandle,
     script: Option<ScriptHandle>,
     supersedes: &[Id],
+    personas: &[Id],
 ) -> Fragment {
     entity! { _ @
         metadata::tag: &KIND_HABIT_ID,
@@ -444,6 +447,7 @@ fn habit_record(
         attrs::condition: condition,
         attrs::nudge: nudge,
         attrs::script?: script,
+        attrs::persona*: personas.iter(),
         metadata::supersedes*: supersedes.iter(),
     }
 }
@@ -505,12 +509,16 @@ fn state_record(
 /// *without* an edge is not an error — it is two live definitions that happen
 /// to share a display name, which is the truth, and a later revision citing
 /// both resolves it.
+///
+/// `personas` is an optional set of exact notification targets. No targets
+/// means global; it never defaults to the writer or the ambient persona.
 pub fn habit_fragment(
     label: impl Into<String>,
     condition: impl Into<String>,
     nudge: impl Into<String>,
     script: Option<Vec<u8>>,
     supersedes: &[Id],
+    personas: &[Id],
 ) -> Result<(Fragment, Id)> {
     let label = canonical_label(label)?;
     let condition = canonical_required(condition, "Habit condition")?;
@@ -524,11 +532,12 @@ pub fn habit_fragment(
     check_script_agreement(&parsed, script.is_some(), &format!("Habit {label:?}"))?;
 
     let supersedes = sorted_ids(supersedes.iter().copied());
+    let personas = sorted_ids(personas.iter().copied());
     let mut fragment = Fragment::empty();
     let condition = fragment.put(condition);
     let nudge = fragment.put(nudge);
     let script = script.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
-    let record = habit_record(&label, condition, nudge, script, &supersedes);
+    let record = habit_record(&label, condition, nudge, script, &supersedes, &personas);
     let id = record
         .root()
         .expect("Habit definition has one intrinsic root");
@@ -617,6 +626,7 @@ struct RawHabit {
     nudge: TextHandle,
     script: Option<ScriptHandle>,
     supersedes: Vec<Id>,
+    personas: Vec<Id>,
 }
 
 #[derive(Clone)]
@@ -677,6 +687,10 @@ fn parse_habit(facts: &TribleSet, id: Id) -> Result<RawHabit> {
         supersedes: sorted_ids(find!(
             value: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?value }])
+        )),
+        personas: sorted_ids(find!(
+            value: Id,
+            pattern!(facts, [{ id @ attrs::persona: ?value }])
         )),
     })
 }
@@ -756,6 +770,7 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
             raw.nudge,
             raw.script,
             &raw.supersedes,
+            &raw.personas,
         );
         if expected.root() != Some(id) {
             // Additive cutovers retain the exact random-id legacy record next
@@ -958,6 +973,10 @@ where
             predecessor: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?predecessor }])
         ));
+        let personas = sorted_ids(find!(
+            persona: Id,
+            pattern!(facts, [{ id @ attrs::persona: ?persona }])
+        ));
         let mut scripts: Vec<ScriptHandle> = find!(
             script: ScriptHandle,
             pattern!(facts, [{ id @ attrs::script: ?script }])
@@ -974,6 +993,7 @@ where
                 nudge,
                 script: None,
                 supersedes,
+                personas,
             });
         } else {
             definitions.extend(scripts.into_iter().map(|script| RawHabit {
@@ -983,6 +1003,7 @@ where
                 nudge,
                 script: Some(script),
                 supersedes: supersedes.clone(),
+                personas: personas.clone(),
             }));
         }
     }
@@ -1093,6 +1114,7 @@ where
             nudge,
             script,
             supersedes: raw.supersedes,
+            personas: raw.personas,
         });
     }
     definitions.sort_by(|left, right| {
@@ -1395,6 +1417,7 @@ where
                 nudge,
                 script,
                 supersedes: raw_habit.supersedes.clone(),
+                personas: raw_habit.personas.clone(),
             },
         );
     }
@@ -1500,6 +1523,7 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
                 raw.nudge,
                 raw.script,
                 &raw.supersedes,
+                &raw.personas,
             ),
             "Habit definition",
         )?;
@@ -1927,7 +1951,7 @@ mod tests {
     fn intrinsic_definition_and_exact_retry_are_idempotent() {
         let fixture = Fixture::new();
         let (fragment, id) =
-            habit_fragment("journal", "every 1d", "write the journal", None, &[]).unwrap();
+            habit_fragment("journal", "every 1d", "write the journal", None, &[], &[]).unwrap();
         let first = fixture.publish(fragment.clone());
         let after_first = std::fs::metadata(&fixture.pile).unwrap().len();
         let replay = fixture.publish(fragment);
@@ -1949,6 +1973,48 @@ mod tests {
                 .unwrap()
         );
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn persona_targets_are_optional_repeated_identity_facts() {
+        let a = Id::new([0xB1; 16]).unwrap();
+        let b = Id::new([0xB2; 16]).unwrap();
+        let (global, global_id) =
+            habit_fragment("tick", "every 1h", "notice", None, &[], &[]).unwrap();
+        let raw = parse_habit(global.facts(), global_id).unwrap();
+        assert!(raw.personas.is_empty());
+        // Adding the optional empty field preserves the old unscoped identity.
+        let old_record = entity! { _ @
+            metadata::tag: &KIND_HABIT_ID,
+            attrs::label: "tick",
+            attrs::condition: raw.condition,
+            attrs::nudge: raw.nudge,
+        };
+        assert_eq!(old_record.root(), Some(global_id));
+        let (scoped, scoped_id) =
+            habit_fragment("tick", "every 1h", "notice", None, &[], &[b, a, a]).unwrap();
+        let (reordered, reordered_id) =
+            habit_fragment("tick", "every 1h", "notice", None, &[], &[a, b]).unwrap();
+        assert_eq!(scoped_id, reordered_id);
+        assert_eq!(scoped.facts(), reordered.facts());
+        assert_ne!(global_id, scoped_id);
+        assert_eq!(
+            parse_habit(scoped.facts(), scoped_id).unwrap().personas,
+            vec![a, b]
+        );
+        validate_publication_fragment(&scoped).unwrap();
+        let fixture = Fixture::new();
+        fixture.publish(global);
+        fixture.publish(scoped);
+        let catalog = fixture.catalog();
+        assert_eq!(
+            catalog
+                .habits()
+                .find(|habit| habit.id == scoped_id)
+                .unwrap()
+                .personas,
+            vec![a, b]
+        );
     }
 
     #[test]
@@ -1988,7 +2054,7 @@ mod tests {
         .into_facts();
 
         let (successor, successor_id) =
-            habit_fragment("current", "every 1h", "do it", None, &[retired]).unwrap();
+            habit_fragment("current", "every 1h", "do it", None, &[retired], &[]).unwrap();
         let mut facts = retired_facts;
         facts += successor.facts().clone();
         let mut stored = successor.clone();
@@ -2020,7 +2086,7 @@ mod tests {
     fn concurrent_state_assertions_stay_forked_until_reconciled() {
         let fixture = Fixture::new();
         let (definition, habit) =
-            habit_fragment("journal", "every 1h", "write", None, &[]).unwrap();
+            habit_fragment("journal", "every 1h", "write", None, &[], &[]).unwrap();
         fixture.publish(definition);
 
         // Two writers observed the same empty frontier and asserted different
@@ -2053,6 +2119,7 @@ mod tests {
             "sweep",
             None,
             &[],
+            &[],
         )
         .unwrap();
         fixture.publish(original);
@@ -2064,6 +2131,7 @@ mod tests {
             "sweep",
             Some(b"#!/bin/sh\nexit 0\n".to_vec()),
             &[original_id],
+            &[],
         )
         .unwrap();
         fixture.publish(successor);
@@ -2092,9 +2160,9 @@ mod tests {
     #[test]
     fn liveness_is_order_independent() {
         let (original, original_id) =
-            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+            habit_fragment("sweep", "every 1h", "sweep", None, &[], &[]).unwrap();
         let (successor, successor_id) =
-            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[]).unwrap();
 
         for order in [[0usize, 1], [1, 0]] {
             let fixture = Fixture::new();
@@ -2120,11 +2188,13 @@ mod tests {
     fn identical_revisions_authored_independently_are_one_definition() {
         let fixture = Fixture::new();
         let (original, original_id) =
-            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+            habit_fragment("sweep", "every 1h", "sweep", None, &[], &[]).unwrap();
         fixture.publish(original);
 
-        let first = habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
-        let second = habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+        let first =
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[]).unwrap();
+        let second =
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[]).unwrap();
         assert_eq!(first.1, second.1);
         fixture.publish(first.0);
         fixture.publish(second.0);
@@ -2138,14 +2208,22 @@ mod tests {
     #[test]
     fn concurrent_creation_stays_forked_until_an_edge_resolves_it() {
         let fixture = Fixture::new();
-        let (mine, mine_id) = habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
-        let (theirs, theirs_id) = habit_fragment("sweep", "every 2h", "sweep", None, &[]).unwrap();
+        let (mine, mine_id) = habit_fragment("sweep", "every 1h", "sweep", None, &[], &[]).unwrap();
+        let (theirs, theirs_id) =
+            habit_fragment("sweep", "every 2h", "sweep", None, &[], &[]).unwrap();
         fixture.publish(mine);
         fixture.publish(theirs);
         assert_eq!(live_ids(&fixture.catalog()).len(), 2);
 
-        let (joined, joined_id) =
-            habit_fragment("sweep", "every 3h", "sweep", None, &[mine_id, theirs_id]).unwrap();
+        let (joined, joined_id) = habit_fragment(
+            "sweep",
+            "every 3h",
+            "sweep",
+            None,
+            &[mine_id, theirs_id],
+            &[],
+        )
+        .unwrap();
         fixture.publish(joined);
         assert_eq!(live_ids(&fixture.catalog()), vec![joined_id]);
     }
@@ -2158,9 +2236,9 @@ mod tests {
     fn an_edge_to_an_unseen_definition_retires_it_on_arrival() {
         let fixture = Fixture::new();
         let (original, original_id) =
-            habit_fragment("sweep", "every 1h", "sweep", None, &[]).unwrap();
+            habit_fragment("sweep", "every 1h", "sweep", None, &[], &[]).unwrap();
         let (successor, successor_id) =
-            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id]).unwrap();
+            habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[]).unwrap();
 
         fixture.publish(successor);
         // The predecessor is not here; nothing is retired, and the catalog reads.
@@ -2177,9 +2255,9 @@ mod tests {
     fn concurrent_definition_conflicts_are_visible_not_timestamp_arbitrated() {
         let fixture = Fixture::new();
         let (daily, daily_id) =
-            habit_fragment("hygiene", "every 1d", "inspect branches", None, &[]).unwrap();
+            habit_fragment("hygiene", "every 1d", "inspect branches", None, &[], &[]).unwrap();
         let (weekly, weekly_id) =
-            habit_fragment("hygiene", "every 7d", "inspect branches", None, &[]).unwrap();
+            habit_fragment("hygiene", "every 7d", "inspect branches", None, &[], &[]).unwrap();
         fixture.publish(daily);
         fixture.publish(weekly);
         let catalog = fixture.catalog();
@@ -2195,7 +2273,7 @@ mod tests {
 
     #[test]
     fn strict_catalog_rejects_extra_facts_and_dangling_events() {
-        let mut fragment = habit_fragment("journal", "every 1h", "write", None, &[])
+        let mut fragment = habit_fragment("journal", "every 1h", "write", None, &[], &[])
             .unwrap()
             .0;
         let id = fragment.root().unwrap();
@@ -2220,7 +2298,7 @@ mod tests {
     #[test]
     fn additive_legacy_records_are_inert_beside_exact_intrinsic_shadows() {
         let (mut fragment, native) =
-            habit_fragment("journal", "every 1h", "write", None, &[]).unwrap();
+            habit_fragment("journal", "every 1h", "write", None, &[], &[]).unwrap();
         let raw = parse_habit(fragment.facts(), native).unwrap();
         let legacy = Id::new([0xA7; 16]).unwrap();
         assert_ne!(legacy, native);
@@ -2248,7 +2326,7 @@ mod tests {
     fn publication_definition_must_carry_its_own_payloads() {
         let missing_condition = TextHandle::new([3; 32]);
         let missing_nudge = TextHandle::new([4; 32]);
-        let bare = habit_record("journal", missing_condition, missing_nudge, None, &[]);
+        let bare = habit_record("journal", missing_condition, missing_nudge, None, &[], &[]);
         let error = validate_publication_fragment(&bare).unwrap_err();
         assert!(format!("{error:#}").contains("missing condition payload"));
     }
@@ -2375,6 +2453,7 @@ mod tests {
             "sweep the worktrees",
             Some(source.clone()),
             &[],
+            &[],
         )
         .unwrap();
         fixture.publish(fragment);
@@ -2389,7 +2468,7 @@ mod tests {
     #[test]
     fn condition_and_attachment_must_agree() {
         let dangling =
-            habit_fragment("sweep", "when @script --due", "sweep", None, &[]).unwrap_err();
+            habit_fragment("sweep", "when @script --due", "sweep", None, &[], &[]).unwrap_err();
         assert!(format!("{dangling:#}").contains("carries no script"));
 
         let unreachable = habit_fragment(
@@ -2398,6 +2477,7 @@ mod tests {
             "sweep",
             Some(b"#!/bin/sh\n".to_vec()),
             &[],
+            &[],
         )
         .unwrap_err();
         assert!(format!("{unreachable:#}").contains("no condition reaches"));
@@ -2405,7 +2485,7 @@ mod tests {
         let mut fragment = Fragment::empty();
         let condition = fragment.put("when @script --due".to_owned());
         let nudge = fragment.put("sweep".to_owned());
-        let record = habit_record("sweep", condition, nudge, None, &[]);
+        let record = habit_record("sweep", condition, nudge, None, &[], &[]);
         fragment += record;
         let error = validate_publication_fragment(&fragment).unwrap_err();
         assert!(format!("{error:#}").contains("carries no script"));
@@ -2419,7 +2499,7 @@ mod tests {
         let condition = fragment.put("when @script --due".to_owned());
         let nudge = fragment.put("sweep".to_owned());
         let absent = ScriptHandle::new([7; 32]);
-        let record = habit_record("sweep", condition, nudge, Some(absent), &[]);
+        let record = habit_record("sweep", condition, nudge, Some(absent), &[], &[]);
         let id = record.root().unwrap();
         fragment += record;
 
