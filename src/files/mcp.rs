@@ -62,7 +62,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "files_index", description: "Maintain the semantic index over every stored file through the nomic-vision root in the working pile (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
     Tool {
         name: "files_similar", description: "Semantic similarity search over the derived index. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through the model its content asks for (image or text). Images and texts rank as two groups unless kind picks one.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0.15},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
     },
     Tool {
         name: "files_embed7b", description: "Compute stored image/PDF-page embeddings. Requires the local-embed build and a supported model/runtime.",
@@ -323,5 +323,36 @@ impl Faculty for Files {
             }
             other => bail!("Files MCP has no tool {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The defaults the schema advertises are the defaults serde applies: a
+    /// client that selects the advertised floor must see the same hits as
+    /// one that omits it (the 0.15 the schema once claimed hid every
+    /// text-to-image match, which sit near 0.07).
+    #[test]
+    fn similar_schema_defaults_match_the_deserializer() {
+        let tool = TOOLS
+            .iter()
+            .find(|tool| tool.name == "files_similar")
+            .expect("files_similar tool");
+        let schema: serde_json::Value = serde_json::from_str(tool.input_schema).unwrap();
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["floor"]["default"].as_f64().unwrap() as f32,
+            similarity_floor()
+        );
+        assert_eq!(
+            properties["limit"]["default"].as_u64().unwrap() as usize,
+            similarity_limit()
+        );
+        let args: Similar = decode_arguments(Bytes::from(br#"{"text":"q"}"#.to_vec())).unwrap();
+        assert_eq!(args.floor, similarity_floor());
+        assert_eq!(args.limit, similarity_limit());
+        assert_eq!(args.kind, None);
     }
 }
