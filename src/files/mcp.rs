@@ -61,8 +61,8 @@ const TOOLS: &[Tool] = &[
     },
     Tool { name: "files_index", description: "Maintain the semantic index over every stored file through the nomic-vision root in the working pile (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
     Tool {
-        name: "files_similar", description: "Semantic similarity search over the derived index. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through nomic-vision.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0.15},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
+        name: "files_similar", description: "Semantic similarity search over the derived index. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through the model its content asks for (image or text). Images and texts rank as two groups unless kind picks one.",
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0.15},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
     },
     Tool {
         name: "files_embed7b", description: "Compute stored image/PDF-page embeddings. Requires the local-embed build and a supported model/runtime.",
@@ -166,6 +166,8 @@ struct Similar {
     limit: usize,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     mm7b: bool,
 }
@@ -271,6 +273,7 @@ impl Faculty for Files {
                         floor: args.floor,
                         limit: args.limit,
                         tags: &args.tags,
+                        kind: args.kind.as_deref().map(str::parse).transpose()?,
                         mm7b: args.mm7b,
                     },
                     out,

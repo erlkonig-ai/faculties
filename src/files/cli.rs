@@ -122,6 +122,11 @@ const VERBS: &[Verb] = &[
                 .short('n'),
             Param::caller("tag", "Only results carrying all these tags (repeatable)").repeated(),
             Param::caller(
+                "kind",
+                "Rank only images or only texts; both, as two groups, otherwise",
+            )
+            .optional(),
+            Param::caller(
                 "mm7b",
                 "Search the nomic-embed-multimodal-7b space; run embed7b first",
             )
@@ -293,6 +298,11 @@ fn execute_with_input(
                     .parse()
                     .context("invalid --limit")?,
                 tags: invocation.values("tag"),
+                kind: invocation
+                    .get("kind")
+                    .map(str::parse)
+                    .transpose()
+                    .context("invalid --kind")?,
                 mm7b: invocation.flag("mm7b"),
             },
             out,

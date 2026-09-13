@@ -38,7 +38,7 @@ use triblespace::prelude::*;
 #[cfg(feature = "local-embed")]
 use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet};
 #[cfg(feature = "local-embed")]
-use triblespace_search::semantic::{local_compute, SemanticIndex};
+use triblespace_search::semantic::{classify, local_compute, Content, SemanticIndex};
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -1776,15 +1776,21 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
     Ok(())
 }
 
-/// Semantic nearest-neighbour search over image embeddings.
+/// Semantic nearest-neighbour search over the derived Files index.
 ///
-/// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding768>` per
-/// image file); the HNSW index itself is rebuilt on demand here — at this
-/// scale a build is sub-second, so there is no stale index to maintain. The
-/// query is pile-native: `candidates_above` walks the graph, and the optional
-/// `--tag` filter is the hybrid join that separates real forms from mascots.
-/// With `mm7b`, the query and candidates live in the 3584-d nomic-7b space
-/// (`attr_mm7b::embedding`, populated by `files embed7b`) instead of the 768-d one.
+/// The index ([`SemanticIndex`]) holds one NVFP4 row per stored file: images
+/// through the vision model, PDF text layers, UTF-8 and HTML text through the
+/// text model, all in the one nomic space, each row keyed by the root of the
+/// model it went through and the file's entity. A text query goes through the
+/// text model's query side; a file query embeds that file's own bytes the way
+/// the index did, image or text by content. Images and texts are ranked
+/// separately, told apart by the row key: text-to-text cosines in this space
+/// sit near 0.7 and text-to-image near 0.07, so one mixed ranking puts every
+/// text above every image. The group whose best hit scores higher is printed
+/// first, and `kind` restricts the answer to one group. The optional `--tag`
+/// filter is the hybrid join that separates real forms from mascots. With
+/// `mm7b`, the query and candidates live in the 3584-d nomic-7b space
+/// (`attr_mm7b::embedding`, populated by `files embed7b`) instead.
 fn cmd_similar<P: TriblePattern>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1797,6 +1803,7 @@ fn cmd_similar<P: TriblePattern>(
     floor: f32,
     limit: usize,
     filter_tags: &[String],
+    kind: Option<Kind>,
     mm7b: bool,
     out: &mut Out<'_>,
 ) -> Result<()> {
@@ -1805,7 +1812,7 @@ fn cmd_similar<P: TriblePattern>(
     }
     #[cfg(not(feature = "local-embed"))]
     {
-        let _ = (store, collection, signer, runtime);
+        let _ = (store, collection, signer, runtime, kind);
         bail!("`files similar` needs the embedders — rebuild with --features local-embed");
     }
     #[cfg(feature = "local-embed")]
@@ -1831,28 +1838,35 @@ fn cmd_similar<P: TriblePattern>(
                     .get::<anybytes::Bytes, _>(h)
                     .context("read the query file's bytes")?;
                 let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-                let vector = crate::nomic::load_vision_embedder_in(reader)?
-                    .embed_image(bytes.as_ref())
-                    .context("embed the query image")?;
+                let vector = match classify(bytes.as_ref()) {
+                    Content::Image => crate::nomic::load_vision_embedder_in(reader)?
+                        .embed_image(bytes.as_ref())
+                        .context("embed the query image")?,
+                    Content::Pdf(text) | Content::Text(text) => {
+                        crate::nomic::load_text_embedder_in(reader)?
+                            .embed_document(&text)
+                            .context("embed the query document")?
+                    }
+                    Content::Other => bail!(
+                        "{name} is neither an image nor text the index embeds; query with --text instead"
+                    ),
+                };
                 (vector, Some(eid), name)
             }
             (None, None) => bail!("give a file id/hash, or --text \"a query\""),
         };
 
-        // The index: maintained here when this machine is the canonical
-        // compute, so a file saved a minute ago is found; read as it stands
-        // otherwise, its rows having replicated from a machine that is.
-        let snapshot_and_target = if local_compute() == SEMANTIC_COMPUTE {
-            let (target, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
-            (snapshot, target)
-        } else {
-            let target = semantic_target(store, collection)?;
-            let snapshot = store
-                .snapshot()
-                .context("freeze the pile for the Files semantic index")?;
-            (snapshot, target)
-        };
-        let (snapshot, target) = snapshot_and_target;
+        // The index as it stands: a query is a read and never waits on the
+        // GPU. `files add` maintains the rows of the file it just saved and
+        // `files index` the rest, on the canonical compute; elsewhere the rows
+        // arrive by replication. (Before 2026-09-13 a query on gb10 maintained
+        // the whole index first, and paid for every member whose bytes had
+        // arrived since the last build: minutes to hours before one answer.)
+        let target = semantic_target(store, collection)?;
+        let snapshot = store
+            .snapshot()
+            .context("freeze the pile for the Files semantic index")?;
+        let _ = (signer, runtime);
         let index = snapshot
             .collection(target)
             .context("observe the Files semantic index")?
@@ -1863,24 +1877,47 @@ fn cmd_similar<P: TriblePattern>(
                 "the Files semantic index has no rows yet: run `files index` on a {SEMANTIC_COMPUTE}, or wait for its rows to replicate"
             );
         }
+        if std::env::var_os("SEMANTIC_TRACE").is_some() {
+            eprintln!(
+                "semantic index {}: {} segment(s), {} row(s) read",
+                collection_hex(target.handle()),
+                index.segment_count(),
+                index.len()
+            );
+            for (handle, rows) in index.segments() {
+                eprintln!("semantic segment {} {rows}", hex::encode(handle));
+            }
+        }
+        // Every row, ranked: the wanted images may sit below thousands of
+        // texts for a text query, and the scan prices all rows anyway.
         let ranked = index
-            .reconstructed_top_k(&query_vec, limit.saturating_mul(8).max(64))
+            .reconstructed_top_k(&query_vec, index.len())
             .map_err(|error| anyhow::anyhow!("search the Files semantic index: {error}"))?;
 
-        // One row per entity, the hybrid tag filter, the floor, the limit.
-        let mut rows: Vec<(f32, Id)> = Vec::new();
+        // One row per entity, the floor, the hybrid tag filter, per kind.
+        let models = crate::nomic::index_models_in(reader)?;
+        let want_images = kind != Some(Kind::Text);
+        let want_texts = kind != Some(Kind::Image);
+        let mut image_hits: Vec<(f32, Id)> = Vec::new();
+        let mut text_hits: Vec<(f32, Id)> = Vec::new();
         let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
         for (key, score) in ranked {
-            let Some((attribute, eid)) =
-                SemanticIndex::<embeddings::Embedding768>::row_entity(&key)
+            let Some((root, eid)) = SemanticIndex::<embeddings::Embedding768>::row_entity(&key)
             else {
                 continue;
             };
-            if attribute != file::content.id() {
-                continue;
-            }
             let cos = score as f32;
-            if cos < floor || Some(eid) == query_eid || !seen.insert(eid) {
+            if cos < floor {
+                break;
+            }
+            let (wanted, bucket) = if root == models.vision_root {
+                (want_images, &mut image_hits)
+            } else if root == models.text_root {
+                (want_texts, &mut text_hits)
+            } else {
+                continue;
+            };
+            if !wanted || bucket.len() >= limit || Some(eid) == query_eid || !seen.insert(eid) {
                 continue;
             }
             if !filter_tags.is_empty() {
@@ -1889,28 +1926,56 @@ fn cmd_similar<P: TriblePattern>(
                     continue;
                 }
             }
-            rows.push((cos, eid));
+            bucket.push((cos, eid));
+            let images_done = !want_images || image_hits.len() >= limit;
+            let texts_done = !want_texts || text_hits.len() >= limit;
+            if images_done && texts_done {
+                break;
+            }
         }
-        rows.truncate(limit);
 
-        if rows.is_empty() {
+        let mut groups: Vec<(&str, Vec<(f32, Id)>)> = Vec::new();
+        if !image_hits.is_empty() {
+            groups.push(("Images", image_hits));
+        }
+        if !text_hits.is_empty() {
+            groups.push(("Texts", text_hits));
+        }
+        if groups.is_empty() {
             out.line(format!("no files similar to {label} above cos {floor}"))?;
             return Ok(());
         }
+        // The group whose best hit scores higher first: same-modality hits lead.
+        groups.sort_by(|a, b| {
+            b.1[0]
+                .0
+                .partial_cmp(&a.1[0].0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.line(format!("Similar to {label} (cos ≥ {floor}):"))?;
-        for (cos, eid) in &rows {
-            let name = read_name(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-            let mime = read_mime(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-            let hash = content_handle_of(space, *eid)
-                .map(handle_hex)
-                .unwrap_or_default();
-            let tags = tags_of(space, *eid);
-            let tagstr = if tags.is_empty() {
-                String::new()
+        for (group, hits) in &groups {
+            let indent = if kind.is_none() {
+                out.line(format!("  {group}:"))?;
+                "    "
             } else {
-                format!("  [{}]", tags.join(", "))
+                "  "
             };
-            out.line(format!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}"))?;
+            for (cos, eid) in hits {
+                let name = read_name(space, reader, *eid)?.unwrap_or_else(|| "?".into());
+                let mime = read_mime(space, reader, *eid)?.unwrap_or_else(|| "?".into());
+                let hash = content_handle_of(space, *eid)
+                    .map(handle_hex)
+                    .unwrap_or_default();
+                let tags = tags_of(space, *eid);
+                let tagstr = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", tags.join(", "))
+                };
+                out.line(format!(
+                    "{indent}{cos:.3}  {name}  ({mime})  {hash}{tagstr}"
+                ))?;
+            }
         }
         Ok(())
     }
@@ -2077,7 +2142,28 @@ pub struct SimilarityOptions<'a> {
     pub floor: f32,
     pub limit: usize,
     pub tags: &'a [String],
+    /// Rank only this kind; both kinds, as two groups, when absent.
+    pub kind: Option<Kind>,
     pub mm7b: bool,
+}
+
+/// One of the two kinds the semantic index ranks separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Text,
+}
+
+impl std::str::FromStr for Kind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "image" | "images" => Ok(Kind::Image),
+            "text" | "texts" => Ok(Kind::Text),
+            other => bail!("unknown kind {other:?}: image or text"),
+        }
+    }
 }
 
 pub struct EmbeddingOptions {
@@ -2232,6 +2318,7 @@ impl Files {
                     options.floor,
                     options.limit,
                     options.tags,
+                    options.kind,
                     options.mm7b,
                     out,
                 )
