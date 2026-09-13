@@ -1,8 +1,9 @@
 use super::SpeechDisposition;
 
 /// An output sink rejected a speech report. This is not evidence of a device
-/// failure. `playback` is known only when the local queue has already drained;
-/// otherwise playback may have begun but was interrupted by the reporting error.
+/// failure. `playback` is known only when a local or Soma queue has already
+/// drained; otherwise playback may have begun but was interrupted by the
+/// reporting error.
 #[derive(Debug)]
 pub struct SpeechReportingError {
     pub playback: Option<SpeechDisposition>,
@@ -12,6 +13,9 @@ impl std::fmt::Display for SpeechReportingError {
         match self.playback {
             Some(SpeechDisposition::LocalPlaybackDrained) => {
                 formatter.write_str("speech reporting failed after local playback drained")
+            }
+            Some(SpeechDisposition::SomaPlaybackDrained) => {
+                formatter.write_str("speech reporting failed after Soma playback drained")
             }
             _ => formatter.write_str("speech reporting failed; playback completion is unknown"),
         }
@@ -86,6 +90,23 @@ mod tests {
                 .unwrap()
                 .playback,
             Some(SpeechDisposition::LocalPlaybackDrained)
+        );
+    }
+
+    #[test]
+    fn failed_completion_report_preserves_known_soma_drain() {
+        let error = report(
+            &mut Out::new(&mut |_| anyhow::bail!("delivery failed")),
+            "played".into(),
+            Some(SpeechDisposition::SomaPlaybackDrained),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<SpeechReportingError>()
+                .unwrap()
+                .playback,
+            Some(SpeechDisposition::SomaPlaybackDrained)
         );
     }
 

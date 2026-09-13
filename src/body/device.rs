@@ -1,6 +1,7 @@
 //! Explicit host/device operations. Construction never contacts hardware.
-//! The camera remains the original embedded Python/WebRTC island; REST motion
-//! and state access are native. These operations are not registered with MCP.
+//! The camera remains the original embedded Python/WebRTC island and connects
+//! to the same configured daemon as native REST motion and state access. These
+//! operations are not registered with MCP.
 
 use super::{Body, CaptureInput, CaptureReceipt, Signal};
 use anybytes::Bytes;
@@ -141,7 +142,7 @@ impl Device {
         Ok(felt)
     }
     pub fn frame(&self) -> Result<Frame> {
-        grab_frame(&self.python)
+        grab_frame(&self.python, &self.daemon)
     }
     pub fn look(&self, body: &Body, note: Option<&str>) -> Result<CaptureReceipt> {
         let frame = self.frame()?;
@@ -548,7 +549,7 @@ impl Drop for TemporaryFrame {
         let _ = std::fs::remove_file(&self.0);
     }
 }
-fn grab_frame(python: &str) -> Result<Frame> {
+fn grab_frame(python: &str, daemon: &str) -> Result<Frame> {
     let stamp = crate::clock::tai_nanoseconds_now()?;
     let path = std::env::temp_dir().join(format!("body-frame-{}-{stamp}.png", std::process::id()));
     let file = std::fs::OpenOptions::new()
@@ -562,6 +563,7 @@ fn grab_frame(python: &str) -> Result<Frame> {
         .arg("-c")
         .arg(FRAME_SHIM)
         .arg(&output_path.0)
+        .arg(daemon)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -602,4 +604,32 @@ fn grab_frame(python: &str) -> Result<Frame> {
         width,
         height,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::Device;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn frame_forwards_the_configured_daemon_to_the_camera_shim() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim = directory.path().join("fake-python");
+        fs::write(
+            &shim,
+            b"#!/bin/sh\nprintf '%s' \"$4\" > \"$3\"\nprintf '2x1\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&shim, permissions).unwrap();
+
+        let daemon = "http://reachy.example:8123";
+        let frame = Device::new(daemon.into(), shim.to_string_lossy().into_owned())
+            .frame()
+            .unwrap();
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(frame.bytes.as_ref(), daemon.as_bytes());
+    }
 }

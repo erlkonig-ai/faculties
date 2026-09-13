@@ -21,11 +21,20 @@ use retention::retain_after_playback;
 pub use retention::SpeechRetentionError;
 
 pub const DEFAULT_DAEMON: &str = "http://localhost:8000";
+#[cfg(feature = "voice")]
 fn http() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("build voice HTTP client")
+}
+
+fn probe_http() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("build voice endpoint probe")
 }
 
 /// Enumerate connected audio OUTPUT devices natively via cpal (CoreAudio on
@@ -130,10 +139,18 @@ fn play_on_reachy(daemon: &str, wav: &Path) -> Result<()> {
 }
 
 fn reachy_reachable(daemon: &str) -> bool {
-    http()
+    probe_http()
         .get(format!("{daemon}/api/daemon/status"))
         .send()
         .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn soma_reachable(soma: &str) -> bool {
+    probe_http()
+        .get(format!("{}/state", soma.trim_end_matches('/')))
+        .send()
+        .map(|response| response.status().is_success())
         .unwrap_or(false)
 }
 
@@ -146,7 +163,7 @@ fn reachy_reachable(daemon: &str) -> bool {
 #[cfg_attr(not(feature = "voice"), allow(dead_code))]
 enum Spoken {
     /// Synthesized and written to `out`; the disposition distinguishes a
-    /// drained local queue from the Reachy daemon accepting a request.
+    /// drained local/Soma queue from the Reachy daemon accepting a request.
     Played(SpeechDisposition),
     /// The full utterance was synthesized and written to `out`, but playback
     /// failed — the caller logs the audio, then surfaces this error.
@@ -159,7 +176,8 @@ enum Spoken {
 /// writing the COMPLETE utterance to `out` for the log. Never called for the
 /// `Routed::Text` fallback (the caller short-circuits it — no GPU work for a
 /// silent utterance). Local playback settles; Reachy only acknowledges the
-/// playback request. See [`Spoken`] for the failure-stage split.
+/// playback request; Soma acknowledges a drained ring. See [`Spoken`] for the
+/// failure-stage split.
 #[cfg(feature = "voice")]
 fn speak_and_play(
     routed: &Routed,
@@ -186,6 +204,7 @@ fn speak_and_play(
             }
             Ok(())
         }
+        Routed::Soma(endpoint) => stream_to_soma(&mut stream, &mut samples, endpoint, sr, output),
         Routed::Devices(ladder) => stream_to_device(
             &mut stream,
             &mut samples,
@@ -222,11 +241,51 @@ fn speak_and_play(
             return Ok(Spoken::PlaybackFailed(e));
         }
     }
-    Ok(Spoken::Played(if matches!(routed, Routed::Reachy) {
-        SpeechDisposition::ReachyRequestAccepted
-    } else {
-        SpeechDisposition::LocalPlaybackDrained
+    Ok(Spoken::Played(match routed {
+        Routed::Soma(_) => SpeechDisposition::SomaPlaybackDrained,
+        Routed::Reachy => SpeechDisposition::ReachyRequestAccepted,
+        Routed::Devices(_) => SpeechDisposition::LocalPlaybackDrained,
+        Routed::Text(_) => unreachable!("text fallback never reaches playback"),
     }))
+}
+
+/// Stream generated mono PCM through Soma's bounded client. `finish` is the
+/// completion boundary: it returns only after Soma's ring drained, and its
+/// receipt must account for every sample this producer sent. Any early error
+/// drops the body as a barge-in; audio is never replayed through a fallback
+/// because some prefix may already have been audible.
+#[cfg(feature = "voice")]
+fn stream_to_soma(
+    stream: &mut mary::speak::SpeakStream,
+    samples: &mut Vec<f32>,
+    endpoint: &str,
+    sample_rate: u32,
+    output: &mut Out<'_>,
+) -> Result<()> {
+    let mut playback =
+        soma_client::SomaPlayback::open(endpoint, soma_client::PlaybackSpec::mono(sample_rate))?;
+    for chunk in stream.by_ref() {
+        // Retain before the fallible transport write. If Soma rejects the
+        // request, the caller can still drain and persist the complete WAV.
+        samples.extend_from_slice(&chunk);
+        playback.push_f32(&chunk)?;
+    }
+    let receipt = playback.finish()?;
+    let audio_seconds = receipt.samples as f64 / sample_rate as f64;
+    report(
+        output,
+        format!(
+            "  [stream] Soma drained {audio_seconds:.1}s ({} samples; {} underrun; \
+             {} callbacks, {} late, max {:.2}ms)",
+            receipt.samples,
+            receipt.underrun_samples,
+            receipt.callbacks,
+            receipt.late_callbacks,
+            receipt.max_callback_ms,
+        ),
+        Some(SpeechDisposition::SomaPlaybackDrained),
+    )?;
+    Ok(())
 }
 
 /// Drain `stream` into the first device of `ladder` that OPENS, through the
@@ -482,6 +541,8 @@ fn unique_voice_tmp() -> Result<PathBuf> {
 pub struct RouteReport {
     pub devices: Vec<AudioDevice>,
     pub daemon_up: bool,
+    pub soma: Option<String>,
+    pub soma_up: bool,
     pub routes: Vec<(super::RoutePolicy, Routed)>,
 }
 impl RouteReport {
@@ -490,6 +551,13 @@ impl RouteReport {
             "Reachy daemon: {}",
             if self.daemon_up { "reachable" } else { "down" }
         ))?;
+        match &self.soma {
+            Some(soma) => out.line(format!(
+                "Soma at {soma}: {}",
+                if self.soma_up { "reachable" } else { "down" }
+            ))?,
+            None => out.line("Soma: not configured")?,
+        }
         out.line("")?;
         out.line("connected output devices:")?;
         for device in &self.devices {
@@ -526,6 +594,9 @@ pub enum SpeechDisposition {
     /// The native queue drained and its device-buffer flush delay elapsed.
     /// This is not evidence that a listener heard it.
     LocalPlaybackDrained,
+    /// Soma returned its exact receipt after the remote playback ring drained.
+    /// This is not evidence that a listener heard it.
+    SomaPlaybackDrained,
     /// Reachy accepted upload/play_sound; physical completion is not observed.
     ReachyRequestAccepted,
 }
@@ -550,13 +621,20 @@ impl SpeechReceipt {
 pub struct Device {
     pub voice: Voice,
     pub daemon: String,
+    pub soma: Option<String>,
     pub synthesizer: Synthesizer,
 }
 impl Device {
-    pub fn new(voice: Voice, daemon: String, synthesizer: Synthesizer) -> Self {
+    pub fn new(
+        voice: Voice,
+        daemon: String,
+        soma: Option<String>,
+        synthesizer: Synthesizer,
+    ) -> Self {
         Self {
             voice,
             daemon,
+            soma,
             synthesizer,
         }
     }
@@ -564,12 +642,18 @@ impl Device {
         let policies = self.voice.routes()?;
         let devices = detect_output_devices()?;
         let daemon_up = reachy_reachable(&self.daemon);
+        let soma_up = self.soma.as_deref().is_some_and(soma_reachable);
         let routes = policies
             .into_iter()
             .map(|policy| {
                 let routed = match policy.channel {
                     Channel::Say => route_say(&policy.devices, &devices),
-                    Channel::Shout => route_shout(&policy.devices, &devices, daemon_up),
+                    Channel::Shout => route_shout(
+                        &policy.devices,
+                        &devices,
+                        daemon_up,
+                        self.soma.as_deref().filter(|_| soma_up),
+                    ),
                 };
                 (policy, routed)
             })
@@ -577,6 +661,8 @@ impl Device {
         Ok(RouteReport {
             devices,
             daemon_up,
+            soma: self.soma.clone(),
+            soma_up,
             routes,
         })
     }
@@ -593,10 +679,30 @@ impl Device {
     ) -> Result<SpeechReceipt> {
         super::operations::validate_text(text)?;
         let prefs = self.voice.route(channel)?;
-        let devices = detect_output_devices()?;
         let routed = match channel {
-            Channel::Say => route_say(&prefs, &devices),
-            Channel::Shout => route_shout(&prefs, &devices, reachy_reachable(&self.daemon)),
+            Channel::Say => route_say(&prefs, &detect_output_devices()?),
+            Channel::Shout => {
+                let soma = match self.soma.as_deref() {
+                    Some(soma) if soma_reachable(soma) => Some(soma),
+                    Some(soma) => {
+                        out.line(format!(
+                            "  [route] Soma at {soma} is not answering; falling through"
+                        ))?;
+                        None
+                    }
+                    None => None,
+                };
+                if soma.is_some() {
+                    route_shout(&prefs, &[], false, soma)
+                } else {
+                    route_shout(
+                        &prefs,
+                        &detect_output_devices()?,
+                        reachy_reachable(&self.daemon),
+                        None,
+                    )
+                }
+            }
         };
         out.line(format!("[{}] → {}", channel.name(), routed.describe()))?;
         if dry_run {

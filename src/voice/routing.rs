@@ -87,6 +87,9 @@ fn connected_matches<'a>(
 /// The outcome of resolving a channel's routing against the live devices.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Routed {
+    /// Stream public speech to Soma and wait for its playback ring to drain.
+    /// This variant is never produced by [`route_say`].
+    Soma(String),
     /// Play through the Reachy robot speaker (daemon upload + play).
     Reachy,
     /// Play through the native sink on the first OPENABLE device of this
@@ -100,6 +103,7 @@ pub enum Routed {
 impl Routed {
     pub fn describe(&self) -> String {
         match self {
+            Routed::Soma(endpoint) => format!("Soma speaker ({endpoint})"),
             Routed::Reachy => "Reachy speaker (daemon)".to_string(),
             Routed::Devices(ladder) => {
                 let (first, rest) = ladder.split_first().expect("ladder is never empty");
@@ -136,13 +140,20 @@ pub fn route_say(prefs: &[String], devices: &[AudioDevice]) -> Routed {
     }
 }
 
-/// Resolve the PUBLIC `shout` channel — broadcasting is the point, so it
-/// builds the whole audible ladder: every connected policy match in priority
-/// order, with the default output appended as the last resort. Reachy
-/// short-circuits when it is the FIRST connected match and the daemon is up
-/// (its sink is the whole-file daemon upload, not the streaming device sink);
-/// when the daemon is down it is skipped and the ladder keeps going.
-pub fn route_shout(prefs: &[String], devices: &[AudioDevice], daemon_up: bool) -> Routed {
+/// Resolve the PUBLIC `shout` channel. A reachable Soma is the body's canonical
+/// streaming speaker and wins before host-device policy. Without it, build the
+/// audible ladder from every connected policy match and append the default
+/// output as last resort. Reachy short-circuits when it is the first connected
+/// match and the daemon is up; when the daemon is down it is skipped.
+pub fn route_shout(
+    prefs: &[String],
+    devices: &[AudioDevice],
+    daemon_up: bool,
+    soma: Option<&str>,
+) -> Routed {
+    if let Some(endpoint) = soma {
+        return Routed::Soma(endpoint.to_owned());
+    }
     let mut ladder: Vec<String> = Vec::new();
     for pat in prefs {
         for dev in connected_matches(pat, devices) {

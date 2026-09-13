@@ -24,6 +24,11 @@ pub struct Cli {
     /// Reachy daemon base URL (the `shout` Reachy-speaker target).
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
+    /// Soma base URL. When explicitly configured and reachable, this is the
+    /// preferred drained-stream target for public `shout`; it is never used by
+    /// private `say`.
+    #[arg(long, env = "SOMA_URL")]
+    soma: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -49,9 +54,9 @@ enum Command {
         #[arg(long, env = "VOICE_PAUSE_FILE")]
         pause_file: Option<PathBuf>,
     },
-    /// Speak ALOUD on the PUBLIC channel — Reachy speaker → room → laptop.
-    /// Broadcasting is the point; falls back to any audible device. Recorded on
-    /// the fixed Voice collection.
+    /// Speak ALOUD on the PUBLIC channel — Soma body first, then Reachy daemon
+    /// and audible host-device fallbacks. Recorded on the fixed Voice
+    /// collection.
     Shout {
         /// What to shout.
         text: String,
@@ -103,7 +108,7 @@ pub fn run() -> Result<()> {
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
     let voice = Voice::new(cli.pile, cli.key);
     let synthesizer = Synthesizer::new(ModelSources::from_environment());
-    let device = Device::new(voice.clone(), cli.daemon, synthesizer.clone());
+    let device = Device::new(voice.clone(), cli.daemon, cli.soma, synthesizer.clone());
     match cli.command {
         None => anyhow::bail!("Voice requires an explicit command"),
         Some(Command::Say {

@@ -14,6 +14,7 @@ impl std::fmt::Display for SpeechRetentionError {
             SpeechDisposition::LocalPlaybackDrained => {
                 formatter.write_str("local playback drained")
             }
+            SpeechDisposition::SomaPlaybackDrained => formatter.write_str("Soma playback drained"),
             SpeechDisposition::ReachyRequestAccepted => formatter
                 .write_str("Reachy accepted the playback request; completion was not observed"),
             SpeechDisposition::DryRun => formatter.write_str("a dry run"),
@@ -46,6 +47,10 @@ mod tests {
             (
                 SpeechDisposition::ReachyRequestAccepted,
                 "completion was not observed",
+            ),
+            (
+                SpeechDisposition::SomaPlaybackDrained,
+                "Soma playback drained",
             ),
         ] {
             let error = retain_after_playback::<u8>(

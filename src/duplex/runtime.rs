@@ -28,7 +28,7 @@ const _: () = assert!(FRAME_SAMPLES * 1_000 == 80 * SAMPLE_RATE as usize);
 
 /// Where the body is, unless told otherwise. The same default the rest of the
 /// suite uses (`voice`, `body`, `hear`).
-pub const DEFAULT_SOMA: &str = "http://localhost:8000";
+pub const DEFAULT_SOMA: &str = soma_client::DEFAULT_BASE;
 /// How far the capture ring may run ahead before the loop discards the
 /// backlog. The model's step count IS its clock, so a loop that falls behind
 /// the world cannot catch up by stepping faster — it can only skip forward.

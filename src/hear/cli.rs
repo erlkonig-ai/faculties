@@ -80,7 +80,7 @@ struct ListenArgs {
     #[command(flatten)]
     shared: Shared,
     /// Base URL of the running Soma that owns the microphone.
-    #[arg(long, env = "SOMA_URL", default_value = "http://localhost:8000")]
+    #[arg(long, env = "SOMA_URL", default_value = soma_client::DEFAULT_BASE)]
     soma: String,
     /// Half-duplex pause file. While it exists, captured frames are DISCARDED
     /// — the stream is never closed. The speaking side holds the same path

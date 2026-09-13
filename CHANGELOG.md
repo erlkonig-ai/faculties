@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Body frame capture now passes the configured `REACHY_DAEMON` origin into the
+  embedded Reachy SDK shim. Local origins retain the local media path; remote
+  origins use the SDK's network/WebRTC mode, so camera capture follows the same
+  robot as native pose and motion calls instead of silently forcing localhost.
+
+- Public `voice shout` now prefers Soma's bounded streaming playback when its
+  configured `SOMA_URL` is reachable, propagates backpressure into synthesis,
+  treats cancellation as barge-in, and reports completion only after Soma's
+  ring returns an exact drained-sample receipt. Private `voice say` has no Soma
+  route, and Voice only selects Soma when `SOMA_URL` is explicitly configured.
+  The Soma server, Hear, and Duplex now share its canonical local endpoint
+  (`http://localhost:8383`) from `soma-client` instead of carrying stale port
+  literals; native-device and Reachy-daemon fallbacks remain explicit.
+
 - Use the existing durable signing key for collection maintenance as well as
   COMMIT publication. New MERGE/DERIVE equations require target WRITE authority;
   readers may reuse an already realised cover without becoming its producers.

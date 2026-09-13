@@ -463,7 +463,7 @@ mod tests {
             dev("Reachy Mini Audio", false),
         ];
         assert!(matches!(
-            route_shout(&prefs(&["Reachy", "MacBook"]), &devices, true),
+            route_shout(&prefs(&["Reachy", "MacBook"]), &devices, true, None),
             Routed::Reachy
         ));
     }
@@ -479,6 +479,7 @@ mod tests {
             &prefs(&["Reachy", "Studio", "MacBook"]),
             &devices,
             false,
+            None,
         ));
         assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
     }
@@ -490,10 +491,10 @@ mod tests {
             dev("Studio Display Speakers", false),
         ];
         // Policy matches nothing: fall to the default output alone.
-        let l = ladder(route_shout(&prefs(&["Reachy"]), &devices, false));
+        let l = ladder(route_shout(&prefs(&["Reachy"]), &devices, false, None));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
         // Policy matches something: default output still appended as fallback.
-        let l = ladder(route_shout(&prefs(&["Studio"]), &devices, false));
+        let l = ladder(route_shout(&prefs(&["Studio"]), &devices, false, None));
         assert_eq!(l, vec!["Studio Display Speakers", "MacBook Pro Speakers"]);
     }
 
@@ -504,8 +505,31 @@ mod tests {
             dev("Reachy Mini Audio", false),
         ];
         // Reachy below a local match is not a streaming-sink candidate.
-        let l = ladder(route_shout(&prefs(&["MacBook", "Reachy"]), &devices, true));
+        let l = ladder(route_shout(
+            &prefs(&["MacBook", "Reachy"]),
+            &devices,
+            true,
+            None,
+        ));
         assert_eq!(l, vec!["MacBook Pro Speakers"]);
+    }
+
+    #[test]
+    fn shout_prefers_reachable_soma_but_say_has_no_soma_path() {
+        let devices = [dev("AirPods Max", false), dev("MacBook Pro Speakers", true)];
+        assert_eq!(
+            route_shout(
+                &prefs(&["MacBook"]),
+                &devices,
+                false,
+                Some("http://body:8383"),
+            ),
+            Routed::Soma("http://body:8383".into()),
+        );
+        assert!(matches!(
+            route_say(&prefs(&["AirPods"]), &devices),
+            Routed::Devices(_)
+        ));
     }
 
     // ── adaptive prebuffer math ──
@@ -571,6 +595,14 @@ mod tests {
         assert_eq!(
             routed.describe(),
             "AirPods Max (native sink; fallbacks: AirPods Pro)"
+        );
+    }
+
+    #[test]
+    fn describe_names_soma_as_the_remote_drained_speaker() {
+        assert_eq!(
+            Routed::Soma("http://body:8383".into()).describe(),
+            "Soma speaker (http://body:8383)"
         );
     }
 }

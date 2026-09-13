@@ -201,7 +201,7 @@ rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
-soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex (Soma's framed 80 ms capture contract; anyhow + the reqwest already here). Unconditional: the capture seam is not a feature, it is how the body is reached.
+soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex capture and voice playback (shared Soma wire/HTTP contracts). Unconditional: this is how the body is reached.
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
