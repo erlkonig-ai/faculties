@@ -620,10 +620,14 @@ mod tests {
         let mut bytes = valid.to_bytes();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        let invalid = CollectionCommit::from_bytes(bytes);
-        assert!(invalid.verify_strict().is_err());
-        pile.insert(CollectionRecord::Commit(invalid)).unwrap();
+        assert!(CollectionCommit::from_bytes(bytes).is_err());
+        pile.insert(CollectionRecord::Commit(valid)).unwrap();
         pile.close().unwrap();
+        // Explicit migration audit must still see bad persisted evidence;
+        // checked foreign-byte constructors no longer manufacture this value.
+        let mut raw = fs::read(&path).unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        fs::write(&path, raw).unwrap();
 
         let plan = plan_path(&path, Some(&key)).unwrap();
         assert_eq!(plan.invalid_commits(), 1);
@@ -649,14 +653,16 @@ mod tests {
         );
         let source = CollectionCommit::sign(&signer, old, missing_data(1), missing_metadata(2));
         pile.insert(CollectionRecord::Commit(source)).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::new(
+        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &signer,
             old,
             missing_data(1),
             missing_data(3),
             missing_data(4),
         )))
         .unwrap();
-        pile.insert(CollectionRecord::Derive(CollectionDerive::new(
+        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
             old,
             missing_data(1),
             missing_data(5),

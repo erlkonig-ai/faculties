@@ -276,9 +276,9 @@ impl DiscordSession<'_> {
             .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
         self.reader = pollster::block_on(async {
-            drop(self.pile.ensure(self.collection).await?);
-            drop(self.pile.maintain(self.succinct).await?);
-            self.pile.maintain(self.rank9).await
+            drop(self.pile.ensure(self.collection, &self.signer).await?);
+            drop(self.pile.maintain(self.succinct, &self.signer).await?);
+            self.pile.maintain(self.rank9, &self.signer).await
         })
         .context("maintain Discord fact collection after commit")?;
         self.facts = self
@@ -345,9 +345,9 @@ impl DiscordStorage<'_> {
                     policy,
                 )?;
                 let store_snapshot = pollster::block_on(async {
-                    drop(pile.ensure(collection).await?);
-                    drop(pile.maintain(maintained_succinct).await?);
-                    pile.maintain(maintained_rank9).await
+                    drop(pile.ensure(collection, signer).await?);
+                    drop(pile.maintain(maintained_succinct, signer).await?);
+                    pile.maintain(maintained_rank9, signer).await
                 })
                 .context("maintain Discord fact collection")?;
                 let facts = store_snapshot

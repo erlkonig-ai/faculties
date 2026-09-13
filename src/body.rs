@@ -556,23 +556,23 @@ pub async fn materialize_indexed_collection(
     let target = intent_register_collection(pile, signer.verifying_key())?;
 
     drop(
-        pile.ensure(source)
+        pile.ensure(source, signer)
             .await
             .context("ensure Body source collection")?,
     );
     drop(
-        pile.maintain(succinct)
+        pile.maintain(succinct, signer)
             .await
             .context("maintain Body Succinct collection")?,
     );
     let ready = pile
-        .maintain(rank9)
+        .maintain(rank9, signer)
         .await
         .context("maintain Body fact collection")?;
     let instant = ready.instant();
     drop(ready);
     drop(
-        pile.maintain(target)
+        pile.maintain(target, signer)
             .await
             .map_err(|error| anyhow!("maintain Body intent register: {error}"))?,
     );
@@ -671,8 +671,8 @@ mod tests {
             });
             let second_id = second.root().unwrap();
             pile.commit(source, &signer, second).unwrap();
-            drop(pile.maintain(succinct).await.unwrap());
-            let snapshot = pile.maintain(rank9).await.unwrap();
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            let snapshot = pile.maintain(rank9, &signer).await.unwrap();
             let fact_collection = snapshot.collection(rank9).unwrap();
             let intent_collection = snapshot.collection(target).unwrap();
             assert_ne!(fact_collection.support(), intent_collection.support());
@@ -683,7 +683,7 @@ mod tests {
                 first_id
             );
 
-            let snapshot = pile.maintain(target).await.unwrap();
+            let snapshot = pile.maintain(target, &signer).await.unwrap();
             let advanced = snapshot
                 .collection(target)
                 .unwrap()

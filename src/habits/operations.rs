@@ -118,9 +118,9 @@ impl Habits {
                     policy,
                 )?;
                 let snapshot = pollster::block_on(async {
-                    drop(session.pile.ensure(source).await?);
-                    drop(session.pile.maintain(succinct).await?);
-                    session.pile.maintain(rank9).await
+                    drop(session.pile.ensure(source, session.signer).await?);
+                    drop(session.pile.maintain(succinct, session.signer).await?);
+                    session.pile.maintain(rank9, session.signer).await
                 })?;
                 let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
                 for input in personas {
@@ -297,9 +297,9 @@ fn with_habits<T>(
         let maintained_rank9 =
             pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(maintained_succinct, (), policy)?;
         let reader = pollster::block_on(async {
-            drop(pile.ensure(collection).await?);
-            drop(pile.maintain(maintained_succinct).await?);
-            pile.maintain(maintained_rank9).await
+            drop(pile.ensure(collection, signer).await?);
+            drop(pile.maintain(maintained_succinct, signer).await?);
+            pile.maintain(maintained_rank9, signer).await
         })
         .context("maintain Habit fact collection")?;
         let facts = reader

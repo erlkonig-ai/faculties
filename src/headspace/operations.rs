@@ -200,7 +200,7 @@ impl Storage {
                     ("Secrets", secrets_collection.source()),
                 ] {
                     drop(
-                        pile.ensure(source)
+                        pile.ensure(source, &self.signer)
                             .await
                             .with_context(|| format!("ensure {label} source collection"))?,
                     );
@@ -214,17 +214,17 @@ impl Storage {
                     .context("admit Secrets collection support")?;
                 drop(before);
                 drop(
-                    pile.maintain(collection_succinct)
+                    pile.maintain(collection_succinct, &self.signer)
                         .await
                         .context("maintain Headspace fact collection")?,
                 );
                 drop(
-                    pile.maintain(collection_rank9)
+                    pile.maintain(collection_rank9, &self.signer)
                         .await
                         .context("maintain Headspace fact collection")?,
                 );
                 let store_snapshot = secrets_collection
-                    .ensure_exact(pile, &secrets_support)
+                    .ensure_exact(pile, &self.signer, &secrets_support)
                     .await
                     .context("ensure configured Secrets collection")?;
                 let secrets = secret_storage::snapshot_exact(

@@ -1620,9 +1620,9 @@ mod tests {
             1
         );
         let store_snapshot = pollster::block_on(async {
-            drop(pile.ensure(messages).await.unwrap());
-            drop(pile.maintain(succinct).await.unwrap());
-            pile.maintain(rank9).await.unwrap()
+            drop(pile.ensure(messages, &signer).await.unwrap());
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            pile.maintain(rank9, &signer).await.unwrap()
         });
         let observed = store_snapshot.collection(rank9).unwrap();
         let message_facts = observed.view::<FactArchive>().unwrap();

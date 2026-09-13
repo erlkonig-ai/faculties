@@ -341,7 +341,7 @@ impl Storage {
                         ("Secrets", secrets_collection.source()),
                     ] {
                         drop(
-                            pile.ensure(source)
+                            pile.ensure(source, &self.signer)
                                 .await
                                 .with_context(|| format!("ensure {label} source collection"))?,
                         );
@@ -356,48 +356,48 @@ impl Storage {
                     drop(before);
 
                     drop(
-                        pile.maintain(mail_succinct)
+                        pile.maintain(mail_succinct, &self.signer)
                             .await
                             .context("maintain Mail fact collection")?,
                     );
                     drop(
-                        pile.maintain(mail_rank9)
+                        pile.maintain(mail_rank9, &self.signer)
                             .await
                             .context("maintain Mail fact collection")?,
                     );
                     drop(
-                        pile.maintain(files_succinct)
+                        pile.maintain(files_succinct, &self.signer)
                             .await
                             .context("maintain Files fact collection")?,
                     );
                     drop(
-                        pile.maintain(files_rank9)
+                        pile.maintain(files_rank9, &self.signer)
                             .await
                             .context("maintain Files fact collection")?,
                     );
                     drop(
-                        pile.maintain(decide_succinct)
+                        pile.maintain(decide_succinct, &self.signer)
                             .await
                             .context("maintain Decide fact collection")?,
                     );
                     drop(
-                        pile.maintain(decide_rank9)
+                        pile.maintain(decide_rank9, &self.signer)
                             .await
                             .context("maintain Decide fact collection")?,
                     );
                     drop(
-                        pile.maintain(relations_succinct)
+                        pile.maintain(relations_succinct, &self.signer)
                             .await
                             .context("maintain Relations fact collection")?,
                     );
                     drop(
-                        pile.maintain(relations_rank9)
+                        pile.maintain(relations_rank9, &self.signer)
                             .await
                             .context("maintain Relations fact collection")?,
                     );
 
                     let store_snapshot = secrets_collection
-                        .ensure_exact(pile, &secrets_support)
+                        .ensure_exact(pile, &self.signer, &secrets_support)
                         .await
                         .context("ensure configured Secrets collection")?;
                     let secrets = secret_storage::snapshot_exact(

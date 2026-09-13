@@ -45,35 +45,35 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: triblespace/triblespace-rs
-          ref: 2bf0bb7af1d300808a4de04fc793434658e15e27
+          ref: 1381faea4dc988c4780277690ee4e3443587d1f6
           path: triblespace-rs
 
       - name: Check out Mary cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: f5468c8b071d7666bf5a0a3d1484fc1fdb8c813a
+          ref: 662815676c9a5688a5dff8e720f98bcca171b79b
           path: mary
 
       - name: Check out GORBIE cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/GORBIE
-          ref: 2340cc2a406877ed25cf5024ed768dd9c76cd1ff
+          ref: 761c962a9beed416e14390fa8632f803fd4a485a
           path: GORBIE
 
       - name: Check out Soma cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/soma
-          ref: ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
+          ref: e75ef119fae679aed27420fc5e0835be60f5920d
           path: soma
 
       - name: Check out CubeCL zero-copy cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/cubecl
-          ref: 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
+          ref: f4b58290e5c1acb26c1c00d8b0606b208816c295
           path: cubecl-fork
 
       - name: Install rust toolchain

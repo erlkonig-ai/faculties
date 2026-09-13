@@ -424,14 +424,18 @@ impl MemoryStorage<'_> {
                 let collection = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Rank9 Memory collection")?;
-                drop(pile.ensure(source).await.context("ensure Memory source")?);
                 drop(
-                    pile.maintain(succinct)
+                    pile.ensure(source, signer)
+                        .await
+                        .context("ensure Memory source")?,
+                );
+                drop(
+                    pile.maintain(succinct, signer)
                         .await
                         .context("maintain Succinct Memory collection")?,
                 );
                 let store_snapshot = pile
-                    .maintain(collection)
+                    .maintain(collection, signer)
                     .await
                     .context("maintain Rank9 Memory collection")?;
                 Self::load_memory_from_snapshot(collection, &store_snapshot)
@@ -483,28 +487,28 @@ impl MemoryStorage<'_> {
                 } else {
                     None
                 };
-                drop(pile.ensure(memory_source).await?);
+                drop(pile.ensure(memory_source, signer).await?);
                 if let Some((source, _, _)) = embeddings_collections {
-                    drop(pile.ensure(source).await?);
+                    drop(pile.ensure(source, signer).await?);
                 }
                 drop(
-                    pile.maintain(memory_succinct)
+                    pile.maintain(memory_succinct, signer)
                         .await
                         .context("maintain Succinct Memory collection")?,
                 );
                 drop(
-                    pile.maintain(memory_collection)
+                    pile.maintain(memory_collection, signer)
                         .await
                         .context("maintain Rank9 Memory collection")?,
                 );
                 if let Some((_, succinct, rank9)) = embeddings_collections {
                     drop(
-                        pile.maintain(succinct)
+                        pile.maintain(succinct, signer)
                             .await
                             .context("maintain Succinct shared Embeddings collection")?,
                     );
                     drop(
-                        pile.maintain(rank9)
+                        pile.maintain(rank9, signer)
                             .await
                             .context("maintain Rank9 shared Embeddings collection")?,
                     );
@@ -560,25 +564,25 @@ impl MemoryStorage<'_> {
                 let comb_collection = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
                     .context("register Rank9 Comb collection")?;
-                drop(pile.ensure(memory_source).await?);
-                drop(pile.ensure(comb_source).await?);
+                drop(pile.ensure(memory_source, signer).await?);
+                drop(pile.ensure(comb_source, signer).await?);
                 drop(
-                    pile.maintain(memory_succinct)
+                    pile.maintain(memory_succinct, signer)
                         .await
                         .context("maintain Succinct Memory collection")?,
                 );
                 drop(
-                    pile.maintain(memory_collection)
+                    pile.maintain(memory_collection, signer)
                         .await
                         .context("maintain Rank9 Memory collection")?,
                 );
                 drop(
-                    pile.maintain(comb_succinct)
+                    pile.maintain(comb_succinct, signer)
                         .await
                         .context("maintain Succinct Comb collection")?,
                 );
                 drop(
-                    pile.maintain(comb_collection)
+                    pile.maintain(comb_collection, signer)
                         .await
                         .context("maintain Rank9 Comb collection")?,
                 );
@@ -661,7 +665,7 @@ impl MemoryStorage<'_> {
                     )
                     .context("register Rank9 Archive collection")?;
                 for source in [memory_source, cognition_source, archive_source] {
-                    drop(pile.ensure(source).await?);
+                    drop(pile.ensure(source, signer).await?);
                 }
                 for (succinct, collection, label) in [
                     (memory_succinct, memory_collection, "Memory"),
@@ -669,12 +673,12 @@ impl MemoryStorage<'_> {
                     (archive_succinct, archive_collection, "Archive"),
                 ] {
                     drop(
-                        pile.maintain(succinct)
+                        pile.maintain(succinct, signer)
                             .await
                             .with_context(|| format!("maintain Succinct {label} collection"))?,
                     );
                     drop(
-                        pile.maintain(collection)
+                        pile.maintain(collection, signer)
                             .await
                             .with_context(|| format!("maintain Rank9 {label} collection"))?,
                     );

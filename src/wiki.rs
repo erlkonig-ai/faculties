@@ -1625,22 +1625,22 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let target = latest_collection(pile, signer.verifying_key())?;
     drop(
-        pile.ensure(collection)
+        pile.ensure(collection, signer)
             .await
             .context("ensure Wiki source collection")?,
     );
     drop(
-        pile.maintain(succinct)
+        pile.maintain(succinct, signer)
             .await
             .context("maintain Wiki Succinct collection")?,
     );
     drop(
-        pile.maintain(rank9)
+        pile.maintain(rank9, signer)
             .await
             .context("maintain Wiki fact collection")?,
     );
     let store_snapshot = pile
-        .maintain(target)
+        .maintain(target, signer)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let facts = store_snapshot
@@ -1676,7 +1676,7 @@ pub async fn materialize_indexed_collection(
         .context("read Wiki collection")?;
     let target = latest_collection(pile, signer.verifying_key())?;
     let maintained = pile
-        .maintain_exact(target, &cover)
+        .maintain_exact(target, signer, &cover)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let latest = maintained
@@ -1875,7 +1875,7 @@ mod tests {
             store
                 .commit(source, &signer, author_fragment + root_fragment)
                 .unwrap();
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let lagging = ready
                 .collection(target)
                 .unwrap()
@@ -1911,7 +1911,7 @@ mod tests {
                 and!(current.has(state), state.is(next.to_inline()))
             ));
 
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let advanced = ready
                 .collection(target)
                 .unwrap()

@@ -319,7 +319,7 @@ impl WebStorage<'_> {
                     ("Secrets", secrets_collection.source()),
                 ] {
                     drop(
-                        pile.ensure(source)
+                        pile.ensure(source, signer)
                             .await
                             .with_context(|| format!("ensure {label} source collection"))?,
                     );
@@ -333,18 +333,18 @@ impl WebStorage<'_> {
                     .context("admit Secrets collection support")?;
                 drop(before);
                 drop(
-                    pile.maintain(headspace_succinct)
+                    pile.maintain(headspace_succinct, signer)
                         .await
                         .context("maintain Headspace fact collection")?,
                 );
                 drop(
-                    pile.maintain(headspace_rank9)
+                    pile.maintain(headspace_rank9, signer)
                         .await
                         .context("maintain Headspace fact collection")?,
                 );
 
                 let store_snapshot = secrets_collection
-                    .ensure_exact(pile, &secrets_support)
+                    .ensure_exact(pile, signer, &secrets_support)
                     .await
                     .context("ensure configured Secrets collection")?;
                 let secrets = secret_storage::snapshot_exact(
@@ -927,9 +927,9 @@ mod tests {
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)
             .unwrap();
         let store_snapshot = pollster::block_on(async {
-            drop(pile.ensure(source).await?);
-            drop(pile.maintain(collection_succinct).await?);
-            pile.maintain(collection_rank9).await
+            drop(pile.ensure(source, &signer).await?);
+            drop(pile.maintain(collection_succinct, &signer).await?);
+            pile.maintain(collection_rank9, &signer).await
         })
         .unwrap();
         let facts = store_snapshot

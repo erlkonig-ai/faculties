@@ -350,35 +350,35 @@ impl CompassStorage<'_> {
 
             runtime.block_on(async {
                 drop(
-                    pile.ensure(compass_source)
+                    pile.ensure(compass_source, signer)
                         .await
                         .context("ensure Compass source collection")?,
                 );
                 if let Some((source, _, _)) = relation_collections {
                     drop(
-                        pile.ensure(source)
+                        pile.ensure(source, signer)
                             .await
                             .context("ensure Relations source collection for Compass persona")?,
                     );
                 }
                 drop(
-                    pile.maintain(compass_succinct)
+                    pile.maintain(compass_succinct, signer)
                         .await
                         .context("maintain Compass Succinct collection")?,
                 );
                 drop(
-                    pile.maintain(compass_rank9)
+                    pile.maintain(compass_rank9, signer)
                         .await
                         .context("maintain Compass Rank9 collection")?,
                 );
                 if let Some((_, succinct, rank9)) = relation_collections {
                     drop(
-                        pile.maintain(succinct).await.context(
+                        pile.maintain(succinct, signer).await.context(
                             "maintain Relations Succinct collection for Compass persona",
                         )?,
                     );
                     drop(
-                        pile.maintain(rank9)
+                        pile.maintain(rank9, signer)
                             .await
                             .context("maintain Relations Rank9 collection for Compass persona")?,
                     );

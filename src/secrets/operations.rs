@@ -48,8 +48,9 @@ impl Secrets {
     pub fn get(&self, secret: Id) -> Result<Zeroizing<Vec<u8>>> {
         self.storage().with_pile(|pile, signer| {
             let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-            let snapshot =
-                pollster::block_on(secret_storage::ensure_and_snapshot(pile, collection))?;
+            let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
+                pile, collection, signer,
+            ))?;
             snapshot.open(secret, signer).map(Zeroizing::new)
         })
     }
@@ -57,8 +58,9 @@ impl Secrets {
     pub fn list(&self) -> Result<Vec<SecretMetadata>> {
         self.storage().with_pile(|pile, signer| {
             let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-            let snapshot =
-                pollster::block_on(secret_storage::ensure_and_snapshot(pile, collection))?;
+            let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
+                pile, collection, signer,
+            ))?;
             let Some(facts) = snapshot.facts() else {
                 return Ok(Vec::new());
             };
@@ -77,8 +79,9 @@ impl Secrets {
     pub fn maintain(&self) -> Result<usize> {
         self.storage().with_pile(|pile, signer| {
             let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-            let snapshot =
-                pollster::block_on(secret_storage::maintain_and_snapshot(pile, collection))?;
+            let snapshot = pollster::block_on(secret_storage::maintain_and_snapshot(
+                pile, collection, signer,
+            ))?;
             secret_storage::maintain_recipient_envelopes(
                 pile, signer, &snapshot, collection, signer,
             )

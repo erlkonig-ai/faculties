@@ -468,32 +468,32 @@ fn with_storage<T>(
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
                 .context("register Message Rank9 collection")?;
             drop(
-                pile.ensure(relations_source)
+                pile.ensure(relations_source, signer)
                     .await
                     .context("ensure Relations source collection")?,
             );
             drop(
-                pile.ensure(message_source)
+                pile.ensure(message_source, signer)
                     .await
                     .context("ensure Message source collection")?,
             );
             drop(
-                pile.maintain(relations_succinct)
+                pile.maintain(relations_succinct, signer)
                     .await
                     .context("maintain Relations Succinct collection")?,
             );
             drop(
-                pile.maintain(relations_rank9)
+                pile.maintain(relations_rank9, signer)
                     .await
                     .context("maintain Relations Rank9 collection")?,
             );
             drop(
-                pile.maintain(message_succinct)
+                pile.maintain(message_succinct, signer)
                     .await
                     .context("maintain Message Succinct collection")?,
             );
             drop(
-                pile.maintain(message_rank9)
+                pile.maintain(message_rank9, signer)
                     .await
                     .context("maintain Message Rank9 collection")?,
             );
@@ -948,9 +948,9 @@ mod tests {
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
         let before = pollster::block_on(async {
-            drop(store.pile.ensure(source).await.unwrap());
-            drop(store.pile.maintain(succinct).await.unwrap());
-            store.pile.maintain(rank9).await.unwrap()
+            drop(store.pile.ensure(source, &signer).await.unwrap());
+            drop(store.pile.maintain(succinct, &signer).await.unwrap());
+            store.pile.maintain(rank9, &signer).await.unwrap()
         });
         let observed = before.collection(rank9).unwrap();
         let facts = observed.view::<FactArchive>().unwrap();

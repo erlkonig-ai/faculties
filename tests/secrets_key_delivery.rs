@@ -8,7 +8,8 @@ use triblespace::core::capability::{
     Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
 };
 use triblespace::core::collection::{
-    read_capability, AdmissionPolicy, CollectionPolicy, CollectionStoreExt,
+    read_capability, AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRealizationError,
+    CollectionStoreExt,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{CapabilityProofStore, SnapshotSource};
@@ -115,6 +116,35 @@ fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority()
         .source()
         .reader_is_admitted(&pile.snapshot().unwrap(), recipient.verifying_key(),)
         .unwrap());
+
+    // Possessing a delivered envelope does not grant the recipient WRITE on
+    // either derived collection. Missing physical encodings need a producer.
+    let error = pollster::block_on(secrets::storage::ensure_and_snapshot(
+        &mut pile, collection, &recipient,
+    ))
+    .err()
+    .expect("recipient cannot publish the missing Secrets cover");
+    assert!(matches!(
+        error.downcast_ref::<CollectionRealizationError>(),
+        Some(CollectionRealizationError::UnauthorizedProducer { collection: target })
+            if *target == collection.succinct().handle()
+    ));
+
+    // The actual owner publishes the encodings. Subsequent local readers
+    // reuse that complete cover without new WRITE or current READ/delivery.
+    drop(
+        pollster::block_on(secrets::storage::ensure_and_snapshot(
+            &mut pile, collection, &owner,
+        ))
+        .unwrap(),
+    );
+    let produced_records = pile
+        .snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     pile.close().unwrap();
     let handle = hex::encode(collection.handle().raw);
     let command = || {
@@ -138,4 +168,17 @@ fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority()
         "still decryptable"
     );
     assert!(successful(command().arg("list").output().unwrap()).contains("already delivered"));
+
+    let mut pile = Pile::open(&path).unwrap();
+    assert_eq!(
+        pile.snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        produced_records,
+        "foreign get/list reuse the owner's equations without publishing records",
+    );
+    pile.close().unwrap();
 }

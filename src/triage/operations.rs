@@ -167,13 +167,13 @@ impl TriageSnapshot {
         let secrets = pollster::block_on(async {
             for ((_, label), source) in registered.iter().zip(&sources) {
                 drop(
-                    pile.ensure(*source)
+                    pile.ensure(*source, signer)
                         .await
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
             }
             drop(
-                pile.ensure(secrets_collection.source())
+                pile.ensure(secrets_collection.source(), signer)
                     .await
                     .context("ensure Secrets source collection")?,
             );
@@ -188,18 +188,18 @@ impl TriageSnapshot {
 
             for (index, (_, label)) in registered.iter().enumerate() {
                 drop(
-                    pile.maintain(succinct[index])
+                    pile.maintain(succinct[index], signer)
                         .await
                         .with_context(|| format!("maintain {label} succinct fact archive"))?,
                 );
                 drop(
-                    pile.maintain(rank9[index])
+                    pile.maintain(rank9[index], signer)
                         .await
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
             }
             let store_snapshot = secrets_collection
-                .ensure_exact(pile, &secrets_support)
+                .ensure_exact(pile, signer, &secrets_support)
                 .await
                 .context("ensure configured Secrets collection")?;
             let secrets =

@@ -547,9 +547,9 @@ mod tests {
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
         let snapshot = pollster::block_on(async {
-            drop(pile.ensure(source).await.unwrap());
-            drop(pile.maintain(succinct).await.unwrap());
-            pile.maintain(rank9).await.unwrap()
+            drop(pile.ensure(source, &signer).await.unwrap());
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            pile.maintain(rank9, &signer).await.unwrap()
         });
         let facts = snapshot
             .collection(rank9)

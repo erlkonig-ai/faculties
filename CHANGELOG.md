@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Use the existing durable signing key for collection maintenance as well as
+  COMMIT publication. New MERGE/DERIVE equations require target WRITE authority;
+  readers may reuse an already realised cover without becoming its producers.
+  Native target discovery no longer repeats signature verification or exposes
+  a second crypto-diagnostics catalog. This source requires the signed-equation
+  TribleSpace cohort; legacy unsigned equations need explicit endorsement or
+  ordinary recomputation by an authorised writer, not entity-ID migration.
+
 - Habit definitions support repeated explicit persona targets through CLI
   `habit add --persona LABEL_OR_ID` and MCP `habit_add.personas`. Omitted
   targets stay global, independent of ambient `PERSONA`. Orient filters

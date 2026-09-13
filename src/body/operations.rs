@@ -348,9 +348,9 @@ impl BodyStorage<'_> {
                 policy,
             )?;
             let store_snapshot = pollster::block_on(async {
-                drop(pile.ensure(source).await?);
-                drop(pile.maintain(collection_succinct).await?);
-                pile.maintain(collection_rank9).await
+                drop(pile.ensure(source, signer).await?);
+                drop(pile.maintain(collection_succinct, signer).await?);
+                pile.maintain(collection_rank9, signer).await
             })
             .context("maintain Body fact collection")?;
             let facts = store_snapshot

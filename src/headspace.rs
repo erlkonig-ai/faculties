@@ -1585,9 +1585,9 @@ mod tests {
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
         let reader = pollster::block_on(async {
-            drop(pile.ensure(source).await.unwrap());
-            drop(pile.maintain(succinct).await.unwrap());
-            pile.maintain(rank9).await.unwrap()
+            drop(pile.ensure(source, signer).await.unwrap());
+            drop(pile.maintain(succinct, signer).await.unwrap());
+            pile.maintain(rank9, signer).await.unwrap()
         });
         let facts = reader
             .collection(rank9)
@@ -1751,9 +1751,10 @@ mod tests {
         secrets::storage::add_secret(&mut pile, &signer, collection, "hs/model", b"second", at(4))
             .unwrap();
         let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
-        let secrets =
-            pollster::block_on(secrets::storage::ensure_and_snapshot(&mut pile, collection))
-                .unwrap();
+        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
+            &mut pile, collection, &signer,
+        ))
+        .unwrap();
 
         let anchor = test_id(0x42);
         let mut profile = default_profile(anchor, "exact");
@@ -1790,9 +1791,10 @@ mod tests {
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
         let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
-        let secrets =
-            pollster::block_on(secrets::storage::ensure_and_snapshot(&mut pile, collection))
-                .unwrap();
+        let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
+            &mut pile, collection, &signer,
+        ))
+        .unwrap();
         let error = validate_secret_references(&catalog, &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));
         pile.close().unwrap();

@@ -45,11 +45,11 @@ git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 2bf0bb7af1d300808a4de04fc793434658e15e27
-git -C mary checkout f5468c8b071d7666bf5a0a3d1484fc1fdb8c813a
-git -C GORBIE checkout 2340cc2a406877ed25cf5024ed768dd9c76cd1ff
-git -C soma checkout ebbb149a3ae1c21b77b40aedfcd7a3d3ae09cd90
-git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
+git -C triblespace-rs checkout 1381faea4dc988c4780277690ee4e3443587d1f6
+git -C mary checkout 662815676c9a5688a5dff8e720f98bcca171b79b
+git -C GORBIE checkout 761c962a9beed416e14390fa8632f803fd4a485a
+git -C soma checkout e75ef119fae679aed27420fc5e0835be60f5920d
+git -C cubecl-fork checkout f4b58290e5c1acb26c1c00d8b0606b208816c295
 cd faculties
 RUSTFLAGS='-Ctarget-cpu=native' cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
@@ -612,6 +612,21 @@ Use `maintain_exact` only when the operation actually requests a particular
 support, not as ordinary read bookkeeping. Archive
 uses this same generic collection snapshot rather than a separate decoded
 catalog or COMMIT-list facade.
+
+Maintenance receives the same existing durable signing key as COMMIT
+publication. Newly published MERGE and DERIVE equations require WRITE on their
+target collection; reusing an already realised cover does not. Native target
+discovery trusts local record signatures, while snapshot admission still checks
+each producer's WRITE authority. Audit unfamiliar piles explicitly before
+accepting them as trusted local storage.
+
+This source uses the signed-equation TribleSpace cohort. Historical unsigned
+equations stay inert and are not silently signed by whichever reader encounters
+them. An authorised writer may recompute missing results, or explicitly endorse
+resident legacy equations with `trible pile migrate <PILE>
+endorse-unsigned-equations --collection <HANDLE> --signing-key <EXISTING_KEY>`.
+That append-only operation is a new endorsement, not recovered authorship; it
+does not change domain entity IDs or existing COMMIT data and metadata.
 
 By default, a named faculty collection is rooted at the pile's durable signer.
 An operator can instead select an already-resident exact descriptor for one

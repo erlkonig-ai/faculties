@@ -350,9 +350,9 @@ impl DecideStorage<'_> {
                     policy,
                 )?;
                 let store_snapshot = pollster::block_on(async {
-                    drop(pile.ensure(collection).await?);
-                    drop(pile.maintain(maintained_succinct).await?);
-                    pile.maintain(maintained_rank9).await
+                    drop(pile.ensure(collection, signer).await?);
+                    drop(pile.maintain(maintained_succinct, signer).await?);
+                    pile.maintain(maintained_rank9, signer).await
                 })
                 .context("maintain Decide fact collection")?;
                 let facts = store_snapshot

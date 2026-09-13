@@ -319,14 +319,14 @@ impl RelationsStorage<'_> {
                     (),
                     policy,
                 )?;
-                drop(pile.ensure(collection).await?);
+                drop(pile.ensure(collection, signer).await?);
                 drop(
-                    pile.maintain(maintained_succinct)
+                    pile.maintain(maintained_succinct, signer)
                         .await
                         .context("maintain Relations fact collection")?,
                 );
                 let store_snapshot = pile
-                    .maintain(maintained_rank9)
+                    .maintain(maintained_rank9, signer)
                     .await
                     .context("maintain Relations fact collection")?;
                 let observed = store_snapshot

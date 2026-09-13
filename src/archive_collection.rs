@@ -70,7 +70,7 @@ impl ArchiveImportWriter {
         let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(&mut pile, source).await?;
+            let observed = ensure_facts(&mut pile, source, &signer).await?;
             let current = observed
                 .view::<FactArchive>()
                 .context("read Archive facts")?;
@@ -112,7 +112,7 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             schema::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
         )?;
-        let observed = ensure_facts(pile.borrow_mut(), source).await?;
+        let observed = ensure_facts(pile.borrow_mut(), source, signer).await?;
         let current = observed
             .view::<FactArchive>()
             .context("read Archive facts")?;
@@ -306,13 +306,14 @@ pub fn ensure_local_with_storage(
 ) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_pile(|pile, signer| {
         let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        pollster::block_on(ensure_facts(pile, source))
+        pollster::block_on(ensure_facts(pile, source, signer))
     })
 }
 
 async fn ensure_facts(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
+    signer: &SigningKey,
 ) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     let policy = source
         .policy(
@@ -328,17 +329,17 @@ async fn ensure_facts(
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
         .context("register Rank9 Archive fact collection")?;
     drop(
-        pile.ensure(source)
+        pile.ensure(source, signer)
             .await
             .context("ensure Archive source dependencies")?,
     );
     drop(
-        pile.maintain(succinct)
+        pile.maintain(succinct, signer)
             .await
             .context("maintain Succinct Archive fact collection")?,
     );
     let after = pile
-        .maintain(rank9)
+        .maintain(rank9, signer)
         .await
         .context("maintain Rank9 Archive fact collection")?;
     after
@@ -386,17 +387,17 @@ struct EnsuredBm25 {
 async fn ensure_bm25_exact(
     pile: &mut Pile,
     support: &Support,
-    authority: VerifyingKey,
+    signer: &SigningKey,
 ) -> Result<EnsuredBm25> {
     let target = pile
         .derive_with(
             support.collection(),
             archive_bm25::ArchiveBlockTextBm25Mapping,
-            crate::collection_names::private_policy(authority),
+            crate::collection_names::private_policy(signer.verifying_key()),
         )
         .context("register Archive BM25 derivation")?;
     let maintained = pile
-        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, support)
+        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer, support)
         .await
         .context("maintain exact Archive BM25 cover")?;
     let attached = maintained
@@ -432,12 +433,10 @@ pub fn ensure_bm25_index_with_storage(
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(pile, source).await?;
-            Ok(
-                ensure_bm25_exact(pile, observed.support(), signer.verifying_key())
-                    .await?
-                    .report,
-            )
+            let observed = ensure_facts(pile, source, signer).await?;
+            Ok(ensure_bm25_exact(pile, observed.support(), signer)
+                .await?
+                .report)
         })
     })
 }
@@ -467,9 +466,8 @@ pub fn ensure_search_local_with_storage(
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(pile, source).await?;
-            let ensured =
-                ensure_bm25_exact(pile, observed.support(), signer.verifying_key()).await?;
+            let observed = ensure_facts(pile, source, signer).await?;
+            let ensured = ensure_bm25_exact(pile, observed.support(), signer).await?;
             // Search maintenance may have acquired referenced text payloads. Attach
             // the fact view through the final reader while retaining exact support.
             let after = pile
@@ -1693,7 +1691,8 @@ mod tests {
             Handle::<SimpleArchive>::to_hash(pile.put::<SimpleArchive, _>(union.clone()).unwrap());
         CollectionStore::insert(
             &mut pile,
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &signer,
                 source.handle(),
                 block_commit.data(),
                 remainder_commit.data(),
@@ -1707,7 +1706,7 @@ mod tests {
         let output = archive_bm25::derive_element(&reader, union.clone()).unwrap();
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive = CollectionDerive::new(target.handle(), input_data, output_data);
+        let derive = CollectionDerive::sign(&signer, target.handle(), input_data, output_data);
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
@@ -1764,19 +1763,15 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
+        let signer = initialize_archive_fixture(&pile_path, &key);
 
         let first = commit_projection(&pile_path, &key, "session:frozen", "frozen needle");
         let frozen = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let later = commit_projection(&pile_path, &key, "session:later", "later needle");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let ensured = pollster::block_on(ensure_bm25_exact(
-            &mut pile,
-            frozen.support(),
-            test_authority(&pile_path, &key),
-        ))
-        .unwrap();
+        let ensured =
+            pollster::block_on(ensure_bm25_exact(&mut pile, frozen.support(), &signer)).unwrap();
 
         assert_eq!(ensured.report.source_elements, 1);
         drop(ensured);
@@ -1807,7 +1802,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
+        let signer = initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
         let first_archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let first_support = first_archive.support().clone();
@@ -1823,6 +1818,7 @@ mod tests {
         let first_snapshot = pollster::block_on(
             pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
+                &signer,
                 &first_support,
             ),
         )
@@ -1846,6 +1842,7 @@ mod tests {
         let full_snapshot = pollster::block_on(
             pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
+                &signer,
                 &full_support,
             ),
         )
@@ -1878,6 +1875,7 @@ mod tests {
         let retry_snapshot = pollster::block_on(
             pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
+                &signer,
                 &full_support,
             ),
         )
@@ -1905,7 +1903,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
+        let signer = initialize_archive_fixture(&pile_path, &key);
         let commit = commit_projection(&pile_path, &key, "session:pending", "recover output");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -1918,7 +1916,7 @@ mod tests {
             .unwrap();
         let output = archive_bm25::derive_element(&store_snapshot, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let pending = CollectionDerive::new(target.handle(), commit.data(), output_data);
+        let pending = CollectionDerive::sign(&signer, target.handle(), commit.data(), output_data);
         drop(output);
         drop(store_snapshot);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
@@ -1932,6 +1930,7 @@ mod tests {
         let ready_snapshot = pollster::block_on(
             pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
                 target,
+                &signer,
                 &source_support,
             ),
         )
@@ -1969,7 +1968,7 @@ mod tests {
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile_path, &key);
+        let signer = initialize_archive_fixture(&pile_path, &key);
 
         // Chunk and snapshot ids are deliberately extrinsic. Two different
         // witnesses of identical byte geometry must not duplicate the output.
@@ -2013,8 +2012,8 @@ mod tests {
         stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
         let data = pile.put::<SimpleArchive, _>(facts).unwrap();
         let support = source.cover([data]);
-        drop(pollster::block_on(pile.maintain_exact(succinct, &support)).unwrap());
-        let after = pollster::block_on(pile.maintain_exact(rank9, &support)).unwrap();
+        drop(pollster::block_on(pile.maintain_exact(succinct, &signer, &support)).unwrap());
+        let after = pollster::block_on(pile.maintain_exact(rank9, &signer, &support)).unwrap();
         let observed = after.collection_exact(rank9, &support).unwrap();
         assert!(observed
             .support()

@@ -1083,22 +1083,22 @@ where
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let status_target = status_register_for_source(pile, source)?;
     drop(
-        pile.ensure(source)
+        pile.ensure(source, signer)
             .await
             .context("ensure Compass source collection")?,
     );
     drop(
-        pile.maintain(succinct)
+        pile.maintain(succinct, signer)
             .await
             .context("maintain Compass Succinct collection")?,
     );
     drop(
-        pile.maintain(rank9)
+        pile.maintain(rank9, signer)
             .await
             .context("maintain Compass fact collection")?,
     );
     let store_snapshot = pile
-        .maintain(status_target)
+        .maintain(status_target, signer)
         .await
         .context("maintain Compass status register")?;
     let fact_archive = store_snapshot
@@ -1185,7 +1185,7 @@ mod tests {
                 .unwrap();
             let target = status_register_for_source(&mut store, source).unwrap();
             store.commit(source, &signer, initial).unwrap();
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let lagging = ready
                 .collection(target)
                 .unwrap()
@@ -1209,7 +1209,7 @@ mod tests {
                 None
             );
 
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let advanced = ready
                 .collection(target)
                 .unwrap()

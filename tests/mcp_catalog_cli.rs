@@ -202,7 +202,9 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
         .unwrap();
     assert!(!response.contains("discovery-must-not-"));
     let response: Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 218);
+    let tools = response["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 219);
+    assert!(tools.iter().any(|tool| tool["name"] == "files_index"));
     assert_eq!(directory.path().read_dir().unwrap().count(), 0);
 }
 
@@ -422,7 +424,9 @@ mod http_process {
             .unwrap()
             .json()
             .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 218);
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 219);
+        assert!(tools.iter().any(|tool| tool["name"] == "files_index"));
         assert!(!directory.path().join("not-opened.pile").exists());
         assert!(!key.exists());
         assert_eq!(

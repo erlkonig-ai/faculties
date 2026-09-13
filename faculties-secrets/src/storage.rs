@@ -131,6 +131,7 @@ impl SecretsCollection {
     pub async fn ensure_exact<S>(
         self,
         store: &mut S,
+        signer: &SigningKey,
         support: &triblespace::core::collection::Support,
     ) -> Result<S::Snapshot>
     where
@@ -138,23 +139,23 @@ impl SecretsCollection {
     {
         drop(
             store
-                .ensure_exact(self.succinct, support)
+                .ensure_exact(self.succinct, signer, support)
                 .await
                 .context("ensure Succinct Secrets collection")?,
         );
         store
-            .ensure_exact(self.rank9, support)
+            .ensure_exact(self.rank9, signer, support)
             .await
             .context("ensure Rank9 Secrets collection")
     }
 
     /// Ensure the root, then realize its selected support across both encodings.
-    pub async fn ensure<S>(self, store: &mut S) -> Result<S::Snapshot>
+    pub async fn ensure<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         let ready = store
-            .ensure(self.source)
+            .ensure(self.source, signer)
             .await
             .context("ensure Secrets source collection")?;
         let support = self
@@ -162,13 +163,14 @@ impl SecretsCollection {
             .admitted(&ready)
             .context("admit Secrets source support")?;
         drop(ready);
-        self.ensure_exact(store, &support).await
+        self.ensure_exact(store, signer, &support).await
     }
 
     /// Maintain both derived lattices for one exact foundational support.
     pub async fn maintain_exact<S>(
         self,
         store: &mut S,
+        signer: &SigningKey,
         support: &triblespace::core::collection::Support,
     ) -> Result<S::Snapshot>
     where
@@ -176,23 +178,23 @@ impl SecretsCollection {
     {
         drop(
             store
-                .maintain_exact(self.succinct, support)
+                .maintain_exact(self.succinct, signer, support)
                 .await
                 .context("maintain Succinct Secrets collection")?,
         );
         store
-            .maintain_exact(self.rank9, support)
+            .maintain_exact(self.rank9, signer, support)
             .await
             .context("maintain Rank9 Secrets collection")
     }
 
     /// Ensure the root, then maintain its selected support across both encodings.
-    pub async fn maintain<S>(self, store: &mut S) -> Result<S::Snapshot>
+    pub async fn maintain<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
         let ready = store
-            .ensure(self.source)
+            .ensure(self.source, signer)
             .await
             .context("ensure Secrets source collection")?;
         let support = self
@@ -200,7 +202,7 @@ impl SecretsCollection {
             .admitted(&ready)
             .context("admit Secrets source support")?;
         drop(ready);
-        self.maintain_exact(store, &support).await
+        self.maintain_exact(store, signer, &support).await
     }
 }
 
@@ -272,12 +274,13 @@ where
 pub async fn maintain_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
+    signer: &SigningKey,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
     S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
 {
     let ready = store
-        .ensure(collection.source)
+        .ensure(collection.source, signer)
         .await
         .context("ensure Secrets source collection")?;
     let support = collection
@@ -285,7 +288,7 @@ where
         .admitted(&ready)
         .context("admit Secrets source support")?;
     drop(ready);
-    let store_snapshot = collection.maintain_exact(store, &support).await?;
+    let store_snapshot = collection.maintain_exact(store, signer, &support).await?;
     snapshot_exact(store_snapshot, collection, support)
 }
 
@@ -299,12 +302,13 @@ where
 pub async fn ensure_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
+    signer: &SigningKey,
 ) -> Result<SecretsSnapshot<S::Snapshot>>
 where
     S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
 {
     let ready = store
-        .ensure(collection.source)
+        .ensure(collection.source, signer)
         .await
         .context("ensure Secrets source collection")?;
     let support = collection
@@ -312,7 +316,7 @@ where
         .admitted(&ready)
         .context("admit Secrets source support")?;
     drop(ready);
-    let store_snapshot = collection.ensure_exact(store, &support).await?;
+    let store_snapshot = collection.ensure_exact(store, signer, &support).await?;
     snapshot_exact(store_snapshot, collection, support)
 }
 
@@ -624,7 +628,9 @@ mod tests {
                 at(1),
             )
             .unwrap();
-            let secrets = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let secrets = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             assert_eq!(secrets.instant(), secrets.store_snapshot().instant());
             assert_eq!(secrets.collection(), collection.handle());
             assert!(secrets.contains(secret));
@@ -693,7 +699,9 @@ mod tests {
                 at(1),
             )
             .unwrap();
-            let before = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let before = ensure_and_snapshot(&mut store, collection, &owner)
+                .await
+                .unwrap();
             assert!(collection
                 .source()
                 .reader_is_admitted(before.store_snapshot(), replica.verifying_key(),)
@@ -739,13 +747,17 @@ mod tests {
                 0,
                 "the selected proof frontier stays frozen"
             );
-            let current = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let current = ensure_and_snapshot(&mut store, collection, &owner)
+                .await
+                .unwrap();
             assert_eq!(
                 maintain_recipient_envelopes(&mut store, &owner, &current, collection, &owner,)
                     .unwrap(),
                 1
             );
-            let after = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let after = ensure_and_snapshot(&mut store, collection, &owner)
+                .await
+                .unwrap();
             assert_eq!(after.open(secret, &replica).unwrap(), b"separate authority");
             assert_eq!(
                 super::super::secret_rows_for(after.facts().unwrap(), secret)[0].body,
@@ -845,7 +857,9 @@ mod tests {
                 at(3),
             )
             .unwrap();
-            let before = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let before = ensure_and_snapshot(&mut store, collection, &owner)
+                .await
+                .unwrap();
             assert!(!before.contains(secret));
             drop(before);
 
@@ -856,7 +870,9 @@ mod tests {
                 offline_writer.verifying_key(),
             )
             .unwrap();
-            let after = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let after = ensure_and_snapshot(&mut store, collection, &owner)
+                .await
+                .unwrap();
             assert_eq!(after.open(secret, &owner).unwrap(), b"authored offline");
         });
     }
@@ -906,7 +922,7 @@ mod tests {
                 .cover([Handle::<SimpleArchive>::from_hash(right_commit.data())]);
             drop(
                 collection
-                    .ensure_exact(&mut store, &right_support)
+                    .ensure_exact(&mut store, &authority, &right_support)
                     .await
                     .unwrap(),
             );
@@ -926,13 +942,17 @@ mod tests {
             // not widen the exact support carried across the second edge.
             store.inject_proof_on_derive = Some(right_proof);
 
-            let first = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let first = ensure_and_snapshot(&mut store, collection, &authority)
+                .await
+                .unwrap();
             assert!(first.contains(left_secret));
             assert!(!first.contains(right_secret));
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
             drop(first);
 
-            let second = ensure_and_snapshot(&mut store, collection).await.unwrap();
+            let second = ensure_and_snapshot(&mut store, collection, &authority)
+                .await
+                .unwrap();
             assert!(second.contains(left_secret));
             assert!(second.contains(right_secret));
         });
@@ -954,7 +974,9 @@ mod tests {
                 add_secret(&mut store, &alice, collection, "token", b"value", at(4)).unwrap();
             let second =
                 add_secret(&mut store, &alice, collection, "password", b"other", at(5)).unwrap();
-            let before = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let before = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             assert!(before.open(first, &bob).is_err());
             assert!(before.open(second, &bob).is_err());
 
@@ -972,13 +994,17 @@ mod tests {
                     .unwrap(),
                 0
             );
-            let current = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let current = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             let added =
                 maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice)
                     .unwrap();
             assert_eq!(added, 2);
 
-            let after = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let after = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             assert_eq!(after.open(first, &bob).unwrap(), b"value");
             assert_eq!(after.open(second, &bob).unwrap(), b"other");
             assert!(before.open(first, &bob).is_err());
@@ -1014,7 +1040,9 @@ mod tests {
             );
             store.insert_proof(proof).unwrap();
 
-            let current = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let current = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             assert!(current.open(secret, &bob).is_err());
 
             let added =
@@ -1025,7 +1053,9 @@ mod tests {
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
             drop(current);
 
-            let after = maintain_and_snapshot(&mut store, collection).await.unwrap();
+            let after = maintain_and_snapshot(&mut store, collection, &alice)
+                .await
+                .unwrap();
             assert_eq!(after.open(secret, &bob).unwrap(), b"value");
         });
     }
@@ -1069,7 +1099,11 @@ mod tests {
                 .unwrap();
             // The final proof contains Bob's signed key-delivery prefix too.
             store.insert_proof(proof).unwrap();
-            drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
+            drop(
+                ensure_and_snapshot(&mut store, collection, &alice)
+                    .await
+                    .unwrap(),
+            );
             let instant = Epoch::from_unix_seconds(100.0);
             let current = snapshot(store.snapshot_at(instant).unwrap(), collection).unwrap();
             let expired_instant = Epoch::from_unix_seconds(200.0);
@@ -1107,7 +1141,11 @@ mod tests {
                 at(200),
             )
             .unwrap();
-            drop(ensure_and_snapshot(&mut store, collection).await.unwrap());
+            drop(
+                ensure_and_snapshot(&mut store, collection, &alice)
+                    .await
+                    .unwrap(),
+            );
             let expired =
                 snapshot(store.snapshot_at(expired_instant).unwrap(), collection).unwrap();
             assert_eq!(

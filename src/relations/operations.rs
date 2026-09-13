@@ -928,9 +928,9 @@ impl Relations {
                 pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
             let reader = runtime
                 .block_on(async {
-                    drop(pile.ensure(collection).await?);
-                    drop(pile.maintain(facts_succinct).await?);
-                    pile.maintain(facts_rank9).await
+                    drop(pile.ensure(collection, signer).await?);
+                    drop(pile.maintain(facts_succinct, signer).await?);
+                    pile.maintain(facts_rank9, signer).await
                 })
                 .context("maintain Relations fact collection")?;
             let observed = reader
@@ -1141,9 +1141,9 @@ mod tests {
         store.commit(collection, &signer, right).unwrap();
 
         let reader = pollster::block_on(async {
-            drop(store.ensure(collection).await?);
-            drop(store.maintain(facts_succinct).await?);
-            store.maintain(facts_rank9).await
+            drop(store.ensure(collection, &signer).await?);
+            drop(store.maintain(facts_succinct, &signer).await?);
+            store.maintain(facts_rank9, &signer).await
         })
         .unwrap();
         let observed = reader.collection(facts_rank9).unwrap();
@@ -1189,9 +1189,9 @@ mod tests {
         let initial = pile.commit(collection, &signer, facts.into()).unwrap();
         let frozen = runtime
             .block_on(async {
-                drop(pile.ensure(collection).await?);
-                drop(pile.maintain(succinct).await?);
-                pile.maintain(rank9).await
+                drop(pile.ensure(collection, &signer).await?);
+                drop(pile.maintain(succinct, &signer).await?);
+                pile.maintain(rank9, &signer).await
             })
             .unwrap();
         let instant = frozen.instant();

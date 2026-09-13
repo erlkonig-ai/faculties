@@ -644,7 +644,7 @@ impl TeamsSession {
                     ("Secrets", self.secret_collection.source()),
                 ] {
                     drop(
-                        pile.ensure(source)
+                        pile.ensure(source, &self.signer)
                             .await
                             .with_context(|| format!("ensure {label} source after Teams commit"))?,
                     );
@@ -659,12 +659,12 @@ impl TeamsSession {
                     .context("admit Secrets support after Teams commit")?;
                 drop(shared_control);
                 drop(
-                    pile.maintain(self.succinct)
+                    pile.maintain(self.succinct, &self.signer)
                         .await
                         .context("maintain Teams succinct fact collection after commit")?,
                 );
                 drop(
-                    pile.maintain(self.rank9)
+                    pile.maintain(self.rank9, &self.signer)
                         .await
                         .context("maintain Teams fact collection after commit")?,
                 );
@@ -683,7 +683,7 @@ impl TeamsSession {
         storage.with_pile(|pile, _| {
             pollster::block_on(async {
                 let ready = pile
-                    .ensure(self.secret_collection.source())
+                    .ensure(self.secret_collection.source(), &self.signer)
                     .await
                     .context("ensure Secrets source after credential publication")?;
                 let secrets_support = self
@@ -706,7 +706,7 @@ impl TeamsSession {
     ) -> Result<()> {
         let store_snapshot = self
             .secret_collection
-            .ensure_exact(pile, &secrets_support)
+            .ensure_exact(pile, &self.signer, &secrets_support)
             .await
             .context("refresh configured Secrets collection for Teams")?;
         let secrets =
@@ -781,7 +781,7 @@ impl TeamsStorage {
                         ("Secrets", secret_collection.source()),
                     ] {
                         drop(
-                            pile.ensure(source)
+                            pile.ensure(source, signer)
                                 .await
                                 .with_context(|| format!("ensure {label} source collection"))?,
                         );
@@ -795,17 +795,17 @@ impl TeamsStorage {
                         .context("admit Secrets support before Teams maintenance")?;
                     drop(shared_control);
                     drop(
-                        pile.maintain(maintained_succinct)
+                        pile.maintain(maintained_succinct, signer)
                             .await
                             .context("maintain Teams fact collection")?,
                     );
                     drop(
-                        pile.maintain(maintained_rank9)
+                        pile.maintain(maintained_rank9, signer)
                             .await
                             .context("maintain Teams fact collection")?,
                     );
                     let store_snapshot = secret_collection
-                        .ensure_exact(pile, &secrets_support)
+                        .ensure_exact(pile, signer, &secrets_support)
                         .await
                         .context("ensure configured Secrets collection for Teams")?;
                     let secrets = secret_storage::snapshot_exact(
@@ -3851,9 +3851,11 @@ mod tests {
                         source_fragment("newer-session-input.example"),
                     )?;
                     pollster::block_on(async {
-                        drop(pile.ensure(session.collection).await?);
-                        drop(pile.maintain(session.succinct).await?);
-                        pile.maintain(session.rank9).await.map_err(Into::into)
+                        drop(pile.ensure(session.collection, signer).await?);
+                        drop(pile.maintain(session.succinct, signer).await?);
+                        pile.maintain(session.rank9, signer)
+                            .await
+                            .map_err(Into::into)
                     })
                 })?;
                 assert_ne!(later.collection(session.rank9)?.support(), &support);

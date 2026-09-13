@@ -267,35 +267,35 @@ impl WikiStorage<'_> {
                     auxiliaries.push((source, succinct, rank9, label));
                 }
                 drop(
-                    pile.ensure(wiki_source)
+                    pile.ensure(wiki_source, signer)
                         .await
                         .context("ensure Wiki source collection")?,
                 );
                 for (source, _, _, label) in &auxiliaries {
                     drop(
-                        pile.ensure(*source)
+                        pile.ensure(*source, signer)
                             .await
                             .with_context(|| format!("ensure {label} source collection"))?,
                     );
                 }
                 drop(
-                    pile.maintain(wiki_succinct)
+                    pile.maintain(wiki_succinct, signer)
                         .await
                         .context("maintain Wiki Succinct collection")?,
                 );
                 drop(
-                    pile.maintain(wiki_rank9)
+                    pile.maintain(wiki_rank9, signer)
                         .await
                         .context("maintain Wiki Rank9 collection")?,
                 );
                 for (_, succinct, rank9, label) in &auxiliaries {
                     drop(
-                        pile.maintain(*succinct)
+                        pile.maintain(*succinct, signer)
                             .await
                             .with_context(|| format!("maintain {label} Succinct collection"))?,
                     );
                     drop(
-                        pile.maintain(*rank9)
+                        pile.maintain(*rank9, signer)
                             .await
                             .with_context(|| format!("maintain {label} Rank9 collection"))?,
                     );
@@ -304,7 +304,7 @@ impl WikiStorage<'_> {
                 // Positive membership makes latest a normal joined relation:
                 // a lagging index never admits an unseen Wiki revision.
                 drop(
-                    pile.maintain(latest)
+                    pile.maintain(latest, signer)
                         .await
                         .context("maintain Wiki supersession index")?,
                 );

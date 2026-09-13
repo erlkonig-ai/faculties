@@ -52,9 +52,9 @@ impl Cognition {
             let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
             let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
             let snapshot = pollster::block_on(async {
-                drop(pile.ensure(source).await?);
-                drop(pile.maintain(succinct).await?);
-                pile.maintain(rank9).await
+                drop(pile.ensure(source, signer).await?);
+                drop(pile.maintain(succinct, signer).await?);
+                pile.maintain(rank9, signer).await
             })
             .context("maintain Cognition fact collection")?;
             let facts = snapshot

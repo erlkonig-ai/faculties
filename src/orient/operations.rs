@@ -352,14 +352,14 @@ impl OrientSource {
         })
     }
 
-    async fn maintain(&self, pile: &mut FacultyStore) -> Result<()> {
+    async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         drop(
-            pile.maintain(self.succinct)
+            pile.maintain(self.succinct, signer)
                 .await
                 .with_context(|| format!("maintain {} Succinct collection", self.label))?,
         );
         drop(
-            pile.maintain(self.rank9)
+            pile.maintain(self.rank9, signer)
                 .await
                 .with_context(|| format!("maintain {} Rank9 collection", self.label))?,
         );
@@ -391,7 +391,7 @@ struct OrientSources {
 
 impl OrientSources {
     /// Fetch direct source dependencies before choosing a common observation.
-    async fn ensure(&self, pile: &mut FacultyStore) -> Result<()> {
+    async fn ensure(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         for source in [
             Some(&self.messages),
             Some(&self.mail),
@@ -406,7 +406,7 @@ impl OrientSources {
         .flatten()
         {
             drop(
-                pile.ensure(source.source)
+                pile.ensure(source.source, signer)
                     .await
                     .with_context(|| format!("ensure {} source collection", source.label))?,
             );
@@ -502,7 +502,11 @@ impl OrientObservation {
 
 /// Advance each explicit mapping hop from its currently resident source.
 /// Readers select their target views only after this optional cache work.
-async fn maintain_sources(pile: &mut FacultyStore, sources: &OrientSources) -> Result<()> {
+async fn maintain_sources(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    sources: &OrientSources,
+) -> Result<()> {
     for source in [
         Some(&sources.messages),
         Some(&sources.mail),
@@ -516,10 +520,10 @@ async fn maintain_sources(pile: &mut FacultyStore, sources: &OrientSources) -> R
     .into_iter()
     .flatten()
     {
-        source.maintain(pile).await?;
+        source.maintain(pile, signer).await?;
     }
     drop(
-        pile.maintain(sources.compass_status)
+        pile.maintain(sources.compass_status, signer)
             .await
             .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
     );
@@ -577,10 +581,11 @@ fn observe_sources(
 /// boundary, the next poll must still see that boundary and refresh admission.
 async fn maintain_and_observe_snapshot(
     pile: &mut FacultyStore,
+    signer: &SigningKey,
     watermark: &FacultySnapshot,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
-    maintain_sources(pile, sources).await?;
+    maintain_sources(pile, signer, sources).await?;
     let snapshot = pile
         .snapshot_at(watermark.instant())
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
@@ -589,13 +594,14 @@ async fn maintain_and_observe_snapshot(
 
 async fn maintain_and_observe_sources(
     pile: &mut FacultyStore,
+    signer: &SigningKey,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
-    sources.ensure(pile).await?;
+    sources.ensure(pile, signer).await?;
     let watermark = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_snapshot(pile, &watermark, sources).await
+    maintain_and_observe_snapshot(pile, signer, &watermark, sources).await
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2265,10 +2271,10 @@ async fn cmd_baseline(
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
         let health_events = health.report().attention;
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = maintain_and_observe_sources(pile, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
         let (persona, events) = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
@@ -2307,7 +2313,7 @@ async fn cmd_show(
     use std::fmt::Write as _;
 
     async {
-        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
         let health_report = health.report();
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
@@ -2320,7 +2326,7 @@ async fn cmd_show(
             }
         }
         let sources = OrientSources::open(pile, signer, true).await?;
-        let observation = maintain_and_observe_sources(pile, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
         let instant = observation.snapshot.instant();
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
             read(pile, &observation.snapshot, |reader| {
@@ -2573,7 +2579,7 @@ async fn cmd_poll(
             return Ok(());
         }
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = maintain_and_observe_sources(pile, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
         let prepared = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
@@ -2658,6 +2664,7 @@ impl WaitFrameLoad {
 
 async fn load_wait_frame(
     pile: &mut FacultyStore,
+    signer: &SigningKey,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
     pile_path: &Path,
@@ -2667,7 +2674,7 @@ async fn load_wait_frame(
     // observation selects resident targets once; subsequent payload retries
     // keep those views fixed without replacing this change-detection baseline.
     let instant = snapshot.instant();
-    let mut observation = maintain_and_observe_snapshot(pile, &snapshot, sources).await?;
+    let mut observation = maintain_and_observe_snapshot(pile, signer, &snapshot, sources).await?;
     let (persona, reader) = match read(pile, &observation.snapshot, |reader| {
         let persona = resolve_native_persona(&observation.query(reader), persona_input)?;
         Ok((persona, reader.clone()))
@@ -2768,6 +2775,7 @@ fn authorization_change_elapsed(boundary: Option<Epoch>, now: Epoch) -> bool {
 /// before deciding whether to resume this attention view.
 async fn load_wait_frame_before_health_deadline(
     pile: &mut FacultyStore,
+    signer: &SigningKey,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
     pile_path: &Path,
@@ -2779,18 +2787,19 @@ async fn load_wait_frame_before_health_deadline(
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+        frame = load_wait_frame(pile, signer, sources, snapshot, pile_path, persona_input) => frame.map(Some),
     }
 }
 
 async fn ensure_sources_before_health_deadline(
     pile: &mut FacultyStore,
+    signer: &SigningKey,
     sources: &OrientSources,
     next_health_change: Option<Epoch>,
 ) -> Result<bool> {
     tokio::select! {
         boundary = health::deadline(next_health_change) => { boundary?; Ok(false) }
-        ensured = sources.ensure(pile) => { ensured?; Ok(true) }
+        ensured = sources.ensure(pile, signer) => { ensured?; Ok(true) }
     }
 }
 
@@ -2843,12 +2852,15 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
-            if !ensure_sources_before_health_deadline(pile, &sources, next_health_change).await? {
+            if !ensure_sources_before_health_deadline(pile, signer, &sources, next_health_change)
+                .await?
+            {
                 continue;
             }
             let sampled = pile.snapshot()?;
             if let Some(attempt) = load_wait_frame_before_health_deadline(
                 pile,
+                signer,
                 &sources,
                 sampled,
                 pile_path,
@@ -2926,7 +2938,9 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
-            if !ensure_sources_before_health_deadline(pile, &sources, next_health_change).await? {
+            if !ensure_sources_before_health_deadline(pile, signer, &sources, next_health_change)
+                .await?
+            {
                 view_pending = true;
                 continue;
             }
@@ -2954,6 +2968,7 @@ async fn cmd_wait(
             if storage_changed || authorization_changed || view_pending {
                 let Some(attempt) = load_wait_frame_before_health_deadline(
                     pile,
+                    signer,
                     &sources,
                     sampled,
                     pile_path,
@@ -3120,21 +3135,22 @@ async fn cmd_wake(
         let wiki_collection = OrientSource::open(storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
         let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
-        sources.ensure(storage).await?;
-        drop(storage.ensure(memory_collection.source).await?);
-        drop(storage.ensure(wiki_collection.source).await?);
+        sources.ensure(storage, signer).await?;
+        drop(storage.ensure(memory_collection.source, signer).await?);
+        drop(storage.ensure(wiki_collection.source, signer).await?);
         let watermark = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake authorization instant: {error}"))?;
-        memory_collection.maintain(storage).await?;
-        wiki_collection.maintain(storage).await?;
+        memory_collection.maintain(storage, signer).await?;
+        wiki_collection.maintain(storage, signer).await?;
         drop(
             storage
-                .maintain(wiki_latest)
+                .maintain(wiki_latest, signer)
                 .await
                 .context("maintain Wiki supersession index")?,
         );
-        let observation = maintain_and_observe_snapshot(storage, &watermark, &sources).await?;
+        let observation =
+            maintain_and_observe_snapshot(storage, signer, &watermark, &sources).await?;
         drop(watermark);
         let memory_facts = observation
             .snapshot
@@ -3446,11 +3462,16 @@ mod tests {
             )
             .unwrap();
             let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
-            let WaitFrameLoad::Ready(frame) =
-                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
-                    .await
-                    .unwrap()
-            else {
+            let WaitFrameLoad::Ready(frame) = load_wait_frame(
+                &mut pile,
+                &fixture.signer,
+                &sources,
+                watermark,
+                &fixture.path,
+                "gpt",
+            )
+            .await
+            .unwrap() else {
                 panic!("complete local inputs must be ready")
             };
             assert_eq!(frame.persona, gpt);
@@ -3516,11 +3537,12 @@ mod tests {
             let initial_id = initial.root().unwrap();
             pile.commit(sources.compass.source, &fixture.signer, initial)
                 .unwrap();
-            sources.ensure(&mut pile).await.unwrap();
+            sources.ensure(&mut pile, &fixture.signer).await.unwrap();
             let watermark = pile.snapshot().unwrap();
-            let observation = maintain_and_observe_snapshot(&mut pile, &watermark, &sources)
-                .await
-                .unwrap();
+            let observation =
+                maintain_and_observe_snapshot(&mut pile, &fixture.signer, &watermark, &sources)
+                    .await
+                    .unwrap();
 
             let next = compass::status_fragment(
                 goal,
@@ -3540,8 +3562,15 @@ mod tests {
             let unseen_id = unseen.root().unwrap();
             pile.commit(sources.compass.source, &fixture.signer, next + unseen)
                 .unwrap();
-            drop(pile.maintain(sources.compass.succinct).await.unwrap());
-            let snapshot = pile.maintain(sources.compass.rank9).await.unwrap();
+            drop(
+                pile.maintain(sources.compass.succinct, &fixture.signer)
+                    .await
+                    .unwrap(),
+            );
+            let snapshot = pile
+                .maintain(sources.compass.rank9, &fixture.signer)
+                .await
+                .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
             let status_support = lagging.snapshot.collection(sources.compass_status).unwrap();
             assert_ne!(lagging.facts.compass.support(), status_support.support());
@@ -3549,7 +3578,10 @@ mod tests {
             assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
             assert_eq!(latest_goal_status(&query, unseen_goal), None);
 
-            let ready = pile.maintain(sources.compass_status).await.unwrap();
+            let ready = pile
+                .maintain(sources.compass_status, &fixture.signer)
+                .await
+                .unwrap();
             let advanced = observe_sources(ready, &sources).unwrap();
             let query = advanced.query(&advanced.snapshot);
             assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
@@ -3609,11 +3641,24 @@ mod tests {
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        drop(pile.ensure(sources.messages.source).await.unwrap());
-        drop(pile.maintain(sources.messages.succinct).await.unwrap());
-        drop(pile.maintain(sources.messages.rank9).await.unwrap());
+        drop(
+            pile.ensure(sources.messages.source, &fixture.signer)
+                .await
+                .unwrap(),
+        );
+        drop(
+            pile.maintain(sources.messages.succinct, &fixture.signer)
+                .await
+                .unwrap(),
+        );
+        drop(
+            pile.maintain(sources.messages.rank9, &fixture.signer)
+                .await
+                .unwrap(),
+        );
         let attempt = load_wait_frame(
             &mut pile,
+            &fixture.signer,
             &sources,
             watermark.clone(),
             &fixture.path,
@@ -3769,8 +3814,13 @@ mod tests {
                         entity! { metadata::tag: &KIND_MESSAGE_ID },
                     )
                     .unwrap();
-                drop(self.store.maintain(self.succinct).await.unwrap());
-                drop(self.store.maintain(self.rank9).await.unwrap());
+                drop(
+                    self.store
+                        .maintain(self.succinct, &self.signer)
+                        .await
+                        .unwrap(),
+                );
+                drop(self.store.maintain(self.rank9, &self.signer).await.unwrap());
                 Ok(Some(self.bytes.clone()))
             }
         }
@@ -3827,11 +3877,12 @@ mod tests {
                 ),
             )
             .unwrap();
-            sources.ensure(&mut pile).await.unwrap();
+            sources.ensure(&mut pile, &fixture.signer).await.unwrap();
             let watermark = pile.snapshot_at(instant).unwrap();
-            let observation = maintain_and_observe_snapshot(&mut pile, &watermark, &sources)
-                .await
-                .unwrap();
+            let observation =
+                maintain_and_observe_snapshot(&mut pile, &fixture.signer, &watermark, &sources)
+                    .await
+                    .unwrap();
             let support = observation.facts.messages.support().clone();
             let handle = Inline::new(body.raw);
             let mut supply = Supply {
@@ -3915,6 +3966,7 @@ mod tests {
 
         let attempt = load_wait_frame(
             &mut pile,
+            &fixture.signer,
             &sources,
             watermark.clone(),
             &fixture.path,

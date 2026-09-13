@@ -31,8 +31,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
-    CollectionRecord, CollectionRecordDiagnostic, CollectionRecordDiagnosticError,
-    CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
+    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::id::Id;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
@@ -425,45 +424,33 @@ where
 
 /// Canonical records currently known for one scoped target collection.
 ///
-/// Discovery verifies commit self-signatures, but deliberately does not turn
-/// authorship into authorization. Consumers still decide which signing keys
-/// may introduce membership roots. Unsigned merge and derive records are only
-/// structurally canonical here; their recipes still require
-/// representation-specific validation before they become usable equations.
+/// Discovery classifies trusted local records without repeating signature
+/// verification. It does not assign WRITE authority: collection observation
+/// decides which writers' signed assertions and equations are usable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetDiscovery {
     commits: Vec<CollectionCommit>,
     merges: Vec<CollectionMerge>,
     derives: Vec<CollectionDerive>,
-    diagnostics: Vec<CollectionRecordDiagnostic>,
 }
 
 impl TargetDiscovery {
-    /// Valid self-signed commits targeting this collection, in deterministic
+    /// Retained signed commits targeting this collection, in deterministic
     /// store order.
     pub fn commits(&self) -> &[CollectionCommit] {
         &self.commits
     }
 
-    /// Structurally canonical merge claims inside this collection, in
-    /// deterministic store order. Their recipe has not been validated here.
+    /// Retained signed merge claims, in deterministic store order.
+    /// WRITE admission has not been evaluated here.
     pub fn merges(&self) -> &[CollectionMerge] {
         &self.merges
     }
 
-    /// Structurally canonical derive claims whose target is this collection,
-    /// in deterministic store order. Their recipe has not been validated here.
+    /// Retained signed derive claims whose target is this collection,
+    /// in deterministic store order. WRITE admission is not evaluated here.
     pub fn derives(&self) -> &[CollectionDerive] {
         &self.derives
-    }
-
-    /// Invalid signed records observed during the same store enumeration.
-    ///
-    /// Core diagnostics retain the exact structurally valid commit, so they
-    /// can still be scoped after signature verification fails. They are
-    /// surfaced here rather than silently hidden from migration preflight.
-    pub fn diagnostics(&self) -> &[CollectionRecordDiagnostic] {
-        &self.diagnostics
     }
 }
 
@@ -497,16 +484,9 @@ where
     let mut commits = Vec::new();
     let mut merges = Vec::new();
     let mut derives = Vec::new();
-    let mut diagnostics = Vec::new();
     for record in records {
         match record {
-            CollectionRecord::Commit(commit) => match commit.verify_strict() {
-                Ok(()) => commits.push(commit),
-                Err(error) => diagnostics.push(CollectionRecordDiagnostic {
-                    record: commit,
-                    error: CollectionRecordDiagnosticError::InvalidCommit(error),
-                }),
-            },
+            CollectionRecord::Commit(commit) => commits.push(commit),
             CollectionRecord::Merge(merge) => merges.push(merge),
             CollectionRecord::Derive(derive) => derives.push(derive),
         }
@@ -516,7 +496,6 @@ where
         commits,
         merges,
         derives,
-        diagnostics,
     })
 }
 
@@ -1025,22 +1004,24 @@ mod tests {
             Inline::new([2; 32]),
             empty_metadata_handle(),
         );
-        let target_merge = CollectionMerge::new(
+        let target_merge = CollectionMerge::sign(
+            &signer,
             target,
             Inline::new([3; 32]),
             Inline::new([4; 32]),
             Inline::new([5; 32]),
         );
-        let other_merge = CollectionMerge::new(
+        let other_merge = CollectionMerge::sign(
+            &signer,
             other,
             Inline::new([6; 32]),
             Inline::new([7; 32]),
             Inline::new([8; 32]),
         );
         let derive_to_target =
-            CollectionDerive::new(target, Inline::new([9; 32]), Inline::new([10; 32]));
+            CollectionDerive::sign(&signer, target, Inline::new([9; 32]), Inline::new([10; 32]));
         let derive_from_target =
-            CollectionDerive::new(other, Inline::new([11; 32]), Inline::new([12; 32]));
+            CollectionDerive::sign(&signer, other, Inline::new([11; 32]), Inline::new([12; 32]));
 
         for record in [
             CollectionRecord::Commit(target_commit),
@@ -1057,7 +1038,6 @@ mod tests {
         assert_eq!(discovered.commits(), &[target_commit]);
         assert_eq!(discovered.merges(), &[target_merge]);
         assert_eq!(discovered.derives(), &[derive_to_target]);
-        assert!(discovered.diagnostics().is_empty());
         assert!(
             !store.blobs.is_empty(),
             "registration retains the descriptor attachment closure"
@@ -1093,9 +1073,9 @@ mod tests {
         store.commit(source, &signer, fragment).unwrap();
 
         let after = pollster::block_on(async {
-            drop(store.ensure(source).await.unwrap());
-            drop(store.maintain(succinct).await.unwrap());
-            store.maintain(rank9).await.unwrap()
+            drop(store.ensure(source, &signer).await.unwrap());
+            drop(store.maintain(succinct, &signer).await.unwrap());
+            store.maintain(rank9, &signer).await.unwrap()
         });
         let observed = after.collection(rank9).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
@@ -1154,7 +1134,6 @@ mod tests {
         assert_eq!(target.commits()[0].collection(), target_collection.handle());
         assert!(target.merges().is_empty());
         assert!(target.derives().is_empty());
-        assert!(target.diagnostics().is_empty());
 
         let unrelated_target = discover_target(&mut pile, other_scope, team).unwrap();
         assert_eq!(unrelated_target.commits().len(), 1);

@@ -220,32 +220,32 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
 
     pollster::block_on(async {
         drop(
-            pile.ensure(status_source)
+            pile.ensure(status_source, signer)
                 .await
                 .context("ensure Status source collection")?,
         );
         drop(
-            pile.ensure(relations_source)
+            pile.ensure(relations_source, signer)
                 .await
                 .context("ensure Relations source collection")?,
         );
         drop(
-            pile.maintain(status_succinct)
+            pile.maintain(status_succinct, signer)
                 .await
                 .context("maintain Status fact collection")?,
         );
         drop(
-            pile.maintain(status_rank9)
+            pile.maintain(status_rank9, signer)
                 .await
                 .context("maintain Status fact collection")?,
         );
         drop(
-            pile.maintain(relations_succinct)
+            pile.maintain(relations_succinct, signer)
                 .await
                 .context("maintain Relations fact collection")?,
         );
         drop(
-            pile.maintain(relations_rank9)
+            pile.maintain(relations_rank9, signer)
                 .await
                 .context("maintain Relations fact collection")?,
         );
@@ -284,9 +284,9 @@ fn maintain_and_observe_relations(
     let collection_rank9 =
         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
     let snapshot = pollster::block_on(async {
-        drop(pile.ensure(source).await?);
-        drop(pile.maintain(collection_succinct).await?);
-        pile.maintain(collection_rank9).await
+        drop(pile.ensure(source, signer).await?);
+        drop(pile.maintain(collection_succinct, signer).await?);
+        pile.maintain(collection_rank9, signer).await
     })
     .context("maintain Relations fact collection")?;
     let relations = snapshot

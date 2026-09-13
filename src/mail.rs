@@ -3514,6 +3514,7 @@ mod tests {
             let secrets = pollster::block_on(secret_storage::ensure_and_snapshot(
                 &mut pile,
                 secrets_collection,
+                &signer,
             ))
             .unwrap();
             let mail = open_configured(

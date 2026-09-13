@@ -85,6 +85,12 @@ reconciliation.
 
 ## CI / releases
 
+* Run temporary-pile tests without live deployment environment overrides,
+  especially `TRIBLESPACE_COLLECTION_*`, `TRIBLESPACE_KEY`, `PILE`, and
+  `DRIVE_ENDPOINT`. SSH shells on the Sparks may export these automatically.
+  Use a process-local clean test environment; do not change the host profile
+  or loosen collection admission to make a fixture pass. On 2026-09-13,
+  inherited live descriptors caused 226 unrelated fixture failures.
 * `.github/workflows/release.yml` fires on `v*` tags. It builds
   every CLI faculty for x86_64-linux-gnu, native aarch64-linux-gnu,
   and aarch64-apple-darwin, then

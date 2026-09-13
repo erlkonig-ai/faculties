@@ -281,18 +281,18 @@ fn with_files_view<T>(
         let reader = runtime.block_on(async {
             drop(
                 store
-                    .ensure(collection)
+                    .ensure(collection, signer)
                     .await
                     .context("ensure Files source collection")?,
             );
             drop(
                 store
-                    .maintain(succinct)
+                    .maintain(succinct, signer)
                     .await
                     .context("maintain Files Succinct collection")?,
             );
             store
-                .maintain(rank9)
+                .maintain(rank9, signer)
                 .await
                 .context("maintain Files Rank9 collection")
         })?;
@@ -422,6 +422,7 @@ fn semantic_target(
 fn maintain_semantic(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<(
     Collection<NvFp4CosineSet<embeddings::Embedding768>>,
@@ -437,12 +438,12 @@ fn maintain_semantic(
     let snapshot = runtime.block_on(async {
         drop(
             store
-                .ensure(collection)
+                .ensure(collection, signer)
                 .await
                 .context("ensure Files source collection")?,
         );
         store
-            .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target)
+            .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
             .await
             .context("maintain the Files semantic index")
     })?;
@@ -674,7 +675,7 @@ fn cmd_add(
     // path); elsewhere its rows arrive from a machine that can.
     #[cfg(feature = "local-embed")]
     if local_compute() == SEMANTIC_COMPUTE {
-        match maintain_semantic(pile, collection, runtime) {
+        match maintain_semantic(pile, collection, signer, runtime) {
             Ok(_) => {}
             Err(error) => out.line(format!("Semantic index not maintained: {error:#}"))?,
         }
@@ -1377,17 +1378,18 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
     out: &mut Out<'_>,
 ) -> Result<()> {
     #[cfg(not(feature = "local-embed"))]
     {
-        let _ = (store, collection, runtime, out);
+        let _ = (store, collection, signer, runtime, out);
         bail!("`files index` needs the embedders — rebuild with --features local-embed");
     }
     #[cfg(feature = "local-embed")]
     {
-        let (target, snapshot) = maintain_semantic(store, collection, runtime)?;
+        let (target, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
         let index = snapshot
             .collection(target)
             .context("observe the Files semantic index")?
@@ -1786,6 +1788,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
 fn cmd_similar<P: TriblePattern>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
@@ -1802,7 +1805,7 @@ fn cmd_similar<P: TriblePattern>(
     }
     #[cfg(not(feature = "local-embed"))]
     {
-        let _ = (store, collection, runtime);
+        let _ = (store, collection, signer, runtime);
         bail!("`files similar` needs the embedders — rebuild with --features local-embed");
     }
     #[cfg(feature = "local-embed")]
@@ -1840,7 +1843,7 @@ fn cmd_similar<P: TriblePattern>(
         // compute, so a file saved a minute ago is found; read as it stands
         // otherwise, its rows having replicated from a machine that is.
         let snapshot_and_target = if local_compute() == SEMANTIC_COMPUTE {
-            let (target, snapshot) = maintain_semantic(store, collection, runtime)?;
+            let (target, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
             (snapshot, target)
         } else {
             let target = semantic_target(store, collection)?;
@@ -2216,10 +2219,11 @@ impl Files {
         );
         with_files_view(
             &self.storage,
-            |store, collection, _, facts, snapshot, runtime| {
+            |store, collection, signer, facts, snapshot, runtime| {
                 cmd_similar(
                     store,
                     collection,
+                    signer,
                     runtime,
                     facts,
                     snapshot,
@@ -2237,8 +2241,8 @@ impl Files {
 
     /// Maintain the semantic index over every stored file (see [`cmd_index`]).
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
-        with_files_store(&self.storage, |store, collection, _, runtime| {
-            cmd_index(store, collection, runtime, out)
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
+            cmd_index(store, collection, signer, runtime, out)
         })
     }
 

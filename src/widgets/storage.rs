@@ -719,14 +719,14 @@ async fn load_inputs_from_pile(
 
         for (_, label, source, _, _) in &collections {
             drop(
-                pile.ensure(*source)
+                pile.ensure(*source, signer)
                     .await
                     .map_err(|error| format!("ensure {label} source collection: {error:#}"))?,
             );
         }
         if let Some(collection) = secrets_collection {
             drop(
-                pile.ensure(collection.source())
+                pile.ensure(collection.source(), signer)
                     .await
                     .map_err(|error| format!("ensure Secrets source collection: {error:#}"))?,
             );
@@ -750,12 +750,12 @@ async fn load_inputs_from_pile(
 
         for (_, label, _, succinct, rank9) in &collections {
             drop(
-                pile.maintain(*succinct).await.map_err(|error| {
+                pile.maintain(*succinct, signer).await.map_err(|error| {
                     format!("maintain Succinct {label} fact archive: {error:#}")
                 })?,
             );
             drop(
-                pile.maintain(*rank9)
+                pile.maintain(*rank9, signer)
                     .await
                     .map_err(|error| format!("maintain Rank9 {label} fact archive: {error:#}"))?,
             );
@@ -769,7 +769,7 @@ async fn load_inputs_from_pile(
         // support need not equal fact support to admit only known winners.
         if let Some(target) = compass_register {
             drop(
-                pile.maintain(target)
+                pile.maintain(target, signer)
                     .await
                     .map_err(|error| format!("maintain Compass status register: {error}"))?,
             );
@@ -777,7 +777,7 @@ async fn load_inputs_from_pile(
 
         if let Some(target) = wiki_latest {
             drop(
-                pile.maintain(target)
+                pile.maintain(target, signer)
                     .await
                     .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
             );
@@ -785,7 +785,7 @@ async fn load_inputs_from_pile(
 
         let secrets = if let Some((collection, support)) = secrets_support {
             let store_snapshot = collection
-                .ensure_exact(pile, &support)
+                .ensure_exact(pile, signer, &support)
                 .await
                 .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?;
             let snapshot = secret_storage::snapshot_exact(store_snapshot, collection, support)
@@ -1164,7 +1164,7 @@ mod tests {
             store
                 .commit(source, &signer, entity! { &root @ metadata::name: "root" })
                 .unwrap();
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let lagging = ready.collection(target).unwrap();
             store
                 .commit(
@@ -1178,7 +1178,7 @@ mod tests {
             let mut before = DatasetRevision::from_collection(source.handle(), facts.support());
             before.include_collection(target.handle(), lagging.support());
 
-            let ready = store.maintain(target).await.unwrap();
+            let ready = store.maintain(target, &signer).await.unwrap();
             let advanced = ready.collection(target).unwrap();
             let mut after = DatasetRevision::from_collection(source.handle(), facts.support());
             after.include_collection(target.handle(), advanced.support());
@@ -1353,10 +1353,9 @@ mod tests {
         let mut storage = StorageState::new(&path);
 
         assert!(storage.context().dataset(SourceKey::Wiki).is_none());
-        assert!(storage
-            .error()
-            .expect("missing signer is surfaced")
-            .contains("signer"));
+        let error = storage.error().expect("missing signer is surfaced");
+        assert!(error.contains("load durable signing key"), "{error}");
+        assert!(!crate::storage::signer_path(&path, None).exists());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
     }
 }

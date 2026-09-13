@@ -44,23 +44,27 @@ impl HealthSources {
         })
     }
 
-    fn maintain(&self, pile: &FacultyStore) -> Result<()> {
+    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<()> {
         let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
         pollster::block_on(async {
             for source in [&self.health, &self.relations, &self.presentations] {
-                drop(local.maintain(source.succinct).await?);
-                drop(local.maintain(source.rank9).await?);
+                drop(local.maintain(source.succinct, signer).await?);
+                drop(local.maintain(source.rank9, signer).await?);
             }
-            drop(local.maintain(self.latest).await?);
+            drop(local.maintain(self.latest, signer).await?);
             Ok(())
         })
     }
 
-    pub(super) fn observe(&self, pile: &mut FacultyStore) -> Result<HealthObservation> {
-        self.maintain(pile)?;
+    pub(super) fn observe(
+        &self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+    ) -> Result<HealthObservation> {
+        self.maintain(pile, signer)?;
         self.at(pile.snapshot()?)
     }
 
@@ -74,7 +78,7 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        let observation = self.observe(pile)?;
+        let observation = self.observe(pile, signer)?;
         let report = observation.report();
         if report.attention.is_empty() {
             return Ok((false, report.next_change));
@@ -368,7 +372,7 @@ mod tests {
         }
 
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
-            self.sources.maintain(&self.store).unwrap();
+            self.sources.maintain(&self.store, &self.signer).unwrap();
             self.sources
                 .at(self.store.snapshot_at(at).unwrap())
                 .unwrap()
@@ -571,8 +575,18 @@ mod tests {
         {
             let mut local = f.store.store();
             pollster::block_on(async {
-                drop(local.maintain(f.sources.health.succinct).await.unwrap());
-                drop(local.maintain(f.sources.health.rank9).await.unwrap());
+                drop(
+                    local
+                        .maintain(f.sources.health.succinct, &f.signer)
+                        .await
+                        .unwrap(),
+                );
+                drop(
+                    local
+                        .maintain(f.sources.health.rank9, &f.signer)
+                        .await
+                        .unwrap(),
+                );
             });
         }
         let lagging = f

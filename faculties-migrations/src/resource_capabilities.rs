@@ -495,14 +495,16 @@ mod tests {
         let source = sparse_commit(&signer, old, 0x51);
         let mut pile = open_pile_strict(&path).unwrap();
         pile.insert(CollectionRecord::Commit(source)).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::new(
+        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &signer,
             old,
             Inline::new([1; 32]),
             Inline::new([2; 32]),
             Inline::new([3; 32]),
         )))
         .unwrap();
-        pile.insert(CollectionRecord::Derive(CollectionDerive::new(
+        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
             old,
             Inline::new([4; 32]),
             Inline::new([5; 32]),
@@ -706,10 +708,14 @@ mod tests {
         let mut bytes = source.to_bytes();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        let invalid = CollectionCommit::from_bytes(bytes);
+        assert!(CollectionCommit::from_bytes(bytes).is_err());
         let mut pile = open_pile_strict(&path).unwrap();
-        pile.insert(CollectionRecord::Commit(invalid)).unwrap();
+        pile.insert(CollectionRecord::Commit(source)).unwrap();
         pile.close().unwrap();
+        // Preserve the explicit audit's malformed native-record fixture.
+        let mut raw = fs::read(&path).unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        fs::write(&path, raw).unwrap();
         let before = fs::read(&path).unwrap();
         assert_eq!(
             plan_path(&path, Some(&key), None, false)

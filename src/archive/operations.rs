@@ -255,17 +255,17 @@ impl ArchiveStorage<'_> {
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Rank9 Comb cursor collection")?;
                 drop(
-                    pile.ensure(source)
+                    pile.ensure(source, signer)
                         .await
                         .context("ensure Comb source dependencies")?,
                 );
                 drop(
-                    pile.maintain(succinct)
+                    pile.maintain(succinct, signer)
                         .await
                         .context("maintain Succinct Comb cursor collection")?,
                 );
                 let after = pile
-                    .maintain(rank9)
+                    .maintain(rank9, signer)
                     .await
                     .context("maintain Rank9 Comb cursor collection")?;
                 after
@@ -322,32 +322,32 @@ impl ArchiveStorage<'_> {
                 // Acquire the roots, maintain each immediate derivation, then
                 // observe both representations through one final snapshot.
                 drop(
-                    pile.ensure(archive_source)
+                    pile.ensure(archive_source, signer)
                         .await
                         .context("ensure Archive source dependencies")?,
                 );
                 drop(
-                    pile.ensure(comb_source)
+                    pile.ensure(comb_source, signer)
                         .await
                         .context("ensure Comb cursor dependencies")?,
                 );
                 drop(
-                    pile.maintain(comb_succinct)
+                    pile.maintain(comb_succinct, signer)
                         .await
                         .context("maintain Succinct Comb cursor collection")?,
                 );
                 drop(
-                    pile.maintain(comb_rank9)
+                    pile.maintain(comb_rank9, signer)
                         .await
                         .context("maintain Rank9 Comb cursor collection")?,
                 );
                 drop(
-                    pile.maintain(archive_succinct)
+                    pile.maintain(archive_succinct, signer)
                         .await
                         .context("maintain Succinct Archive replay facts")?,
                 );
                 let after = pile
-                    .maintain(archive_rank9)
+                    .maintain(archive_rank9, signer)
                     .await
                     .context("maintain Rank9 Archive replay facts")?;
                 let archive = after

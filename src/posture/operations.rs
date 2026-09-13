@@ -2127,16 +2127,20 @@ impl PostureStorage<'_> {
                 }
                 pollster::block_on(async {
                     for ((_, label), collection) in scopes.iter().zip(&sources) {
-                        drop(pile.ensure(*collection).await.with_context(|| {
+                        drop(pile.ensure(*collection, signer).await.with_context(|| {
                             format!("ensure Posture {label} source collection")
                         })?);
                     }
                     for (index, (_, label)) in scopes.iter().enumerate() {
-                        drop(pile.maintain(succinct[index]).await.with_context(|| {
-                            format!("maintain succinct Posture {label} collection")
-                        })?);
                         drop(
-                            pile.maintain(rank9[index])
+                            pile.maintain(succinct[index], signer)
+                                .await
+                                .with_context(|| {
+                                    format!("maintain succinct Posture {label} collection")
+                                })?,
+                        );
+                        drop(
+                            pile.maintain(rank9[index], signer)
                                 .await
                                 .with_context(|| format!("maintain Posture {label} collection"))?,
                         );
