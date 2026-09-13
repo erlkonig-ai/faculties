@@ -120,7 +120,7 @@ widgets = [
 web-export = []
 # Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
 # embeddings via mary's embedder). Default (see above).
-local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
+local-embed = ["dep:mary", "mary/embed", "mary/gemma", "triblespace-search/semantic"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]
 # In-process Qwen3-TTS in the `voice` faculty (`voice say`/

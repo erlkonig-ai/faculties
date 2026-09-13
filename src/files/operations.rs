@@ -16,6 +16,8 @@ use ed25519_dalek::SigningKey;
 use hifitime::efmt::consts::ISO8601_DATE;
 use hifitime::efmt::Formatter;
 use hifitime::Epoch;
+#[cfg(feature = "local-embed")]
+use mary::embed::LocalEmbedder as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -33,15 +35,16 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::*;
+#[cfg(feature = "local-embed")]
+use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet};
+#[cfg(feature = "local-embed")]
+use triblespace_search::semantic::{local_compute, SemanticIndex};
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
-/// A vector in the shared 768-d text and image space (`schemas::embeddings`).
-type SharedHandle = Inline<inlineencodings::Handle<embeddings::Embedding768>>;
-/// Handle into the nomic-embed-multimodal-7b dense space (3584-d). A distinct
-/// type from `SharedHandle` (nomic 768-d) so the two spaces index independently and
-/// can never collide in one HNSW.
+/// Handle into the nomic-embed-multimodal-7b dense space (3584-d), distinct
+/// from the shared 768-d nomic space the semantic index lives in.
 type Mm7bHandle = Inline<inlineencodings::Handle<embeddings::Embedding3584>>;
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -367,84 +370,88 @@ fn print_fs_tree(
 }
 
 // ── embedder seam (mary, behind `local-embed`) ────────────────────────────
-// A faculties-local trait so the rest of `files` stays feature-independent;
-// the only impl is mary's `LocalEmbedder`, gated behind `local-embed`. Without
-// the feature there is no way to construct one, so embed-on-add is a no-op.
-#[allow(dead_code)] // embed_text is used by `files similar --text` (feature-gated)
-trait ImageEmbedder {
-    fn embed_image(&self, bytes: &[u8]) -> Result<Vec<f32>>;
-    fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+/// The compute class the Files semantic index is canonical on: the Sparks.
+/// The descriptor is the same from every machine, so one index exists; a
+/// machine of another class reads the rows that replicate to it.
+#[cfg(feature = "local-embed")]
+const SEMANTIC_COMPUTE: &str = "gb10";
+
+/// The semantic index over this Files collection, as a function of the
+/// working pile's model roots: file bytes under `file::content` through the
+/// pinned nomic-vision root, rows keyed by attribute and entity. The same
+/// descriptor from every machine, so `files similar` never has to discover
+/// it; a new model in the pile is a new descriptor.
+#[cfg(feature = "local-embed")]
+fn semantic_index(descriptors: &PileSnapshot) -> Result<SemanticIndex<embeddings::Embedding768>> {
+    let models = crate::nomic::index_models_in(descriptors)?;
+    SemanticIndex::new(
+        Some(file::content.id()),
+        [],
+        models.archives,
+        Some(models.vision_root),
+        Some(models.text_root),
+        SEMANTIC_COMPUTE,
+        embeddings::DIM,
+    )
+    .map_err(|error| anyhow::anyhow!("describe the Files semantic index: {error}"))
+}
+
+/// Register the index descriptor (idempotent) and return its collection.
+#[cfg(feature = "local-embed")]
+fn semantic_target(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+) -> Result<Collection<NvFp4CosineSet<embeddings::Embedding768>>> {
+    let descriptors = store
+        .snapshot()
+        .context("freeze the pile for the Files semantic index")?;
+    let policy = collection
+        .policy(&descriptors)
+        .context("read Files source collection policy")?;
+    let index = semantic_index(&descriptors)?;
+    drop(descriptors);
+    store
+        .derive_with(collection, index, policy)
+        .context("register the Files semantic index")
+}
+
+/// Maintain the index: embed every Files member that has no rows yet (this
+/// machine must be the canonical compute) and return the snapshot that sees
+/// the result.
+#[cfg(feature = "local-embed")]
+fn maintain_semantic(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(
+    Collection<NvFp4CosineSet<embeddings::Embedding768>>,
+    FacultySnapshot,
+)> {
+    if local_compute() != SEMANTIC_COMPUTE {
+        bail!(
+            "the Files semantic index is computed on {SEMANTIC_COMPUTE} and this machine is {}; its rows arrive by replication",
+            local_compute()
+        );
+    }
+    let target = semantic_target(store, collection)?;
+    let snapshot = runtime.block_on(async {
+        drop(
+            store
+                .ensure(collection)
+                .await
+                .context("ensure Files source collection")?,
+        );
+        store
+            .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target)
+            .await
+            .context("maintain the Files semantic index")
+    })?;
+    Ok((target, snapshot))
 }
 
 #[cfg(feature = "local-embed")]
-impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
-    fn embed_image(&self, bytes: &[u8]) -> Result<Vec<f32>> {
-        mary::embed::LocalEmbedder::embed_image(self, bytes)
-    }
-    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        mary::embed::LocalEmbedder::embed_text(self, text)
-    }
-}
-
-/// The image side of the shared 768-d space: nomic-embed-vision-v1.5 from its
-/// native model root in the working pile itself, the same
-/// coordinates nomic-embed-text-v1.5 puts prose into, so a text query finds an
-/// image by cosine alone (JP, 2026-09-12: "we shouldn't use nomic and clip
-/// because that prevents us from finding the images when searching for
-/// text"). Prefers a packed NVFP4 root when the pile carries one; see
-/// [`crate::nomic`].
-#[cfg(feature = "local-embed")]
-fn load_image_embedder() -> Result<Box<dyn ImageEmbedder>> {
-    Ok(Box::new(crate::nomic::load_vision_embedder()?))
-}
-
-/// [`load_image_embedder`] from the pile snapshot a command already holds:
-/// the working pile carries the model itself (JP, 2026-09-13), so a command
-/// that has it open should not open it a second time to find the weights.
-#[cfg(feature = "local-embed")]
-fn load_image_embedder_in(reader: &PileSnapshot) -> Result<Box<dyn ImageEmbedder>> {
-    Ok(Box::new(crate::nomic::load_vision_embedder_in(reader)?))
-}
-
-/// Embed an image on `add` and stage it as `file::embedding` exhaust (stored
-/// under the file's intrinsic record id, so identity is unaffected). Lazy-loads
-/// the embedder on the first image. No-op without `local-embed` or for
-/// non-raster mimes (SVG isn't a bitmap the vision tower can decode).
-#[allow(unused_variables)]
-fn embed_image_on_add(
-    embedder: &mut Option<Box<dyn ImageEmbedder>>,
-    mime: &str,
-    bytes: &[u8],
-) -> Result<Option<Vec<f32>>> {
-    #[cfg(feature = "local-embed")]
-    {
-        if !mime.starts_with("image/") || mime == "image/svg+xml" {
-            return Ok(None);
-        }
-        if embedder.is_none() {
-            eprintln!("files: loading nomic-vision embedder (once)…");
-            *embedder = Some(load_image_embedder()?);
-        }
-        return Ok(Some(embedder.as_ref().unwrap().embed_image(bytes)?));
-    }
-    #[cfg(not(feature = "local-embed"))]
-    {
-        let _ = (embedder, mime, bytes);
-        Ok(None)
-    }
-}
-
-/// Embed a text query into the shared image+text space (for `files similar
-/// --text`): nomic-embed-text-v1.5's query side, the coordinates the images
-/// were embedded into. Loads the embedder fresh — a one-off query.
-#[allow(unused_variables)]
-fn embed_text_query(reader: &PileSnapshot, text: &str) -> Result<Vec<f32>> {
-    #[cfg(feature = "local-embed")]
-    {
-        return crate::nomic::load_text_embedder_in(reader)?.embed_query(text);
-    }
-    #[cfg(not(feature = "local-embed"))]
-    bail!("`files similar --text` needs the embedder — rebuild with --features local-embed");
+fn collection_hex(handle: triblespace::core::collection::CollectionHandle) -> String {
+    hex::encode(handle.raw)
 }
 
 // ── nomic-embed-multimodal-7b seam (3584-d dense space) ───────────────────
@@ -542,33 +549,20 @@ fn read_embedding_3584<R: BlobStoreGet>(reader: &R, h: Mm7bHandle) -> Result<Vec
     Ok(v.as_ref().to_vec())
 }
 
-fn build_tree(
-    path: &Path,
-    mime_override: Option<&str>,
-    stats: &mut TreeStats,
-    embedder: &mut Option<Box<dyn ImageEmbedder>>,
-) -> Result<Fragment> {
+fn build_tree(path: &Path, mime_override: Option<&str>, stats: &mut TreeStats) -> Result<Fragment> {
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
 
     if meta.is_file() {
         let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
         let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(path));
-        // Embed BEFORE the bytes are moved into the blob store.
-        let embedding = embed_image_on_add(embedder, mime, &bytes)?;
         let name_str = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed");
 
         stats.files += 1;
-        let mut frag = file_capability::stage(bytes, name_str, mime)?;
-        if let Some(vector) = embedding {
-            // Exhaust: stored under the intrinsic record id, so identity holds.
-            let fid = frag.root().expect("file entity has an intrinsic id");
-            let eh: SharedHandle = frag.put::<embeddings::Embedding768, _>(vector);
-            frag += entity! { ExclusiveId::force_ref(&fid) @ embeddings::attr::embedding: eh };
-        }
+        let frag = file_capability::stage(bytes, name_str, mime)?;
         Ok(frag)
     } else if meta.is_dir() {
         // Collect children sorted by name for deterministic ordering.
@@ -586,7 +580,7 @@ fn build_tree(
         let mut children = Fragment::default();
 
         for (_name, child_path) in &entries {
-            let child_frag = build_tree(child_path, None, stats, embedder)?;
+            let child_frag = build_tree(child_path, None, stats)?;
             children += child_frag;
         }
 
@@ -633,6 +627,7 @@ fn cmd_add(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
@@ -648,8 +643,7 @@ fn cmd_add(
         dirs: 0,
         bytes: 0,
     };
-    let mut embedder: Option<Box<dyn ImageEmbedder>> = None;
-    let tree = build_tree(&abs_path, mime_override, &mut stats, &mut embedder)?;
+    let tree = build_tree(&abs_path, mime_override, &mut stats)?;
     let root_id = tree.root().expect("tree has a root");
     let root_content = content_handle_of(tree.facts(), root_id);
 
@@ -674,6 +668,19 @@ fn cmd_add(
 
     pile.commit(collection, signer, change)
         .context("commit Files import")?;
+
+    // A saved image is searchable the moment it is saved, where this machine
+    // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
+    // path); elsewhere its rows arrive from a machine that can.
+    #[cfg(feature = "local-embed")]
+    if local_compute() == SEMANTIC_COMPUTE {
+        match maintain_semantic(pile, collection, runtime) {
+            Ok(_) => {}
+            Err(error) => out.line(format!("Semantic index not maintained: {error:#}"))?,
+        }
+    }
+    #[cfg(not(feature = "local-embed"))]
+    let _ = runtime;
 
     if stats.dirs > 0 {
         out.line(format!(
@@ -798,14 +805,8 @@ fn stage_byte_import(
     source: &str,
 ) -> Result<(Fragment, Id, Id)> {
     let mime = file_capability::normalize_media_type(mime)?;
-    let embedding = embed_image_on_add(&mut None, &mime, bytes.as_ref())?;
     let mut change = file_capability::stage(bytes, name, &mime)?;
     let file_id = change.root().expect("staged file has a root");
-    if let Some(vector) = embedding {
-        let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(vector);
-        change +=
-            entity! { ExclusiveId::force_ref(&file_id) @ embeddings::attr::embedding: handle };
-    }
     let import = entity! {
         metadata::tag: &KIND_IMPORT,
         file::root: &file_id,
@@ -1367,115 +1368,42 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 
 // ── main ─────────────────────────────────────────────────────────────────
 
-/// Read a stored embedding blob back into a plain `Vec<f32>`.
-fn read_embedding_768<R: BlobStoreGet>(reader: &R, h: SharedHandle) -> Result<Vec<f32>> {
-    let v: anybytes::View<[f32]> = reader.get(h).context("read shared-space embedding blob")?;
-    Ok(v.as_ref().to_vec())
-}
-
-/// Embed every image file into the shared 768-d space with nomic-embed-vision
-/// and store the vector on `embeddings::attr::embedding` under the file's
-/// intrinsic record id: exhaust, identity unaffected. Images embed on `add`
-/// since 2026-09-12; this is for the ones stored before that, and for a pile
-/// whose images were embedded by an earlier model. Idempotent: files already
-/// carrying a shared-space vector are skipped unless `force`. Identical bytes
-/// are embedded once and the vector fanned out to every entity sharing them.
-#[allow(unused_variables)]
-fn cmd_embed<P: TriblePattern>(
-    pile: &mut FacultyStore,
+/// Maintain the Files semantic index: every stored file's bytes under
+/// `file::content` embedded through the nomic-vision root in the working
+/// pile, as rows of a derived NVFP4 cosine set keyed by file entity (see
+/// `triblespace_search::semantic`). Idempotent: members already derived are
+/// reused, only missing DERIVE work is computed. Only a machine of the
+/// canonical compute class computes; the rows replicate to the others.
+fn cmd_index(
+    store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
-    signer: &SigningKey,
-    space: &P,
-    reader: &PileSnapshot,
-    force: bool,
+    runtime: &tokio::runtime::Runtime,
     out: &mut Out<'_>,
 ) -> Result<()> {
     #[cfg(not(feature = "local-embed"))]
-    bail!("`files embed` needs the embedder — rebuild with --features local-embed");
+    {
+        let _ = (store, collection, runtime, out);
+        bail!("`files index` needs the embedders — rebuild with --features local-embed");
+    }
     #[cfg(feature = "local-embed")]
     {
-        let mut groups: BTreeMap<String, (FileHandle, Vec<(Id, bool)>)> = BTreeMap::new();
-        for (eid, h) in find!(
-            (eid: Id, h: FileHandle),
-            pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
-        ) {
-            let mime = read_mime(space, reader, eid)?.unwrap_or_default();
-            if !mime.starts_with("image/") || mime == "image/svg+xml" {
-                continue;
-            }
-            let has = exists!(
-                (e: SharedHandle),
-                pattern!(space, [{ eid @ embeddings::attr::embedding: ?e }])
-            );
-            groups
-                .entry(handle_hex(h))
-                .or_insert_with(|| (h, Vec::new()))
-                .1
-                .push((eid, has));
-        }
-        if groups.is_empty() {
-            out.line("(no image files to embed)".to_string())?;
-            return Ok(());
-        }
-        let pending: Vec<_> = groups
-            .into_iter()
-            .filter(|(_, (_, eids))| force || eids.iter().any(|(_, has)| !*has))
-            .collect();
-        let total_imgs: usize = pending.iter().map(|(_, (_, e))| e.len()).sum();
-        if pending.is_empty() {
-            out.line(
-                "All image files already have a shared-space embedding (use --force to re-embed)."
-                    .to_string(),
-            )?;
-            return Ok(());
-        }
-
-        let embedder = load_image_embedder_in(reader)?;
-        let mut change = Fragment::empty();
-        let (mut embedded, mut assigned, mut failed) = (0usize, 0usize, 0usize);
-        for (hash, (content, eids)) in &pending {
-            let bytes: anybytes::Bytes = match reader.get::<anybytes::Bytes, _>(*content) {
-                Ok(b) => b,
-                Err(e) => {
-                    out.line(format!("  skip {hash}: read content failed: {e:?}"))?;
-                    failed += 1;
-                    continue;
-                }
-            };
-            let v = match embedder.embed_image(bytes.as_ref()) {
-                Ok(v) => v,
-                Err(e) => {
-                    out.line(format!("  skip {hash}: embed failed: {e:#}"))?;
-                    failed += 1;
-                    continue;
-                }
-            };
-            embedded += 1;
-            for (eid, has) in eids {
-                if *has && !force {
-                    continue;
-                }
-                let handle: SharedHandle = change.put::<embeddings::Embedding768, _>(v.clone());
-                change +=
-                    entity! { ExclusiveId::force_ref(eid) @ embeddings::attr::embedding: handle };
-                assigned += 1;
-            }
-            out.line(format!(
-                "  embedded {hash}  ({} bytes → 768-d)",
-                bytes.len()
-            ))?;
-        }
-        if change.is_empty() {
-            out.line(format!(
-                "Nothing to commit (embedded {embedded}, failed {failed})."
-            ))?;
-            return Ok(());
-        }
-        pile.commit(collection, signer, change)
-            .context("commit Files shared-space embeddings")?;
+        let (target, snapshot) = maintain_semantic(store, collection, runtime)?;
+        let index = snapshot
+            .collection(target)
+            .context("observe the Files semantic index")?
+            .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+            .context("read the Files semantic index")?;
+        let rows: usize = index
+            .scan_segments()
+            .iter()
+            .map(|segment| segment.rows())
+            .sum();
         out.line(format!(
-            "embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
-            if failed > 0 { format!(", {failed} failed") } else { String::new() }
+            "Files semantic index {}: {} member(s), {} row(s), computed on {}",
+            collection_hex(target.handle()),
+            index.segment_count(),
+            rows,
+            SEMANTIC_COMPUTE
         ))?;
         Ok(())
     }
@@ -1856,6 +1784,9 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
 /// With `mm7b`, the query and candidates live in the 3584-d nomic-7b space
 /// (`attr_mm7b::embedding`, populated by `files embed7b`) instead of the 768-d one.
 fn cmd_similar<P: TriblePattern>(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
     id: Option<&str>,
@@ -1869,116 +1800,117 @@ fn cmd_similar<P: TriblePattern>(
     if mm7b {
         return cmd_similar_mm7b(space, reader, id, text, floor, limit, filter_tags, out);
     }
-
-    // The query vector + a label, from either a text string (cross-modal) or a
-    // query file's stored embedding. `query_eid` is Some only for a file query,
-    // so it drops itself from its own results.
-    let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
-        (Some(t), _) => (embed_text_query(reader, t)?, None, format!("{t:?}")),
-        (None, Some(idstr)) => {
-            let eid = file_capability::resolve_selector(space, idstr)?;
-            let h: SharedHandle = find!(
-                (h: SharedHandle),
-                pattern!(space, [{ eid @ embeddings::attr::embedding: ?h }])
-            )
-            .map(|(h,)| h)
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "that file has no embedding in the shared space — images embed \
-                     on `add`; `files embed` embeds the ones already stored; or \
-                     query with --text instead"
-                )
-            })?;
-            let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-            (read_embedding_768(reader, h)?, Some(eid), name)
-        }
-        (None, None) => bail!("give a file id/hash, or --text \"a query\""),
-    };
-
-    // Every embedded file: (entity, handle). Read each vector back from the
-    // pile and stage it into a local store the HNSW can attach to.
-    let pairs: Vec<(Id, SharedHandle)> = find!(
-        (eid: Id, h: SharedHandle),
-        pattern!(space, [{ ?eid @ embeddings::attr::embedding: ?h }])
-    )
-    .collect();
-    if pairs.is_empty() {
-        bail!("no files in the shared space yet — `files embed` embeds every image already stored; new images embed on add");
+    #[cfg(not(feature = "local-embed"))]
+    {
+        let _ = (store, collection, runtime);
+        bail!("`files similar` needs the embedders — rebuild with --features local-embed");
     }
-
-    // Read every embedding into a plain vector and run the pure NN core. A
-    // vector whose bytes this snapshot does not hold yet (the record travels
-    // ahead of its blob while the pile replicates; Sol on the Mac,
-    // 2026-09-13) is not a candidate: skipped and counted, never a refusal of
-    // the whole query. The store names the cause in its own words.
-    let mut vec_pairs: Vec<(Id, Vec<f32>)> = Vec::with_capacity(pairs.len());
-    let mut unreadable = 0usize;
-    let mut cause: Option<String> = None;
-    for (eid, h) in &pairs {
-        match read_embedding_768(reader, *h) {
-            Ok(v) => vec_pairs.push((*eid, v)),
-            Err(e) => {
-                unreadable += 1;
-                cause.get_or_insert_with(|| format!("{e:#}"));
+    #[cfg(feature = "local-embed")]
+    {
+        // The query vector + a label, from either a text string (cross-modal,
+        // the text model's query side) or a query file's bytes (image to
+        // image). `query_eid` is Some only for a file query, so it drops
+        // itself from its own results.
+        let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
+            (Some(t), _) => (
+                crate::nomic::load_text_embedder_in(reader)?.embed_query(t)?,
+                None,
+                format!("{t:?}"),
+            ),
+            (None, Some(idstr)) => {
+                let eid = file_capability::resolve_selector(space, idstr)?;
+                let h = content_handle_of(space, eid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "that entity has no content bytes to embed; query with --text instead"
+                    )
+                })?;
+                let bytes: anybytes::Bytes = reader
+                    .get::<anybytes::Bytes, _>(h)
+                    .context("read the query file's bytes")?;
+                let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
+                let vector = crate::nomic::load_vision_embedder_in(reader)?
+                    .embed_image(bytes.as_ref())
+                    .context("embed the query image")?;
+                (vector, Some(eid), name)
             }
-        }
-    }
-    if unreadable > 0 {
-        eprintln!(
-            "files similar: {unreadable} of {} shared-space vector(s) skipped, blob not readable in this snapshot (usually still replicating from the machine that wrote it): {}",
-            pairs.len(),
-            cause.unwrap_or_default()
-        );
-    }
-    if vec_pairs.is_empty() {
-        bail!(
-            "none of the {} shared-space vector(s) is readable in this snapshot yet",
-            pairs.len()
-        );
-    }
-    let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
+            (None, None) => bail!("give a file id/hash, or --text \"a query\""),
+        };
 
-    // Drop self (file query only), apply the hybrid tag filter, truncate. One
-    // row per entity: an entity re-embedded (`files embed --force`, or the
-    // same bytes imported twice) carries several vectors in the append-only
-    // pile, and the ranked list holds them all; the first hit is its best.
-    let mut rows: Vec<(f32, Id)> = Vec::new();
-    let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
-    for (cos, eid) in ranked {
-        if Some(eid) == query_eid || !seen.insert(eid) {
-            continue;
+        // The index: maintained here when this machine is the canonical
+        // compute, so a file saved a minute ago is found; read as it stands
+        // otherwise, its rows having replicated from a machine that is.
+        let snapshot_and_target = if local_compute() == SEMANTIC_COMPUTE {
+            let (target, snapshot) = maintain_semantic(store, collection, runtime)?;
+            (snapshot, target)
+        } else {
+            let target = semantic_target(store, collection)?;
+            let snapshot = store
+                .snapshot()
+                .context("freeze the pile for the Files semantic index")?;
+            (snapshot, target)
+        };
+        let (snapshot, target) = snapshot_and_target;
+        let index = snapshot
+            .collection(target)
+            .context("observe the Files semantic index")?
+            .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+            .context("read the Files semantic index")?;
+        if index.is_empty() {
+            bail!(
+                "the Files semantic index has no rows yet: run `files index` on a {SEMANTIC_COMPUTE}, or wait for its rows to replicate"
+            );
         }
-        if !filter_tags.is_empty() {
-            let tags = tags_of(space, eid);
-            if !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
+        let ranked = index
+            .reconstructed_top_k(&query_vec, limit.saturating_mul(8).max(64))
+            .map_err(|error| anyhow::anyhow!("search the Files semantic index: {error}"))?;
+
+        // One row per entity, the hybrid tag filter, the floor, the limit.
+        let mut rows: Vec<(f32, Id)> = Vec::new();
+        let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        for (key, score) in ranked {
+            let Some((attribute, eid)) =
+                SemanticIndex::<embeddings::Embedding768>::row_entity(&key)
+            else {
+                continue;
+            };
+            if attribute != file::content.id() {
                 continue;
             }
+            let cos = score as f32;
+            if cos < floor || Some(eid) == query_eid || !seen.insert(eid) {
+                continue;
+            }
+            if !filter_tags.is_empty() {
+                let tags = tags_of(space, eid);
+                if !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
+                    continue;
+                }
+            }
+            rows.push((cos, eid));
         }
-        rows.push((cos, eid));
-    }
-    rows.truncate(limit);
+        rows.truncate(limit);
 
-    if rows.is_empty() {
-        out.line(format!("no files similar to {label} above cos {floor}"))?;
-        return Ok(());
+        if rows.is_empty() {
+            out.line(format!("no files similar to {label} above cos {floor}"))?;
+            return Ok(());
+        }
+        out.line(format!("Similar to {label} (cos ≥ {floor}):"))?;
+        for (cos, eid) in &rows {
+            let name = read_name(space, reader, *eid)?.unwrap_or_else(|| "?".into());
+            let mime = read_mime(space, reader, *eid)?.unwrap_or_else(|| "?".into());
+            let hash = content_handle_of(space, *eid)
+                .map(handle_hex)
+                .unwrap_or_default();
+            let tags = tags_of(space, *eid);
+            let tagstr = if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", tags.join(", "))
+            };
+            out.line(format!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}"))?;
+        }
+        Ok(())
     }
-    out.line(format!("Similar to {label} (cos ≥ {floor}):"))?;
-    for (cos, eid) in &rows {
-        let name = read_name(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-        let mime = read_mime(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-        let hash = content_handle_of(space, *eid)
-            .map(handle_hex)
-            .unwrap_or_default();
-        let tags = tags_of(space, *eid);
-        let tagstr = if tags.is_empty() {
-            String::new()
-        } else {
-            format!("  [{}]", tags.join(", "))
-        };
-        out.line(format!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}"))?;
-    }
-    Ok(())
 }
 
 /// Nearest-neighbour search in the nomic-embed-multimodal-7b 3584-d space.
@@ -2198,8 +2130,8 @@ impl Files {
         if dry_run {
             return cmd_add_dry_run(path, tags, out);
         }
-        with_files_store(&self.storage, |store, collection, signer, _| {
-            cmd_add(store, collection, signer, path, mime, tags, out)
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
+            cmd_add(store, collection, signer, runtime, path, mime, tags, out)
         })
     }
 
@@ -2282,29 +2214,32 @@ impl Files {
             options.floor.is_finite() && (0.0..=1.0).contains(&options.floor),
             "floor must be between 0 and 1"
         );
-        with_files_view(&self.storage, |_, _, _, facts, snapshot, _| {
-            cmd_similar(
-                facts,
-                snapshot,
-                options.id,
-                options.text,
-                options.floor,
-                options.limit,
-                options.tags,
-                options.mm7b,
-                out,
-            )
-        })
-    }
-
-    /// Embed every stored image into the shared 768-d space (see [`cmd_embed`]).
-    pub fn embed(&self, force: bool, out: &mut Out<'_>) -> Result<()> {
         with_files_view(
             &self.storage,
-            |store, collection, signer, facts, snapshot, _| {
-                cmd_embed(store, collection, signer, facts, snapshot, force, out)
+            |store, collection, _, facts, snapshot, runtime| {
+                cmd_similar(
+                    store,
+                    collection,
+                    runtime,
+                    facts,
+                    snapshot,
+                    options.id,
+                    options.text,
+                    options.floor,
+                    options.limit,
+                    options.tags,
+                    options.mm7b,
+                    out,
+                )
             },
         )
+    }
+
+    /// Maintain the semantic index over every stored file (see [`cmd_index`]).
+    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
+        with_files_store(&self.storage, |store, collection, _, runtime| {
+            cmd_index(store, collection, runtime, out)
+        })
     }
 
     pub fn embed7b(&self, options: &EmbeddingOptions, out: &mut Out<'_>) -> Result<()> {

@@ -32,7 +32,7 @@ const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProper
 const TOOLS: &[Tool] = &[
     Tool {
         name: "files_add",
-        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. With local-embed builds, raster images also embed through nomic-vision into the shared 768-d text and image space and require the launcher-configured model/runtime.",
+        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. On a gb10 build the semantic index is maintained after the import, so an image is found by `files_similar` at once; elsewhere its rows arrive by replication and require the launcher-configured model/runtime.",
         input_schema: r#"{"type":"object","properties":{"data":{"type":"string","description":"Base64-encoded file bytes"},"name":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["data","name","mime"],"additionalProperties":false}"#,
     },
     Tool {
@@ -52,15 +52,16 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. With local-embed builds, raster images also embed through nomic-vision into the shared 768-d text and image space and require the launcher-configured model/runtime.",
+        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. On a gb10 build the semantic index is maintained after the import, so an image is found by `files_similar` at once; elsewhere its rows arrive by replication and require the launcher-configured model/runtime.",
         input_schema: r#"{"type":"object","properties":{"url":{"type":"string"},"mime":{"type":"string"},"name":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"max_bytes":{"type":"integer","minimum":1,"default":8388608}},"required":["url"],"additionalProperties":false}"#,
     },
     Tool {
         name: "files_search", description: "Search stored file names, media types, and tags.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
+    Tool { name: "files_index", description: "Maintain the semantic index over every stored file through the nomic-vision root in the working pile (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
     Tool {
-        name: "files_similar", description: "Semantic similarity search. Supply exactly one of id or text; requires a configured embedding model.",
+        name: "files_similar", description: "Semantic similarity search over the derived index. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through nomic-vision.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0.15},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
     },
     Tool {
@@ -274,6 +275,10 @@ impl Faculty for Files {
                     },
                     out,
                 )
+            }
+            "files_index" => {
+                let _: Empty = decode_arguments(arguments)?;
+                files.index(out)
             }
             "files_embed7b" => {
                 let args: Embed = decode_arguments(arguments)?;

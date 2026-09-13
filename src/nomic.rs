@@ -174,6 +174,64 @@ fn vision_embedder_from(
     )
 }
 
+/// The models the semantic index embeds with, as the index pins them: the
+/// member archives of the working pile's model collection (exact bytes) and
+/// the one root this loader would select for each of the two nomic models,
+/// packed preferred.
+pub struct IndexModels {
+    pub archives: Vec<[u8; 32]>,
+    pub text_root: triblespace::core::id::Id,
+    pub vision_root: triblespace::core::id::Id,
+}
+
+/// [`IndexModels`] from a pile snapshot the caller already holds.
+pub fn index_models_in(store: &PileSnapshot) -> Result<IndexModels> {
+    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+        .context("freeze the working pile's model collection for the semantic index")?;
+    let archives = snapshot
+        .support()
+        .members()
+        .map(|member| member.raw)
+        .collect();
+    Ok(IndexModels {
+        archives,
+        text_root: preferred_root(&snapshot, NOMIC_TEXT_MODEL)?,
+        vision_root: preferred_root(&snapshot, NOMIC_VISION_MODEL)?,
+    })
+}
+
+/// The root [`select_weights`] would load for `source`: the first label in
+/// [`NOMIC_QUANTIZATIONS`] that has exactly one root.
+fn preferred_root(snapshot: &ModelPileSnapshot, source: &str) -> Result<triblespace::core::id::Id> {
+    for quantization in NOMIC_QUANTIZATIONS {
+        let roots = match mary::selection::select_model_roots(
+            snapshot.facts(),
+            snapshot.store(),
+            ModelSelector::Source {
+                source,
+                quantization,
+            },
+        ) {
+            Ok(roots) => roots,
+            Err(_) => continue,
+        };
+        match roots.as_slice() {
+            [root] => return Ok(*root),
+            [] => continue,
+            many => {
+                return Err(anyhow!(
+                    "the working pile carries {} {quantization} roots of {source}; one is needed",
+                    many.len()
+                ))
+            }
+        }
+    }
+    Err(anyhow!(
+        "the working pile carries no {source} root labelled {} (pack it in with nomic_pack --append)",
+        NOMIC_QUANTIZATIONS.join(" or ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

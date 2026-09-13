@@ -129,9 +129,9 @@ const VERBS: &[Verb] = &[
         ],
     },
     Verb {
-        name: "embed",
-        about: "Embed every stored image into the shared text+image space with nomic-vision (requires local-embed)",
-        params: &[Param::caller("force", "Re-embed files already carrying a shared-space embedding").flag()],
+        name: "index",
+        about: "Maintain the semantic index: every stored file's bytes embedded through the nomic-vision root in the working pile, rows keyed by file (requires local-embed and a gb10; elsewhere the rows arrive by replication)",
+        params: &[],
     },
     Verb {
         name: "embed7b",
@@ -297,7 +297,7 @@ fn execute_with_input(
             },
             out,
         ),
-        "embed" => files.embed(invocation.flag("force"), out),
+        "index" => files.index(out),
         "embed7b" => files.embed7b(
             &EmbeddingOptions {
                 force: invocation.flag("force"),
