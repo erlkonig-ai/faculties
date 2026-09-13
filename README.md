@@ -45,7 +45,7 @@ git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 1381faea4dc988c4780277690ee4e3443587d1f6
+git -C triblespace-rs checkout 9c82f23f84b515c105234e2cd5319f081c0e1430
 git -C mary checkout d6802b09ca7b693819238d2520378aff3571af8b
 git -C GORBIE checkout 22a31671bb5b2591b69ae13c1d0069cbf963c17b
 git -C soma checkout e75ef119fae679aed27420fc5e0835be60f5920d

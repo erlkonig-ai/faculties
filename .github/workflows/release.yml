@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: triblespace/triblespace-rs
-          ref: 1381faea4dc988c4780277690ee4e3443587d1f6
+          ref: 9c82f23f84b515c105234e2cd5319f081c0e1430
           path: triblespace-rs
 
       - name: Check out Mary cohort
