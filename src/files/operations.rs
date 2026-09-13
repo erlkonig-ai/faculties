@@ -387,7 +387,7 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
 }
 
 /// The image side of the shared 768-d space: nomic-embed-vision-v1.5 from its
-/// native model pile (`NOMIC_VISION_PILE` overrides the path), the same
+/// native model root in the working pile itself, the same
 /// coordinates nomic-embed-text-v1.5 puts prose into, so a text query finds an
 /// image by cosine alone (JP, 2026-09-12: "we shouldn't use nomic and clip
 /// because that prevents us from finding the images when searching for

@@ -1,20 +1,26 @@
 //! The durable Nomic embedder seam.
 //!
-//! Ordinary inference reads one immutable native Mary collection snapshot per
-//! model pile. Weight and tokenizer selection then happen against the same
-//! frozen facts and blob reader, so a concurrent append cannot give one
-//! component a different authority set from the other. There is no Repository
+//! The nomic models live in the working pile itself, as roots of its
+//! `mary-model-graph` collection, and replication carries them to every
+//! machine (JP, 2026-09-13: "I wouldn't load it from a separate pile, I'd just
+//! put it into self.pile because it's small enough and then let replication
+//! take care of the rest"; and: "let's not fall back to a model directory, we
+//! shouldn't need structure outside our pile"). Ordinary inference reads one
+//! immutable native Mary collection snapshot of that pile. Weight and
+//! tokenizer selection then happen against the same frozen facts and blob
+//! reader, so a concurrent append cannot give one component a different
+//! authority set from the other. There is no model directory, Repository
 //! branch, mutable Workspace, tokenizer JSON, temporary file, or Hugging Face
 //! fallback in this runtime path.
 //!
-//! Import and schema-epoch migration belong in Mary. A model pile without the
-//! canonical native graph fails loudly here instead of silently switching
+//! Import and packing belong in Mary (`nomic_pack ... --out <pile> --append`).
+//! A pile without the model fails loudly here instead of silently switching
 //! storage models.
 
 use std::path::{Path, PathBuf};
 use triblespace::core::repo::pile::PileSnapshot;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use mary::model_collection::ModelPileSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
 
@@ -22,25 +28,12 @@ use mary::selection::{ModelSelector, TokenizerSelector};
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 pub const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
-/// Default model-pile filenames (resolved under [`crate::model_dir`]).
-/// `NOMIC_TEXT_PILE` / `NOMIC_VISION_PILE` override the full path.
-pub const NOMIC_TEXT_PILE_FILE: &str = "nomic_text.pile";
-pub const NOMIC_VISION_PILE_FILE: &str = "nomic_vision.pile";
-
-/// The text model pile path (env override, else the model-dir default).
-pub fn text_pile() -> PathBuf {
-    match std::env::var_os("NOMIC_TEXT_PILE") {
-        Some(path) => PathBuf::from(path),
-        None => crate::model_dir().join(NOMIC_TEXT_PILE_FILE),
-    }
-}
-
-/// The vision model pile path (env override, else the model-dir default).
-pub fn vision_pile() -> PathBuf {
-    match std::env::var_os("NOMIC_VISION_PILE") {
-        Some(path) => PathBuf::from(path),
-        None => crate::model_dir().join(NOMIC_VISION_PILE_FILE),
-    }
+/// The working pile: `PILE`, the path every faculty takes. The models are in
+/// it or nowhere.
+fn working_pile() -> Result<PathBuf> {
+    std::env::var_os("PILE")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("PILE is not set; the nomic models are read from the working pile"))
 }
 
 fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
@@ -57,70 +50,12 @@ fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
     Ok(snapshot)
 }
 
-/// The weight roots a nomic pile may carry for one source, most wanted first:
-/// the calibrated packed NVFP4 model (`mary::calibrate`, label
+/// The weight roots a pile may carry for one source, most wanted first: the
+/// calibrated packed NVFP4 model (`mary::calibrate`, label
 /// `nvfp4-calibrated`) when the pile has one, else the native f32 import.
 /// Both decode to the same f32 keymap for the embedder; the packed one is a
 /// seventh of the bytes on disk.
 const NOMIC_QUANTIZATIONS: [&str; 2] = ["nvfp4-calibrated", mary::persist::QUANTIZATION_NATIVE];
-
-/// The working pile, when the process knows it: `PILE`, the path every faculty
-/// takes.
-fn working_pile() -> Option<PathBuf> {
-    std::env::var_os("PILE").map(PathBuf::from)
-}
-
-/// Whether a frozen model collection carries a root of `source` under any
-/// label this loader takes.
-fn carries(snapshot: &ModelPileSnapshot, source: &str) -> bool {
-    NOMIC_QUANTIZATIONS.iter().any(|quantization| {
-        mary::selection::select_model_roots(
-            snapshot.facts(),
-            snapshot.store(),
-            ModelSelector::Source {
-                source,
-                quantization,
-            },
-        )
-        .is_ok()
-    })
-}
-
-/// Where a nomic model comes from, in order: the working pile, when it carries
-/// a model collection with a root of `source` (JP, 2026-09-13: "I wouldn't
-/// load it from a separate pile, I'd just put it into self.pile because it's
-/// small enough and then let replication take care of the rest"); else the
-/// model directory's file. Returns the snapshot and the path it came from.
-fn model_snapshot_for(source: &str, file: PathBuf) -> Result<(ModelPileSnapshot, PathBuf)> {
-    if let Some(pile) = working_pile() {
-        if pile != file {
-            if let Ok(snapshot) = mary::model_collection::load_model_collection_local_latest(&pile)
-            {
-                if carries(&snapshot, source) {
-                    return Ok((snapshot, pile));
-                }
-            }
-        }
-    }
-    let snapshot = load_model_snapshot(&file, source)?;
-    Ok((snapshot, file))
-}
-
-/// The same, from a pile snapshot the caller already holds open (a faculty
-/// command that has the working pile in hand should not open it twice).
-fn model_snapshot_in(
-    store: &PileSnapshot,
-    source: &str,
-    file: PathBuf,
-) -> Result<(ModelPileSnapshot, PathBuf)> {
-    if let Ok(snapshot) = mary::model_collection::snapshot_model_collection_in(store) {
-        if carries(&snapshot, source) {
-            return Ok((snapshot, PathBuf::from("the working pile")));
-        }
-    }
-    let snapshot = load_model_snapshot(&file, source)?;
-    Ok((snapshot, file))
-}
 
 /// The first root of `source` in the pile, in [`NOMIC_QUANTIZATIONS`] order.
 fn select_weights(
@@ -144,7 +79,7 @@ fn select_weights(
         })
         .with_context(|| {
             format!(
-                "{} carries no {source} root labelled {}",
+                "{} carries no {source} root labelled {} (pack it in with nomic_pack --append)",
                 pile.display(),
                 NOMIC_QUANTIZATIONS.join(" or ")
             )
@@ -165,22 +100,25 @@ fn select_weights(
     })
 }
 
-/// Load nomic-embed-text-v1.5 entirely from one canonical collection snapshot.
+/// Load nomic-embed-text-v1.5 from the working pile's model collection.
 ///
-/// Absence or ambiguity of either the native weight graph or tokenizer graph
-/// is an error. Migrate the pile with Mary's model migration CLI rather than
-/// adding a compatibility path to ordinary inference.
+/// Absence or ambiguity of either the weight graph or tokenizer graph is an
+/// error. Pack the model into the pile with Mary's `nomic_pack --append`
+/// rather than adding a compatibility path to ordinary inference.
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let (snapshot, pile) = model_snapshot_for(NOMIC_TEXT_MODEL, text_pile())?;
+    let pile = working_pile()?;
+    let snapshot = load_model_snapshot(&pile, NOMIC_TEXT_MODEL)?;
     text_embedder_from(&snapshot, &pile)
 }
 
-/// [`load_text_embedder`] from a pile snapshot the caller already holds.
+/// [`load_text_embedder`] from a pile snapshot the caller already holds (a
+/// command that has the working pile open should not open it twice).
 pub fn load_text_embedder_in(
     store: &PileSnapshot,
 ) -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let (snapshot, pile) = model_snapshot_in(store, NOMIC_TEXT_MODEL, text_pile())?;
-    text_embedder_from(&snapshot, &pile)
+    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+        .context("freeze the working pile's model collection for nomic-embed-text")?;
+    text_embedder_from(&snapshot, Path::new("the working pile"))
 }
 
 fn text_embedder_from(
@@ -204,9 +142,10 @@ fn text_embedder_from(
         })
 }
 
-/// Load nomic-embed-vision-v1.5 from one canonical collection snapshot.
+/// Load nomic-embed-vision-v1.5 from the working pile's model collection.
 pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let (snapshot, pile) = model_snapshot_for(NOMIC_VISION_MODEL, vision_pile())?;
+    let pile = working_pile()?;
+    let snapshot = load_model_snapshot(&pile, NOMIC_VISION_MODEL)?;
     vision_embedder_from(&snapshot, &pile)
 }
 
@@ -214,8 +153,9 @@ pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::n
 pub fn load_vision_embedder_in(
     store: &PileSnapshot,
 ) -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let (snapshot, pile) = model_snapshot_in(store, NOMIC_VISION_MODEL, vision_pile())?;
-    vision_embedder_from(&snapshot, &pile)
+    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+        .context("freeze the working pile's model collection for nomic-embed-vision")?;
+    vision_embedder_from(&snapshot, Path::new("the working pile"))
 }
 
 fn vision_embedder_from(
