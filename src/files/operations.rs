@@ -398,6 +398,14 @@ fn load_image_embedder() -> Result<Box<dyn ImageEmbedder>> {
     Ok(Box::new(crate::nomic::load_vision_embedder()?))
 }
 
+/// [`load_image_embedder`] from the pile snapshot a command already holds:
+/// the working pile carries the model itself (JP, 2026-09-13), so a command
+/// that has it open should not open it a second time to find the weights.
+#[cfg(feature = "local-embed")]
+fn load_image_embedder_in(reader: &PileSnapshot) -> Result<Box<dyn ImageEmbedder>> {
+    Ok(Box::new(crate::nomic::load_vision_embedder_in(reader)?))
+}
+
 /// Embed an image on `add` and stage it as `file::embedding` exhaust (stored
 /// under the file's intrinsic record id, so identity is unaffected). Lazy-loads
 /// the embedder on the first image. No-op without `local-embed` or for
@@ -430,10 +438,10 @@ fn embed_image_on_add(
 /// --text`): nomic-embed-text-v1.5's query side, the coordinates the images
 /// were embedded into. Loads the embedder fresh — a one-off query.
 #[allow(unused_variables)]
-fn embed_text_query(text: &str) -> Result<Vec<f32>> {
+fn embed_text_query(reader: &PileSnapshot, text: &str) -> Result<Vec<f32>> {
     #[cfg(feature = "local-embed")]
     {
-        return crate::nomic::load_text_embedder()?.embed_query(text);
+        return crate::nomic::load_text_embedder_in(reader)?.embed_query(text);
     }
     #[cfg(not(feature = "local-embed"))]
     bail!("`files similar --text` needs the embedder — rebuild with --features local-embed");
@@ -1422,7 +1430,7 @@ fn cmd_embed<P: TriblePattern>(
             return Ok(());
         }
 
-        let embedder = load_image_embedder()?;
+        let embedder = load_image_embedder_in(reader)?;
         let mut change = Fragment::empty();
         let (mut embedded, mut assigned, mut failed) = (0usize, 0usize, 0usize);
         for (hash, (content, eids)) in &pending {
@@ -1866,7 +1874,7 @@ fn cmd_similar<P: TriblePattern>(
     // query file's stored embedding. `query_eid` is Some only for a file query,
     // so it drops itself from its own results.
     let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
-        (Some(t), _) => (embed_text_query(t)?, None, format!("{t:?}")),
+        (Some(t), _) => (embed_text_query(reader, t)?, None, format!("{t:?}")),
         (None, Some(idstr)) => {
             let eid = file_capability::resolve_selector(space, idstr)?;
             let h: SharedHandle = find!(
@@ -1899,10 +1907,35 @@ fn cmd_similar<P: TriblePattern>(
         bail!("no files in the shared space yet — `files embed` embeds every image already stored; new images embed on add");
     }
 
-    // Read every embedding into a plain vector and run the pure NN core.
+    // Read every embedding into a plain vector and run the pure NN core. A
+    // vector whose bytes this snapshot does not hold yet (the record travels
+    // ahead of its blob while the pile replicates; Sol on the Mac,
+    // 2026-09-13) is not a candidate: skipped and counted, never a refusal of
+    // the whole query. The store names the cause in its own words.
     let mut vec_pairs: Vec<(Id, Vec<f32>)> = Vec::with_capacity(pairs.len());
+    let mut unreadable = 0usize;
+    let mut cause: Option<String> = None;
     for (eid, h) in &pairs {
-        vec_pairs.push((*eid, read_embedding_768(reader, *h)?));
+        match read_embedding_768(reader, *h) {
+            Ok(v) => vec_pairs.push((*eid, v)),
+            Err(e) => {
+                unreadable += 1;
+                cause.get_or_insert_with(|| format!("{e:#}"));
+            }
+        }
+    }
+    if unreadable > 0 {
+        eprintln!(
+            "files similar: {unreadable} of {} shared-space vector(s) skipped, blob not readable in this snapshot (usually still replicating from the machine that wrote it): {}",
+            pairs.len(),
+            cause.unwrap_or_default()
+        );
+    }
+    if vec_pairs.is_empty() {
+        bail!(
+            "none of the {} shared-space vector(s) is readable in this snapshot yet",
+            pairs.len()
+        );
     }
     let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
 
