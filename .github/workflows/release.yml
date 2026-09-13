@@ -52,14 +52,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: 662815676c9a5688a5dff8e720f98bcca171b79b
+          ref: d6802b09ca7b693819238d2520378aff3571af8b
           path: mary
 
       - name: Check out GORBIE cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/GORBIE
-          ref: 761c962a9beed416e14390fa8632f803fd4a485a
+          ref: 22a31671bb5b2591b69ae13c1d0069cbf963c17b
           path: GORBIE
 
       - name: Check out Soma cohort

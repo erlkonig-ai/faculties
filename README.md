@@ -46,8 +46,8 @@ git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
 git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout 1381faea4dc988c4780277690ee4e3443587d1f6
-git -C mary checkout 662815676c9a5688a5dff8e720f98bcca171b79b
-git -C GORBIE checkout 761c962a9beed416e14390fa8632f803fd4a485a
+git -C mary checkout d6802b09ca7b693819238d2520378aff3571af8b
+git -C GORBIE checkout 22a31671bb5b2591b69ae13c1d0069cbf963c17b
 git -C soma checkout e75ef119fae679aed27420fc5e0835be60f5920d
 git -C cubecl-fork checkout f4b58290e5c1acb26c1c00d8b0606b208816c295
 cd faculties
