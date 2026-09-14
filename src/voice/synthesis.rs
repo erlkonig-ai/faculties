@@ -1,7 +1,9 @@
 //! One streaming Qwen3-TTS source, drained either into resident audio or a host sink.
 use anybytes::Bytes;
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "voice")]
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub struct ModelSources {
@@ -84,13 +86,41 @@ impl AudioClip {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Synthesizer {
     pub sources: ModelSources,
+    #[cfg(feature = "voice")]
+    resident: Arc<Mutex<Option<Resident>>>,
+}
+#[cfg(feature = "voice")]
+struct Resident {
+    session: mary::speak::Synthesizer,
+    reference_seconds: f32,
+    reference_chars: usize,
+}
+impl std::fmt::Debug for Synthesizer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("Synthesizer");
+        debug.field("sources", &self.sources);
+        #[cfg(feature = "voice")]
+        debug.field(
+            "resident",
+            &self
+                .resident
+                .lock()
+                .map(|resident| resident.is_some())
+                .unwrap_or(true),
+        );
+        debug.finish()
+    }
 }
 impl Synthesizer {
     pub fn new(sources: ModelSources) -> Self {
-        Self { sources }
+        Self {
+            sources,
+            #[cfg(feature = "voice")]
+            resident: Arc::new(Mutex::new(None)),
+        }
     }
     /// Finite audio synthesis only. Never enumerates, selects, or plays devices,
     /// creates a pause file, writes a journal, or saves audio on the host.
@@ -113,9 +143,51 @@ impl Synthesizer {
             AudioClip::from_samples(&samples, sample_rate)
         }
     }
+    /// Start the resident model loader once, without queuing an utterance.
+    /// Construction and MCP discovery remain inert; a streaming caller uses
+    /// this immediately before it begins accepting text so model loading can
+    /// overlap the arrival of the first sentence.
+    pub fn prime(&self) -> Result<()> {
+        #[cfg(not(feature = "voice"))]
+        anyhow::bail!("speech synthesis requires a build with the `voice` feature");
+        #[cfg(feature = "voice")]
+        {
+            let mut resident = self
+                .resident
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resident speech session is poisoned"))?;
+            if resident.is_none() {
+                *resident = Some(self.load_resident()?);
+            }
+            Ok(())
+        }
+    }
     #[cfg(feature = "voice")]
     pub(super) fn start(&self, text: &str) -> Result<PreparedSpeech> {
         super::operations::validate_text(text)?;
+        self.prime()?;
+        let resident = self
+            .resident
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resident speech session is poisoned"))?;
+        let resident = resident.as_ref().expect("initialized above");
+        let estimate = estimate_audio_secs(
+            text.chars().count(),
+            resident.reference_seconds,
+            resident.reference_chars,
+        );
+        let started = std::time::Instant::now();
+        let stream = resident.session.speak(text)?;
+        Ok(PreparedSpeech {
+            stream,
+            sample_rate: mary::speak::SpeakStream::SAMPLE_RATE,
+            estimated_seconds: estimate,
+            started,
+        })
+    }
+
+    #[cfg(feature = "voice")]
+    fn load_resident(&self) -> Result<Resident> {
         let ref_text = std::fs::read_to_string(&self.sources.reference_text)
             .context("read configured reference transcript")?;
         ensure!(!ref_text.trim().is_empty(), "reference transcript is empty");
@@ -124,11 +196,6 @@ impl Synthesizer {
             std::fs::read(&self.sources.reference_wav).context("read configured reference WAV")?;
         let (sample_count, sample_rate) = reference_metadata(&reference)?;
         preflight_reference_codes(&self.sources.reference_codes)?;
-        let estimate = estimate_audio_secs(
-            text.chars().count(),
-            sample_count as f32 / sample_rate as f32,
-            ref_text.trim().chars().count(),
-        );
         let snapshot =
             mary::model_collection::load_model_collection_local_latest(&self.sources.pile)
                 .with_context(|| {
@@ -139,19 +206,16 @@ impl Synthesizer {
                 })?;
         let weights = mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, self.sources.variant)
             .context("select configured native Qwen3-TTS cohort")?;
-        let started = std::time::Instant::now();
-        let stream = mary::speak::synthesize_stream(
+        let session = mary::speak::Synthesizer::spawn(
             weights,
             &self.sources.reference_wav,
             ref_text.trim(),
             &self.sources.reference_codes,
-            text,
         )?;
-        Ok(PreparedSpeech {
-            stream,
-            sample_rate: mary::speak::SpeakStream::SAMPLE_RATE,
-            estimated_seconds: estimate,
-            started,
+        Ok(Resident {
+            session,
+            reference_seconds: sample_count as f32 / sample_rate as f32,
+            reference_chars: ref_text.trim().chars().count(),
         })
     }
 }

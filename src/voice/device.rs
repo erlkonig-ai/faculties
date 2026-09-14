@@ -146,7 +146,7 @@ fn reachy_reachable(daemon: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn soma_reachable(soma: &str) -> bool {
+pub(super) fn soma_reachable(soma: &str) -> bool {
     probe_http()
         .get(format!("{}/state", soma.trim_end_matches('/')))
         .send()

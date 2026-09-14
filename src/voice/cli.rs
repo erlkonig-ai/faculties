@@ -1,6 +1,6 @@
 //! Explicit CLI UX: named-device speech remains a host operation; synthesis
 //! can instead return audio to Drive without playing anything on the host.
-use super::device::{Device, DEFAULT_DAEMON};
+use super::device::{DEFAULT_DAEMON, Device};
 use super::synthesis::{ModelSources, Synthesizer};
 use super::{Channel, Voice};
 use anyhow::Result;
@@ -69,6 +69,17 @@ enum Command {
         #[arg(long, env = "VOICE_PAUSE_FILE")]
         pause_file: Option<PathBuf>,
     },
+    /// Speak a framed text stream from stdin as it arrives. Complete sentences
+    /// become 24 kHz mono PCM records on stdout and, when configured, stream
+    /// to the Soma body through the same resident Mary session.
+    Stream {
+        /// Channel under which completed sentences are recorded.
+        #[arg(long, default_value = "shout")]
+        channel: String,
+        /// Half-duplex pause file, held for the life of the stream.
+        #[arg(long, env = "VOICE_PAUSE_FILE")]
+        pause_file: Option<PathBuf>,
+    },
     /// Show the routing policy for both channels, the connected audio devices,
     /// and what each channel WOULD select right now (a pure dry-run). Read-only.
     Route,
@@ -103,8 +114,49 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     }
+    if matches!(&cli.command, Some(Command::Stream { .. })) {
+        return execute_stream(cli);
+    }
     crate::cli::with_output("voice", |out| execute(cli, out))
 }
+
+fn execute_stream(cli: Cli) -> Result<()> {
+    let Cli {
+        pile,
+        key,
+        soma,
+        command,
+        ..
+    } = cli;
+    let Some(Command::Stream {
+        channel,
+        pause_file,
+    }) = command
+    else {
+        anyhow::bail!("Voice framed execution requires the stream command");
+    };
+    let channel = Channel::parse(&channel)?;
+    let _pause = pause_file.as_deref().map(|path| {
+        eprintln!("  [half-duplex] holding {}", path.display());
+        crate::turntaking::PauseGuard::hold(path)
+    });
+    let storage = crate::storage::Storage::shared(pile, key);
+    let voice = Voice::with_storage(storage.clone());
+    let synthesizer = Synthesizer::new(ModelSources::from_environment());
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let result = super::stream::run(
+        &voice,
+        &synthesizer,
+        channel,
+        soma.as_deref(),
+        stdin.lock(),
+        stdout.lock(),
+    )
+    .map(|_| ());
+    storage.finish(result)
+}
+
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
     let voice = Voice::new(cli.pile, cli.key);
     let synthesizer = Synthesizer::new(ModelSources::from_environment());
@@ -130,6 +182,9 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             device
                 .speak(Channel::Shout, &text, dry_run, pause_file.as_deref(), out)?
                 .emit(Channel::Shout, out)
+        }
+        Some(Command::Stream { .. }) => {
+            anyhow::bail!("voice stream writes framed PCM and must bypass ordinary CLI output")
         }
         Some(Command::Route) => device.routes()?.emit(out),
         Some(Command::RouteSet { channel, devices }) => voice

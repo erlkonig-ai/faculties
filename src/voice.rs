@@ -12,6 +12,7 @@ pub mod device;
 pub mod mcp;
 mod operations;
 pub mod routing;
+pub mod stream;
 pub mod synthesis;
 pub use operations::{Channel, RoutePolicy, RouteReceipt, Voice};
 

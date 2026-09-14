@@ -123,13 +123,15 @@ web-export = []
 local-embed = ["dep:mary", "mary/embed", "mary/gemma", "triblespace-search/semantic"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]
-# In-process Qwen3-TTS in the `voice` faculty (`voice say`/
-# `voice shout`) via mary's ported Burn/Metal pipeline. Calls
-# `mary::speak::synthesize_stream` directly — no separately-built binary that can
-# drift stale against the pile format (the staleness class that truncated memory
-# on 2026-06-30). Four explicit roots are selected from one frozen native
-# model-collection pile (`QWEN3TTS_PILE`): exact base, shared codec, filtered
-# f16 talker, and folded f16 talker.
+# In-process Qwen3-TTS in the `voice` faculty (`voice say`/`voice shout`/`voice
+# stream`) via mary's ported Burn pipeline. One resident `mary::speak::Synthesizer`
+# is retained by each Voice frontend instance, so a stream or MCP server loads
+# its selected cohort once instead of paying model startup per utterance. There
+# is no separately-built speech binary that can drift stale against the pile
+# format (the staleness class that truncated memory on 2026-06-30). Four explicit
+# roots are selected from one frozen native model-collection pile
+# (`QWEN3TTS_PILE`): exact base, shared codec, filtered f16 talker, and folded
+# f16 talker.
 # Native audio device enumeration + playback sink (rodio/cpal). Default so
 # stock installs keep `voice devices`/routing; excluded on audio-less servers
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
