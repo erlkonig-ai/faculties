@@ -1,6 +1,6 @@
 //! Explicit CLI UX: named-device speech remains a host operation; synthesis
 //! can instead return audio to Drive without playing anything on the host.
-use super::device::{DEFAULT_DAEMON, Device};
+use super::device::{Device, DEFAULT_DAEMON};
 use super::synthesis::{ModelSources, Synthesizer};
 use super::{Channel, Voice};
 use anyhow::Result;
@@ -27,10 +27,30 @@ pub struct Cli {
     /// Soma base URL. When explicitly configured and reachable, this is the
     /// preferred drained-stream target for public `shout`; it is never used by
     /// private `say`.
-    #[arg(long, env = "SOMA_URL")]
+    #[arg(long, env = "SOMA_URL", global = true)]
     soma: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_accepts_drive_argument_order() {
+        let cli = Cli::try_parse_from([
+            "voice",
+            "--pile",
+            "voice-test.pile",
+            "stream",
+            "--soma",
+            "http://body:8383",
+        ])
+        .unwrap();
+        assert_eq!(cli.soma.as_deref(), Some("http://body:8383"));
+        assert!(matches!(cli.command, Some(Command::Stream { .. })));
+    }
 }
 
 #[derive(Subcommand)]
@@ -70,8 +90,8 @@ enum Command {
         pause_file: Option<PathBuf>,
     },
     /// Speak a framed text stream from stdin as it arrives. Complete sentences
-    /// become 24 kHz mono PCM records on stdout and, when configured, stream
-    /// to the Soma body through the same resident Mary session.
+    /// become 24 kHz mono PCM records on stdout and, for public `shout`, stream
+    /// to a configured Soma body through the same resident Mary session.
     Stream {
         /// Channel under which completed sentences are recorded.
         #[arg(long, default_value = "shout")]

@@ -6,7 +6,9 @@
 
 use super::synthesis::{AudioClip, Synthesizer};
 use super::{Channel, Voice};
-use anyhow::{Context, Result};
+#[cfg(feature = "voice")]
+use anyhow::Context;
+use anyhow::Result;
 use framed_stream::{EndStatus, Frame, FramedReader, FramedWriter, TEXT_PLAIN, UNIT_SAMPLES};
 use std::io::{Read, Write};
 
@@ -171,7 +173,10 @@ pub fn run<R: Read, W: Write>(
     #[cfg(feature = "voice")]
     {
         synthesizer.prime()?;
-        let mut mirror = SomaMirror::open(soma);
+        if channel == Channel::Say && soma.is_some() {
+            eprintln!("[stream] private say never mirrors to the Soma body");
+        }
+        let mut mirror = SomaMirror::open(soma_target(channel, soma));
         let (jobs, incoming) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
         let ledger_voice = voice.clone();
         let ledger = std::thread::Builder::new()
@@ -216,6 +221,13 @@ pub fn run<R: Read, W: Write>(
                 "Voice ledger also failed while settling the stream: {ledger:#}"
             ))),
         }
+    }
+}
+
+fn soma_target(channel: Channel, configured: Option<&str>) -> Option<&str> {
+    match channel {
+        Channel::Say => None,
+        Channel::Shout => configured,
     }
 }
 
@@ -439,6 +451,15 @@ mod tests {
         assert_eq!(sentence_end("Wait."), None);
         assert_eq!(sentence_end("Wait. "), Some("Wait.".len()));
         assert_eq!(sentence_end("no end here"), None);
+    }
+
+    #[test]
+    fn private_stream_never_targets_soma() {
+        assert_eq!(soma_target(Channel::Say, Some("http://body")), None);
+        assert_eq!(
+            soma_target(Channel::Shout, Some("http://body")),
+            Some("http://body")
+        );
     }
 
     #[test]
