@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Relations, Message, Compass, Wiki, and Orient can read resident rollups
+  without WRITE on their derived targets, even when source commits arrive
+  before their images. Authorized producers retain inline upkeep for local
+  read-your-writes; edits and acknowledgements retain their current preparation.
+  Orient also applies this rule to its health-first and wake inputs, while
+  consuming notifications still requires its own Presented receipts to become
+  visible. A non-consuming peek can read older receipt views. Wiki's Latest
+  descriptor now inherits the source policy rather than the reader's key;
+  ordinary owner-private identities are unchanged. This does not grant access,
+  deploy background maintenance, or rewrite existing entities.
+
 - Files semantic indexes now carry explicit text, vision, and tokenizer root
   references plus their model collection handle. Golden observations, other
   models, and differently packaged support no longer change the descriptor for

@@ -44,17 +44,37 @@ impl HealthSources {
         })
     }
 
-    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<()> {
+    fn maintain(
+        &self,
+        pile: &FacultyStore,
+        signer: &SigningKey,
+        require_receipts: bool,
+    ) -> Result<()> {
         let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
         pollster::block_on(async {
-            for source in [&self.health, &self.relations, &self.presentations] {
+            let snapshot = local.snapshot()?;
+            for source in [&self.health, &self.relations] {
+                if !source.can_maintain(&snapshot, signer)? {
+                    continue;
+                }
                 drop(local.maintain(source.succinct, signer).await?);
                 drop(local.maintain(source.rank9, signer).await?);
             }
-            drop(local.maintain(self.latest, signer).await?);
+            // Unlike external input, our own presentation receipts must be
+            // visible to the next one-shot invocation.
+            if require_receipts || self.presentations.can_maintain(&snapshot, signer)? {
+                drop(local.maintain(self.presentations.succinct, signer).await?);
+                drop(local.maintain(self.presentations.rank9, signer).await?);
+            }
+            if self
+                .latest
+                .writer_is_admitted(&snapshot, signer.verifying_key())?
+            {
+                drop(local.maintain(self.latest, signer).await?);
+            }
             Ok(())
         })
     }
@@ -64,7 +84,7 @@ impl HealthSources {
         pile: &mut FacultyStore,
         signer: &SigningKey,
     ) -> Result<HealthObservation> {
-        self.maintain(pile, signer)?;
+        self.maintain(pile, signer, true)?;
         self.at(pile.snapshot()?)
     }
 
@@ -78,7 +98,8 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        let observation = self.observe(pile, signer)?;
+        self.maintain(pile, signer, !peek)?;
+        let observation = self.at(pile.snapshot()?)?;
         let report = observation.report();
         if report.attention.is_empty() {
             return Ok((false, report.next_change));
@@ -427,7 +448,9 @@ mod tests {
         }
 
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
-            self.sources.maintain(&self.store, &self.signer).unwrap();
+            self.sources
+                .maintain(&self.store, &self.signer, true)
+                .unwrap();
             self.sources
                 .at(self.store.snapshot_at(at).unwrap())
                 .unwrap()
@@ -446,6 +469,53 @@ mod tests {
 
     fn at(seconds: f64) -> Epoch {
         Epoch::from_unix_seconds(1_700_000_000.0 + seconds)
+    }
+
+    #[test]
+    fn health_reader_keeps_resident_input_when_source_grows_without_images() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        let first = recorder
+            .record(at(0.0), [condition(State::Current, false)])
+            .unwrap();
+        let first_id = first.root().unwrap();
+        f.publish(first);
+        f.observe_at(at(1.0));
+        let second = recorder
+            .record(at(2.0), [condition(State::Stalled, true)])
+            .unwrap();
+        f.publish(second);
+
+        let reader_key = SigningKey::from_bytes(&[73; 32]);
+        // Keep receipt publication local while health and Relations are
+        // external, read-only input for this signing principal.
+        f.sources.presentations = pollster::block_on(OrientSource::open(
+            &mut f.store,
+            &reader_key,
+            crate::schemas::orient::DEFAULT_SCOPE_ID,
+            "Orient",
+        ))
+        .unwrap();
+        let before = f.store.snapshot().unwrap();
+        let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
+        let observed = f.sources.observe(&mut f.store, &reader_key).unwrap();
+        let reports = find!(
+            report: Id,
+            pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
+        )
+        .collect::<BTreeSet<_>>();
+        assert_eq!(reports, BTreeSet::from([first_id]));
+        assert_eq!(
+            f.store
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            records,
+            "health-first reads must not require WRITE on remote inputs",
+        );
     }
 
     #[test]

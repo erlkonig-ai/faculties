@@ -22,8 +22,9 @@ use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::prelude::*;
 
-/// A configured Message capability. Every call observes one newly maintained,
-/// frozen Message/Relations view through its storage handle.
+/// A configured Message capability. Every call observes one frozen
+/// Message/Relations view through its storage handle. Read operations maintain
+/// targets they may write and otherwise attach the replicated views as they stand.
 /// No transport, sender environment, or text-file convention is consulted.
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -131,25 +132,25 @@ impl Message {
 
     pub fn send(&self, options: &SendOptions<'_>) -> Result<SentMessage> {
         options.validate()?;
-        with_storage(self, |storage, runtime| {
+        with_storage(self, false, |storage, runtime| {
             runtime.block_on(send(storage, options))
         })
     }
 
     pub fn list(&self, options: &ListOptions<'_>) -> Result<MessageList> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, true, |storage, runtime| {
             runtime.block_on(list(storage, options))
         })
     }
 
     pub fn ack(&self, id: &str, by: &str) -> Result<Acknowledgement> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, false, |storage, runtime| {
             runtime.block_on(ack(storage, id, by))
         })
     }
 
     pub fn ack_all(&self, options: &AckAllOptions<'_>) -> Result<AcknowledgedMessages> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, false, |storage, runtime| {
             runtime.block_on(ack_all(storage, options))
         })
     }
@@ -422,6 +423,7 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
 
 fn with_storage<T>(
     capability: &Message,
+    read_only: bool,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
@@ -438,84 +440,11 @@ fn with_storage<T>(
                         .await?;
                 }
             }
-            // Register the representations, then maintain each edge from its
-            // realized immediate source. Both reads use one final snapshot.
             let relations_source =
                 open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
             let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptors = pile.snapshot().context("freeze Message source policies")?;
-            let relations_policy = relations_source
-                .policy(&descriptors)
-                .context("read Relations source policy")?;
-            let message_policy = message_source
-                .policy(&descriptors)
-                .context("read Message source policy")?;
-            drop(descriptors);
-            let relations_succinct = pile
-                .derive::<SuccinctArchiveBlob>(relations_source, (), relations_policy.clone())
-                .context("register Relations Succinct collection")?;
-            let relations_rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    relations_succinct,
-                    (),
-                    relations_policy,
-                )
-                .context("register Relations Rank9 collection")?;
-            let message_succinct = pile
-                .derive::<SuccinctArchiveBlob>(message_source, (), message_policy.clone())
-                .context("register Message Succinct collection")?;
-            let message_rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
-                .context("register Message Rank9 collection")?;
-            drop(
-                pile.ensure(relations_source, signer)
-                    .await
-                    .context("ensure Relations source collection")?,
-            );
-            drop(
-                pile.ensure(message_source, signer)
-                    .await
-                    .context("ensure Message source collection")?,
-            );
-            drop(
-                pile.maintain(relations_succinct, signer)
-                    .await
-                    .context("maintain Relations Succinct collection")?,
-            );
-            drop(
-                pile.maintain(relations_rank9, signer)
-                    .await
-                    .context("maintain Relations Rank9 collection")?,
-            );
-            drop(
-                pile.maintain(message_succinct, signer)
-                    .await
-                    .context("maintain Message Succinct collection")?,
-            );
-            drop(
-                pile.maintain(message_rank9, signer)
-                    .await
-                    .context("maintain Message Rank9 collection")?,
-            );
-
-            // Both query views retain their selected support. Later selected-text
-            // acquisition may add bytes, but never replaces these frozen facts.
-            let reader = pile
-                .snapshot()
-                .context("freeze maintained Message snapshot")?;
-            let relation_collection = reader
-                .collection(relations_rank9)
-                .context("observe Relations Rank9 projection")?;
-            let relation_facts = relation_collection
-                .view::<FactArchive>()
-                .context("read Relations Rank9 projection")?;
-            let message_collection = reader
-                .collection(message_rank9)
-                .context("observe Message Rank9 projection")?;
-            let message_facts = message_collection
-                .view::<FactArchive>()
-                .context("read Message Rank9 projection")?;
-
+            let (reader, relation_facts, message_facts) =
+                message_views(pile, signer, relations_source, message_source, read_only).await?;
             Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
         })?;
         let mut storage = MessageStorage {
@@ -530,10 +459,122 @@ fn with_storage<T>(
     })
 }
 
+async fn message_views(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    relations_source: Collection<SimpleArchive>,
+    message_source: Collection<SimpleArchive>,
+    read_only: bool,
+) -> Result<(FacultySnapshot, FactArchive, FactArchive)> {
+    // Register the same representations for readers and writers. A read-only
+    // operation may attach a chain that another principal maintains.
+    let descriptors = pile.snapshot().context("freeze Message source policies")?;
+    let relations_policy = relations_source
+        .policy(&descriptors)
+        .context("read Relations source policy")?;
+    let message_policy = message_source
+        .policy(&descriptors)
+        .context("read Message source policy")?;
+    drop(descriptors);
+    let relations_succinct = pile
+        .derive::<SuccinctArchiveBlob>(relations_source, (), relations_policy.clone())
+        .context("register Relations Succinct collection")?;
+    let relations_rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), relations_policy)
+        .context("register Relations Rank9 collection")?;
+    let message_succinct = pile
+        .derive::<SuccinctArchiveBlob>(message_source, (), message_policy.clone())
+        .context("register Message Succinct collection")?;
+    let message_rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
+        .context("register Message Rank9 collection")?;
+    let (maintain_relations, maintain_messages) = if read_only {
+        let snapshot = pile.snapshot().context("freeze Message WRITE admission")?;
+        let subject = signer.verifying_key();
+        let relations = relations_succinct
+            .writer_is_admitted(&snapshot, subject)
+            .map_err(|error| {
+                anyhow::anyhow!("check Relations Succinct WRITE admission: {error}")
+            })?
+            && relations_rank9
+                .writer_is_admitted(&snapshot, subject)
+                .map_err(|error| {
+                    anyhow::anyhow!("check Relations Rank9 WRITE admission: {error}")
+                })?;
+        let messages = message_succinct
+            .writer_is_admitted(&snapshot, subject)
+            .map_err(|error| anyhow::anyhow!("check Message Succinct WRITE admission: {error}"))?
+            && message_rank9
+                .writer_is_admitted(&snapshot, subject)
+                .map_err(|error| anyhow::anyhow!("check Message Rank9 WRITE admission: {error}"))?;
+        (relations, messages)
+    } else {
+        // Send and ACK preparation still requires current derivations; never
+        // prepare a mutation from an older view just to bypass missing WRITE.
+        (true, true)
+    };
+    if maintain_relations {
+        drop(
+            pile.ensure(relations_source, signer)
+                .await
+                .context("ensure Relations source collection")?,
+        );
+    }
+    if maintain_messages {
+        drop(
+            pile.ensure(message_source, signer)
+                .await
+                .context("ensure Message source collection")?,
+        );
+    }
+    if maintain_relations {
+        drop(
+            pile.maintain(relations_succinct, signer)
+                .await
+                .context("maintain Relations Succinct collection")?,
+        );
+        drop(
+            pile.maintain(relations_rank9, signer)
+                .await
+                .context("maintain Relations Rank9 collection")?,
+        );
+    }
+    if maintain_messages {
+        drop(
+            pile.maintain(message_succinct, signer)
+                .await
+                .context("maintain Message Succinct collection")?,
+        );
+        drop(
+            pile.maintain(message_rank9, signer)
+                .await
+                .context("maintain Message Rank9 collection")?,
+        );
+    }
+
+    // Both query views retain their selected support. Later selected-text
+    // acquisition may add bytes, but never replaces these frozen facts.
+    let reader = pile.snapshot().context("freeze Message observation")?;
+    let relation_collection = reader
+        .collection(relations_rank9)
+        .context("observe Relations Rank9 projection")?;
+    let relation_facts = relation_collection
+        .view::<FactArchive>()
+        .context("read Relations Rank9 projection")?;
+    let message_collection = reader
+        .collection(message_rank9)
+        .context("observe Message Rank9 projection")?;
+    let message_facts = message_collection
+        .view::<FactArchive>()
+        .context("read Message Rank9 projection")?;
+    Ok((reader, relation_facts, message_facts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
     use std::convert::Infallible;
     use std::future::{ready, Future};
 
@@ -541,7 +582,9 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::MemoryBlobStoreSnapshot;
+    use triblespace::core::collection::{CollectionRead, CollectionRecordSelector};
     use triblespace::core::repo::pile::ReadError;
+    use triblespace::core::repo::StorageClose;
 
     /// A real resident-only pile with a deterministic remote blob fixture.
     struct AcquiringPile {
@@ -602,6 +645,319 @@ mod tests {
 
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn non_writer_lists_resident_messages_while_send_and_ack_preparation_stays_strict() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[91; 32]);
+        let observer = SigningKey::from_bytes(&[92; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let mut selectors = BTreeSet::new();
+        for source in [relations_source, message_source] {
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            for handle in [source.handle(), succinct.handle(), rank9.handle()] {
+                selectors.insert(CollectionRecordSelector::Collection(handle));
+            }
+        }
+        let sender = test_id(61);
+        let recipient = test_id(62);
+        let mut people = relations::person_fragment(
+            sender,
+            relations::ProfileInput {
+                label: "sender".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        people += relations::person_fragment(
+            recipient,
+            relations::ProfileInput {
+                label: "reader".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        pile.commit(relations_source, &owner, people).unwrap();
+        let (first, first_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(recipient),
+            "first message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &owner, first).unwrap();
+        drop(
+            runtime
+                .block_on(message_views(
+                    &mut pile,
+                    &owner,
+                    relations_source,
+                    message_source,
+                    true,
+                ))
+                .unwrap(),
+        );
+
+        let (second, second_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(recipient),
+            "second message",
+            clock::point_now().unwrap(),
+        );
+        let later_person = test_id(63);
+        let later = relations::person_fragment(
+            later_person,
+            relations::ProfileInput {
+                label: "later person".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        let options = ListOptions::new("reader");
+        for growth in [None, Some((later, second))] {
+            if let Some((person, message)) = growth {
+                pile.commit(relations_source, &owner, person).unwrap();
+                pile.commit(message_source, &owner, message).unwrap();
+            }
+            let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+            let (snapshot, relation_facts, message_facts) = runtime
+                .block_on(message_views(
+                    &mut pile,
+                    &observer,
+                    relations_source,
+                    message_source,
+                    true,
+                ))
+                .unwrap();
+            assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
+            let mut input = MessageStorage {
+                pile: &mut pile,
+                signer: &observer,
+                collection: message_source,
+                reader: &snapshot,
+                messages: &message_facts,
+                relations: &relation_facts,
+            };
+            let result = runtime.block_on(list(&mut input, &options)).unwrap();
+            assert_eq!(result.reader, recipient);
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.entries[0].row.id, first_id);
+            assert_eq!(result.entries[0].body, "first message");
+            assert_eq!(result.entries[0].status, MessageStatus::Unread);
+            assert_eq!(
+                pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+                before
+            );
+        }
+
+        let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+        let error = match runtime.block_on(message_views(
+            &mut pile,
+            &observer,
+            relations_source,
+            message_source,
+            false,
+        )) {
+            Ok(_) => panic!("send/ACK preparation must not use the older observation"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("requires an admitted WRITE producer"));
+        assert_eq!(
+            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+            before
+        );
+
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                false,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let acknowledgement = runtime
+            .block_on(ack(&mut input, &fmt_id(first_id), "reader"))
+            .unwrap();
+        assert!(!acknowledgement.already_read);
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                true,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let result = runtime.block_on(list(&mut input, &options)).unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .find(|entry| entry.row.id == first_id)
+                .unwrap()
+                .status,
+            MessageStatus::Read
+        );
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .find(|entry| entry.row.id == second_id)
+                .unwrap()
+                .status,
+            MessageStatus::Unread
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn message_reads_maintain_each_authorized_chain_independently() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let relations_owner = SigningKey::from_bytes(&[93; 32]);
+        let message_owner = SigningKey::from_bytes(&[94; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            relations_owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_SCOPE_ID,
+            message_owner.verifying_key(),
+        )
+        .unwrap();
+        let first_person = test_id(64);
+        let second_person = test_id(65);
+        pile.commit(
+            relations_source,
+            &relations_owner,
+            relations::person_fragment(
+                first_person,
+                relations::ProfileInput {
+                    label: "first".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        let (first, first_message) = message::message_fragment(
+            first_person,
+            &message::Recipient::Person(first_person),
+            "first message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &message_owner, first).unwrap();
+        for signer in [&relations_owner, &message_owner] {
+            drop(
+                runtime
+                    .block_on(message_views(
+                        &mut pile,
+                        signer,
+                        relations_source,
+                        message_source,
+                        true,
+                    ))
+                    .unwrap(),
+            );
+        }
+        pile.commit(
+            relations_source,
+            &relations_owner,
+            relations::person_fragment(
+                second_person,
+                relations::ProfileInput {
+                    label: "second".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        let (second, second_message) = message::message_fragment(
+            first_person,
+            &message::Recipient::Person(first_person),
+            "second message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &message_owner, second).unwrap();
+
+        let (_, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &message_owner,
+                relations_source,
+                message_source,
+                true,
+            ))
+            .unwrap();
+        assert_eq!(
+            relations::person_anchors(&relation_facts),
+            BTreeSet::from([first_person])
+        );
+        let messages = message::load_message_rows(&message_facts).unwrap();
+        assert_eq!(
+            messages.iter().map(|row| row.id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_message, second_message])
+        );
+
+        let (_, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &relations_owner,
+                relations_source,
+                message_source,
+                true,
+            ))
+            .unwrap();
+        assert_eq!(
+            relations::person_anchors(&relation_facts),
+            BTreeSet::from([first_person, second_person])
+        );
+        assert_eq!(message::load_message_rows(&message_facts).unwrap().len(), 2);
+        pile.close().unwrap();
     }
 
     #[test]

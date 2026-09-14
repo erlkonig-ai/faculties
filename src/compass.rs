@@ -1069,7 +1069,8 @@ pub fn materialize_collection(
 }
 
 /// Capture Compass facts and the positive status LWW index through one store
-/// observation, constructing missing derived artifacts if necessary.
+/// observation. An admitted producer first maintains its read-your-writes view;
+/// other readers attach the resident targets without publishing equations.
 pub async fn materialize_indexed_collection<S>(
     pile: &mut S,
     signer: &SigningKey,
@@ -1078,29 +1079,58 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    materialize_indexed_source(pile, source, signer).await
+}
+
+async fn materialize_indexed_source<S>(
+    pile: &mut S,
+    source: Collection<blobencodings::SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<CompassSnapshot<S::Snapshot>>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
     let policy = source.policy(&pile.snapshot()?)?;
     let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let status_target = status_register_for_source(pile, source)?;
-    drop(
-        pile.ensure(source, signer)
+    let admitted = {
+        let snapshot = pile
+            .snapshot()
+            .context("freeze Compass admission snapshot")?;
+        let subject = signer.verifying_key();
+        succinct
+            .writer_is_admitted(&snapshot, subject)
+            .context("check Compass Succinct WRITE admission")?
+            && rank9
+                .writer_is_admitted(&snapshot, subject)
+                .context("check Compass Rank9 WRITE admission")?
+            && status_target
+                .writer_is_admitted(&snapshot, subject)
+                .context("check Compass status WRITE admission")?
+    };
+    let store_snapshot = if admitted {
+        drop(
+            pile.ensure(source, signer)
+                .await
+                .context("ensure Compass source collection")?,
+        );
+        drop(
+            pile.maintain(succinct, signer)
+                .await
+                .context("maintain Compass Succinct collection")?,
+        );
+        drop(
+            pile.maintain(rank9, signer)
+                .await
+                .context("maintain Compass fact collection")?,
+        );
+        pile.maintain(status_target, signer)
             .await
-            .context("ensure Compass source collection")?,
-    );
-    drop(
-        pile.maintain(succinct, signer)
-            .await
-            .context("maintain Compass Succinct collection")?,
-    );
-    drop(
-        pile.maintain(rank9, signer)
-            .await
-            .context("maintain Compass fact collection")?,
-    );
-    let store_snapshot = pile
-        .maintain(status_target, signer)
-        .await
-        .context("maintain Compass status register")?;
+            .context("maintain Compass status register")?
+    } else {
+        pile.snapshot().context("freeze resident Compass targets")?
+    };
     let fact_archive = store_snapshot
         .collection(rank9)
         .context("observe Compass fact collection")?
@@ -1148,6 +1178,94 @@ mod tests {
     fn at(value: i128) -> IntervalValue {
         let value = Epoch::from_unix_seconds(value as f64);
         (value, value).try_to_inline().unwrap()
+    }
+
+    #[test]
+    fn indexed_read_without_write_keeps_resident_targets_and_owner_reads_advance() {
+        pollster::block_on(async {
+            let owner = SigningKey::from_bytes(&[23; 32]);
+            let reader = SigningKey::from_bytes(&[24; 32]);
+            let mut store = MemoryRepo::default();
+            let source =
+                crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, owner.verifying_key())
+                    .unwrap();
+            let (mut first, goal) = goal_fragment("earlier", vec![], None, at(1)).unwrap();
+            first += status_fragment(goal, "todo", None, at(1)).unwrap();
+            store.commit(source, &owner, first).unwrap();
+            let warm = materialize_indexed_source(&mut store, source, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    warm.facts(),
+                    warm.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "todo",
+            );
+
+            let (mut later, new_goal) = goal_fragment("later", vec![], None, at(2)).unwrap();
+            later += status_fragment(new_goal, "todo", None, at(2)).unwrap();
+            later += status_fragment(goal, "done", None, at(2)).unwrap();
+            store.commit(source, &owner, later).unwrap();
+            let before = store
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            let resident = materialize_indexed_source(&mut store, source, &reader)
+                .await
+                .unwrap();
+            assert_eq!(
+                find!(id: Id, pattern!(resident.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([goal]),
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    resident.facts(),
+                    resident.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "todo",
+            );
+            assert_eq!(
+                resident
+                    .store_snapshot()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                before,
+                "a reader must not publish maintenance equations",
+            );
+
+            let current = materialize_indexed_source(&mut store, source, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                find!(id: Id, pattern!(current.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([goal, new_goal]),
+            );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    current.facts(),
+                    current.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "done",
+            );
+        });
     }
 
     #[test]

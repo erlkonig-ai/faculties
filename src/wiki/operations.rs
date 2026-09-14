@@ -202,6 +202,12 @@ struct WikiStorage<'a> {
     storage: &'a Storage,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Preparation {
+    Read,
+    Update,
+}
+
 #[derive(Clone)]
 struct WikiView {
     facts: FactArchive,
@@ -227,142 +233,33 @@ impl WikiStorage<'_> {
     /// after this returns: only the pure preparation may be retried.
     fn views<T>(
         &self,
+        preparation: Preparation,
         scopes: &[(Id, &str)],
-        mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
+        prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
             runtime.block_on(async {
-                let authority = signer.verifying_key();
-                let wiki_source = open_source(pile, schema::DEFAULT_SCOPE_ID, authority).await?;
-                let descriptors = pile
-                    .snapshot()
-                    .context("freeze Wiki source policy snapshot")?;
-                let policy = wiki_source
-                    .policy(&descriptors)
-                    .context("read Wiki source policy")?;
-                drop(descriptors);
-                let wiki_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(wiki_source, (), policy.clone())
-                    .context("register Wiki Succinct collection")?;
-                let wiki_rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_succinct, (), policy)
-                    .context("register Wiki Rank9 collection")?;
-                let latest = wiki_model::latest_collection(pile, authority)?;
-                let mut auxiliaries = Vec::with_capacity(scopes.len());
-                for &(scope, label) in scopes {
-                    let source = open_source(pile, scope, authority).await?;
-                    let descriptors = pile
-                        .snapshot()
-                        .with_context(|| format!("freeze {label} source policy snapshot"))?;
-                    let policy = source
-                        .policy(&descriptors)
-                        .with_context(|| format!("read {label} source policy"))?;
-                    drop(descriptors);
-                    let succinct = pile
-                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                        .with_context(|| format!("register {label} Succinct collection"))?;
-                    let rank9 = pile
-                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-                        .with_context(|| format!("register {label} Rank9 collection"))?;
-                    auxiliaries.push((source, succinct, rank9, label));
-                }
-                drop(
-                    pile.ensure(wiki_source, signer)
-                        .await
-                        .context("ensure Wiki source collection")?,
-                );
-                for (source, _, _, label) in &auxiliaries {
-                    drop(
-                        pile.ensure(*source, signer)
-                            .await
-                            .with_context(|| format!("ensure {label} source collection"))?,
-                    );
-                }
-                drop(
-                    pile.maintain(wiki_succinct, signer)
-                        .await
-                        .context("maintain Wiki Succinct collection")?,
-                );
-                drop(
-                    pile.maintain(wiki_rank9, signer)
-                        .await
-                        .context("maintain Wiki Rank9 collection")?,
-                );
-                for (_, succinct, rank9, label) in &auxiliaries {
-                    drop(
-                        pile.maintain(*succinct, signer)
-                            .await
-                            .with_context(|| format!("maintain {label} Succinct collection"))?,
-                    );
-                    drop(
-                        pile.maintain(*rank9, signer)
-                            .await
-                            .with_context(|| format!("maintain {label} Rank9 collection"))?,
-                    );
-                }
-
-                // Positive membership makes latest a normal joined relation:
-                // a lagging index never admits an unseen Wiki revision.
-                drop(
-                    pile.maintain(latest, signer)
-                        .await
-                        .context("maintain Wiki supersession index")?,
-                );
-
-                // Attach every maintained view from one later snapshot. No
-                // command can accidentally combine Wiki facts from one revision
-                // of the pile with Files or Embeddings from another.
-                let reader = pile
-                    .snapshot()
-                    .context("freeze maintained Wiki and auxiliary snapshot")?;
-                let facts = reader
-                    .collection(wiki_rank9)
-                    .context("observe Wiki fact collection")?
-                    .view::<FactArchive>()
-                    .context("read Wiki fact collection")?;
-                let latest = reader
-                    .collection(latest)
-                    .context("observe Wiki supersession index")?
-                    .view::<LatestIndex>()
-                    .context("read Wiki supersession index")?;
-                let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
-                for (_, _, rank9, label) in &auxiliaries {
-                    auxiliary_facts.push(
-                        reader
-                            .collection(*rank9)
-                            .with_context(|| format!("observe {label} fact collection"))?
-                            .view::<FactArchive>()
-                            .with_context(|| format!("read {label} fact collection"))?,
-                    );
-                }
-                let mut view = WikiView {
-                    facts,
-                    reader,
-                    latest,
-                };
-                let snapshot = view.reader.clone();
-                read(pile, &snapshot, |reader| {
-                    // New bytes may be resident, but the fact archives and
-                    // latest relation never select a newer frontier.
-                    view.reader = reader.clone();
-                    prepare(&view, &auxiliary_facts)
-                })
-                .await
+                let source =
+                    open_source(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).await?;
+                views_in(pile, source, signer, preparation, scopes, prepare).await
             })
         })
     }
 
     fn view<T>(&self, mut prepare: impl FnMut(&WikiView) -> Result<T>) -> Result<T> {
-        self.views(&[], |wiki, _| prepare(wiki))
+        self.views(Preparation::Read, &[], |wiki, _| prepare(wiki))
     }
 
     fn view_with_scope<T>(
         &self,
+        preparation: Preparation,
         scope: Id,
         label: &str,
         mut prepare: impl FnMut(&WikiView, &FactArchive) -> Result<T>,
     ) -> Result<T> {
-        self.views(&[(scope, label)], |wiki, facts| prepare(wiki, &facts[0]))
+        self.views(preparation, &[(scope, label)], |wiki, facts| {
+            prepare(wiki, &facts[0])
+        })
     }
 
     #[cfg(feature = "local-embed")]
@@ -390,6 +287,156 @@ impl WikiStorage<'_> {
         self.storage
             .with_store(|_, signer, _| Ok(wiki_model::author_record(&signer.verifying_key())))
     }
+}
+
+/// Read preparation may use existing rollups without WRITE. Update preparation
+/// keeps the complete pre-edit maintenance path: a stale frontier is not a
+/// substitute for the frontier an edit is about to supersede.
+async fn views_in<T>(
+    pile: &mut FacultyStore,
+    wiki_source: Collection<blobencodings::SimpleArchive>,
+    signer: &ed25519_dalek::SigningKey,
+    preparation: Preparation,
+    scopes: &[(Id, &str)],
+    mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
+) -> Result<T> {
+    let descriptors = pile
+        .snapshot()
+        .context("freeze Wiki source policy snapshot")?;
+    let policy = wiki_source
+        .policy(&descriptors)
+        .context("read Wiki source policy")?;
+    drop(descriptors);
+    let wiki_succinct = pile
+        .derive::<SuccinctArchiveBlob>(wiki_source, (), policy.clone())
+        .context("register Wiki Succinct collection")?;
+    let wiki_rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_succinct, (), policy)
+        .context("register Wiki Rank9 collection")?;
+    let latest = wiki_model::latest_for_source(pile, wiki_source)?;
+    let mut auxiliaries = Vec::with_capacity(scopes.len());
+    for &(scope, label) in scopes {
+        let source = open_source(pile, scope, signer.verifying_key()).await?;
+        let descriptors = pile
+            .snapshot()
+            .with_context(|| format!("freeze {label} source policy snapshot"))?;
+        let policy = source
+            .policy(&descriptors)
+            .with_context(|| format!("read {label} source policy"))?;
+        drop(descriptors);
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .with_context(|| format!("register {label} Succinct collection"))?;
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .with_context(|| format!("register {label} Rank9 collection"))?;
+        auxiliaries.push((source, succinct, rank9, label));
+    }
+    let maintain = if preparation == Preparation::Update {
+        true
+    } else {
+        let snapshot = pile.snapshot().context("freeze Wiki admission snapshot")?;
+        let subject = signer.verifying_key();
+        let mut admitted = wiki_succinct
+            .writer_is_admitted(&snapshot, subject)
+            .context("check Wiki Succinct WRITE admission")?
+            && wiki_rank9
+                .writer_is_admitted(&snapshot, subject)
+                .context("check Wiki Rank9 WRITE admission")?
+            && latest
+                .writer_is_admitted(&snapshot, subject)
+                .context("check Wiki latest WRITE admission")?;
+        for (_, succinct, rank9, label) in &auxiliaries {
+            admitted &= succinct
+                .writer_is_admitted(&snapshot, subject)
+                .with_context(|| format!("check {label} Succinct WRITE admission"))?
+                && rank9
+                    .writer_is_admitted(&snapshot, subject)
+                    .with_context(|| format!("check {label} Rank9 WRITE admission"))?;
+        }
+        admitted
+    };
+    if maintain {
+        drop(
+            pile.ensure(wiki_source, signer)
+                .await
+                .context("ensure Wiki source collection")?,
+        );
+        for (source, _, _, label) in &auxiliaries {
+            drop(
+                pile.ensure(*source, signer)
+                    .await
+                    .with_context(|| format!("ensure {label} source collection"))?,
+            );
+        }
+        drop(
+            pile.maintain(wiki_succinct, signer)
+                .await
+                .context("maintain Wiki Succinct collection")?,
+        );
+        drop(
+            pile.maintain(wiki_rank9, signer)
+                .await
+                .context("maintain Wiki Rank9 collection")?,
+        );
+        for (_, succinct, rank9, label) in &auxiliaries {
+            drop(
+                pile.maintain(*succinct, signer)
+                    .await
+                    .with_context(|| format!("maintain {label} Succinct collection"))?,
+            );
+            drop(
+                pile.maintain(*rank9, signer)
+                    .await
+                    .with_context(|| format!("maintain {label} Rank9 collection"))?,
+            );
+        }
+        drop(
+            pile.maintain(latest, signer)
+                .await
+                .context("maintain Wiki supersession index")?,
+        );
+    }
+
+    // Positive membership makes latest a normal joined relation. Missing
+    // maintenance is an older resident answer, never a demand for equal source
+    // support or a new query-time supersession scan.
+    let reader = pile
+        .snapshot()
+        .context("freeze Wiki and auxiliary snapshot")?;
+    let facts = reader
+        .collection(wiki_rank9)
+        .context("observe Wiki fact collection")?
+        .view::<FactArchive>()
+        .context("read Wiki fact collection")?;
+    let latest = reader
+        .collection(latest)
+        .context("observe Wiki supersession index")?
+        .view::<LatestIndex>()
+        .context("read Wiki supersession index")?;
+    let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
+    for (_, _, rank9, label) in &auxiliaries {
+        auxiliary_facts.push(
+            reader
+                .collection(*rank9)
+                .with_context(|| format!("observe {label} fact collection"))?
+                .view::<FactArchive>()
+                .with_context(|| format!("read {label} fact collection"))?,
+        );
+    }
+    let mut view = WikiView {
+        facts,
+        reader,
+        latest,
+    };
+    let snapshot = view.reader.clone();
+    read(pile, &snapshot, |reader| {
+        // New bytes may be resident, but the fact archives and latest relation
+        // never select a newer frontier during payload preparation.
+        view.reader = reader.clone();
+        prepare(&view, &auxiliary_facts)
+    })
+    .await
 }
 
 async fn open_source(
@@ -819,13 +866,17 @@ fn cmd_create(
     force: bool,
 ) -> Result<Id> {
     let raw = content;
-    let (content, tags, mut fragment) =
-        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+    let (content, tags, mut fragment) = storage.view_with_scope(
+        Preparation::Update,
+        FILES_SCOPE_ID,
+        "Files",
+        |view, files| {
             let content = prepare_content(&raw, &view.facts, Some(files), force)?;
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((content, tags, fragment))
-        })?;
+        },
+    )?;
     let revision = stage_revision(storage, &mut fragment, None, title, content, tags)?;
     storage.publish(fragment)?;
     Ok(revision)
@@ -844,31 +895,35 @@ fn cmd_edit(
     } else {
         Vec::new()
     };
-    let (entry, title, content, tags, mut fragment) = storage.views(&scopes, |view, files| {
-        let entry = mutation_entry(view, &id)?;
-        if content.is_none() && title.is_none() && tag_names.is_empty() && entry.frontier.len() == 1
-        {
-            bail!("nothing to change");
-        }
-        let title = match &title {
-            Some(value) => value.clone(),
-            None => read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?,
-        };
-        let content = match &content {
-            Some(raw) => prepare_content(raw, &view.facts, files.first(), force)?,
-            None => read_string(
-                &view.reader,
-                agreed(&entry, |head| head.content, "content")?,
-            )?,
-        };
-        let mut fragment = Fragment::empty();
-        let tags = if tag_names.is_empty() {
-            agreed(&entry, |head| head.tags.clone(), "tags")?
-        } else {
-            resolve_tags(&view.facts, &view.reader, &tag_names, &mut fragment)?
-        };
-        Ok((entry, title, content, tags, fragment))
-    })?;
+    let (entry, title, content, tags, mut fragment) =
+        storage.views(Preparation::Update, &scopes, |view, files| {
+            let entry = mutation_entry(view, &id)?;
+            if content.is_none()
+                && title.is_none()
+                && tag_names.is_empty()
+                && entry.frontier.len() == 1
+            {
+                bail!("nothing to change");
+            }
+            let title = match &title {
+                Some(value) => value.clone(),
+                None => read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?,
+            };
+            let content = match &content {
+                Some(raw) => prepare_content(raw, &view.facts, files.first(), force)?,
+                None => read_string(
+                    &view.reader,
+                    agreed(&entry, |head| head.content, "content")?,
+                )?,
+            };
+            let mut fragment = Fragment::empty();
+            let tags = if tag_names.is_empty() {
+                agreed(&entry, |head| head.tags.clone(), "tags")?
+            } else {
+                resolve_tags(&view.facts, &view.reader, &tag_names, &mut fragment)?
+            };
+            Ok((entry, title, content, tags, fragment))
+        })?;
     let revision = stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
     storage.publish(fragment)?;
     Ok(revision)
@@ -1031,7 +1086,7 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
     if normalized.is_empty() {
         bail!("tag name cannot be empty");
     }
-    let prepared = storage.view(|view| {
+    let prepared = storage.views(Preparation::Update, &[], |view, _| {
         let entry = mutation_entry(view, &id)?;
         let mut fragment = Fragment::empty();
         let mut tags: BTreeSet<Id> = agreed(&entry, |head| head.tags.clone(), "tags")?
@@ -1081,7 +1136,7 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
 }
 
 fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<Id> {
-    let (entry, title, content, tags) = storage.view(|view| {
+    let (entry, title, content, tags) = storage.views(Preparation::Update, &[], |view, _| {
         let entry = mutation_entry(view, &id)?;
         let rows = wiki_model::entry_history(&view.facts, &entry);
         let Some(chosen) = rows.get(to.saturating_sub(1)) else {
@@ -1587,7 +1642,9 @@ fn cmd_tag_list(storage: WikiStorage<'_>, out: &mut Out<'_>) -> Result<()> {
 }
 
 fn cmd_tag_mint(storage: WikiStorage<'_>, name: String) -> Result<Id> {
-    let ids = storage.view(|view| tag_ids_named(&view.facts, &view.reader, &name))?;
+    let ids = storage.views(Preparation::Update, &[], |view, _| {
+        tag_ids_named(&view.facts, &view.reader, &name)
+    })?;
     if let Some(id) = ids.first() {
         return Ok(*id);
     }
@@ -1601,12 +1658,16 @@ fn cmd_import(
     documents: Vec<ImportDocument>,
     tags: Vec<String>,
 ) -> Result<Vec<Id>> {
-    let (view, files_catalog, tags, mut fragment) =
-        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+    let (view, files_catalog, tags, mut fragment) = storage.view_with_scope(
+        Preparation::Update,
+        FILES_SCOPE_ID,
+        "Files",
+        |view, files| {
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((view.clone(), files.clone(), tags, fragment))
-        })?;
+        },
+    )?;
     let mut ids = Vec::new();
     for document in documents {
         let content = document.content;
@@ -1770,9 +1831,10 @@ fn resolve_reference_line(
 }
 
 fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String, out: &mut Out<'_>) -> Result<()> {
-    let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
-        Ok((view.clone(), files.clone()))
-    })?;
+    let (view, files) =
+        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
+            Ok((view.clone(), files.clone()))
+        })?;
     let resolver = ReferenceResolver {
         wiki: &view.facts,
         files: Some(&files),
@@ -1788,8 +1850,15 @@ fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String, out: &mut Out<'_>)
 }
 
 fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>) -> Result<()> {
-    let (report, changed, revisions) =
-        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+    let (report, changed, revisions) = storage.view_with_scope(
+        if fix {
+            Preparation::Update
+        } else {
+            Preparation::Read
+        },
+        FILES_SCOPE_ID,
+        "Files",
+        |view, files| {
             let resolver = ReferenceResolver {
                 wiki: &view.facts,
                 files: Some(files),
@@ -1829,7 +1898,8 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
                 }
             }
             Ok((report, changed, revisions))
-        })?;
+        },
+    )?;
     let mut fragment = Fragment::empty();
     for (entry, title, content, tags) in revisions {
         stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
@@ -1859,7 +1929,7 @@ fn cmd_batch_export(storage: WikiStorage<'_>) -> Result<Vec<(Id, String)>> {
 }
 
 fn cmd_batch_import(storage: WikiStorage<'_>, imports: Vec<(Id, String)>) -> Result<()> {
-    let revisions = storage.view(|view| {
+    let revisions = storage.views(Preparation::Update, &[], |view, _| {
         let mut revisions = Vec::new();
         for (revision_id, content) in &imports {
             let revision_id = *revision_id;
@@ -1905,6 +1975,7 @@ fn l2_normalize(mut values: Vec<f32>) -> Vec<f32> {
 #[cfg(feature = "local-embed")]
 fn cmd_embed(storage: WikiStorage<'_>, out: &mut Out<'_>) -> Result<()> {
     let documents = storage.view_with_scope(
+        Preparation::Update,
         EMBEDDINGS_SCOPE_ID,
         "Embeddings",
         |view, embedding_facts| {
@@ -1960,6 +2031,7 @@ fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<String> {
     let embedder = crate::nomic::load_text_embedder()?;
     let query = l2_normalize(embedder.embed_query(&query)?);
     let report = storage.view_with_scope(
+        Preparation::Read,
         EMBEDDINGS_SCOPE_ID,
         "Embeddings",
         |view, embedding_facts| {
@@ -2134,6 +2206,148 @@ mod tests {
                 storage: &self.storage,
             }
         }
+    }
+
+    #[test]
+    fn read_without_write_keeps_resident_frontier_and_owner_read_advances() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let source = storage
+            .with_pile(|pile, signer, _| {
+                Ok(crate::collection_names::open(
+                    pile,
+                    schema::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?)
+            })
+            .unwrap();
+        let mut genesis = Fragment::empty();
+        let root = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "original".to_owned(),
+            "old body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage
+            .with_pile(|pile, signer, _| {
+                pile.commit(source, signer, genesis)?;
+                Ok(())
+            })
+            .unwrap();
+        let current = storage
+            .with_pile(|pile, signer, runtime| {
+                runtime.block_on(views_in(
+                    pile,
+                    source,
+                    signer,
+                    Preparation::Read,
+                    &[],
+                    |view, _| Ok(view.clone()),
+                ))
+            })
+            .unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
+        let mut successor = Fragment::empty();
+        let next = stage_revision(
+            storage,
+            &mut successor,
+            Some(&entry),
+            "current".to_owned(),
+            "new body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage
+            .with_pile(|pile, signer, _| {
+                pile.commit(source, signer, successor)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let reader_key = fixture._directory.path().join("reader.key");
+        crate::storage::initialize_signer(&fixture.pile, Some(&reader_key)).unwrap();
+        let reader = Storage::new(fixture.pile.clone(), Some(reader_key));
+        reader
+            .with_store(|pile, signer, runtime| {
+                let before = pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?;
+                let resident = runtime.block_on(views_in(
+                    pile,
+                    source,
+                    signer,
+                    Preparation::Read,
+                    &[],
+                    |view, _| Ok(view.clone()),
+                ))?;
+                let entry = wiki_model::entry(&resident.facts, &resident.latest, root).unwrap();
+                assert_eq!(
+                    entry
+                        .frontier
+                        .iter()
+                        .map(|head| head.id)
+                        .collect::<Vec<_>>(),
+                    [root]
+                );
+                assert_eq!(
+                    revision_content(&resident.reader, &entry.frontier[0])?,
+                    "old body"
+                );
+                assert!(!wiki_model::revision_ids(&resident.facts).contains(&next));
+                assert_eq!(
+                    pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?,
+                    before,
+                    "a reader must not publish maintenance equations",
+                );
+
+                // A pre-edit operation cannot silently replace its full
+                // current-frontier preparation with the read-only fallback.
+                let update = runtime.block_on(views_in(
+                    pile,
+                    source,
+                    signer,
+                    Preparation::Update,
+                    &[],
+                    |_, _| Ok(()),
+                ));
+                assert!(
+                    update.is_err(),
+                    "updating the missing rollups requires WRITE"
+                );
+                assert_eq!(
+                    pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?,
+                    before,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let current = storage
+            .with_pile(|pile, signer, runtime| {
+                runtime.block_on(views_in(
+                    pile,
+                    source,
+                    signer,
+                    Preparation::Read,
+                    &[],
+                    |view, _| Ok(view.clone()),
+                ))
+            })
+            .unwrap();
+        let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
+        assert_eq!(
+            entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            [next]
+        );
+        assert_eq!(
+            revision_content(&current.reader, &entry.frontier[0]).unwrap(),
+            "new body"
+        );
     }
 
     /// Model the exact requested bytes arriving from a concurrent replicator
@@ -2543,7 +2757,9 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let files = storage
-            .view_with_scope(FILES_SCOPE_ID, "Files", |_, files| Ok(files.clone()))
+            .view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |_, files| {
+                Ok(files.clone())
+            })
             .unwrap();
         assert!(find!(
             id: Id,

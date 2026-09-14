@@ -910,6 +910,7 @@ impl Relations {
 
     fn with_relations<T>(
         &self,
+        read_only: bool,
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
@@ -919,39 +920,7 @@ impl Relations {
             } else {
                 open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?
             };
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = collection.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let facts_succinct =
-                pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-            let facts_rank9 =
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
-            let reader = runtime
-                .block_on(async {
-                    drop(pile.ensure(collection, signer).await?);
-                    drop(pile.maintain(facts_succinct, signer).await?);
-                    pile.maintain(facts_rank9, signer).await
-                })
-                .context("maintain Relations fact collection")?;
-            let observed = reader
-                .collection(facts_rank9)
-                .context("observe Relations Rank9 projection")?;
-            let view = observed
-                .view::<FactArchive>()
-                .context("read Relations Rank9 projection")?;
-            // Only exact payload gets may acquire here. Facts, records, proofs,
-            // and their interpretation instant remain those of this observation.
-            // Dispatch stays outside block_on: Blocking owns the one CLI boundary.
-            let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(runtime));
-            let mut storage = RelationsStorage {
-                pile,
-                signer,
-                collection,
-                facts: &view,
-                reader: &payload_reader,
-            };
-
-            execute(&mut storage)
+            with_relations_view(pile, signer, runtime, collection, read_only, execute)
         })
     }
 
@@ -961,7 +930,9 @@ impl Relations {
         id: Option<Id>,
         sources: &[String],
     ) -> Result<AddedPerson> {
-        self.with_relations(|storage| add_person(storage, profile, id, sources.to_vec()))
+        self.with_relations(false, |storage| {
+            add_person(storage, profile, id, sources.to_vec())
+        })
     }
     pub fn set(
         &self,
@@ -969,7 +940,7 @@ impl Relations {
         patch: ProfilePatch,
         sources: &[String],
     ) -> Result<ProfileUpdate> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             set_profile(storage, person.to_owned(), sources.to_vec(), patch)
         })
     }
@@ -979,12 +950,12 @@ impl Relations {
         base: Option<&str>,
         patch: ProfilePatch,
     ) -> Result<ProfileReconciliation> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             reconcile_profile(storage, person.to_owned(), base.map(str::to_owned), patch)
         })
     }
     pub fn list(&self, limit: usize, filter: PeopleFilter) -> Result<String> {
-        self.with_relations(|storage| {
+        self.with_relations(true, |storage| {
             list_people(
                 storage,
                 limit,
@@ -994,40 +965,46 @@ impl Relations {
         })
     }
     pub fn show(&self, person: &str) -> Result<String> {
-        self.with_relations(|storage| show_person(storage, person.to_owned()))
+        self.with_relations(true, |storage| show_person(storage, person.to_owned()))
     }
     pub fn retire(&self, person: &str) -> Result<LifecycleChange> {
-        self.with_relations(|storage| set_retired(storage, person.to_owned(), true))
+        self.with_relations(false, |storage| {
+            set_retired(storage, person.to_owned(), true)
+        })
     }
     pub fn unretire(&self, person: &str) -> Result<LifecycleChange> {
-        self.with_relations(|storage| set_retired(storage, person.to_owned(), false))
+        self.with_relations(false, |storage| {
+            set_retired(storage, person.to_owned(), false)
+        })
     }
     pub fn group_create(&self, name: &str) -> Result<AddedGroup> {
-        self.with_relations(|storage| create_group(storage, name.to_owned()))
+        self.with_relations(false, |storage| create_group(storage, name.to_owned()))
     }
     pub fn group_add(&self, group: &str, person: &str) -> Result<GroupAddition> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             add_group_member(storage, group.to_owned(), person.to_owned())
         })
     }
     pub fn group_remove(&self, group: &str, person: &str) -> Result<GroupRemoval> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             remove_group_member(storage, group.to_owned(), person.to_owned())
         })
     }
     pub fn group_rename(&self, group: &str, name: &str) -> Result<GroupRename> {
-        self.with_relations(|storage| rename_group(storage, group.to_owned(), name.to_owned()))
+        self.with_relations(false, |storage| {
+            rename_group(storage, group.to_owned(), name.to_owned())
+        })
     }
     pub fn group_reconcile(&self, group: &str, name: Option<&str>) -> Result<GroupReconciliation> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             reconcile_group(storage, group.to_owned(), name.map(str::to_owned))
         })
     }
     pub fn group_list(&self) -> Result<String> {
-        self.with_relations(list_groups)
+        self.with_relations(true, list_groups)
     }
     pub fn group_show(&self, group: &str) -> Result<String> {
-        self.with_relations(|storage| show_group(storage, group.to_owned()))
+        self.with_relations(true, |storage| show_group(storage, group.to_owned()))
     }
     pub fn identity_resolve(
         &self,
@@ -1035,13 +1012,75 @@ impl Relations {
         second: &str,
         same: bool,
     ) -> Result<IdentityChange> {
-        self.with_relations(|storage| {
+        self.with_relations(false, |storage| {
             resolve_identity(storage, first.to_owned(), second.to_owned(), same)
         })
     }
     pub fn identity_list(&self) -> Result<String> {
-        self.with_relations(list_identities)
+        self.with_relations(true, list_identities)
     }
+}
+
+fn with_relations_view<T>(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    runtime: &Arc<tokio::runtime::Runtime>,
+    collection: Collection<SimpleArchive>,
+    read_only: bool,
+    execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
+) -> Result<T> {
+    let descriptor_snapshot = pile.snapshot()?;
+    let policy = collection.policy(&descriptor_snapshot)?;
+    drop(descriptor_snapshot);
+    let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+    let facts_rank9 =
+        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
+    // Mutation preparation keeps its existing ensure/maintain contract. Only
+    // read operations may use replicated views while their producer catches up.
+    let maintain = if read_only {
+        let snapshot = pile.snapshot()?;
+        let subject = signer.verifying_key();
+        facts_succinct
+            .writer_is_admitted(&snapshot, subject)
+            .map_err(|error| anyhow::anyhow!("check Relations Succinct WRITE admission: {error}"))?
+            && facts_rank9
+                .writer_is_admitted(&snapshot, subject)
+                .map_err(|error| {
+                    anyhow::anyhow!("check Relations Rank9 WRITE admission: {error}")
+                })?
+    } else {
+        true
+    };
+    let reader = if maintain {
+        runtime
+            .block_on(async {
+                drop(pile.ensure(collection, signer).await?);
+                drop(pile.maintain(facts_succinct, signer).await?);
+                pile.maintain(facts_rank9, signer).await
+            })
+            .context("maintain Relations fact collection")?
+    } else {
+        pile.snapshot()
+            .context("freeze resident Relations fact collection")?
+    };
+    let observed = reader
+        .collection(facts_rank9)
+        .context("observe Relations Rank9 projection")?;
+    let view = observed
+        .view::<FactArchive>()
+        .context("read Relations Rank9 projection")?;
+    // Only exact payload gets may acquire here. Facts, records, proofs,
+    // and their interpretation instant remain those of this observation.
+    // Dispatch stays outside block_on: Blocking owns the one CLI boundary.
+    let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(runtime));
+    let mut storage = RelationsStorage {
+        pile,
+        signer,
+        collection,
+        facts: &view,
+        reader: &payload_reader,
+    };
+    execute(&mut storage)
 }
 #[cfg(test)]
 mod tests {
@@ -1108,6 +1147,106 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn non_writer_reads_resident_relations_without_hiding_pending_updates_from_writers() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = open_store(file.path()).unwrap();
+        let runtime = Arc::new(runtime().unwrap());
+        let owner = SigningKey::from_bytes(&[91; 32]);
+        let reader = SigningKey::from_bytes(&[92; 32]);
+        let source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let selectors = BTreeSet::from([
+            CollectionRecordSelector::Collection(source.handle()),
+            CollectionRecordSelector::Collection(succinct.handle()),
+            CollectionRecordSelector::Collection(rank9.handle()),
+        ]);
+        let first = genid().id;
+        let second = genid().id;
+        pile.commit(
+            source,
+            &owner,
+            relations::person_fragment(first, profile("Ada")).unwrap().0,
+        )
+        .unwrap();
+        // The owner's ordinary read maintains the newly authored person.
+        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
+            assert!(list_people(storage, 20, false, false)?.contains("Ada"));
+            Ok(())
+        })
+        .unwrap();
+
+        let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
+            assert!(show_person(storage, "Ada".to_owned())?.contains("Ada"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+            before
+        );
+
+        pile.commit(
+            source,
+            &owner,
+            relations::person_fragment(second, profile("Grace"))
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
+            assert_eq!(
+                relations::person_anchors(storage.facts),
+                BTreeSet::from([first])
+            );
+            let list = list_people(storage, 20, false, false)?;
+            assert!(list.contains("Ada"));
+            assert!(!list.contains("Grace"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+            before
+        );
+
+        let mut mutation_prepared = false;
+        let error = with_relations_view(&mut pile, &reader, &runtime, source, false, |_| {
+            mutation_prepared = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("requires an admitted WRITE producer"));
+        assert!(
+            !mutation_prepared,
+            "mutation preparation must not use the older view"
+        );
+        assert_eq!(
+            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+            before
+        );
+
+        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
+            assert_eq!(
+                relations::person_anchors(storage.facts),
+                BTreeSet::from([first, second])
+            );
+            Ok(())
+        })
+        .unwrap();
+        pile.close().unwrap();
     }
 
     #[test]

@@ -620,6 +620,21 @@ discovery trusts local record signatures, while snapshot admission still checks
 each producer's WRITE authority. Audit unfamiliar piles explicitly before
 accepting them as trusted local storage.
 
+Relations, Message, Compass, Wiki, and Orient do not require a reader to be a
+producer. At their read boundaries, a signer admitted to the needed targets
+still performs inline upkeep; other readers attach the resident rollups,
+including a partial view while newer source commits await derivation or
+replication. This preserves local read-your-writes without making WRITE a
+prerequisite for reading shared data. Transport READ must independently cover
+the exact derived collections being replicated, not just their foundation.
+
+State-dependent edits and Message acknowledgements retain their pre-action
+maintenance. Orient also keeps strict maintenance for its own Presented
+receipt rollups when consuming notifications; those receipts still need a
+correctly configured local writer. `poll --peek` is non-consuming and may use
+the resident receipt view. Moving all upkeep out of authorized reads is a
+separate handoff to autonomous maintenance, not part of this reader recovery.
+
 This source uses the signed-equation TribleSpace cohort. Historical unsigned
 equations stay inert and are not silently signed by whichever reader encounters
 them. An authorised writer may recompute missing results, or explicitly endorse

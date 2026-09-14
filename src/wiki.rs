@@ -259,11 +259,24 @@ where
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    let target = store.derive::<LatestBlob>(
-        source,
-        metadata::supersedes.id(),
-        crate::collection_names::private_policy(authority),
-    )?;
+    latest_for_source(store, source)
+}
+
+pub(crate) fn latest_for_source<S>(
+    store: &mut S,
+    source: Collection<blobencodings::SimpleArchive>,
+) -> Result<Collection<LatestBlob>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+{
+    let snapshot = store
+        .snapshot()
+        .context("freeze Wiki source policy snapshot")?;
+    let policy = source
+        .policy(&snapshot)
+        .context("read Wiki source collection policy")?;
+    let target = store.derive::<LatestBlob>(source, metadata::supersedes.id(), policy)?;
     Ok(target)
 }
 
@@ -1715,6 +1728,22 @@ mod tests {
 
     use hifitime::Epoch;
     use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+    #[test]
+    fn latest_inherits_the_source_collection_policy() {
+        let mut store = MemoryRepo::default();
+        let authority = SigningKey::from_bytes(&[25; 32]).verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::delegable(authority));
+        let source = store.collection("shared-wiki", policy.clone()).unwrap();
+
+        let latest = latest_for_source(&mut store, source).unwrap();
+        let snapshot = store.snapshot().unwrap();
+
+        assert_eq!(latest.policy(&snapshot).unwrap(), policy);
+    }
 
     fn at(seconds: f64) -> IntervalValue {
         let epoch = Epoch::from_tai_seconds(seconds);

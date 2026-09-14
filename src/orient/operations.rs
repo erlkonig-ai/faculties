@@ -352,7 +352,33 @@ impl OrientSource {
         })
     }
 
+    fn can_maintain<S>(&self, snapshot: &S, signer: &SigningKey) -> Result<bool>
+    where
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    {
+        let subject = signer.verifying_key();
+        Ok(self
+            .succinct
+            .writer_is_admitted(snapshot, subject)
+            .with_context(|| format!("check {} Succinct WRITE admission", self.label))?
+            && self
+                .rank9
+                .writer_is_admitted(snapshot, subject)
+                .with_context(|| format!("check {} Rank9 WRITE admission", self.label))?)
+    }
+
+    /// Readers without production authority use the target as it stands.
+    /// An authorized local producer still catches up its own recent writes.
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
+        if !self.can_maintain(&pile.snapshot()?, signer)? {
+            return Ok(());
+        }
+        self.maintain_required(pile, signer).await
+    }
+
+    /// Presented receipts are part of this operation's write protocol: a
+    /// subsequent one-shot watcher must see them, not report them again.
+    async fn maintain_required(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         drop(
             pile.maintain(self.succinct, signer)
                 .await
@@ -390,8 +416,10 @@ struct OrientSources {
 }
 
 impl OrientSources {
-    /// Fetch direct source dependencies before choosing a common observation.
+    /// Acquire inputs only for chains this process can maintain. External
+    /// read-only chains remain at their resident target observation.
     async fn ensure(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
+        let snapshot = pile.snapshot()?;
         for source in [
             Some(&self.messages),
             Some(&self.mail),
@@ -400,17 +428,24 @@ impl OrientSources {
             Some(&self.relations),
             Some(&self.status),
             self.habits.as_ref(),
-            Some(&self.presentations),
         ]
         .into_iter()
         .flatten()
         {
+            if !source.can_maintain(&snapshot, signer)? {
+                continue;
+            }
             drop(
                 pile.ensure(source.source, signer)
                     .await
                     .with_context(|| format!("ensure {} source collection", source.label))?,
             );
         }
+        drop(
+            pile.ensure(self.presentations.source, signer)
+                .await
+                .context("ensure Orient presentation receipts")?,
+        );
         Ok(())
     }
 
@@ -506,6 +541,7 @@ async fn maintain_sources(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     sources: &OrientSources,
+    require_receipts: bool,
 ) -> Result<()> {
     for source in [
         Some(&sources.messages),
@@ -515,18 +551,31 @@ async fn maintain_sources(
         Some(&sources.relations),
         Some(&sources.status),
         sources.habits.as_ref(),
-        Some(&sources.presentations),
     ]
     .into_iter()
     .flatten()
     {
         source.maintain(pile, signer).await?;
     }
-    drop(
-        pile.maintain(sources.compass_status, signer)
-            .await
-            .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
-    );
+    if require_receipts {
+        sources
+            .presentations
+            .maintain_required(pile, signer)
+            .await?;
+    } else {
+        sources.presentations.maintain(pile, signer).await?;
+    }
+    if sources
+        .compass_status
+        .writer_is_admitted(&pile.snapshot()?, signer.verifying_key())
+        .context("check Compass status WRITE admission")?
+    {
+        drop(
+            pile.maintain(sources.compass_status, signer)
+                .await
+                .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
+        );
+    }
     Ok(())
 }
 
@@ -584,8 +633,9 @@ async fn maintain_and_observe_snapshot(
     signer: &SigningKey,
     watermark: &FacultySnapshot,
     sources: &OrientSources,
+    require_receipts: bool,
 ) -> Result<OrientObservation> {
-    maintain_sources(pile, signer, sources).await?;
+    maintain_sources(pile, signer, sources, require_receipts).await?;
     let snapshot = pile
         .snapshot_at(watermark.instant())
         .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
@@ -596,12 +646,13 @@ async fn maintain_and_observe_sources(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     sources: &OrientSources,
+    require_receipts: bool,
 ) -> Result<OrientObservation> {
     sources.ensure(pile, signer).await?;
     let watermark = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_snapshot(pile, signer, &watermark, sources).await
+    maintain_and_observe_snapshot(pile, signer, &watermark, sources, require_receipts).await
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2315,7 +2366,7 @@ async fn cmd_baseline(
         let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
         let health_events = health.report().attention;
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources, true).await?;
         let (persona, events) = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
@@ -2367,7 +2418,7 @@ async fn cmd_show(
             }
         }
         let sources = OrientSources::open(pile, signer, true).await?;
-        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources, true).await?;
         let instant = observation.snapshot.instant();
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
             read(pile, &observation.snapshot, |reader| {
@@ -2620,7 +2671,7 @@ async fn cmd_poll(
             return Ok(());
         }
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = maintain_and_observe_sources(pile, signer, &sources).await?;
+        let observation = maintain_and_observe_sources(pile, signer, &sources, !peek).await?;
         let prepared = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
@@ -2715,7 +2766,8 @@ async fn load_wait_frame(
     // observation selects resident targets once; subsequent payload retries
     // keep those views fixed without replacing this change-detection baseline.
     let instant = snapshot.instant();
-    let mut observation = maintain_and_observe_snapshot(pile, signer, &snapshot, sources).await?;
+    let mut observation =
+        maintain_and_observe_snapshot(pile, signer, &snapshot, sources, true).await?;
     let (persona, reader) = match read(pile, &observation.snapshot, |reader| {
         let persona = resolve_native_persona(&observation.query(reader), persona_input)?;
         Ok((persona, reader.clone()))
@@ -3177,21 +3229,32 @@ async fn cmd_wake(
         let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
             .context("register maintained Wiki supersession index")?;
         sources.ensure(storage, signer).await?;
-        drop(storage.ensure(memory_collection.source, signer).await?);
-        drop(storage.ensure(wiki_collection.source, signer).await?);
+        let admission = storage.snapshot()?;
+        if memory_collection.can_maintain(&admission, signer)? {
+            drop(storage.ensure(memory_collection.source, signer).await?);
+        }
+        if wiki_collection.can_maintain(&admission, signer)? {
+            drop(storage.ensure(wiki_collection.source, signer).await?);
+        }
         let watermark = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake authorization instant: {error}"))?;
         memory_collection.maintain(storage, signer).await?;
         wiki_collection.maintain(storage, signer).await?;
-        drop(
-            storage
-                .maintain(wiki_latest, signer)
-                .await
-                .context("maintain Wiki supersession index")?,
-        );
+        if wiki_latest
+            .writer_is_admitted(&admission, signer.verifying_key())
+            .context("check Wiki supersession WRITE admission")?
+        {
+            drop(
+                storage
+                    .maintain(wiki_latest, signer)
+                    .await
+                    .context("maintain Wiki supersession index")?,
+            );
+        }
         let observation =
-            maintain_and_observe_snapshot(storage, signer, &watermark, &sources).await?;
+            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, persona.is_some())
+                .await?;
         drop(watermark);
         let memory_facts = observation
             .snapshot
@@ -3381,6 +3444,136 @@ mod tests {
 
     fn archive(facts: &TribleSet) -> FactArchive {
         UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(facts)])
+    }
+
+    #[test]
+    fn nonwriter_observes_lagging_external_input_and_retains_own_receipts() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let reader_key = SigningKey::from_bytes(&[73; 32]);
+            let mut pile = open_store(&fixture.path).unwrap();
+            // External Relations are owned elsewhere; notification receipts
+            // remain this local writer's collection.
+            let mut sources = OrientSources::open(&mut pile, &reader_key, false)
+                .await
+                .unwrap();
+            sources.relations =
+                OrientSource::open(&mut pile, &fixture.signer, RELATIONS_SCOPE_ID, "Relations")
+                    .await
+                    .unwrap();
+            let known = id(71);
+            let pending = id(72);
+            let person = |person, label: &str| {
+                relations::person_fragment(
+                    person,
+                    crate::relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .0
+            };
+            pile.commit(
+                sources.relations.source,
+                &fixture.signer,
+                person(known, "resident-reader"),
+            )
+            .unwrap();
+            sources
+                .relations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            pile.commit(
+                sources.relations.source,
+                &fixture.signer,
+                person(pending, "pending-reader"),
+            )
+            .unwrap();
+            let before = pile.snapshot().unwrap();
+            let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
+            let observation = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                person_anchors(observation.facts.relations.view()),
+                BTreeSet::from([known]),
+            );
+            assert_eq!(
+                pile.snapshot()
+                    .unwrap()
+                    .records()
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>(),
+                records,
+                "a nonwriter read must not publish equations for lagging external input",
+            );
+
+            let event = id(74);
+            save_presentations(&mut pile, &reader_key, known, [event]).unwrap();
+            let next = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
+                .await
+                .unwrap();
+            assert!(presented_events(next.facts.presentations.view(), known).contains(&event));
+            assert_eq!(
+                person_anchors(next.facts.relations.view()),
+                BTreeSet::from([known])
+            );
+
+            // A producer's next observation still catches up without a daemon.
+            sources
+                .relations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let caught_up = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                person_anchors(caught_up.facts.relations.view()),
+                BTreeSet::from([known, pending]),
+            );
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
+    fn missing_presentation_images_still_require_a_producer() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let reader_key = SigningKey::from_bytes(&[73; 32]);
+            let mut pile = open_store(&fixture.path).unwrap();
+            let mut sources = OrientSources::open(&mut pile, &reader_key, false)
+                .await
+                .unwrap();
+            sources.presentations = OrientSource::open(
+                &mut pile,
+                &fixture.signer,
+                crate::schemas::orient::DEFAULT_SCOPE_ID,
+                "Orient",
+            )
+            .await
+            .unwrap();
+            pile.commit(
+                sources.presentations.source,
+                &fixture.signer,
+                orient_model::presented_fragment(id(75), [id(76)]),
+            )
+            .unwrap();
+            // A non-consuming peek may use the earlier receipt view.
+            maintain_and_observe_sources(&mut pile, &reader_key, &sources, false)
+                .await
+                .unwrap();
+            let error =
+                match maintain_and_observe_sources(&mut pile, &reader_key, &sources, true).await {
+                    Ok(_) => panic!("missing own receipt images must not silently fall back"),
+                    Err(error) => error,
+                };
+            assert!(format!("{error:#}").contains("WRITE"));
+            pile.close().unwrap();
+        });
     }
 
     #[test]
@@ -3580,10 +3773,15 @@ mod tests {
                 .unwrap();
             sources.ensure(&mut pile, &fixture.signer).await.unwrap();
             let watermark = pile.snapshot().unwrap();
-            let observation =
-                maintain_and_observe_snapshot(&mut pile, &fixture.signer, &watermark, &sources)
-                    .await
-                    .unwrap();
+            let observation = maintain_and_observe_snapshot(
+                &mut pile,
+                &fixture.signer,
+                &watermark,
+                &sources,
+                true,
+            )
+            .await
+            .unwrap();
 
             let next = compass::status_fragment(
                 goal,
@@ -3920,10 +4118,15 @@ mod tests {
             .unwrap();
             sources.ensure(&mut pile, &fixture.signer).await.unwrap();
             let watermark = pile.snapshot_at(instant).unwrap();
-            let observation =
-                maintain_and_observe_snapshot(&mut pile, &fixture.signer, &watermark, &sources)
-                    .await
-                    .unwrap();
+            let observation = maintain_and_observe_snapshot(
+                &mut pile,
+                &fixture.signer,
+                &watermark,
+                &sources,
+                true,
+            )
+            .await
+            .unwrap();
             let support = observation.facts.messages.support().clone();
             let handle = Inline::new(body.raw);
             let mut supply = Supply {
