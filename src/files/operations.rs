@@ -251,8 +251,15 @@ fn with_files_store<T>(
     })
 }
 
-/// Maintain and attach one immutable shard-preserving Files view for commands
-/// whose result or mutation depends on facts already present in the collection.
+/// Attach one immutable shard-preserving Files view for commands whose result
+/// or mutation depends on facts already present in the collection.
+///
+/// A signer that holds WRITE on the derived targets maintains them first, so
+/// a file saved a minute ago is visible; one that does not attaches the views
+/// as they stand, maintained here earlier or replicated from a node that may.
+/// Maintenance is a writer's exhaust, never a reader's obligation: on
+/// 2026-09-14 a read on stars failed for want of WRITE on the Files Succinct
+/// target, and the answer is not wider rights.
 fn with_files_view<T>(
     storage: &Storage,
     f: impl FnOnce(
@@ -265,6 +272,27 @@ fn with_files_view<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(storage, |store, collection, signer, runtime| {
+        files_view_in(store, collection, signer, runtime, f)
+    })
+}
+
+/// Attach the Files views of one already-opened source collection; see
+/// [`with_files_view`] for the maintenance rule.
+fn files_view_in<T>(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &FactArchive,
+        &FacultySnapshot,
+        &tokio::runtime::Runtime,
+    ) -> Result<T>,
+) -> Result<T> {
+    {
         let descriptors = store
             .snapshot()
             .context("freeze Files source policy snapshot")?;
@@ -278,31 +306,51 @@ fn with_files_view<T>(
         let rank9 = store
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .context("register Files Rank9 collection")?;
-        let reader = runtime.block_on(async {
-            drop(
+        let admitted = {
+            let snapshot = store
+                .snapshot()
+                .context("freeze Files admission snapshot")?;
+            let subject = signer.verifying_key();
+            succinct
+                .writer_is_admitted(&snapshot, subject)
+                .map_err(|error| anyhow::anyhow!("check Files Succinct WRITE admission: {error}"))?
+                && rank9
+                    .writer_is_admitted(&snapshot, subject)
+                    .map_err(|error| {
+                        anyhow::anyhow!("check Files Rank9 WRITE admission: {error}")
+                    })?
+        };
+        let reader = if admitted {
+            runtime.block_on(async {
+                drop(
+                    store
+                        .ensure(collection, signer)
+                        .await
+                        .context("ensure Files source collection")?,
+                );
+                drop(
+                    store
+                        .maintain(succinct, signer)
+                        .await
+                        .context("maintain Files Succinct collection")?,
+                );
                 store
-                    .ensure(collection, signer)
+                    .maintain(rank9, signer)
                     .await
-                    .context("ensure Files source collection")?,
-            );
-            drop(
-                store
-                    .maintain(succinct, signer)
-                    .await
-                    .context("maintain Files Succinct collection")?,
-            );
+                    .context("maintain Files Rank9 collection")
+            })?
+        } else {
             store
-                .maintain(rank9, signer)
-                .await
-                .context("maintain Files Rank9 collection")
-        })?;
+                .snapshot()
+                .context("freeze the Files views as they stand")?
+        };
         let space = reader
             .collection(rank9)
             .context("observe Files fact collection")?
             .view::<FactArchive>()
             .context("read Files fact collection")?;
         f(store, collection, signer, &space, &reader, runtime)
-    })
+    }
 }
 
 // ── tree builder ─────────────────────────────────────────────────────────
@@ -3131,6 +3179,76 @@ mod tests {
             cmd_list(space, _reader, &[], None)
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_reader_without_write_attaches_the_files_views_as_they_stand() {
+        let test_pile = TestPile::new();
+        let owner = Storage::new(test_pile.path.clone(), None);
+        let first = file_capability::stage(b"first".to_vec(), "first.txt", "text/plain").unwrap();
+        let second =
+            file_capability::stage(b"second".to_vec(), "second.txt", "text/plain").unwrap();
+        let first_id = first.root().unwrap();
+        let second_id = second.root().unwrap();
+
+        with_files_store(&owner, |store, collection, signer, _| {
+            store
+                .commit(collection, signer, first)
+                .context("commit first fixture")?;
+            Ok(())
+        })
+        .unwrap();
+        // The owner holds WRITE on the derived targets and maintains them.
+        with_files_view(&owner, |_, _, _, space, _, _| {
+            let ids = find!(
+                entity: Id,
+                pattern!(space, [{ ?entity @ metadata::tag: &KIND_FILE }])
+            )
+            .collect::<BTreeSet<_>>();
+            assert_eq!(ids, BTreeSet::from([first_id]));
+            Ok(())
+        })
+        .unwrap();
+        // A second commit that nobody has maintained into the views yet.
+        with_files_store(&owner, |store, collection, signer, _| {
+            store
+                .commit(collection, signer, second)
+                .context("commit second fixture")?;
+            Ok(())
+        })
+        .unwrap();
+
+        // A second key without WRITE reads the owner's collection: it must
+        // neither fail for want of rights nor publish maintenance it may not.
+        let reader_key = test_pile.dir.join("reader.key");
+        initialize_signer(&test_pile.path, Some(&reader_key)).unwrap();
+        let reader = Storage::new(test_pile.path.clone(), Some(reader_key));
+        let authority = load_signer(&test_pile.path, None).unwrap().verifying_key();
+        reader
+            .with_store(|store, signer, runtime| {
+                let collection = open(store, DEFAULT_SCOPE_ID, authority)
+                    .context("open the owner's Files collection")?;
+                files_view_in(
+                    store,
+                    collection,
+                    signer,
+                    runtime,
+                    |_, _, _, space, _, _| {
+                        let ids = find!(
+                            entity: Id,
+                            pattern!(space, [{ ?entity @ metadata::tag: &KIND_FILE }])
+                        )
+                        .collect::<BTreeSet<_>>();
+                        assert!(ids.contains(&first_id), "the maintained view is readable");
+                        assert!(
+                            !ids.contains(&second_id),
+                            "a reader without WRITE attaches the views as they stand"
+                        );
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
     }
 
     #[test]
