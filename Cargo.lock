@@ -1247,11 +1247,11 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burn"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39474be398d30e08681f1f6a8ff446b1e4f1403b5cf7749649a8871fd5945f3a"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-autodiff",
  "burn-core",
+ "burn-cuda",
  "burn-dispatch",
  "burn-ndarray",
  "burn-nn",
@@ -1265,8 +1265,7 @@ dependencies = [
 [[package]]
 name = "burn-autodiff"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b93a80e43bfab909399444b29ce3894ff51f7e879720bfc75b6007ae6a01c3d"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-std",
@@ -1281,8 +1280,7 @@ dependencies = [
 [[package]]
 name = "burn-backend"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64491519ac0867f550fa9c726cd443e5db94608c629050986cf2614c8c5ad39f"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-std",
  "bytemuck",
@@ -1302,8 +1300,7 @@ dependencies = [
 [[package]]
 name = "burn-core"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bde1e3b8e7e39b0aa71cd5905207ceea5c3478bec47bdb64acf72dcd0d6f978"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "ahash",
  "bincode 2.0.1",
@@ -1332,8 +1329,7 @@ dependencies = [
 [[package]]
 name = "burn-cubecl"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26efbec96ca3f691593c966fa90f98ef8a72867f62627904920b619ba3a9e6b6"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-cubecl-fusion",
@@ -1352,8 +1348,7 @@ dependencies = [
 [[package]]
 name = "burn-cubecl-fusion"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6993d15b8ed588f55626e835ca768c1c3c7aa7a79d59beff4c987c40fc82d1f4"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-fusion",
@@ -1368,10 +1363,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-cuda"
+version = "0.21.0"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
+dependencies = [
+ "burn-backend",
+ "burn-cubecl",
+ "cubecl",
+]
+
+[[package]]
 name = "burn-dataset"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba469fba38357c8bb65458873ddfd82aa97534aec0b3bae93d4c44604fc63839"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "csv",
  "derive-new",
@@ -1389,8 +1393,7 @@ dependencies = [
 [[package]]
 name = "burn-derive"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce7be43cdfc9903c43dbaf3f4821543e0497d79047d8fc9ee9084e448844446"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "derive-new",
  "proc-macro2",
@@ -1401,11 +1404,11 @@ dependencies = [
 [[package]]
 name = "burn-dispatch"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2087b9e12323e0d25cc0ebdccfee40427dfdec4a23fa6d3f49ba2aa1f94ac17"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-autodiff",
  "burn-backend",
+ "burn-cuda",
  "burn-ndarray",
  "burn-wgpu",
  "paste",
@@ -1414,8 +1417,7 @@ dependencies = [
 [[package]]
 name = "burn-flex"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0098bf6555c151517b4c98ca0e8ed1ab6a976e40f5f4e967c117b00eee21e192"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "aligned-vec",
  "burn-backend",
@@ -1433,8 +1435,7 @@ dependencies = [
 [[package]]
 name = "burn-fusion"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95e58fcfd52a60cdf2f7da34fbebf0ed38f960fbd8675d384bacd5795cf2bdf2"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-ir",
@@ -1451,8 +1452,7 @@ dependencies = [
 [[package]]
 name = "burn-ir"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a81a55c32f35c2265d9e15ba2e796013d9780d5a49f9e21ea0ac4d29609dbf13"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "hashbrown 0.16.1",
@@ -1462,8 +1462,7 @@ dependencies = [
 [[package]]
 name = "burn-ndarray"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dceb9692e292782bab7ad0259e8e8f5ee80ba2b0329a78f0ba589a26a9633dd6"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "atomic_float",
  "blas-src",
@@ -1490,8 +1489,7 @@ dependencies = [
 [[package]]
 name = "burn-nn"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e4acd90806fa8663610f1071f3a8992eb98637d2d0816ee3062b334f61af00"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-core",
  "num-traits",
@@ -1500,8 +1498,7 @@ dependencies = [
 [[package]]
 name = "burn-optim"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5ea466ae0b85bf18f7656cdc152050dc8c581057fbbe33bbed267e22600228"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-core",
  "derive-new",
@@ -1514,8 +1511,7 @@ dependencies = [
 [[package]]
 name = "burn-rl"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5bb875c36ddbb11f71a467bd6052d329d0ab78fbe79ab3777f4085e72290c4"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-core",
  "burn-optim",
@@ -1527,8 +1523,7 @@ dependencies = [
 [[package]]
 name = "burn-std"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81c7eb60eb2c316854af5b214fd55f59fc7b0e25dfde7db671f09cc49f269048"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -1545,8 +1540,7 @@ dependencies = [
 [[package]]
 name = "burn-tensor"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "223ed3804bb9436e401fc57b87e44c86267070b870813520ed9f706c80c81442"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-std",
@@ -1559,8 +1553,7 @@ dependencies = [
 [[package]]
 name = "burn-train"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa65e2e569e571bb8dc9d37aa8fcf715f522f8159c6ee87f665c1961fee5259f"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "async-channel 2.5.0",
  "burn-core",
@@ -1585,8 +1578,7 @@ dependencies = [
 [[package]]
 name = "burn-vision"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b5a3e9096977462cd22bf713087f9777e427f7693508871f86f5b1e8347a70"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "aligned-vec",
  "bon",
@@ -1608,8 +1600,7 @@ dependencies = [
 [[package]]
 name = "burn-wgpu"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eb009254af15922cb37814f3b3b61043046193ba2fde97c3879a25fbd51a92e"
+source = "git+https://github.com/erlkonig-ai/burn?rev=21adb25bb5277a1ff65179fa61442d8330d494d9#21adb25bb5277a1ff65179fa61442d8330d494d9"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
@@ -2700,8 +2691,7 @@ dependencies = [
 [[package]]
 name = "cubecl-macros"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77aa6df563e8e6a0926d2e9eeacb968737940a0e1ae9be819f6a65a341006e12"
+source = "git+https://github.com/erlkonig-ai/cubecl?rev=8b2aa74e2514e39562df6e384a271c2ef9e53b06#8b2aa74e2514e39562df6e384a271c2ef9e53b06"
 dependencies = [
  "cubecl-common",
  "darling 0.23.0",
