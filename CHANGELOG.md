@@ -4,8 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- Codex Orient notifications use the compact `Orient (forwarded tool output):`
-  prefix. Event text, sender attribution, queue retries, and watcher ownership
+- Codex Orient notifications forward only the captured news, without an added
+  preamble. Event text, sender attribution, queue retries, and watcher ownership
   are unchanged; rearming instructions stay in the standing hook guidance.
 
 - Relations, Message, Compass, Wiki, and Orient can read resident rollups

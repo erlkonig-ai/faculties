@@ -27,14 +27,10 @@ news=$(unset DRIVE_ENDPOINT; exec "$orient" "$@" wait)
 [ -n "$news" ] || exit 0
 printf '%s\n' "$news"
 
-message="Orient (forwarded tool output):
-
-$news"
-
 # Keep the SAME captured event on failure: running Orient again would omit
 # news it has already marked Presented. No eval, shell interpolation of news,
 # model/config overrides, or second conversation owner is involved.
-until codex queue --thread "$thread" --message "$message"; do
+until codex queue --thread "$thread" --message "$news"; do
     echo 'Codex queue failed; retaining this Orient notification and retrying in 5 seconds.' >&2
     sleep 5
 done

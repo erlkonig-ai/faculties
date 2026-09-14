@@ -76,10 +76,7 @@ run_wrapper
 [ "$(cat "$test_case/queue-count")" = 1 ]
 [ "$(wc -l < "$test_case/orient-calls" | tr -d ' ')" = 1 ]
 [ ! -e "$test_case/INJECTED" ]
-expected="Orient (forwarded tool output):
-
-$test_news"
-printf '%s\000' queue --thread "$thread" --message "$expected" > "$test_case/expected-queue"
+printf '%s\000' queue --thread "$thread" --message "$test_news" > "$test_case/expected-queue"
 cmp "$test_case/expected-queue" "$test_case/queue-1"
 printf '%s\000' --pile "$pile" --persona test-agent wait > "$test_case/expected-orient"
 cmp "$test_case/expected-orient" "$test_case/orient-args"
