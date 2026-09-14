@@ -32,8 +32,9 @@ wrapper.
 - Capture one successful, nonempty Orient report on stdout. `DRIVE_ENDPOINT`
   is unset only for that child so a Drive transport cannot consume the report.
 - Print the report into the exec log, then pass it as one quoted `--message`
-  argument to `codex queue --thread ID`. The envelope labels it as forwarded
-  tool output, not new user-authored instructions. No output is evaluated.
+  argument to `codex queue --thread ID`, prefixed with
+  `Orient (forwarded tool output):`. No output is evaluated; event text and
+  sender attribution are preserved without repeating the standing instructions.
 - Retry queue failures every five seconds with the **same** captured report;
   do not call Orient again after it has recorded those events as Presented.
 - Exit after queue acceptance. The awakened root processes relevant news and
