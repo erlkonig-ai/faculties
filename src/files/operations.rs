@@ -482,6 +482,13 @@ fn maintain_semantic(
             local_compute()
         );
     }
+    // The golden vectors first: this device must embed the fixed inputs to
+    // what the model collection records before it publishes a row.
+    let frozen = store
+        .snapshot()
+        .context("freeze the pile for the golden vectors")?;
+    crate::nomic::golden_report(&frozen)?.admit()?;
+    drop(frozen);
     let target = semantic_target(store, collection)?;
     let snapshot = runtime.block_on(async {
         drop(
@@ -496,6 +503,48 @@ fn maintain_semantic(
             .context("maintain the Files semantic index")
     })?;
     Ok((target, snapshot))
+}
+
+/// `files golden`: how this device embeds the golden inputs against the
+/// vectors the model collection records; `--publish` records them on the
+/// roots that have none, from the canonical compute only.
+#[cfg(feature = "local-embed")]
+fn cmd_golden(
+    store: &mut FacultyStore,
+    signer: &SigningKey,
+    publish: bool,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let (report, recorded) = if publish {
+        if local_compute() != SEMANTIC_COMPUTE {
+            bail!(
+                "golden vectors are recorded on {SEMANTIC_COMPUTE} and this machine is {}",
+                local_compute()
+            );
+        }
+        crate::nomic::golden_publish(store, signer)?
+    } else {
+        let frozen = store
+            .snapshot()
+            .context("freeze the pile for the golden vectors")?;
+        (crate::nomic::golden_report(&frozen)?, Vec::new())
+    };
+    for row in &report.rows {
+        let state = if recorded.contains(&row.model) {
+            "recorded now from this device".to_string()
+        } else {
+            match row.cosine() {
+                Some(cos) => format!("cos {cos:.5} to the recorded vector"),
+                None => "no vector recorded".to_string(),
+            }
+        };
+        out.line(format!("{:<5} root {:X}  {state}", row.model, row.root))?;
+    }
+    out.line(format!(
+        "computed on {}; a device below cos {} does not publish rows",
+        local_compute(),
+        crate::nomic::golden::FLOOR
+    ))
 }
 
 #[cfg(feature = "local-embed")]
@@ -2390,6 +2439,18 @@ impl Files {
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
         with_files_store(&self.storage, |store, collection, signer, runtime| {
             cmd_index(store, collection, signer, runtime, out)
+        })
+    }
+
+    pub fn golden(&self, publish: bool, out: &mut Out<'_>) -> Result<()> {
+        #[cfg(not(feature = "local-embed"))]
+        {
+            let _ = (publish, out);
+            bail!("`files golden` needs the embedders — rebuild with --features local-embed");
+        }
+        #[cfg(feature = "local-embed")]
+        with_files_store(&self.storage, |store, _collection, signer, _runtime| {
+            cmd_golden(store, signer, publish, out)
         })
     }
 

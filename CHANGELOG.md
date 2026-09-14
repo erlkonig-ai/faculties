@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Golden vectors for the Files semantic index. `files golden` embeds a fixed
+  sentence and a fixed procedural image with the pinned nomic models and
+  compares the result to the vectors recorded on the model roots
+  (`nomic::golden::{text_embedding,image_embedding}`, minted 2026-09-14);
+  `--publish` records them from the canonical compute where none is. Before
+  `files index` or `files add` publishes a row, the device must reproduce the
+  recorded vectors to cosine 0.999, so a driver or kernel change cannot split
+  the index in two without anyone noticing. A root with no recorded vector
+  publishes with a warning.
+
+- `files similar` ranks one row per file content: a mail attachment saved
+  several times is several entities over one blob and printed once; the
+  query's own bytes are left out under every entity that carries them. The
+  `--floor` help states the measured cosine bands of the index.
+
+- Files reads never ask for WRITE: `with_files_view` maintains the Succinct
+  and Rank9 targets only for a signer the descriptor admits as a writer, and
+  attaches the views as they stand for any other.
+
 - Body frame capture now passes the configured `REACHY_DAEMON` origin into the
   embedded Reachy SDK shim. Local origins retain the local media path; remote
   origins use the SDK's network/WebRTC mode, so camera capture follows the same

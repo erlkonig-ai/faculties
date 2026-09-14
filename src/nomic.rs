@@ -20,9 +20,15 @@
 use std::path::{Path, PathBuf};
 use triblespace::core::repo::pile::PileSnapshot;
 
+use crate::schemas::embeddings::Embedding768;
+use anybytes::View;
 use anyhow::{anyhow, Context, Result};
 use mary::model_collection::ModelPileSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
+use triblespace::core::id::ExclusiveId;
+use triblespace::macros::{entity, find, pattern};
+use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::*;
 
 /// Hugging Face model ids are provenance only; runtime never fetches them.
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
@@ -425,5 +431,262 @@ mod tests {
         let memory = include_str!("bin/memory.rs");
         assert!(!memory.contains(concat!("import-", "tokenizer")));
         assert!(!memory.contains(concat!("ingest-", "tokenizer")));
+    }
+}
+
+// ── golden vectors ─────────────────────────────────────────────────────────
+//
+// What the canonical compute embeds two fixed inputs to, recorded on each
+// model root in the working pile's model collection. A device about to
+// publish semantic rows embeds the same inputs first and compares, so a
+// driver or a kernel that computes something else refuses instead of
+// splitting the index in two without anyone noticing. JP, 2026-09-10: the
+// hardware in the type and the Sparks canonical; "keep the golden vector".
+
+pub mod golden {
+    use triblespace::prelude::*;
+
+    attributes! {
+        /// nomic-embed-text embeds [`TEXT`] to this vector on the canonical
+        /// compute. Minted 2026-09-14.
+        "18AD4630637E03D4A8214A7464D06AAC" as text_embedding: inlineencodings::Handle<crate::schemas::embeddings::Embedding768>;
+        /// nomic-embed-vision embeds [`image_png`] to this vector on the
+        /// canonical compute. Minted 2026-09-14.
+        "7415B83D46A1EDD8EE02BE1EBCEE6304" as image_embedding: inlineencodings::Handle<crate::schemas::embeddings::Embedding768>;
+    }
+
+    /// The fixed text every publishing device embeds.
+    pub const TEXT: &str = "Golden text for the Files semantic index, recorded 2026-09-14: every device that publishes rows embeds this sentence first, and the vector it makes is compared to the one recorded on the model root.";
+
+    /// The fixed image every publishing device embeds: 224 by 224, each
+    /// pixel a function of its coordinates, encoded as PNG in memory, so no
+    /// machine has to fetch anything to make it.
+    pub fn image_png() -> Vec<u8> {
+        let image = image::RgbImage::from_fn(224, 224, |x, y| {
+            image::Rgb([
+                ((x * 37 + y * 11) % 256) as u8,
+                ((x ^ y) % 256) as u8,
+                ((x * y / 197) % 256) as u8,
+            ])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode the golden image as PNG in memory");
+        png.into_inner()
+    }
+
+    /// Below this cosine between the vector this device computes and the
+    /// recorded one, the device does not publish. The port agreed with the
+    /// reference implementation to four nines (2026-09-12); a wrong kernel
+    /// lands near 0.9.
+    pub const FLOOR: f32 = 0.999;
+}
+
+/// One model root's golden comparison: what this device computes for the
+/// fixed input and what the model collection records.
+pub struct GoldenRow {
+    /// `text` or `image`.
+    pub model: &'static str,
+    pub root: triblespace::core::id::Id,
+    pub computed: Vec<f32>,
+    pub recorded: Option<Vec<f32>>,
+}
+
+impl GoldenRow {
+    pub fn cosine(&self) -> Option<f32> {
+        self.recorded
+            .as_ref()
+            .map(|recorded| cosine(&self.computed, recorded))
+    }
+}
+
+/// The golden comparison for every model the semantic index embeds with.
+pub struct GoldenReport {
+    pub rows: Vec<GoldenRow>,
+}
+
+impl GoldenReport {
+    /// Admit this device as a publisher: every recorded golden vector is
+    /// reproduced to at least [`golden::FLOOR`]. A root with no recorded
+    /// vector admits with a warning on stderr; nothing was claimed yet.
+    pub fn admit(&self) -> Result<()> {
+        for row in &self.rows {
+            match row.cosine() {
+                Some(cos) if cos < golden::FLOOR => anyhow::bail!(
+                    "this device embeds the golden {} input to cosine {cos:.5} of the vector recorded on root {:X} (floor {}); it does not publish rows into an index computed elsewhere",
+                    row.model,
+                    row.root,
+                    golden::FLOOR
+                ),
+                Some(_) => {}
+                None => eprintln!(
+                    "warning: no golden vector recorded on {} root {:X}; rows publish unverified (`files golden --publish` on the canonical device records one)",
+                    row.model, row.root
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Cosine of two vectors of any norm.
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Embed the golden inputs with the models the index pins and read what the
+/// model collection records for them.
+pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
+    use mary::embed::LocalEmbedder as _;
+    use triblespace::core::repo::BlobStoreGet;
+    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+        .context("freeze the working pile's model collection for the golden vectors")?;
+    let roots = index_models_in(store)?;
+    let text = text_embedder_from(&snapshot, Path::new("the working pile"))?;
+    let vision = vision_embedder_from(&snapshot, Path::new("the working pile"))?;
+    let computed_text = crate::memory_cover::l2_normalize(
+        text.embed_document(golden::TEXT)
+            .context("embed the golden text")?,
+    );
+    let computed_image = crate::memory_cover::l2_normalize(
+        vision
+            .embed_image(&golden::image_png())
+            .context("embed the golden image")?,
+    );
+    let facts = snapshot.facts();
+    let text_root = roots.text_root;
+    let vision_root = roots.vision_root;
+    let recorded_text: Option<Inline<Handle<Embedding768>>> = find!(
+        h: Inline<Handle<Embedding768>>,
+        pattern!(facts, [{ text_root @ golden::text_embedding: ?h }])
+    )
+    .next();
+    let recorded_image: Option<Inline<Handle<Embedding768>>> = find!(
+        h: Inline<Handle<Embedding768>>,
+        pattern!(facts, [{ vision_root @ golden::image_embedding: ?h }])
+    )
+    .next();
+    let read = |handle: Option<Inline<Handle<Embedding768>>>| -> Result<Option<Vec<f32>>> {
+        handle
+            .map(|h| {
+                let view: View<[f32]> = store
+                    .get(h)
+                    .map_err(|error| anyhow!("read a recorded golden vector: {error:?}"))?;
+                Ok(view.as_ref().to_vec())
+            })
+            .transpose()
+    };
+    Ok(GoldenReport {
+        rows: vec![
+            GoldenRow {
+                model: "text",
+                root: text_root,
+                computed: computed_text,
+                recorded: read(recorded_text)?,
+            },
+            GoldenRow {
+                model: "image",
+                root: vision_root,
+                computed: computed_image,
+                recorded: read(recorded_image)?,
+            },
+        ],
+    })
+}
+
+/// Record this device's golden vectors on the roots that have none, as one
+/// signed commit into the model collection. Returns the report taken before
+/// publishing and the models recorded now; a root that already carries a
+/// vector is left as it is, the report says how close this device came.
+pub fn golden_publish(
+    store: &mut crate::storage::FacultyStore,
+    signer: &ed25519_dalek::SigningKey,
+) -> Result<(GoldenReport, Vec<&'static str>)> {
+    use triblespace::core::repo::SnapshotSource;
+    let snapshot = store
+        .snapshot()
+        .context("freeze the pile for the golden vectors")?;
+    let report = golden_report(&snapshot)?;
+    drop(snapshot);
+    let mut fragment = Fragment::empty();
+    let mut recorded = Vec::new();
+    for row in &report.rows {
+        if row.recorded.is_some() {
+            continue;
+        }
+        let handle = fragment.put::<Embedding768, _>(row.computed.clone());
+        let root = row.root;
+        match row.model {
+            "text" => {
+                fragment +=
+                    entity! { ExclusiveId::force_ref(&root) @ golden::text_embedding: handle }
+            }
+            _ => {
+                fragment +=
+                    entity! { ExclusiveId::force_ref(&root) @ golden::image_embedding: handle }
+            }
+        }
+        recorded.push(row.model);
+    }
+    if !recorded.is_empty() {
+        let mut pile = store.store();
+        mary::model_collection::publish_model_fragment(&mut pile, signer, fragment)
+            .context("record the golden vectors on the model roots")?;
+    }
+    Ok((report, recorded))
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use triblespace::macros::id_hex;
+
+    #[test]
+    fn golden_image_for_files_index_is_deterministic_and_decodes() {
+        let first = golden::image_png();
+        let second = golden::image_png();
+        assert_eq!(first, second);
+        let decoded = image::load_from_memory(&first).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (224, 224));
+    }
+
+    #[test]
+    fn golden_files_admission_refuses_below_the_floor() {
+        let root = id_hex!("18AD4630637E03D4A8214A7464D06AAC");
+        let unit = |i: usize| {
+            let mut v = vec![0.0f32; 768];
+            v[i] = 1.0;
+            v
+        };
+        let row = |recorded: Option<Vec<f32>>| GoldenRow {
+            model: "text",
+            root,
+            computed: unit(0),
+            recorded,
+        };
+        assert!(GoldenReport {
+            rows: vec![row(Some(unit(0)))]
+        }
+        .admit()
+        .is_ok());
+        assert!(GoldenReport {
+            rows: vec![row(None)]
+        }
+        .admit()
+        .is_ok());
+        let off = GoldenReport {
+            rows: vec![row(Some(unit(1)))],
+        };
+        let error = off.admit().unwrap_err().to_string();
+        assert!(error.contains("cosine 0.00000"), "{error}");
+        assert!((cosine(&unit(0), &unit(0)) - 1.0).abs() < 1e-6);
     }
 }

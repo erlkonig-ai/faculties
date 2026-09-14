@@ -139,6 +139,15 @@ const VERBS: &[Verb] = &[
         params: &[],
     },
     Verb {
+        name: "golden",
+        about: "How this device embeds the golden inputs against the vectors recorded on the model roots; --publish records them where none is, from the canonical compute (requires local-embed)",
+        params: &[Param::caller(
+            "publish",
+            "Record this device's golden vectors on the roots that have none",
+        )
+        .flag()],
+    },
+    Verb {
         name: "embed7b",
         about: "Embed images or PDF pages with nomic-embed-multimodal-7b (requires local-embed)",
         params: &[
@@ -308,6 +317,7 @@ fn execute_with_input(
             out,
         ),
         "index" => files.index(out),
+        "golden" => files.golden(invocation.flag("publish"), out),
         "embed7b" => files.embed7b(
             &EmbeddingOptions {
                 force: invocation.flag("force"),
