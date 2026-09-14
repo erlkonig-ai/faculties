@@ -246,6 +246,32 @@ tempfile = "3"
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 # The pinned GORBIE source cohort provides resident PNG capture.
 GORBIE = { path = "../GORBIE" }
+# Match Mary's deterministic macro expansion and mixed-dtype matmul fixes.
+# Cargo ignores a dependency's patch table, and Burn's workspace crates must
+# stay on one source lineage to avoid resolving duplicate burn-tensor types.
+cubecl-macros = { git = "https://github.com/erlkonig-ai/cubecl", rev = "8b2aa74e2514e39562df6e384a271c2ef9e53b06" }
+burn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-autodiff = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-backend = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-core = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cubecl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cubecl-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-cuda = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-dataset = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-derive = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-dispatch = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-flex = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-ir = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-ndarray = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-nn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-optim = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-rl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-std = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
+burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
 cubecl-cuda = { path = "../cubecl-fork/cubecl-cuda" }
 cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
