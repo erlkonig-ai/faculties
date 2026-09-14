@@ -25,8 +25,7 @@ use anybytes::View;
 use anyhow::{anyhow, Context, Result};
 use mary::model_collection::ModelPileSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::id::ExclusiveId;
+use triblespace::core::collection::CollectionHandle;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -181,73 +180,42 @@ fn vision_embedder_from(
     )
 }
 
-/// The models the semantic index embeds with, as the index pins them: the
-/// member archives of the working pile's model collection (exact bytes) and
-/// the one root this loader would select for each of the two nomic models,
-/// packed preferred.
+/// Explicit model references used by the semantic index. Physical member
+/// archives and unrelated facts in this collection are not model identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexModels {
-    pub archives: Vec<[u8; 32]>,
+    pub collection: CollectionHandle,
     pub text_root: triblespace::core::id::Id,
     pub vision_root: triblespace::core::id::Id,
+    pub tokenizer_root: triblespace::core::id::Id,
 }
 
 /// [`IndexModels`] from a pile snapshot the caller already holds.
 ///
-/// The pinned archives are the member archives of the model collection that
-/// carry the two selected roots with their tensors, and the one that carries
-/// the text tokenizer; not every member. Until 2026-09-14 every member was
-/// pinned, so any later commit into the model collection (a golden vector
-/// recorded on a root, another model packed) re-keyed the index and every
-/// `files` command addressed a new, empty one. The index is a function of
-/// the models it embeds with, and of nothing else in that collection.
+/// Discovery selects the roots once, with packed weights preferred, and
+/// records the containing collection handle. The descriptor does not change
+/// when the same selected roots acquire observations, share an archive with
+/// another model, or are packaged into different collection support.
 pub fn index_models_in(store: &PileSnapshot) -> Result<IndexModels> {
-    use triblespace::core::repo::BlobStoreGet;
     let snapshot = mary::model_collection::snapshot_model_collection_in(store)
         .context("freeze the working pile's model collection for the semantic index")?;
-    let text_root = preferred_root(&snapshot, NOMIC_TEXT_MODEL)?;
-    let vision_root = preferred_root(&snapshot, NOMIC_VISION_MODEL)?;
-    let trace = std::env::var_os("SEMANTIC_TRACE").is_some();
-    let mut archives = Vec::new();
-    for member in snapshot.support().members() {
-        let raw = member.raw;
-        let archive: TribleSet = store
-            .get(Inline::<Handle<SimpleArchive>>::new(raw))
-            .map_err(|error| {
-                anyhow!(
-                    "read model collection member {}: {error:?}",
-                    hex::encode_upper(raw)
-                )
-            })?;
-        let text =
-            mary::selection::select_model_root(&archive, store, ModelSelector::Root(text_root))
-                .is_ok();
-        let vision =
-            mary::selection::select_model_root(&archive, store, ModelSelector::Root(vision_root))
-                .is_ok();
-        let tokenizer = mary::selection::select_tokenizer_root(
-            &archive,
-            store,
-            TokenizerSelector::Name(NOMIC_TEXT_MODEL),
-        )
-        .is_ok();
-        if trace {
-            eprintln!(
-                "model archive {}: {} facts; text {text}, vision {vision}, tokenizer {tokenizer}",
-                hex::encode_upper(raw),
-                archive.len()
-            );
-        }
-        if text || vision || tokenizer {
-            archives.push(raw);
-        }
-    }
-    if archives.is_empty() {
-        anyhow::bail!("no member of the model collection carries the nomic roots {text_root:X} and {vision_root:X}");
-    }
+    index_models_from(&snapshot)
+}
+
+fn index_models_from(snapshot: &ModelPileSnapshot) -> Result<IndexModels> {
+    let text_root = preferred_root(snapshot, NOMIC_TEXT_MODEL)?;
+    let vision_root = preferred_root(snapshot, NOMIC_VISION_MODEL)?;
+    let tokenizer_root = mary::selection::select_tokenizer_root(
+        snapshot.facts(),
+        snapshot.store(),
+        TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+    )
+    .context("select the semantic index's text tokenizer root")?;
     Ok(IndexModels {
-        archives,
+        collection: snapshot.support().collection().handle(),
         text_root,
         vision_root,
+        tokenizer_root,
     })
 }
 
@@ -481,26 +449,18 @@ mod tests {
 
 // ── golden vectors ─────────────────────────────────────────────────────────
 //
-// What the canonical compute embeds two fixed inputs to, recorded on each
-// model root in the working pile's model collection. A device about to
+// What the canonical compute embeds two fixed inputs to, recorded as separate
+// observations referring to the model roots. A device about to
 // publish semantic rows embeds the same inputs first and compares, so a
 // driver or a kernel that computes something else refuses instead of
 // splitting the index in two without anyone noticing. JP, 2026-09-10: the
 // hardware in the type and the Sparks canonical; "keep the golden vector".
 
 pub mod golden {
-    use triblespace::prelude::*;
+    pub use crate::schemas::embeddings::golden::{image_embedding, text_embedding};
 
-    attributes! {
-        /// nomic-embed-text embeds [`TEXT`] to this vector on the canonical
-        /// compute. Minted 2026-09-14.
-        "18AD4630637E03D4A8214A7464D06AAC" as text_embedding: inlineencodings::Handle<crate::schemas::embeddings::Embedding768>;
-        /// nomic-embed-vision embeds [`image_png`] to this vector on the
-        /// canonical compute. Minted 2026-09-14.
-        "7415B83D46A1EDD8EE02BE1EBCEE6304" as image_embedding: inlineencodings::Handle<crate::schemas::embeddings::Embedding768>;
-    }
-
-    /// The fixed text every publishing device embeds.
+    /// The fixed text every publishing device embeds. Its historical wording
+    /// remains byte-for-byte unchanged so existing observations still compare.
     pub const TEXT: &str = "Golden text for the Files semantic index, recorded 2026-09-14: every device that publishes rows embeds this sentence first, and the vector it makes is compared to the one recorded on the model root.";
 
     /// The fixed image every publishing device embeds: 224 by 224, each
@@ -535,23 +495,49 @@ pub struct GoldenRow {
     pub model: &'static str,
     pub root: triblespace::core::id::Id,
     pub computed: Vec<f32>,
-    pub recorded: Option<Vec<f32>>,
+    /// Every matching observation, including historical root-owned facts.
+    pub recorded: Vec<Vec<f32>>,
 }
 
 impl GoldenRow {
     pub fn cosine(&self) -> Option<f32> {
         self.recorded
-            .as_ref()
+            .iter()
             .map(|recorded| cosine(&self.computed, recorded))
+            .min_by(f32::total_cmp)
     }
 }
 
 /// The golden comparison for every model the semantic index embeds with.
 pub struct GoldenReport {
+    pub model_collection: CollectionHandle,
     pub rows: Vec<GoldenRow>,
 }
 
 impl GoldenReport {
+    fn unrecorded_observations(&self) -> (Fragment, Vec<&'static str>) {
+        let mut fragment = Fragment::empty();
+        let mut recorded = Vec::new();
+        for row in &self.rows {
+            if !row.recorded.is_empty() {
+                continue;
+            }
+            let handle = fragment.put::<Embedding768, _>(row.computed.clone());
+            fragment += match row.model {
+                "text" => entity! {
+                    mary::format::attrs::model_root: row.root,
+                    golden::text_embedding: handle,
+                },
+                _ => entity! {
+                    mary::format::attrs::model_root: row.root,
+                    golden::image_embedding: handle,
+                },
+            };
+            recorded.push(row.model);
+        }
+        (fragment, recorded)
+    }
+
     /// Admit this device as a publisher: every recorded golden vector is
     /// reproduced to at least [`golden::FLOOR`]. A root with no recorded
     /// vector admits with a warning on stderr; nothing was claimed yet.
@@ -559,14 +545,14 @@ impl GoldenReport {
         for row in &self.rows {
             match row.cosine() {
                 Some(cos) if cos < golden::FLOOR => anyhow::bail!(
-                    "this device embeds the golden {} input to cosine {cos:.5} of the vector recorded on root {:X} (floor {}); it does not publish rows into an index computed elsewhere",
+                    "this device embeds the golden {} input to cosine {cos:.5} of a vector recorded for root {:X} (floor {}); it does not publish rows into an index computed elsewhere",
                     row.model,
                     row.root,
                     golden::FLOOR
                 ),
                 Some(_) => {}
                 None => eprintln!(
-                    "warning: no golden vector recorded on {} root {:X}; rows publish unverified (`files golden --publish` on the canonical device records one)",
+                    "warning: no golden vector recorded for {} root {:X}; rows publish unverified (`files golden --publish` on the canonical device records one)",
                     row.model, row.root
                 ),
             }
@@ -594,9 +580,31 @@ pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
     use triblespace::core::repo::BlobStoreGet;
     let snapshot = mary::model_collection::snapshot_model_collection_in(store)
         .context("freeze the working pile's model collection for the golden vectors")?;
-    let roots = index_models_in(store)?;
-    let text = text_embedder_from(&snapshot, Path::new("the working pile"))?;
-    let vision = vision_embedder_from(&snapshot, Path::new("the working pile"))?;
+    let roots = index_models_from(&snapshot)?;
+    let facts = snapshot.facts();
+    let text = mary::embed::nomic_text_from_parts(
+        mary::selection::load_keymap_from_graph(
+            facts,
+            store,
+            ModelSelector::Root(roots.text_root),
+        )?,
+        mary::selection::load_tokenizer_from_graph(
+            facts,
+            store,
+            TokenizerSelector::Root(roots.tokenizer_root),
+        )?,
+        mary::embed::default_device(),
+    )
+    .context("load the semantic index's selected text model for golden comparison")?;
+    let vision = mary::embed::load_nomic_vision_from_keymap(
+        mary::selection::load_keymap_from_graph(
+            facts,
+            store,
+            ModelSelector::Root(roots.vision_root),
+        )?,
+        mary::embed::default_device(),
+    )
+    .context("load the semantic index's selected vision model for golden comparison")?;
     let computed_text = crate::memory_cover::l2_normalize(
         text.embed_document(golden::TEXT)
             .context("embed the golden text")?,
@@ -606,30 +614,48 @@ pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
             .embed_image(&golden::image_png())
             .context("embed the golden image")?,
     );
-    let facts = snapshot.facts();
     let text_root = roots.text_root;
     let vision_root = roots.vision_root;
-    let recorded_text: Option<Inline<Handle<Embedding768>>> = find!(
+    let recorded_text: std::collections::BTreeSet<Inline<Handle<Embedding768>>> = find!(
+        h: Inline<Handle<Embedding768>>,
+        pattern!(facts, [{ _?observation @
+            mary::format::attrs::model_root: text_root,
+            golden::text_embedding: ?h,
+        }])
+    )
+    .chain(find!(
         h: Inline<Handle<Embedding768>>,
         pattern!(facts, [{ text_root @ golden::text_embedding: ?h }])
+    ))
+    .collect();
+    let recorded_image: std::collections::BTreeSet<Inline<Handle<Embedding768>>> = find!(
+        h: Inline<Handle<Embedding768>>,
+        pattern!(facts, [{ _?observation @
+            mary::format::attrs::model_root: vision_root,
+            golden::image_embedding: ?h,
+        }])
     )
-    .next();
-    let recorded_image: Option<Inline<Handle<Embedding768>>> = find!(
+    .chain(find!(
         h: Inline<Handle<Embedding768>>,
         pattern!(facts, [{ vision_root @ golden::image_embedding: ?h }])
-    )
-    .next();
-    let read = |handle: Option<Inline<Handle<Embedding768>>>| -> Result<Option<Vec<f32>>> {
-        handle
+    ))
+    .collect();
+    // Historical vectors remain readable in place; only new publications use
+    // observation subjects. Compare every matching value rather than choosing
+    // one by archive order or requiring single-valued facts.
+    let read = |handles: std::collections::BTreeSet<Inline<Handle<Embedding768>>>| -> Result<Vec<Vec<f32>>> {
+        handles
+            .into_iter()
             .map(|h| {
                 let view: View<[f32]> = store
                     .get(h)
                     .map_err(|error| anyhow!("read a recorded golden vector: {error:?}"))?;
                 Ok(view.as_ref().to_vec())
             })
-            .transpose()
+            .collect()
     };
     Ok(GoldenReport {
+        model_collection: roots.collection,
         rows: vec![
             GoldenRow {
                 model: "text",
@@ -647,10 +673,10 @@ pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
     })
 }
 
-/// Record this device's golden vectors on the roots that have none, as one
-/// signed commit into the model collection. Returns the report taken before
-/// publishing and the models recorded now; a root that already carries a
-/// vector is left as it is, the report says how close this device came.
+/// Record separate golden-vector observations for roots that have none, as
+/// one signed commit into the explicitly observed model collection. Historical
+/// root-owned facts remain untouched and readable; no model entity is owned or
+/// annotated by this publication.
 pub fn golden_publish(
     store: &mut crate::storage::FacultyStore,
     signer: &ed25519_dalek::SigningKey,
@@ -660,31 +686,15 @@ pub fn golden_publish(
         .snapshot()
         .context("freeze the pile for the golden vectors")?;
     let report = golden_report(&snapshot)?;
+    let collection =
+        mary::model_collection::ModelCollection::open(&snapshot, report.model_collection)
+            .context("open the golden report's model collection")?;
     drop(snapshot);
-    let mut fragment = Fragment::empty();
-    let mut recorded = Vec::new();
-    for row in &report.rows {
-        if row.recorded.is_some() {
-            continue;
-        }
-        let handle = fragment.put::<Embedding768, _>(row.computed.clone());
-        let root = row.root;
-        match row.model {
-            "text" => {
-                fragment +=
-                    entity! { ExclusiveId::force_ref(&root) @ golden::text_embedding: handle }
-            }
-            _ => {
-                fragment +=
-                    entity! { ExclusiveId::force_ref(&root) @ golden::image_embedding: handle }
-            }
-        }
-        recorded.push(row.model);
-    }
+    let (fragment, recorded) = report.unrecorded_observations();
     if !recorded.is_empty() {
-        let mut pile = store.store();
-        mary::model_collection::publish_model_fragment(&mut pile, signer, fragment)
-            .context("record the golden vectors on the model roots")?;
+        store
+            .commit(collection, signer, fragment)
+            .context("record golden observations referring to the model roots")?;
     }
     Ok((report, recorded))
 }
@@ -711,27 +721,96 @@ mod golden_tests {
             v[i] = 1.0;
             v
         };
-        let row = |recorded: Option<Vec<f32>>| GoldenRow {
+        let row = |recorded: Vec<Vec<f32>>| GoldenRow {
             model: "text",
             root,
             computed: unit(0),
             recorded,
         };
         assert!(GoldenReport {
-            rows: vec![row(Some(unit(0)))]
+            model_collection: Inline::new([7; 32]),
+            rows: vec![row(vec![unit(0)])]
         }
         .admit()
         .is_ok());
         assert!(GoldenReport {
-            rows: vec![row(None)]
+            model_collection: Inline::new([7; 32]),
+            rows: vec![row(vec![])]
         }
         .admit()
         .is_ok());
         let off = GoldenReport {
-            rows: vec![row(Some(unit(1)))],
+            model_collection: Inline::new([7; 32]),
+            rows: vec![row(vec![unit(0), unit(1)])],
         };
         let error = off.admit().unwrap_err().to_string();
         assert!(error.contains("cosine 0.00000"), "{error}");
         assert!((cosine(&unit(0), &unit(0)) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn golden_observations_reference_models_without_owning_their_facts() {
+        let text = triblespace::core::id::fucid();
+        let vision = triblespace::core::id::fucid();
+        let report = GoldenReport {
+            model_collection: Inline::new([7; 32]),
+            rows: vec![
+                GoldenRow {
+                    model: "text",
+                    root: *text,
+                    computed: vec![1.0; 768],
+                    recorded: Vec::new(),
+                },
+                GoldenRow {
+                    model: "image",
+                    root: *vision,
+                    computed: vec![2.0; 768],
+                    recorded: Vec::new(),
+                },
+            ],
+        };
+        let (observations, recorded) = report.unrecorded_observations();
+        assert_eq!(recorded, ["text", "image"]);
+        assert!(observations
+            .facts()
+            .iter()
+            .all(|fact| fact.e() != &*text && fact.e() != &*vision));
+        let text_subjects: Vec<Id> = find!(
+            observation: Id,
+            pattern!(observations.facts(), [{ ?observation @
+                mary::format::attrs::model_root: *text,
+                golden::text_embedding: _?vector,
+            }])
+        )
+        .collect();
+        let vision_subjects: Vec<Id> = find!(
+            observation: Id,
+            pattern!(observations.facts(), [{ ?observation @
+                mary::format::attrs::model_root: *vision,
+                golden::image_embedding: _?vector,
+            }])
+        )
+        .collect();
+        assert_eq!(text_subjects.len(), 1);
+        assert_eq!(vision_subjects.len(), 1);
+        assert_ne!(text_subjects[0], vision_subjects[0]);
+        assert_eq!(observations, report.unrecorded_observations().0);
+
+        // A historical observation satisfies the publication precondition in
+        // place: no migration or duplicate observation is silently authored.
+        let historical = GoldenReport {
+            model_collection: report.model_collection,
+            rows: report
+                .rows
+                .into_iter()
+                .map(|mut row| {
+                    row.recorded.push(row.computed.clone());
+                    row
+                })
+                .collect(),
+        };
+        let (unchanged, recorded) = historical.unrecorded_observations();
+        assert!(unchanged.facts().is_empty());
+        assert!(recorded.is_empty());
     }
 }

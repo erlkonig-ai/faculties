@@ -39,6 +39,23 @@ pub const DIM: usize = 768;
 /// `F6BE4C16A56001FEA03A5927C6ED3814`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("F6BE4C16A56001FEA03A5927C6ED3814");
 
+/// Golden-vector observations for the Files semantic index. These attributes
+/// retain their original 2026-09-14 anchors and embedding encoding; new facts
+/// live on separate observations with Mary's `model_root` reference. Historical
+/// root-owned facts remain readable without rewriting their subjects or ids.
+pub mod golden {
+    use triblespace::prelude::*;
+
+    attributes! {
+        /// nomic-embed-text embeds the fixed golden text to this vector on
+        /// the canonical compute. Minted 2026-09-14.
+        "18AD4630637E03D4A8214A7464D06AAC" as text_embedding: inlineencodings::Handle<super::Embedding768>;
+        /// nomic-embed-vision embeds the fixed golden image to this vector on
+        /// the canonical compute. Minted 2026-09-14.
+        "7415B83D46A1EDD8EE02BE1EBCEE6304" as image_embedding: inlineencodings::Handle<super::Embedding768>;
+    }
+}
+
 // ── dimension-typed embedding encoding ────────────────────────────────────
 
 /// Error decoding a dimension-typed embedding blob.

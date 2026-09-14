@@ -428,16 +428,18 @@ const SEMANTIC_COMPUTE: &str = "gb10";
 /// working pile's model roots: file bytes under `file::content` through the
 /// pinned nomic-vision root, rows keyed by attribute and entity. The same
 /// descriptor from every machine, so `files similar` never has to discover
-/// it; a new model in the pile is a new descriptor.
+/// it. Only changing the selected references creates a new descriptor; another
+/// model or observation in the same collection does not.
 #[cfg(feature = "local-embed")]
 fn semantic_index(descriptors: &PileSnapshot) -> Result<SemanticIndex<embeddings::Embedding768>> {
     let models = crate::nomic::index_models_in(descriptors)?;
     SemanticIndex::new(
         Some(file::content.id()),
         [],
-        models.archives,
+        models.collection,
         Some(models.vision_root),
         Some(models.text_root),
+        Some(models.tokenizer_root),
         SEMANTIC_COMPUTE,
         embeddings::DIM,
     )
@@ -506,8 +508,8 @@ fn maintain_semantic(
 }
 
 /// `files golden`: how this device embeds the golden inputs against the
-/// vectors the model collection records; `--publish` records them on the
-/// roots that have none, from the canonical compute only.
+/// vectors the model collection records; `--publish` records separate
+/// observations referring to roots that have none, from the canonical compute.
 #[cfg(feature = "local-embed")]
 fn cmd_golden(
     store: &mut FacultyStore,
@@ -3128,6 +3130,99 @@ mod tests {
                 .unwrap();
         fragment += tokenizer;
         fragment
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn semantic_descriptor_ignores_observations_extra_models_and_support_packaging() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
+
+        let split = TestPile::new();
+        let packed = TestPile::new();
+        let signer = SigningKey::from_bytes(&[0x72; 32]);
+        let text = native_model_fragment(crate::nomic::NOMIC_TEXT_MODEL, "text.weight", 1.0);
+        let vision = native_model_fragment(crate::nomic::NOMIC_VISION_MODEL, "vision.weight", 2.0);
+        let tokenizer = native_tokenizer_fragment(crate::nomic::NOMIC_TEXT_MODEL, WORDPIECE);
+        let mut split_pile = Pile::open(&split.path).unwrap();
+        for fragment in [text.clone(), vision.clone(), tokenizer.clone()] {
+            mary::model_collection::publish_model_fragment(&mut split_pile, &signer, fragment)
+                .unwrap();
+        }
+        let frozen = split_pile.snapshot().unwrap();
+        let before = semantic_index(&frozen).unwrap();
+        let selected_text = before.text_root.unwrap();
+        let other_root = fucid();
+        let mut additions = entity! {
+            mary::format::attrs::model_root: selected_text,
+            crate::nomic::golden::text_embedding: vec![1.0f32; embeddings::DIM],
+        };
+        additions += entity! {
+            mary::format::attrs::model_root: &other_root,
+            crate::nomic::golden::text_embedding: vec![0.0f32; embeddings::DIM],
+        };
+        // Historical root-owned observations also leave the reference tuple
+        // alone. They remain in place; this test does not reinterpret their ids.
+        additions += entity! { ExclusiveId::force_ref(&selected_text) @
+            crate::nomic::golden::text_embedding: vec![1.0f32; embeddings::DIM],
+        };
+        additions += native_model_fragment("another/model", "other.weight", 3.0);
+        additions += native_tokenizer_fragment("another/tokenizer", LATER_WORDPIECE);
+        mary::model_collection::publish_model_fragment(&mut split_pile, &signer, additions.clone())
+            .unwrap();
+        let widened = split_pile.snapshot().unwrap();
+        let after = semantic_index(&widened).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before.fragment(), after.fragment());
+
+        // A separate replica has the same roots and annotations in one member
+        // instead of four. Collection identity stays the same; support does not.
+        let mut packed_pile = Pile::open(&packed.path).unwrap();
+        mary::model_collection::publish_model_fragment(
+            &mut packed_pile,
+            &signer,
+            text + vision + tokenizer + additions,
+        )
+        .unwrap();
+        let repackaged = packed_pile.snapshot().unwrap();
+        let repackaged_index = semantic_index(&repackaged).unwrap();
+        assert_eq!(before, repackaged_index);
+        let split_models = mary::model_collection::snapshot_model_collection_in(&widened).unwrap();
+        let packed_models =
+            mary::model_collection::snapshot_model_collection_in(&repackaged).unwrap();
+        assert_eq!(split_models.support().len(), 4);
+        assert_eq!(packed_models.support().len(), 1);
+        assert_eq!(split_models.facts(), packed_models.facts());
+
+        let root = signer.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let split_source = split_pile.collection("files", policy.clone()).unwrap();
+        let packed_source = packed_pile.collection("files", policy.clone()).unwrap();
+        let first_target = split_pile
+            .derive_with(split_source, before, policy.clone())
+            .unwrap();
+        let later_target = split_pile
+            .derive_with(split_source, after, policy.clone())
+            .unwrap();
+        let repackaged_target = packed_pile
+            .derive_with(packed_source, repackaged_index, policy)
+            .unwrap();
+        assert_eq!(first_target, later_target);
+        assert_eq!(first_target, repackaged_target);
+
+        // Tokenizer selection remains explicit even with an unrelated second
+        // tokenizer in the same collection.
+        let selected = crate::nomic::index_models_in(&repackaged).unwrap();
+        let tokenizer = mary::selection::load_tokenizer_from_graph(
+            packed_models.facts(),
+            &repackaged,
+            mary::selection::TokenizerSelector::Root(selected.tokenizer_root),
+        )
+        .unwrap();
+        assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+        assert_eq!(tokenizer.token_to_id("later"), None);
+        split_pile.close().unwrap();
+        packed_pile.close().unwrap();
     }
 
     #[cfg(feature = "local-embed")]

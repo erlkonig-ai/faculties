@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Files semantic indexes now carry explicit text, vision, and tokenizer root
+  references plus their model collection handle. Golden observations, other
+  models, and differently packaged support no longer change the descriptor for
+  the same selected references. New golden vectors are separate observation
+  entities pointing to Mary `model_root`, without taking ownership of or adding
+  facts to model roots. Historical vector facts and ids remain readable in
+  place; all matching observations participate in comparison. This is a new
+  descriptor algorithm, not an automatic migration or index recomputation.
+  It uses TribleSpace's algorithm `2B69128192930EE0782CCA03B97677F5` and tokenizer
+  anchor `E6A241C22B0457CD24AE65C1FC6AC177`, minted with `trible genid` 2026-09-14,
+  and Mary's shared collection-reference anchor `CC07F0AFB3DCFD254A54A883E86E2617`.
+
 - Golden vectors for the Files semantic index. `files golden` embeds a fixed
   sentence and a fixed procedural image with the pinned nomic models and
   compares the result to the vectors recorded on the model roots

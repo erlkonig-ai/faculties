@@ -140,10 +140,10 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "golden",
-        about: "How this device embeds the golden inputs against the vectors recorded on the model roots; --publish records them where none is, from the canonical compute (requires local-embed)",
+        about: "How this device embeds the golden inputs against recorded model observations; --publish records missing observations from the canonical compute (requires local-embed)",
         params: &[Param::caller(
             "publish",
-            "Record this device's golden vectors on the roots that have none",
+            "Record separate golden-vector observations for roots that have none",
         )
         .flag()],
     },
