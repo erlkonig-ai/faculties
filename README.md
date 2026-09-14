@@ -44,12 +44,12 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
-git clone --branch zero-copy-seam https://github.com/erlkonig-ai/cubecl cubecl-fork
+git clone --branch graph-capture https://github.com/erlkonig-ai/cubecl cubecl-fork
 git -C triblespace-rs checkout 9c82f23f84b515c105234e2cd5319f081c0e1430
-git -C mary checkout d6802b09ca7b693819238d2520378aff3571af8b
+git -C mary checkout 9d47178082a5a346524f873352dfa5ab6fbef110
 git -C GORBIE checkout 22a31671bb5b2591b69ae13c1d0069cbf963c17b
-git -C soma checkout e75ef119fae679aed27420fc5e0835be60f5920d
-git -C cubecl-fork checkout f4b58290e5c1acb26c1c00d8b0606b208816c295
+git -C soma checkout 6cdb487c93b10bb183d62f9d547dc1627782c228
+git -C cubecl-fork checkout 1fc64da1fba7f9609d19a569000bdd6a6eaea2cd
 cd faculties
 RUSTFLAGS='-Ctarget-cpu=native' cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release

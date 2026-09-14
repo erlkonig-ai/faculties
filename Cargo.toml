@@ -236,16 +236,17 @@ tempfile = "3"
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own
 # patch section is ignored when mary is consumed as a path dep here. We mirror
-# it: the nomic-mm7b zero-copy aliasing path (`local-embed`) needs the cubecl
-# fork (adds `register_external_aliased`) and the V3 256-byte-aligned local
-# triblespace-core. The whole suite is on one cubecl lineage (0.10): the
-# widgets GPU graph layout, mary's model ports, and these fork patches all
-# resolve to the same cubecl — widgets, local-embed, imagine, and voice are
-# co-buildable in a single `cargo install`.
+# it: the nomic-mm7b zero-copy aliasing path (`local-embed`) and resident CUDA
+# speech need the CubeCL graph fork (external aliases plus captured/replayed
+# launches), while V3 uses the 256-byte-aligned local triblespace-core. The
+# whole suite is on one CubeCL lineage (0.10): widgets, Mary's model ports, and
+# these fork patches all resolve together — widgets, local-embed, imagine, and
+# voice are co-buildable in one release cohort.
 [patch.crates-io]
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 # The pinned GORBIE source cohort provides resident PNG capture.
 GORBIE = { path = "../GORBIE" }
 cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
+cubecl-cuda = { path = "../cubecl-fork/cubecl-cuda" }
 cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
 triblespace-core = { path = "../triblespace-rs/triblespace-core" }
