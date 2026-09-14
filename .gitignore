@@ -1,4 +1,5 @@
 /target
+.DS_Store
 
 # Piles are user data — don't commit. `self.pile` is the conventional
 # name; contributors may also create demo.pile, test.pile, etc.
