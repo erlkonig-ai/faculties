@@ -25,6 +25,7 @@ use anybytes::View;
 use anyhow::{anyhow, Context, Result};
 use mary::model_collection::ModelPileSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::id::ExclusiveId;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::inlineencodings::Handle;
@@ -191,18 +192,62 @@ pub struct IndexModels {
 }
 
 /// [`IndexModels`] from a pile snapshot the caller already holds.
+///
+/// The pinned archives are the member archives of the model collection that
+/// carry the two selected roots with their tensors, and the one that carries
+/// the text tokenizer; not every member. Until 2026-09-14 every member was
+/// pinned, so any later commit into the model collection (a golden vector
+/// recorded on a root, another model packed) re-keyed the index and every
+/// `files` command addressed a new, empty one. The index is a function of
+/// the models it embeds with, and of nothing else in that collection.
 pub fn index_models_in(store: &PileSnapshot) -> Result<IndexModels> {
+    use triblespace::core::repo::BlobStoreGet;
     let snapshot = mary::model_collection::snapshot_model_collection_in(store)
         .context("freeze the working pile's model collection for the semantic index")?;
-    let archives = snapshot
-        .support()
-        .members()
-        .map(|member| member.raw)
-        .collect();
+    let text_root = preferred_root(&snapshot, NOMIC_TEXT_MODEL)?;
+    let vision_root = preferred_root(&snapshot, NOMIC_VISION_MODEL)?;
+    let trace = std::env::var_os("SEMANTIC_TRACE").is_some();
+    let mut archives = Vec::new();
+    for member in snapshot.support().members() {
+        let raw = member.raw;
+        let archive: TribleSet = store
+            .get(Inline::<Handle<SimpleArchive>>::new(raw))
+            .map_err(|error| {
+                anyhow!(
+                    "read model collection member {}: {error:?}",
+                    hex::encode_upper(raw)
+                )
+            })?;
+        let text =
+            mary::selection::select_model_root(&archive, store, ModelSelector::Root(text_root))
+                .is_ok();
+        let vision =
+            mary::selection::select_model_root(&archive, store, ModelSelector::Root(vision_root))
+                .is_ok();
+        let tokenizer = mary::selection::select_tokenizer_root(
+            &archive,
+            store,
+            TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+        )
+        .is_ok();
+        if trace {
+            eprintln!(
+                "model archive {}: {} facts; text {text}, vision {vision}, tokenizer {tokenizer}",
+                hex::encode_upper(raw),
+                archive.len()
+            );
+        }
+        if text || vision || tokenizer {
+            archives.push(raw);
+        }
+    }
+    if archives.is_empty() {
+        anyhow::bail!("no member of the model collection carries the nomic roots {text_root:X} and {vision_root:X}");
+    }
     Ok(IndexModels {
         archives,
-        text_root: preferred_root(&snapshot, NOMIC_TEXT_MODEL)?,
-        vision_root: preferred_root(&snapshot, NOMIC_VISION_MODEL)?,
+        text_root,
+        vision_root,
     })
 }
 
