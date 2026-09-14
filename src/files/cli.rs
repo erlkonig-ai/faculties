@@ -116,7 +116,7 @@ const VERBS: &[Verb] = &[
                 .positional()
                 .optional(),
             Param::caller("text", "Text query for cross-modal search").optional(),
-            Param::caller("floor", "Minimum cosine similarity, 0..1; text-to-image matches in the nomic space sit near 0.06").default("0"),
+            Param::caller("floor", "Minimum cosine similarity, 0..1. Measured 2026-09-14 over 863 indexed files: any text sits 0.60-0.65 from a text query, any image 0.65-0.86 from an image query, and cross-modal pairs 0.02-0.09; relevance is the margin above that band, not the value").default("0"),
             Param::caller("limit", "Maximum results")
                 .default("10")
                 .short('n'),

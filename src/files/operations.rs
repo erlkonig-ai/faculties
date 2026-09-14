@@ -1942,13 +1942,19 @@ fn cmd_similar<P: TriblePattern>(
             .reconstructed_top_k(&query_vec, index.len())
             .map_err(|error| anyhow::anyhow!("search the Files semantic index: {error}"))?;
 
-        // One row per entity, the floor, the hybrid tag filter, per kind.
+        // One row per file content, the floor, the hybrid tag filter, per
+        // kind. A mail attachment saved three times is three entities over
+        // one blob and the reader wants it once; the query's own bytes are
+        // left out the same way, whichever entity carries them.
         let models = crate::nomic::index_models_in(reader)?;
         let want_images = kind != Some(Kind::Text);
         let want_texts = kind != Some(Kind::Image);
         let mut image_hits: Vec<(f32, Id)> = Vec::new();
         let mut text_hits: Vec<(f32, Id)> = Vec::new();
-        let mut seen: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(handle) = query_eid.and_then(|query| content_handle_of(space, query)) {
+            seen.insert(handle_hex(handle));
+        }
         for (key, score) in ranked {
             let Some((root, eid)) = SemanticIndex::<embeddings::Embedding768>::row_entity(&key)
             else {
@@ -1965,7 +1971,13 @@ fn cmd_similar<P: TriblePattern>(
             } else {
                 continue;
             };
-            if !wanted || bucket.len() >= limit || Some(eid) == query_eid || !seen.insert(eid) {
+            if !wanted || bucket.len() >= limit || Some(eid) == query_eid {
+                continue;
+            }
+            let Some(content) = content_handle_of(space, eid) else {
+                continue;
+            };
+            if !seen.insert(handle_hex(content)) {
                 continue;
             }
             if !filter_tags.is_empty() {
