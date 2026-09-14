@@ -442,7 +442,8 @@ fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger(
     assert_eq!(issues.len(), 1);
     let cli = f.cli(&["--persona", &f.who(), "poll", "--peek"]);
     assert!(text(&cli).contains("DHT publication: stalled"));
-    assert!(text(&cli).contains("do not prove blob availability"));
+    assert!(!text(&cli).contains("Swarm health (local observations)"));
+    assert!(!text(&cli).contains("do not prove blob availability"));
     assert!(f.presented().is_empty());
     assert!(text(&f.call("orient_poll", json!({"persona":f.who()})))
         .contains("DHT publication: stalled"));
@@ -453,9 +454,9 @@ fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger(
     f.health(&mut recorder, at + -20.0, State::Stalled, true);
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
     f.health(&mut recorder, at + -10.0, State::Current, false);
-    assert!(
-        text(&f.call("orient_poll", json!({"persona":f.who(),"peek":false}))).contains("recovered")
-    );
+    assert!(f
+        .call("orient_poll", json!({"persona":f.who(),"peek":false}))
+        .is_empty());
     f.health(&mut recorder, at, State::Current, false);
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }

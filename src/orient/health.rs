@@ -166,10 +166,30 @@ impl HealthObservation {
         }
         use std::fmt::Write as _;
         let mut text = String::new();
+        // Wait/poll are an attention channel, not a health dashboard. Each
+        // reason already identifies the changed subject and actionable state;
+        // the complete resident snapshot remains available through `show`.
+        let mut collection_groups: BTreeMap<CollectionSyncGroup, Vec<&AttentionEvent>> =
+            BTreeMap::new();
         for event in pending.events.values() {
-            writeln!(text, "News: {}", event.reason()).unwrap();
+            match event {
+                AttentionEvent::Health {
+                    collection_group: Some(group),
+                    ..
+                } => collection_groups
+                    .entry(group.clone())
+                    .or_default()
+                    .push(event),
+                _ => writeln!(text, "News: {}", event.reason()).unwrap(),
+            }
         }
-        text.push_str(&report.text);
+        for (group, events) in collection_groups {
+            if events.len() == 1 {
+                writeln!(text, "News: {}", events[0].reason()).unwrap();
+            } else {
+                writeln!(text, "News: {}", group.reason(events.len())).unwrap();
+            }
+        }
         News::Report {
             text,
             events: pending.ids().collect(),
@@ -181,7 +201,7 @@ fn component_name(component: Id) -> Option<&'static str> {
     match component {
         schema::HOST => Some("event loop"),
         schema::STORE => Some("serving snapshot"),
-        schema::COLLECTION => Some("collection repair"),
+        schema::COLLECTION => Some("collection sync"),
         schema::DHT => Some("DHT publication"),
         _ => None,
     }
@@ -196,6 +216,18 @@ fn state_name(component: Id, state: Id) -> &'static str {
         schema::PROGRESSING => "catching up",
         schema::STALLED => "stalled",
         _ => "unknown",
+    }
+}
+
+fn attention_state_name(component: Id, state: Id) -> &'static str {
+    match state {
+        schema::UNKNOWN if component == schema::COLLECTION => {
+            "pairwise-root comparison unavailable beyond progress grace"
+        }
+        schema::STALLED if component == schema::COLLECTION => {
+            "pairwise roots remain divergent without observed progress beyond grace"
+        }
+        _ => state_name(component, state),
     }
 }
 
@@ -265,6 +297,7 @@ fn render_health(
             attention.insert(AttentionEvent::Health {
                 event: report,
                 detail: format!("observer [{observer}] report exceeds reader maximum age; current health unknown (last sample {age} ago)"),
+                collection_group: None,
             });
         }
         let mut conditions = BTreeSet::new();
@@ -280,34 +313,56 @@ fn render_health(
             let Some(component_name) = component_name(component) else {
                 continue;
             };
-            let mut scope = String::new();
-            for collection in find!(collection: Inline<inlineencodings::Handle<SimpleArchive>>,
-                pattern!(facts, [{ condition @ attrs::collection: ?collection }]))
-            {
-                write!(scope, " {}", collection_label(snapshot, collection)).unwrap();
-            }
-            for peer in find!(peer: ed25519_dalek::VerifyingKey,
-                pattern!(facts, [{ condition @ attrs::peer: ?peer }]))
-            {
-                write!(scope, " via [{}]", &hex::encode(peer.to_bytes())[..12]).unwrap();
-            }
+            let mut collections: Vec<String> = find!(
+                collection: Inline<inlineencodings::Handle<SimpleArchive>>,
+                pattern!(facts, [{ condition @ attrs::collection: ?collection }])
+            )
+            .map(|collection| collection_label(snapshot, collection))
+            .collect();
+            collections.sort();
+            let mut peers: Vec<String> = find!(
+                peer: ed25519_dalek::VerifyingKey,
+                pattern!(facts, [{ condition @ attrs::peer: ?peer }])
+            )
+            .map(|peer| hex::encode(peer.to_bytes())[..12].to_owned())
+            .collect();
+            peers.sort();
+            let collection_scope = collections
+                .iter()
+                .map(|collection| format!(" {collection}"))
+                .collect::<String>();
+            let peer_scope = peers
+                .iter()
+                .map(|peer| format!(" via [{peer}]"))
+                .collect::<String>();
+            let scope = format!("{collection_scope}{peer_scope}");
             let detail = format!("{component_name}{scope}: {}", state_name(component, state));
             conditions.insert(detail.clone());
+            // Recovery is retained in the append-only health report, but it is
+            // normal daemon exhaust: only an active alert asks the agent to act.
             if fresh
-                && (exists!(pattern!(facts, [{ condition @ metadata::tag: &schema::KIND_ALERT }]))
-                    || exists!(
-                        pattern!(facts, [{ condition @ metadata::tag: &schema::KIND_RECOVERED }])
-                    ))
+                && exists!(pattern!(facts, [{ condition @ metadata::tag: &schema::KIND_ALERT }]))
             {
-                let recovered = exists!(
-                    pattern!(facts, [{ condition @ metadata::tag: &schema::KIND_RECOVERED }])
-                );
                 attention.insert(AttentionEvent::Health {
                     event: condition,
                     detail: format!(
-                        "observer [{observer}] {detail}{}",
-                        if recovered { " (recovered)" } else { "" }
+                        "observer [{observer}] {component_name}{scope}: {}",
+                        attention_state_name(component, state)
                     ),
+                    collection_group: if component == schema::COLLECTION && collections.len() == 1 {
+                        let issue = match state {
+                            schema::UNKNOWN => Some(CollectionSyncIssue::ComparisonUnavailable),
+                            schema::STALLED => Some(CollectionSyncIssue::DivergenceStalled),
+                            _ => None,
+                        };
+                        issue.map(|issue| CollectionSyncGroup {
+                            observer: observer.to_owned(),
+                            peer_scope,
+                            issue,
+                        })
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -455,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_and_recovery_use_exact_stable_condition_episodes() {
+    fn failure_is_stable_attention_and_recovery_is_quiet() {
         let mut f = Fixture::new();
         let persona = *fucid();
         let mut recorder = Recorder::new(f.signer.verifying_key());
@@ -485,20 +540,14 @@ mod tests {
                 .unwrap(),
         );
         let recovered = f.observe_at(at(21.0)).report();
-        assert_eq!(recovered.attention.ids().len(), 1);
-        assert_ne!(
-            failure.attention.ids().next(),
-            recovered.attention.ids().next()
-        );
+        assert!(recovered.attention.is_empty());
         assert!(recovered
-            .attention
-            .events
-            .values()
-            .next()
-            .unwrap()
-            .reason()
-            .contains("recovered"));
-        save_presentations(&mut f.store, &f.signer, persona, recovered.attention.ids()).unwrap();
+            .text
+            .contains("converged at observed pairwise roots"));
+        assert!(matches!(
+            f.observe_at(at(21.0)).news(persona, &recovered),
+            News::Quiet
+        ));
         f.publish(
             recorder
                 .record(at(30.0), [condition(State::Current, false)])
@@ -517,6 +566,51 @@ mod tests {
                 .unwrap(),
         );
         assert!(f.observe_at(at(41.0)).report().attention.is_empty());
+    }
+
+    #[test]
+    fn news_groups_collection_sync_alerts_with_the_same_observer_and_peer() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let first = *fucid();
+        let second = *fucid();
+        let group = CollectionSyncGroup {
+            observer: "010203040506".to_owned(),
+            peer_scope: " via [111213141516]".to_owned(),
+            issue: CollectionSyncIssue::ComparisonUnavailable,
+        };
+        let mut attention = AttentionView::default();
+        attention.insert(AttentionEvent::Health {
+            event: first,
+            detail: "observer [010203040506] collection sync alpha [aaaaaaaaaaaa] via [111213141516]: pairwise-root comparison unavailable beyond progress grace".to_owned(),
+            collection_group: Some(group.clone()),
+        });
+        attention.insert(AttentionEvent::Health {
+            event: second,
+            detail: "observer [010203040506] collection sync beta [bbbbbbbbbbbb] via [111213141516]: pairwise-root comparison unavailable beyond progress grace".to_owned(),
+            collection_group: Some(group),
+        });
+        let report = HealthReport {
+            text: "complete snapshot".to_owned(),
+            attention,
+            next_change: None,
+        };
+        let observation = f.observe_at(at(1.0));
+        let (text, events) = match observation.news(persona, &report) {
+            News::Report { text, events } => (text, events),
+            News::Quiet => panic!("grouped alerts must remain actionable"),
+        };
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(
+            "observer [010203040506] collection sync via [111213141516]: 2 collection comparisons unavailable beyond progress grace"
+        ));
+        assert!(!text.contains("complete snapshot"));
+        assert!(!text.contains("alpha"));
+        assert!(!text.contains("beta"));
+        assert_eq!(
+            events.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
+        );
     }
 
     #[test]

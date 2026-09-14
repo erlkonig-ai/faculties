@@ -2089,15 +2089,56 @@ fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
         .or_insert(goal_id);
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CollectionSyncIssue {
+    ComparisonUnavailable,
+    DivergenceStalled,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CollectionSyncGroup {
+    observer: String,
+    peer_scope: String,
+    issue: CollectionSyncIssue,
+}
+
+impl CollectionSyncGroup {
+    fn reason(&self, collections: usize) -> String {
+        let issue = match self.issue {
+            CollectionSyncIssue::ComparisonUnavailable => {
+                "collection comparisons unavailable beyond progress grace"
+            }
+            CollectionSyncIssue::DivergenceStalled => {
+                "collections remain divergent without observed progress beyond grace"
+            }
+        };
+        format!(
+            "swarm health: observer [{}] collection sync{}: {collections} {issue}",
+            self.observer, self.peer_scope
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AttentionEvent {
     Message(Id),
     Mail(Id),
     Teams(Id),
-    Goal { event: Id, goal: Id, status: String },
-    Note { note: Id, goal: Id },
+    Goal {
+        event: Id,
+        goal: Id,
+        status: String,
+    },
+    Note {
+        note: Id,
+        goal: Id,
+    },
     StatusWindow(Id),
-    Health { event: Id, detail: String },
+    Health {
+        event: Id,
+        detail: String,
+        collection_group: Option<CollectionSyncGroup>,
+    },
 }
 
 impl AttentionEvent {

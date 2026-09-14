@@ -87,7 +87,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Wait for directed news, a local health alert/recovery, or a stale report
+    /// Wait for directed news, an actionable local health alert, or a stale report
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,
