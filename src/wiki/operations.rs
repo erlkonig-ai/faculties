@@ -289,9 +289,10 @@ impl WikiStorage<'_> {
     }
 }
 
-/// Read preparation may use existing rollups without WRITE. Update preparation
-/// keeps the complete pre-edit maintenance path: a stale frontier is not a
-/// substitute for the frontier an edit is about to supersede.
+/// Read preparation maintains available inputs when permitted and otherwise
+/// uses resident rollups. It never hydrates the whole source first. Update
+/// preparation keeps the complete pre-edit maintenance path: a stale frontier
+/// is not a substitute for the frontier an edit is about to supersede.
 async fn views_in<T>(
     pile: &mut FacultyStore,
     wiki_source: Collection<blobencodings::SimpleArchive>,
@@ -357,17 +358,19 @@ async fn views_in<T>(
         admitted
     };
     if maintain {
-        drop(
-            pile.ensure(wiki_source, signer)
-                .await
-                .context("ensure Wiki source collection")?,
-        );
-        for (source, _, _, label) in &auxiliaries {
+        if preparation == Preparation::Update {
             drop(
-                pile.ensure(*source, signer)
+                pile.ensure(wiki_source, signer)
                     .await
-                    .with_context(|| format!("ensure {label} source collection"))?,
+                    .context("ensure Wiki source collection")?,
             );
+            for (source, _, _, label) in &auxiliaries {
+                drop(
+                    pile.ensure(*source, signer)
+                        .await
+                        .with_context(|| format!("ensure {label} source collection"))?,
+                );
+            }
         }
         drop(
             pile.maintain(wiki_succinct, signer)
@@ -2348,6 +2351,125 @@ mod tests {
             revision_content(&current.reader, &entry.frontier[0]).unwrap(),
             "new body"
         );
+    }
+
+    #[test]
+    fn owner_reads_keep_warm_views_with_cold_source_or_auxiliary_members() {
+        for cold_auxiliary in [false, true] {
+            let fixture = Fixture::new();
+            let storage = fixture.storage();
+            let mut genesis = Fragment::empty();
+            let root = stage_revision(
+                storage,
+                &mut genesis,
+                None,
+                "resident revision".to_owned(),
+                "resident body".to_owned(),
+                BTreeSet::new(),
+            )
+            .unwrap();
+            let auxiliary_marker = ufoid();
+            let (source, auxiliary) = storage
+                .with_pile(|pile, signer, _| {
+                    let source = crate::collection_names::open(
+                        pile,
+                        schema::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                    )?;
+                    let auxiliary = crate::collection_names::open(
+                        pile,
+                        FILES_SCOPE_ID,
+                        signer.verifying_key(),
+                    )?;
+                    pile.commit(source, signer, genesis)?;
+                    pile.commit(
+                        auxiliary,
+                        signer,
+                        entity! { &auxiliary_marker @ metadata::tag: &auxiliary_marker },
+                    )?;
+                    Ok((source, auxiliary))
+                })
+                .unwrap();
+            let warm = storage
+                .with_pile(|pile, signer, runtime| {
+                    runtime.block_on(views_in(
+                        pile,
+                        source,
+                        signer,
+                        Preparation::Read,
+                        &[(FILES_SCOPE_ID, "Files")],
+                        |view, _| Ok(view.clone()),
+                    ))
+                })
+                .unwrap();
+            let entry = wiki_model::entry(&warm.facts, &warm.latest, root).unwrap();
+            let later = if cold_auxiliary {
+                let marker = ufoid();
+                entity! { &marker @ metadata::tag: &marker }
+            } else {
+                let mut fragment = Fragment::empty();
+                stage_revision(
+                    storage,
+                    &mut fragment,
+                    Some(&entry),
+                    "cold revision".to_owned(),
+                    "cold body".to_owned(),
+                    BTreeSet::new(),
+                )
+                .unwrap();
+                fragment
+            };
+
+            storage
+                .with_pile(|pile, signer, runtime| {
+                    let mut remote = MemoryRepo::default();
+                    let arriving = remote.commit(
+                        if cold_auxiliary { auxiliary } else { source },
+                        signer,
+                        later,
+                    )?;
+                    pile.insert(triblespace::core::collection::CollectionRecord::Commit(arriving))?;
+                    let cold = inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
+                        arriving.data(),
+                    );
+                    let before = pile.snapshot()?;
+                    assert!(!before.contains_blob(cold)?);
+                    let records = before.records()?.collect::<Result<Vec<_>, _>>()?;
+                    assert!(pile.wake_plane().is_none());
+
+                    runtime.block_on(views_in(
+                        pile,
+                        source,
+                        signer,
+                        Preparation::Read,
+                        &[(FILES_SCOPE_ID, "Files")],
+                        |view, auxiliaries| {
+                            let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
+                            assert_eq!(
+                                entry.frontier.iter().map(|head| head.id).collect::<Vec<_>>(),
+                                [root],
+                            );
+                            assert_eq!(
+                                revision_content(&view.reader, &entry.frontier[0])?,
+                                "resident body",
+                            );
+                            assert_eq!(
+                                find!(id: Id, pattern!(&auxiliaries[0], [{ ?id @ metadata::tag: &auxiliary_marker }]))
+                                    .collect::<Vec<_>>(),
+                                [*auxiliary_marker],
+                            );
+                            Ok(())
+                        },
+                    ))?;
+                    let after = pile.snapshot()?;
+                    assert!(!after.contains_blob(cold)?);
+                    assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, records);
+                    assert_eq!(after.wants()?.count(), 0);
+                    assert!(pile.wake_plane().is_none(), "an unrelated source miss must not start the mesh");
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     /// Model the exact requested bytes arriving from a concurrent replicator

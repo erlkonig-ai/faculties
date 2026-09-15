@@ -1069,8 +1069,9 @@ pub fn materialize_collection(
 }
 
 /// Capture Compass facts and the positive status LWW index through one store
-/// observation. An admitted producer first maintains its read-your-writes view;
-/// other readers attach the resident targets without publishing equations.
+/// observation. An admitted producer first maintains the available mapping
+/// inputs; other readers attach resident targets without publishing equations.
+/// Missing source payloads do not block an already-readable target view.
 pub async fn materialize_indexed_collection<S>(
     pile: &mut S,
     signer: &SigningKey,
@@ -1110,11 +1111,6 @@ where
                 .context("check Compass status WRITE admission")?
     };
     let store_snapshot = if admitted {
-        drop(
-            pile.ensure(source, signer)
-                .await
-                .context("ensure Compass source collection")?,
-        );
         drop(
             pile.maintain(succinct, signer)
                 .await
@@ -1255,6 +1251,88 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([goal, new_goal]),
             );
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    current.facts(),
+                    current.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "done",
+            );
+        });
+    }
+
+    #[test]
+    fn indexed_owner_read_keeps_warm_targets_with_a_cold_new_source_member() {
+        pollster::block_on(async {
+            let owner = SigningKey::from_bytes(&[25; 32]);
+            let mut store = MemoryRepo::default();
+            let source =
+                crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, owner.verifying_key())
+                    .unwrap();
+            let (mut first, goal) = goal_fragment("resident goal", vec![], None, at(1)).unwrap();
+            first += status_fragment(goal, "todo", None, at(1)).unwrap();
+            store.commit(source, &owner, first).unwrap();
+            drop(
+                materialize_indexed_source(&mut store, source, &owner)
+                    .await
+                    .unwrap(),
+            );
+
+            let (mut later, new_goal) = goal_fragment("cold goal", vec![], None, at(2)).unwrap();
+            later += status_fragment(new_goal, "todo", None, at(2)).unwrap();
+            later += status_fragment(goal, "done", None, at(2)).unwrap();
+            let mut remote = MemoryRepo::default();
+            let arriving = remote.commit(source, &owner, later.clone()).unwrap();
+            store
+                .insert(triblespace::core::collection::CollectionRecord::Commit(
+                    arriving,
+                ))
+                .unwrap();
+            let cold =
+                inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(arriving.data());
+            let before = store.snapshot().unwrap();
+            assert!(!before.contains_blob(cold).unwrap());
+            let records = before
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            let resident = materialize_indexed_source(&mut store, source, &owner)
+                .await
+                .unwrap();
+            assert_eq!(goal_ids(resident.facts()), BTreeSet::from([goal]));
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    resident.facts(),
+                    resident.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "todo",
+            );
+            assert!(!resident.store_snapshot().contains_blob(cold).unwrap());
+            assert_eq!(
+                resident
+                    .store_snapshot()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                records,
+                "a cold source member must not require a new read-side equation",
+            );
+
+            // Normal catch-up remains available once these exact bytes arrive.
+            assert_eq!(store.commit(source, &owner, later).unwrap(), arriving);
+            let current = materialize_indexed_source(&mut store, source, &owner)
+                .await
+                .unwrap();
+            assert_eq!(goal_ids(current.facts()), BTreeSet::from([goal, new_goal]));
             assert_eq!(
                 crate::schemas::compass::latest_status_event(
                     current.facts(),

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient consumes resident receipt rollups after they cover the operation's
+  fixed initial support, without acquiring historical root payloads. Remote
+  maintenance can satisfy that boundary while other personas keep writing;
+  incomplete receipt views stay pending at the normal wait cadence. Receipt
+  publication still requires source WRITE, checked before delivering news,
+  while projection WRITE remains optional and selected bodies fetch lazily.
+
+- Message, Compass, and Wiki ordinary readers no longer acquire whole source
+  collections before attaching resident rollups. A cold new COMMIT does not
+  hide an already readable target. Message sends and acknowledgements check
+  source WRITE only when publishing, without requiring derived WRITE; explicit
+  Wiki and Compass update preparation retains its source acquisition.
+
 - Separate Secrets replication, publication, and per-version DEK delivery.
   Immutable resource descriptors bind the secret ID, encrypted body, collection,
   and delivery policy; bound recipient envelopes carry that exact resource.

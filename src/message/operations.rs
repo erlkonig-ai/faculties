@@ -23,8 +23,8 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::prelude::*;
 
 /// A configured Message capability. Every call observes one frozen
-/// Message/Relations view through its storage handle. Read operations maintain
-/// targets they may write and otherwise attach the replicated views as they stand.
+/// Message/Relations view through its storage handle. Operations maintain targets
+/// they may write and otherwise attach the replicated views as they stand.
 /// No transport, sender environment, or text-file convention is consulted.
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -132,25 +132,25 @@ impl Message {
 
     pub fn send(&self, options: &SendOptions<'_>) -> Result<SentMessage> {
         options.validate()?;
-        with_storage(self, false, |storage, runtime| {
+        with_storage(self, |storage, runtime| {
             runtime.block_on(send(storage, options))
         })
     }
 
     pub fn list(&self, options: &ListOptions<'_>) -> Result<MessageList> {
-        with_storage(self, true, |storage, runtime| {
+        with_storage(self, |storage, runtime| {
             runtime.block_on(list(storage, options))
         })
     }
 
     pub fn ack(&self, id: &str, by: &str) -> Result<Acknowledgement> {
-        with_storage(self, false, |storage, runtime| {
+        with_storage(self, |storage, runtime| {
             runtime.block_on(ack(storage, id, by))
         })
     }
 
     pub fn ack_all(&self, options: &AckAllOptions<'_>) -> Result<AcknowledgedMessages> {
-        with_storage(self, false, |storage, runtime| {
+        with_storage(self, |storage, runtime| {
             runtime.block_on(ack_all(storage, options))
         })
     }
@@ -174,6 +174,19 @@ impl MessageStorage<'_> {
     ) -> Result<T> {
         let (fragment, value) = operation(self.messages, self.relations)?;
         if let Some(mut fragment) = fragment {
+            let snapshot = self
+                .pile
+                .snapshot()
+                .context("freeze Message publication authority")?;
+            anyhow::ensure!(
+                self.collection
+                    .writer_is_admitted(&snapshot, self.signer.verifying_key())
+                    .map_err(|error| {
+                        anyhow::anyhow!("check Message source WRITE admission: {error}")
+                    })?,
+                "publishing a Message fragment requires source collection WRITE"
+            );
+            drop(snapshot);
             fragment.describe_with(entity! { metadata::description: description });
             self.pile
                 .commit(self.collection, self.signer, fragment)
@@ -423,7 +436,6 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
 
 fn with_storage<T>(
     capability: &Message,
-    read_only: bool,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
@@ -444,7 +456,7 @@ fn with_storage<T>(
                 open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
             let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let (reader, relation_facts, message_facts) =
-                message_views(pile, signer, relations_source, message_source, read_only).await?;
+                message_views(pile, signer, relations_source, message_source).await?;
             Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
         })?;
         let mut storage = MessageStorage {
@@ -464,10 +476,9 @@ async fn message_views(
     signer: &SigningKey,
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
-    read_only: bool,
 ) -> Result<(FacultySnapshot, FactArchive, FactArchive)> {
-    // Register the same representations for readers and writers. A read-only
-    // operation may attach a chain that another principal maintains.
+    // Preparing a read, send, or acknowledgement may reuse a chain maintained
+    // by another principal. Publication checks source WRITE independently.
     let descriptors = pile.snapshot().context("freeze Message source policies")?;
     let relations_policy = relations_source
         .policy(&descriptors)
@@ -488,7 +499,7 @@ async fn message_views(
     let message_rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
         .context("register Message Rank9 collection")?;
-    let (maintain_relations, maintain_messages) = if read_only {
+    let (maintain_relations, maintain_messages) = {
         let snapshot = pile.snapshot().context("freeze Message WRITE admission")?;
         let subject = signer.verifying_key();
         let relations = relations_succinct
@@ -508,25 +519,10 @@ async fn message_views(
                 .writer_is_admitted(&snapshot, subject)
                 .map_err(|error| anyhow::anyhow!("check Message Rank9 WRITE admission: {error}"))?;
         (relations, messages)
-    } else {
-        // Send and ACK preparation still requires current derivations; never
-        // prepare a mutation from an older view just to bypass missing WRITE.
-        (true, true)
     };
-    if maintain_relations {
-        drop(
-            pile.ensure(relations_source, signer)
-                .await
-                .context("ensure Relations source collection")?,
-        );
-    }
-    if maintain_messages {
-        drop(
-            pile.ensure(message_source, signer)
-                .await
-                .context("ensure Message source collection")?,
-        );
-    }
+    // One-edge maintenance selects resident immediate-source inputs. Never
+    // acquire an entire root just to read the target: a new COMMIT can arrive
+    // before its payload without hiding the target's already readable facts.
     if maintain_relations {
         drop(
             pile.maintain(relations_succinct, signer)
@@ -582,7 +578,10 @@ mod tests {
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::MemoryBlobStoreSnapshot;
-    use triblespace::core::collection::{CollectionRead, CollectionRecordSelector};
+    use triblespace::core::collection::{
+        empty_metadata_handle, grant_collection_write, CollectionCommit, CollectionRead,
+        CollectionRecord, CollectionRecordSelector,
+    };
     use triblespace::core::repo::pile::ReadError;
     use triblespace::core::repo::StorageClose;
 
@@ -648,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn non_writer_lists_resident_messages_while_send_and_ack_preparation_stays_strict() {
+    fn non_writer_lists_resident_messages_but_cannot_publish() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -711,7 +710,6 @@ mod tests {
                     &owner,
                     relations_source,
                     message_source,
-                    true,
                 ))
                 .unwrap(),
         );
@@ -745,7 +743,6 @@ mod tests {
                     &observer,
                     relations_source,
                     message_source,
-                    true,
                 ))
                 .unwrap();
             assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
@@ -770,17 +767,38 @@ mod tests {
         }
 
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        let error = match runtime.block_on(message_views(
-            &mut pile,
-            &observer,
-            relations_source,
-            message_source,
-            false,
-        )) {
-            Ok(_) => panic!("send/ACK preparation must not use the older observation"),
-            Err(error) => error,
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &observer,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &observer,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
         };
-        assert!(format!("{error:#}").contains("requires an admitted WRITE producer"));
+        let error = runtime
+            .block_on(send(
+                &mut input,
+                &SendOptions {
+                    from: "sender",
+                    to: "reader",
+                    text: "unauthorized message",
+                },
+            ))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("requires source collection WRITE"));
+        let error = runtime
+            .block_on(ack(&mut input, &fmt_id(first_id), "reader"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("requires source collection WRITE"));
+        input.update("no-op", |_, _| Ok((None, ()))).unwrap();
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
             before
@@ -792,7 +810,6 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
-                false,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -813,7 +830,6 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
-                true,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -844,6 +860,285 @@ mod tests {
                 .status,
             MessageStatus::Unread
         );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn source_only_writer_sends_and_acknowledges_without_derived_write() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[95; 32]);
+        let sender = SigningKey::from_bytes(&[96; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let person = test_id(66);
+        pile.commit(
+            relations_source,
+            &owner,
+            relations::person_fragment(
+                person,
+                relations::ProfileInput {
+                    label: "sender".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        let (first, first_id) = message::message_fragment(
+            test_id(68),
+            &message::Recipient::Person(person),
+            "already readable",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &owner, first).unwrap();
+        drop(
+            runtime
+                .block_on(message_views(
+                    &mut pile,
+                    &owner,
+                    relations_source,
+                    message_source,
+                ))
+                .unwrap(),
+        );
+        grant_collection_write(
+            &mut pile,
+            message_source.handle(),
+            &owner,
+            sender.verifying_key(),
+        )
+        .unwrap();
+        for source in [relations_source, message_source] {
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            assert!(!succinct
+                .writer_is_admitted(&snapshot, sender.verifying_key())
+                .unwrap());
+            assert!(!rank9
+                .writer_is_admitted(&snapshot, sender.verifying_key())
+                .unwrap());
+        }
+        let before = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<BTreeSet<_>>();
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &sender,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        assert!(message_source
+            .writer_is_admitted(&snapshot, sender.verifying_key())
+            .unwrap());
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &sender,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let sent = runtime
+            .block_on(send(
+                &mut input,
+                &SendOptions {
+                    from: "sender",
+                    to: "sender",
+                    text: "published without index WRITE",
+                },
+            ))
+            .unwrap();
+        assert!(
+            !runtime
+                .block_on(ack(&mut input, &fmt_id(first_id), "sender"))
+                .unwrap()
+                .already_read
+        );
+        let after = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<BTreeSet<_>>();
+        let added: Vec<_> = after.difference(&before).copied().collect();
+        assert_eq!(added.len(), 2);
+        assert!(added.iter().all(|record| matches!(
+            record,
+            CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
+        )));
+
+        // The owner can subsequently maintain these admitted source writes.
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let listed = runtime
+            .block_on(list(&mut input, &ListOptions::new("sender")))
+            .unwrap();
+        assert_eq!(listed.entries.len(), 2);
+        assert_eq!(
+            listed
+                .entries
+                .iter()
+                .find(|entry| entry.row.id == sent.id)
+                .unwrap()
+                .body,
+            "published without index WRITE"
+        );
+        assert!(pile.health().started_at.is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn owner_reads_warm_targets_without_acquiring_cold_root_members() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[97; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let person = test_id(67);
+        pile.commit(
+            relations_source,
+            &owner,
+            relations::person_fragment(
+                person,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        let (first, first_id) = message::message_fragment(
+            person,
+            &message::Recipient::Person(person),
+            "the resident message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &owner, first).unwrap();
+        drop(
+            runtime
+                .block_on(message_views(
+                    &mut pile,
+                    &owner,
+                    relations_source,
+                    message_source,
+                ))
+                .unwrap(),
+        );
+        assert!(pile.health().started_at.is_none());
+
+        let mut missing = Vec::new();
+        for (source, name) in [
+            (relations_source, "cold Relations member"),
+            (message_source, "cold Message member"),
+        ] {
+            // Model record-first repair: the real signed member arrives, but
+            // its archive does not. Its bytes exist only in this local value.
+            let blob = IntoBlob::<SimpleArchive>::to_blob(
+                entity! { metadata::name: name }.facts().clone(),
+            );
+            let handle = blob.get_handle();
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &owner,
+                source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(handle),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            assert!(source.admitted(&snapshot).unwrap().contains(handle));
+            assert!(!snapshot.contains_blob(handle).unwrap());
+            missing.push(handle);
+        }
+        let before = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<Vec<_>>();
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let listed = runtime
+            .block_on(list(&mut input, &ListOptions::new("reader")))
+            .unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].row.id, first_id);
+        assert_eq!(listed.entries[0].body, "the resident message");
+        let after = pile.snapshot().unwrap();
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .map(|record| record.unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+        for handle in missing {
+            assert!(!after.contains_blob(handle).unwrap());
+        }
+        // A foreground Peer starts only when an unavailable blob is acquired.
+        assert!(pile.health().started_at.is_none());
         pile.close().unwrap();
     }
 
@@ -897,7 +1192,6 @@ mod tests {
                         signer,
                         relations_source,
                         message_source,
-                        true,
                     ))
                     .unwrap(),
             );
@@ -930,7 +1224,6 @@ mod tests {
                 &message_owner,
                 relations_source,
                 message_source,
-                true,
             ))
             .unwrap();
         assert_eq!(
@@ -949,7 +1242,6 @@ mod tests {
                 &relations_owner,
                 relations_source,
                 message_source,
-                true,
             ))
             .unwrap();
         assert_eq!(

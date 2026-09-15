@@ -12,12 +12,13 @@ pub(super) struct HealthSources {
     latest: Collection<LwwRegisterBlob>,
     relations: OrientSource,
     presentations: OrientSource,
+    pub(super) receipt_boundary: Support,
     max_age: Duration,
 }
 
 impl HealthSources {
     pub(super) fn open(
-        pile: &FacultyStore,
+        pile: &mut FacultyStore,
         signer: &SigningKey,
         max_age: Duration,
     ) -> Result<Self> {
@@ -35,21 +36,19 @@ impl HealthSources {
             (attrs::node.id(), metadata::created_at.id()),
             policy,
         )?;
+        drop(local);
+        let receipt_boundary = presentations.receipt_support(&pile.snapshot()?)?;
         Ok(Self {
             health,
             latest,
             relations,
             presentations,
+            receipt_boundary,
             max_age,
         })
     }
 
-    fn maintain(
-        &self,
-        pile: &FacultyStore,
-        signer: &SigningKey,
-        require_receipts: bool,
-    ) -> Result<()> {
+    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<()> {
         let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
@@ -63,9 +62,10 @@ impl HealthSources {
                 drop(local.maintain(source.succinct, signer).await?);
                 drop(local.maintain(source.rank9, signer).await?);
             }
-            // Unlike external input, our own presentation receipts must be
-            // visible to the next one-shot invocation.
-            if require_receipts || self.presentations.can_maintain(&snapshot, signer)? {
+            // A reader may publish receipts in the source without producing
+            // its indexes. Consuming reports check their represented support
+            // below; remote maintenance can catch up this view.
+            if self.presentations.can_maintain(&snapshot, signer)? {
                 drop(local.maintain(self.presentations.succinct, signer).await?);
                 drop(local.maintain(self.presentations.rank9, signer).await?);
             }
@@ -84,7 +84,7 @@ impl HealthSources {
         pile: &mut FacultyStore,
         signer: &SigningKey,
     ) -> Result<HealthObservation> {
-        self.maintain(pile, signer, true)?;
+        self.maintain(pile, signer)?;
         self.at(pile.snapshot()?)
     }
 
@@ -98,7 +98,7 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        self.maintain(pile, signer, !peek)?;
+        self.maintain(pile, signer)?;
         let observation = self.at(pile.snapshot()?)?;
         let report = observation.report();
         if report.attention.is_empty() {
@@ -113,6 +113,15 @@ impl HealthSources {
         };
         let news = observation.news(persona, &report);
         let fired = matches!(news, News::Report { .. });
+        if fired && !peek {
+            match require_receipts(&self.receipt_boundary, &observation.presentations) {
+                Ok(()) => {}
+                Err(error) if error.is::<PresentationReceiptsPending>() => {
+                    return Ok((false, report.next_change));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         apply_prepared_news(pile, signer, persona, peek, &news, "", output)?;
         Ok((fired, report.next_change))
     }
@@ -431,8 +440,9 @@ mod tests {
             std::fs::File::create(&path).unwrap();
             // Test-only author, never a live transport or pile identity.
             let signer = SigningKey::from_bytes(&[71; 32]);
-            let store = open_store(&path).unwrap();
-            let sources = HealthSources::open(&store, &signer, Duration::from_secs(60)).unwrap();
+            let mut store = open_store(&path).unwrap();
+            let sources =
+                HealthSources::open(&mut store, &signer, Duration::from_secs(60)).unwrap();
             Self {
                 store,
                 sources,
@@ -448,9 +458,7 @@ mod tests {
         }
 
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
-            self.sources
-                .maintain(&self.store, &self.signer, true)
-                .unwrap();
+            self.sources.maintain(&self.store, &self.signer).unwrap();
             self.sources
                 .at(self.store.snapshot_at(at).unwrap())
                 .unwrap()
@@ -516,6 +524,118 @@ mod tests {
             records,
             "health-first reads must not require WRITE on remote inputs",
         );
+    }
+
+    #[test]
+    fn consuming_health_waits_for_remote_receipt_indexes_without_write_authority() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .unwrap(),
+        );
+        let health = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let events: Vec<_> = health.report().attention.ids().collect();
+        assert!(!events.is_empty());
+
+        // The reader owns the receipt source; a different producer owns its
+        // physical indexes. No global collection overrides are needed here.
+        let reader_key = SigningKey::from_bytes(&[73; 32]);
+        let source = open_configured(
+            &mut f.store,
+            crate::schemas::orient::DEFAULT_SCOPE_ID,
+            reader_key.verifying_key(),
+        )
+        .unwrap();
+        let policy = f
+            .sources
+            .health
+            .source
+            .policy(&f.store.snapshot().unwrap())
+            .unwrap();
+        let succinct = f
+            .store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = f
+            .store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        f.sources.presentations = OrientSource {
+            source,
+            succinct,
+            rank9,
+            label: "Orient",
+        };
+        save_presentations(&mut f.store, &reader_key, persona, events).unwrap();
+        f.sources.receipt_boundary = f
+            .sources
+            .presentations
+            .receipt_support(&f.store.snapshot().unwrap())
+            .unwrap();
+
+        let before: Vec<_> = f
+            .store
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut parts = Vec::new();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        let (fired, _) = f
+            .sources
+            .poll(
+                &mut f.store,
+                &reader_key,
+                &fmt_id(persona),
+                false,
+                &mut Out::new(&mut emit),
+            )
+            .unwrap();
+        assert!(
+            !fired,
+            "a lagging receipt view must not replay a health report"
+        );
+        assert!(parts.is_empty());
+        assert_eq!(
+            f.store
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            before,
+            "waiting for remote indexes must not attempt their publication",
+        );
+
+        f.sources.maintain(&f.store, &f.signer).unwrap();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        let (fired, _) = f
+            .sources
+            .poll(
+                &mut f.store,
+                &reader_key,
+                &fmt_id(persona),
+                false,
+                &mut Out::new(&mut emit),
+            )
+            .unwrap();
+        assert!(
+            !fired,
+            "the remotely maintained receipt suppresses the old report"
+        );
+        assert!(parts.is_empty());
     }
 
     #[test]
