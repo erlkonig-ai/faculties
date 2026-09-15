@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Separate Secrets replication, publication, and per-version DEK delivery.
+  Immutable resource descriptors bind the secret ID, encrypted body, collection,
+  and delivery policy; bound recipient envelopes carry that exact resource.
+  CLI/MCP grants can constrain future delivery and onward delegation through
+  capability-definition facts, without expiring collection COMMIT admission or
+  making already-delivered envelopes unreadable. Grant-by-secret preserves the
+  recovered body/resource binding, so another collection writer cannot redirect
+  it to a different secret. Legacy envelopes remain decryptable without gaining
+  new delivery authority. Resource kind `8DE676F5445D85A874435C68C9C387E4`,
+  envelope magic `0AFF57FBB4533A0E74171F2B7893BDC9`, and delivery-bound anchors
+  `08CA9343966A09348C3C9B8369021DC0` / `17757D913DFEE244444735ED933953CE`
+  were minted with `trible genid` on 2026-09-14.
+
+- Read the support certified by resident target rollups, including when their
+  historical source payloads or writer proofs are absent. Secrets and credential
+  consumers share the final target snapshot; only a typed lack of producer
+  authority falls back to a resident read, while real acquisition and algebra
+  errors propagate. Update migration consumers for descriptor-defined actions
+  and witness-bound equations without changing historical collection identities.
+
 - Codex Orient notifications forward only the captured news, without an added
   preamble. Event text, sender attribution, queue retries, and watcher ownership
   are unchanged; rearming instructions stay in the standing hook guidance.

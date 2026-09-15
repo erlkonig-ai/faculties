@@ -314,24 +314,11 @@ impl WebStorage<'_> {
 
                 let secrets_collection =
                     open_secrets_collection_read(pile, signer.verifying_key())?;
-                for (label, source) in [
-                    ("Headspace", source),
-                    ("Secrets", secrets_collection.source()),
-                ] {
-                    drop(
-                        pile.ensure(source, signer)
-                            .await
-                            .with_context(|| format!("ensure {label} source collection"))?,
-                    );
-                }
-                let before = pile
-                    .snapshot()
-                    .context("freeze shared Web credential support snapshot")?;
-                let secrets_support = secrets_collection
-                    .source()
-                    .admitted(&before)
-                    .context("admit Secrets collection support")?;
-                drop(before);
+                drop(
+                    pile.ensure(source, signer)
+                        .await
+                        .context("ensure Headspace source collection")?,
+                );
                 drop(
                     pile.maintain(headspace_succinct, signer)
                         .await
@@ -343,16 +330,9 @@ impl WebStorage<'_> {
                         .context("maintain Headspace fact collection")?,
                 );
 
-                let store_snapshot = secrets_collection
-                    .ensure_exact(pile, signer, &secrets_support)
+                let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                     .await
-                    .context("ensure configured Secrets collection")?;
-                let secrets = secret_storage::snapshot_exact(
-                    store_snapshot,
-                    secrets_collection,
-                    secrets_support,
-                )
-                .context("attach exact Secrets collection")?;
+                    .context("observe configured Secrets collection")?;
 
                 // Observe Headspace and Secrets through one final immutable pile
                 // snapshot, then project only the facts Web actually consumes.

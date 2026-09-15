@@ -2,9 +2,11 @@
 //!
 //! Only the exact direct-policy predecessor descriptors for the standard
 //! Faculties roots are selected. A name is never an authority bridge. New
-//! descriptors carry generic resource-capability bindings; Secrets additionally
-//! binds key delivery to its owner. Same-author COMMITs are re-signed over their
-//! unchanged data and metadata handles, without acquiring either archive.
+//! descriptors carry generic resource-capability bindings. The exact historical
+//! Secrets successor also retains its collection-level key-delivery binding;
+//! this is not authority for current per-version secret resources. Same-author
+//! COMMITs are re-signed over their unchanged data and metadata handles, without
+//! acquiring either archive.
 //!
 //! Old descriptors, records, blobs, and domain entity ids remain untouched.
 //! MERGE/DERIVE artifacts are left for ordinary current maintenance to rebuild.
@@ -29,9 +31,8 @@ use triblespace::core::collection::records::{
     collection_name, collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
 use triblespace::core::collection::{
-    descriptor, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
-    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    CollectionStoreExt,
+    descriptor, AdmissionPolicy, CollectionCommit, CollectionRead, CollectionRecord,
+    CollectionRecordSelector, CollectionStore, CollectionStoreExt, ACTION_READ, ACTION_WRITE,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::genid::GenId;
@@ -149,6 +150,9 @@ fn successor<S: CollectionStoreExt>(
 ) -> Result<CollectionHandle> {
     let policy = faculties::collection_names::private_policy(owner);
     let policy = if scope == faculties::secrets::DEFAULT_SCOPE_ID {
+        // Preserve this migration's already-published successor identity. New
+        // Secrets versions bind delivery to their own immutable resources;
+        // this old collection binding neither creates those nor grants them.
         policy.with_capability(
             faculties::secrets::key_delivery_definition(),
             AdmissionPolicy::direct(owner),
@@ -268,12 +272,18 @@ fn prepare(
                 continue;
             };
             // Current policy bindings can coexist with retired annotations.
-            if descriptor::admission_policies(&facts, read_capability(), Some(SimpleArchive::id()))
-                .next()
-                .is_some()
+            if descriptor::admission_policies(
+                snapshot,
+                &facts,
+                ACTION_READ,
+                Some(SimpleArchive::id()),
+            )
+            .next()
+            .is_some()
                 && descriptor::admission_policies(
+                    snapshot,
                     &facts,
-                    write_capability(),
+                    ACTION_WRITE,
                     Some(SimpleArchive::id()),
                 )
                 .next()
@@ -427,7 +437,9 @@ mod tests {
 
     use faculties::storage::initialize_signer;
     use triblespace::core::blob::encodings::UnknownBlob;
-    use triblespace::core::collection::{CollectionDerive, CollectionMerge};
+    use triblespace::core::collection::{
+        read_capability, write_capability, CollectionDerive, CollectionMerge,
+    };
     use triblespace::core::id::fucid;
     use triblespace::core::repo::{BlobStorePut, CapabilityProofRead};
 
@@ -498,15 +510,15 @@ mod tests {
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
             &signer,
             old,
-            Inline::new([1; 32]),
-            Inline::new([2; 32]),
-            Inline::new([3; 32]),
+            (source.data(), source.fingerprint()),
+            (source.data(), source.fingerprint()),
+            source.data(),
         )))
         .unwrap();
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             old,
-            Inline::new([4; 32]),
+            (source.data(), source.fingerprint()),
             Inline::new([5; 32]),
         )))
         .unwrap();
@@ -731,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn secrets_successor_has_exact_runtime_identity_and_complete_definition_closure() {
+    fn historical_secrets_successor_preserves_identity_and_definition_closure() {
         let (_directory, path, key, owner) = fixture();
         let old = old_handle("secrets", owner.verifying_key());
         let mut pile = open_pile_strict(&path).unwrap();
@@ -747,6 +759,8 @@ mod tests {
             .unwrap()
             .new;
         let mut scratch = MemoryRepo::default();
+        // Current storage can attach this exact historical source descriptor;
+        // it does not require or infer collection-wide key-delivery authority.
         let runtime = faculties::secrets::storage::SecretsCollection::register(
             &mut scratch,
             "secrets",
@@ -760,15 +774,23 @@ mod tests {
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let facts: TribleSet = snapshot.get(target).unwrap();
-        for capability in [
-            read_capability(),
-            write_capability(),
-            faculties::secrets::key_delivery_capability(),
+        for (capability, action) in [
+            (read_capability(), ACTION_READ),
+            (write_capability(), ACTION_WRITE),
+            (
+                faculties::secrets::key_delivery_capability(),
+                faculties::secrets::schema::ACTION_KEY_DELIVERY,
+            ),
         ] {
             let _: Blob<SimpleArchive> = snapshot.get(capability).unwrap();
             assert_eq!(
-                descriptor::admission_policies(&facts, capability, Some(SimpleArchive::id()))
-                    .collect::<Vec<_>>(),
+                descriptor::admission_policies(
+                    &snapshot,
+                    &facts,
+                    action,
+                    Some(SimpleArchive::id()),
+                )
+                .collect::<Vec<_>>(),
                 vec![AdmissionPolicy::direct(owner.verifying_key())],
             );
         }
@@ -778,6 +800,8 @@ mod tests {
         for (handle, _) in attachments.snapshot().unwrap() {
             let _: Blob<UnknownBlob> = snapshot.get(handle).unwrap();
         }
+        // The migration does not issue delivery proofs or turn this binding
+        // into authority over any per-version resource/envelope.
         assert_eq!(snapshot.proofs().unwrap().count(), 0);
         drop(snapshot);
         pile.close().unwrap();

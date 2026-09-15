@@ -639,25 +639,11 @@ impl TeamsSession {
                 .commit(self.collection, &self.signer, fragment)
                 .context("commit Teams fragment")?;
             pollster::block_on(async {
-                for (label, source) in [
-                    ("Teams", self.collection),
-                    ("Secrets", self.secret_collection.source()),
-                ] {
-                    drop(
-                        pile.ensure(source, &self.signer)
-                            .await
-                            .with_context(|| format!("ensure {label} source after Teams commit"))?,
-                    );
-                }
-                let shared_control = pile
-                    .snapshot()
-                    .context("freeze shared Teams post-commit support snapshot")?;
-                let secrets_support = self
-                    .secret_collection
-                    .source()
-                    .admitted(&shared_control)
-                    .context("admit Secrets support after Teams commit")?;
-                drop(shared_control);
+                drop(
+                    pile.ensure(self.collection, &self.signer)
+                        .await
+                        .context("ensure Teams source after commit")?,
+                );
                 drop(
                     pile.maintain(self.succinct, &self.signer)
                         .await
@@ -668,8 +654,7 @@ impl TeamsSession {
                         .await
                         .context("maintain Teams fact collection after commit")?,
                 );
-                self.refresh_secrets_for_async(pile, None, secrets_support)
-                    .await
+                self.refresh_secrets_for_async(pile, None).await
             })?;
             Ok(Some(commit))
         })
@@ -681,20 +666,7 @@ impl TeamsSession {
         let support = self.support.clone();
         let storage = self.storage.clone();
         storage.with_pile(|pile, _| {
-            pollster::block_on(async {
-                let ready = pile
-                    .ensure(self.secret_collection.source(), &self.signer)
-                    .await
-                    .context("ensure Secrets source after credential publication")?;
-                let secrets_support = self
-                    .secret_collection
-                    .source()
-                    .admitted(&ready)
-                    .context("admit Secrets support after credential publication")?;
-                drop(ready);
-                self.refresh_secrets_for_async(pile, Some(support), secrets_support)
-                    .await
-            })
+            pollster::block_on(self.refresh_secrets_for_async(pile, Some(support)))
         })
     }
 
@@ -702,16 +674,11 @@ impl TeamsSession {
         &mut self,
         pile: &mut Pile,
         support: Option<Support>,
-        secrets_support: Support,
     ) -> Result<()> {
-        let store_snapshot = self
-            .secret_collection
-            .ensure_exact(pile, &self.signer, &secrets_support)
-            .await
-            .context("refresh configured Secrets collection for Teams")?;
         let secrets =
-            secret_storage::snapshot_exact(store_snapshot, self.secret_collection, secrets_support)
-                .context("attach exact Secrets collection for Teams")?;
+            secret_storage::ensure_and_snapshot(pile, self.secret_collection, &self.signer)
+                .await
+                .context("refresh configured Secrets collection for Teams")?;
         let reader = secrets.store_snapshot().clone();
         // Credential-only refreshes retain the session's Teams support;
         // Teams commits observe the ordinary view at this final snapshot.
@@ -776,24 +743,11 @@ impl TeamsStorage {
                 )?;
                 let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
                 let secrets = pollster::block_on(async {
-                    for (label, source) in [
-                        ("Teams", collection),
-                        ("Secrets", secret_collection.source()),
-                    ] {
-                        drop(
-                            pile.ensure(source, signer)
-                                .await
-                                .with_context(|| format!("ensure {label} source collection"))?,
-                        );
-                    }
-                    let shared_control = pile
-                        .snapshot()
-                        .context("freeze shared Teams support snapshot")?;
-                    let secrets_support = secret_collection
-                        .source()
-                        .admitted(&shared_control)
-                        .context("admit Secrets support before Teams maintenance")?;
-                    drop(shared_control);
+                    drop(
+                        pile.ensure(collection, signer)
+                            .await
+                            .context("ensure Teams source collection")?,
+                    );
                     drop(
                         pile.maintain(maintained_succinct, signer)
                             .await
@@ -804,16 +758,10 @@ impl TeamsStorage {
                             .await
                             .context("maintain Teams fact collection")?,
                     );
-                    let store_snapshot = secret_collection
-                        .ensure_exact(pile, signer, &secrets_support)
-                        .await
-                        .context("ensure configured Secrets collection for Teams")?;
-                    let secrets = secret_storage::snapshot_exact(
-                        store_snapshot,
-                        secret_collection,
-                        secrets_support,
-                    )
-                    .context("attach exact Secrets collection for Teams")?;
+                    let secrets =
+                        secret_storage::ensure_and_snapshot(pile, secret_collection, signer)
+                            .await
+                            .context("observe configured Secrets collection for Teams")?;
                     Ok::<_, anyhow::Error>(secrets)
                 })?;
                 let reader = secrets.store_snapshot().clone();

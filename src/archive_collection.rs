@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -1689,24 +1689,26 @@ mod tests {
         drop(reader);
         let union_data =
             Handle::<SimpleArchive>::to_hash(pile.put::<SimpleArchive, _>(union.clone()).unwrap());
-        CollectionStore::insert(
-            &mut pile,
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &signer,
-                source.handle(),
-                block_commit.data(),
-                remainder_commit.data(),
-                union_data,
-            )),
-        )
-        .unwrap();
+        let merge = CollectionMerge::sign(
+            &signer,
+            source.handle(),
+            (block_commit.data(), block_commit.fingerprint()),
+            (remainder_commit.data(), remainder_commit.fingerprint()),
+            union_data,
+        );
+        CollectionStore::insert(&mut pile, CollectionRecord::Merge(merge)).unwrap();
 
         let target = test_target(&mut pile, source, &pile_path, &key);
         let reader = pile.snapshot().unwrap();
         let output = archive_bm25::derive_element(&reader, union.clone()).unwrap();
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive = CollectionDerive::sign(&signer, target.handle(), input_data, output_data);
+        let derive = CollectionDerive::sign(
+            &signer,
+            target.handle(),
+            (input_data, merge.fingerprint()),
+            output_data,
+        );
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
@@ -1916,7 +1918,12 @@ mod tests {
             .unwrap();
         let output = archive_bm25::derive_element(&store_snapshot, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let pending = CollectionDerive::sign(&signer, target.handle(), commit.data(), output_data);
+        let pending = CollectionDerive::sign(
+            &signer,
+            target.handle(),
+            (commit.data(), commit.fingerprint()),
+            output_data,
+        );
         drop(output);
         drop(store_snapshot);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
@@ -1964,11 +1971,13 @@ mod tests {
     }
     #[test]
     fn exact_fact_cover_and_raw_export_need_no_outer_commits() {
+        use triblespace::core::collection::CollectionDerivation;
+
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
-        let signer = initialize_archive_fixture(&pile_path, &key);
+        initialize_archive_fixture(&pile_path, &key);
 
         // Chunk and snapshot ids are deliberately extrinsic. Two different
         // witnesses of identical byte geometry must not duplicate the output.
@@ -2011,20 +2020,28 @@ mod tests {
         let (_, facts, _metadata, blobs) = fragment.into_parts();
         stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
         let data = pile.put::<SimpleArchive, _>(facts).unwrap();
-        let support = source.cover([data]);
-        drop(pollster::block_on(pile.maintain_exact(succinct, &signer, &support)).unwrap());
-        let after = pollster::block_on(pile.maintain_exact(rank9, &signer, &support)).unwrap();
-        let observed = after.collection_exact(rank9, &support).unwrap();
-        assert!(observed
-            .support()
-            .commits(observed.snapshot())
-            .unwrap()
-            .is_empty());
-        let facts = observed.view::<FactArchive>().unwrap();
+        // Raw value construction needs no COMMIT authority. It does not,
+        // however, manufacture admitted support or signed collection records.
+        let before = pile.snapshot().unwrap();
+        let raw: Blob<SimpleArchive> = before.get(data).unwrap();
+        let compact = SuccinctArchiveBlob::map(&(), &raw, &before).unwrap();
+        pile.put::<SuccinctArchiveBlob, _>(compact.clone()).unwrap();
+        let accelerated =
+            Rank9AcceleratedSuccinctArchiveBlob::map(&(), &compact, &pile.snapshot().unwrap())
+                .unwrap();
+        let member = pile
+            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated)
+            .unwrap();
+        let after = pile.snapshot().unwrap();
+        assert!(after.collection(rank9).unwrap().cover().is_empty());
+        assert!(source.cover([data]).commits(&after).unwrap().is_empty());
+        let facts = rank9
+            .cover([member])
+            .materialize::<FactArchive, _>(&after)
+            .unwrap();
         let mut output = Vec::new();
         assert_eq!(
-            write_source_snapshot(&facts, observed.snapshot(), snapshot_id.id, &mut output)
-                .unwrap(),
+            write_source_snapshot(&facts, &after, snapshot_id.id, &mut output).unwrap(),
             3,
         );
         assert_eq!(output, b"raw");

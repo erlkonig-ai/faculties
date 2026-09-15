@@ -4015,7 +4015,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("no wrap for this signing key"),
+            format!("{error:#}").contains("no usable wrap for this signing key"),
             "{error:#}"
         );
     }

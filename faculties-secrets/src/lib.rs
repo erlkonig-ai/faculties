@@ -1,10 +1,10 @@
 //! Immutable encrypted secrets in ordinary capability-governed collections.
 //!
 //! A secret version owns one fresh random data-encryption key (DEK). Its body
-//! is encrypted once and the DEK is sealed independently to every subject
-//! admitted for the distinct Secrets key-delivery capability on the source
-//! collection when the version is published. Collection READ permits encrypted
-//! evidence replication, not DEK delivery. Later key-delivery grants add wraps;
+//! is encrypted once and the DEK is initially sealed to its adding signer. Each
+//! envelope binds its immutable resource descriptor, whose distinct key-delivery
+//! capability governs later recipients. Collection READ permits encrypted
+//! evidence replication, not DEK delivery. Later resource grants add wraps;
 //! they never rewrite bodies or secret ids. Generic capability proofs remain
 //! the authority. A delivered wrap opens by possession, without expiry checks.
 
@@ -27,6 +27,8 @@ use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
+mod envelope;
+pub mod resource;
 pub mod schema;
 pub mod storage;
 
@@ -240,38 +242,6 @@ where
     .collect()
 }
 
-/// Every recipient whose wrap attachment is resident and structurally valid.
-///
-/// A typed fact row alone is not evidence that an envelope is usable. In an
-/// open-world store a malformed or missing attachment must not suppress a
-/// later additive repair for the same recipient.
-fn resident_wrap_recipients<R, P>(reader: &R, facts: &P, secret: Id) -> BTreeSet<RecipientPublicKey>
-where
-    R: BlobStoreGet,
-    P: TriblePattern,
-{
-    find!(
-        (
-            recipient: Inline<inlineencodings::ED25519PublicKey>,
-            sealed_dek: BytesHandle
-        ),
-        pattern!(facts, [{
-            _?id @
-                metadata::tag: KIND_WRAP,
-                wrap_secret: secret,
-                wrap_recipient_key: ?recipient,
-                wrap_dek: ?sealed_dek,
-        }])
-    )
-    .filter_map(|(recipient, sealed_dek)| {
-        read_bytes(reader, sealed_dek)
-            .ok()
-            .filter(|sealed| validate_sealed_dek(sealed).is_ok())
-            .map(|_| recipient.raw)
-    })
-    .collect()
-}
-
 pub fn read_text<R: BlobStoreGet>(reader: &R, handle: TextHandle) -> Result<String> {
     let value: anybytes::View<str> = reader.get(handle).context("read UTF-8 string blob")?;
     Ok(value.as_ref().to_owned())
@@ -313,6 +283,11 @@ fn validate_encrypted_body(body: &[u8]) -> Result<()> {
 }
 
 fn validate_sealed_dek(sealed: &[u8]) -> Result<()> {
+    if let Some(payload) = envelope::sealed_payload(sealed) {
+        let _: dryoc::dryocbox::VecBox = DryocBox::from_sealed_bytes(payload)
+            .map_err(|error| anyhow!("parse bound sealed DEK: {error}"))?;
+        return Ok(());
+    }
     if sealed.len() != SEALED_DEK_BYTES {
         bail!("sealed DEK must be {SEALED_DEK_BYTES} bytes");
     }
@@ -432,8 +407,9 @@ pub struct SealedVersion {
     pub recipients: Vec<VerifyingKey>,
 }
 
-/// Encrypt one immutable version with a fresh DEK and seal that DEK to every
-/// distinct caller-selected key recipient.
+/// Encode a legacy unbound version for explicit imports. Ordinary publication
+/// uses [`storage::add_secret`], which binds a per-secret authority descriptor.
+/// These envelopes remain decryptable but confer no authority for new delivery.
 pub fn seal_version<I>(
     name: &str,
     plaintext: &[u8],
@@ -493,7 +469,7 @@ where
         let Ok(sealed) = read_bytes(reader, wrap.sealed_dek) else {
             continue;
         };
-        if validate_sealed_dek(&sealed).is_err() {
+        if sealed.len() != SEALED_DEK_BYTES || validate_sealed_dek(&sealed).is_err() {
             continue;
         }
         let Ok(boxed) = DryocBox::from_sealed_bytes(&sealed) else {
@@ -504,6 +480,10 @@ where
         };
         let bytes = Zeroizing::new(opened);
         if bytes.len() != 32 {
+            continue;
+        }
+        let candidate_key = Key::try_from(&bytes[..]).context("decode DEK")?;
+        if decrypt_secret_body_from_facts(reader, facts, secret, &candidate_key).is_err() {
             continue;
         }
         if recovered
@@ -584,9 +564,31 @@ where
     if secret_rows_for(facts, secret).is_empty() {
         bail!("secret {secret} not found");
     }
-    let dek = recover_dek_from_facts(reader, facts, secret, signing_key)?
-        .ok_or_else(|| anyhow!("no wrap for this signing key on secret {secret}"))?;
-    decrypt_secret_body_from_facts(reader, facts, secret, &dek)
+    let mut plaintext = None::<Zeroizing<Vec<u8>>>;
+    for binding in envelope::recover(reader, facts, secret, signing_key)? {
+        let candidate = envelope::decrypt_body(reader, binding.body, &binding.dek)?;
+        if plaintext
+            .as_ref()
+            .is_some_and(|previous| **previous != *candidate)
+        {
+            bail!("secret {secret} contains competing decryptable bodies");
+        }
+        plaintext = Some(candidate);
+    }
+    if let Some(dek) = recover_dek_from_facts(reader, facts, secret, signing_key)? {
+        if let Ok(candidate) = decrypt_secret_body_from_facts(reader, facts, secret, &dek) {
+            if plaintext
+                .as_ref()
+                .is_some_and(|previous| **previous != candidate)
+            {
+                bail!("secret {secret} contains competing decryptable bodies");
+            }
+            plaintext = Some(Zeroizing::new(candidate));
+        }
+    }
+    plaintext
+        .map(|value| value.to_vec())
+        .ok_or_else(|| anyhow!("no usable wrap for this signing key on secret {secret}"))
 }
 
 pub struct RecipientEnvelopes {
@@ -602,9 +604,10 @@ impl RecipientEnvelopes {
 
 /// Build only the missing direct-recipient envelopes for an existing version.
 ///
-/// `holder` must already have a valid wrap and is used only to recover the
-/// existing DEK. The returned fragment contains no secret-body facts and can
-/// be committed additively into the same source collection.
+/// `holder` must have a bound envelope. This low-level constructor accepts an
+/// explicitly selected audience; [`storage::maintain_recipient_envelopes`]
+/// supplies that audience from each resource's AUTH proofs. It never infers a
+/// new policy for legacy unbound envelopes.
 pub fn add_recipient_envelopes_from_facts<R, P, I>(
     reader: &R,
     facts: &P,
@@ -620,18 +623,17 @@ where
     if secret_rows_for(facts, secret).is_empty() {
         bail!("secret {secret} not found");
     }
-    let dek = recover_dek_from_facts(reader, facts, secret, holder)?
-        .ok_or_else(|| anyhow!("holder has no wrap on secret {secret}"))?;
-    let existing = resident_wrap_recipients(reader, facts, secret);
-    let recipients = deduplicated_recipients(recipients);
+    let bindings = envelope::recover(reader, facts, secret, holder)?;
+    if bindings.is_empty() {
+        bail!("holder has no bound resource envelope on secret {secret}");
+    }
+    let recipients = recipients.into_iter().collect::<Vec<_>>();
     let mut fragment = Fragment::empty();
     let mut added = Vec::new();
-    for recipient in recipients.difference(&existing).copied() {
-        fragment += sealed_dek_fragment(secret, recipient, &dek)?;
-        added.push(
-            VerifyingKey::from_bytes(&recipient)
-                .expect("recipients came from validated VerifyingKey values"),
-        );
+    for binding in bindings {
+        let envelopes = envelope::missing(reader, facts, &binding, recipients.iter().copied())?;
+        fragment += envelopes.fragment;
+        added.extend(envelopes.recipients);
     }
     Ok(RecipientEnvelopes {
         fragment,
@@ -697,10 +699,11 @@ mod tests {
     fn later_reader_adds_only_an_envelope_and_preserves_the_body() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
-        let mut sealed = seal_version(
+        let mut sealed = resource::seal_version(
+            CollectionHandle::new([1; 32]),
+            &alice,
             "database",
             b"unchanged ciphertext",
-            [alice.verifying_key()],
             at(2),
         )
         .unwrap();
@@ -739,8 +742,14 @@ mod tests {
     fn missing_wrap_attachment_does_not_suppress_additive_repair() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
-        let mut sealed =
-            seal_version("database", b"value", [alice.verifying_key()], at(3)).unwrap();
+        let mut sealed = resource::seal_version(
+            CollectionHandle::new([1; 32]),
+            &alice,
+            "database",
+            b"value",
+            at(3),
+        )
+        .unwrap();
         let secret = sealed.secret;
         let missing = Inline::<inlineencodings::Handle<blobencodings::RawBytes>>::new([0x55; 32]);
         sealed.fragment += wrap_record(genid().id, secret, bob.verifying_key().to_bytes(), missing);

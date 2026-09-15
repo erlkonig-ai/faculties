@@ -3,9 +3,12 @@ use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
 use crate::storage::{open_secrets_collection, open_secrets_collection_read};
 use anyhow::Result;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use std::path::PathBuf;
+use triblespace::core::capability::CapabilityProofId;
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -77,14 +80,39 @@ impl Secrets {
     }
     /// Explicit key-delivery maintenance; does not grant new capabilities.
     pub fn maintain(&self) -> Result<usize> {
+        self.maintain_selected(&[])
+    }
+    pub fn maintain_selected(&self, selected: &[SecretTarget]) -> Result<usize> {
         self.storage().with_pile(|pile, signer| {
             let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
             let snapshot = pollster::block_on(secret_storage::maintain_and_snapshot(
                 pile, collection, signer,
             ))?;
-            secret_storage::maintain_recipient_envelopes(
-                pile, signer, &snapshot, collection, signer,
+            secret_storage::maintain_selected_recipient_envelopes(
+                pile, signer, &snapshot, collection, signer, selected,
             )
+        })
+    }
+    /// Sign resource-specific delivery authority, without granting collection
+    /// READ/WRITE and without delivering or exporting plaintext.
+    pub fn grant(
+        &self,
+        target: SecretTarget,
+        recipient: VerifyingKey,
+        limits: DeliveryLimits,
+        delegate: bool,
+    ) -> Result<Vec<CapabilityProofId>> {
+        self.storage().with_pile(|pile, signer| {
+            let collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+            let snapshot = match target {
+                SecretTarget::Resource(_) => {
+                    secret_storage::snapshot(pile.snapshot()?, collection)?
+                }
+                SecretTarget::Secret(_) => pollster::block_on(
+                    secret_storage::ensure_and_snapshot(pile, collection, signer),
+                )?,
+            };
+            secrets::resource::grant(pile, signer, &snapshot, target, recipient, limits, delegate)
         })
     }
 }

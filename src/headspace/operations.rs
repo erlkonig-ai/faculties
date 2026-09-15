@@ -195,24 +195,11 @@ impl Storage {
             let secrets_collection =
                 open_secrets_collection_read(pile, self.signer.verifying_key())?;
             let secrets = pollster::block_on(async {
-                for (label, source) in [
-                    ("Headspace", source),
-                    ("Secrets", secrets_collection.source()),
-                ] {
-                    drop(
-                        pile.ensure(source, &self.signer)
-                            .await
-                            .with_context(|| format!("ensure {label} source collection"))?,
-                    );
-                }
-                let before = pile
-                    .snapshot()
-                    .context("freeze shared Headspace support snapshot")?;
-                let secrets_support = secrets_collection
-                    .source()
-                    .admitted(&before)
-                    .context("admit Secrets collection support")?;
-                drop(before);
+                drop(
+                    pile.ensure(source, &self.signer)
+                        .await
+                        .context("ensure Headspace source collection")?,
+                );
                 drop(
                     pile.maintain(collection_succinct, &self.signer)
                         .await
@@ -223,16 +210,10 @@ impl Storage {
                         .await
                         .context("maintain Headspace fact collection")?,
                 );
-                let store_snapshot = secrets_collection
-                    .ensure_exact(pile, &self.signer, &secrets_support)
-                    .await
-                    .context("ensure configured Secrets collection")?;
-                let secrets = secret_storage::snapshot_exact(
-                    store_snapshot,
-                    secrets_collection,
-                    secrets_support,
-                )
-                .context("attach exact Secrets collection")?;
+                let secrets =
+                    secret_storage::ensure_and_snapshot(pile, secrets_collection, &self.signer)
+                        .await
+                        .context("observe configured Secrets collection")?;
                 Ok::<_, anyhow::Error>(secrets)
             })?;
             // Attach Headspace through the same final immutable physical snapshot

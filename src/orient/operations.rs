@@ -1,6 +1,6 @@
 //! Reusable Orient observations and one-shot waiting, independent of argv and stdout.
 //!
-//! Facts, authorization instants and selected event IDs remain frozen while
+//! Facts, query instants and selected event IDs remain frozen while
 //! exact payloads are acquired. Condition scripts run only after acquisition,
 //! once per evaluation. Presentation follows successful output acceptance.
 
@@ -212,10 +212,9 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
-use triblespace::core::collection::{
-    next_authorization_change, Collection, CollectionSnapshot, CollectionSnapshotExt,
-    CollectionStoreExt, Support,
-};
+use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+#[cfg(test)]
+use triblespace::core::collection::{CollectionSnapshot, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{
@@ -399,7 +398,11 @@ impl OrientSource {
         let view = collection
             .view::<FactArchive>()
             .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
-        Ok(OrientFact { collection, view })
+        Ok(OrientFact {
+            #[cfg(test)]
+            collection,
+            view,
+        })
     }
 }
 
@@ -480,11 +483,13 @@ impl OrientSources {
 }
 
 struct OrientFact {
+    #[cfg(test)]
     collection: CollectionSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     view: FactArchive,
 }
 
 impl OrientFact {
+    #[cfg(test)]
     fn support(&self) -> &Support {
         self.collection.support()
     }
@@ -515,7 +520,6 @@ struct OrientObservation {
     snapshot: FacultySnapshot,
     facts: OrientFacts,
     compass_status: LwwIndex,
-    next_authorization_change: Option<Epoch>,
 }
 
 impl OrientObservation {
@@ -580,13 +584,11 @@ async fn maintain_sources(
 }
 
 /// Read every target collection as it actually exists at one immutable store
-/// boundary and one authorization instant. This function performs no writes.
+/// boundary and one query instant. This function performs no writes.
 fn observe_sources(
     snapshot: FacultySnapshot,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
-    let next_authorization_change = next_authorization_change(&snapshot)
-        .map_err(|error| anyhow!("inspect next collection authorization change: {error}"))?;
     let messages = sources.messages.observe(&snapshot)?;
     let mail = sources.mail.observe(&snapshot)?;
     let teams = sources.teams.observe(&snapshot)?;
@@ -619,15 +621,14 @@ fn observe_sources(
             presentations,
         },
         compass_status,
-        next_authorization_change,
     })
 }
 
 /// Maintain each hop, then observe the targets resident at one later boundary.
 /// `watermark` remains the caller's change-detection baseline, not a support
 /// vector imposed on the target collections.
-/// Preserve its authorization instant too: if maintenance crosses a validity
-/// boundary, the next poll must still see that boundary and refresh admission.
+/// The timestamp remains useful to time-sensitive domain queries, but ordinary
+/// collection admission changes only when proof or descriptor evidence changes.
 async fn maintain_and_observe_snapshot(
     pile: &mut FacultyStore,
     signer: &SigningKey,
@@ -2707,7 +2708,6 @@ struct WaitFrame {
 
 struct PendingWaitFrame {
     watermark: FacultySnapshot,
-    next_authorization_change: Option<Epoch>,
     reason: PendingWaitReason,
 }
 
@@ -2720,16 +2720,8 @@ enum PendingWaitReason {
 }
 
 impl PendingWaitFrame {
-    fn awaiting_view(
-        watermark: FacultySnapshot,
-        observation: &OrientObservation,
-        reason: PendingWaitReason,
-    ) -> Self {
-        Self {
-            watermark,
-            next_authorization_change: observation.next_authorization_change,
-            reason,
-        }
+    fn awaiting_view(watermark: FacultySnapshot, reason: PendingWaitReason) -> Self {
+        Self { watermark, reason }
     }
 }
 
@@ -2743,13 +2735,6 @@ impl WaitFrameLoad {
         match self {
             Self::Pending(pending) => &pending.watermark,
             Self::Ready(frame) => &frame.watermark,
-        }
-    }
-
-    fn next_authorization_change(&self) -> Option<Epoch> {
-        match self {
-            Self::Pending(pending) => pending.next_authorization_change,
-            Self::Ready(frame) => frame.observation.next_authorization_change,
         }
     }
 }
@@ -2778,7 +2763,6 @@ async fn load_wait_frame(
         Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
                 snapshot,
-                &observation,
                 PendingWaitReason::PersonaSelection,
             )));
         }
@@ -2803,7 +2787,6 @@ async fn load_wait_frame(
         Err(error) if is_payload_pending(&error) => {
             return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
                 snapshot,
-                &observation,
                 PendingWaitReason::Payload,
             )));
         }
@@ -2822,25 +2805,6 @@ async fn load_wait_frame(
     }))
 }
 
-fn retained_habit_support_is_admitted(
-    observation: &OrientObservation,
-    sources: &OrientSources,
-    snapshot: &FacultySnapshot,
-) -> Result<bool> {
-    let (Some(source), Some(facts)) = (sources.habits.as_ref(), observation.facts.habits.as_ref())
-    else {
-        return Ok(true);
-    };
-    let admitted = source
-        .source
-        .admitted(snapshot)
-        .map_err(|error| anyhow!("recheck retained Habit authorization: {error}"))?;
-    facts
-        .support()
-        .is_subset(&admitted)
-        .map_err(|error| anyhow!("compare retained Habit authorization: {error}"))
-}
-
 fn observe_habits_in_observation(
     observation: &OrientObservation,
     pile_path: &Path,
@@ -2857,10 +2821,6 @@ fn observe_habits_in_observation(
         pile_path,
         now_secs,
     )
-}
-
-fn authorization_change_elapsed(boundary: Option<Epoch>, now: Epoch) -> bool {
-    boundary.is_some_and(|boundary| now >= boundary)
 }
 
 /// Ordinary source acquisition must yield at a local health validity boundary.
@@ -2984,7 +2944,6 @@ async fn cmd_wait(
         };
 
         let mut observed_snapshot = initial.watermark.clone();
-        let mut next_authorization_change = initial.observation.next_authorization_change;
 
         let WaitFrame {
             watermark: _,
@@ -3043,22 +3002,15 @@ async fn cmd_wait(
             let storage_changed = !sampled.changes_since(&observed_snapshot).is_empty();
             let now = sampled.instant();
             let now_secs = epoch_seconds(now);
-            let authorization_changed = now < observed_snapshot.instant()
-                || authorization_change_elapsed(next_authorization_change, now);
             let cooldown_elapsed = habit_seen
                 .next_cooldown_at
                 .is_some_and(|deadline| now_secs >= deadline);
             let periodic_condition_check = last_habit_sweep.elapsed() >= Duration::from_secs(60);
-            if !storage_changed
-                && !authorization_changed
-                && !view_pending
-                && !cooldown_elapsed
-                && !periodic_condition_check
-            {
+            if !storage_changed && !view_pending && !cooldown_elapsed && !periodic_condition_check {
                 continue;
             }
 
-            if storage_changed || authorization_changed || view_pending {
+            if storage_changed || view_pending {
                 let Some(attempt) = load_wait_frame_before_health_deadline(
                     pile,
                     signer,
@@ -3074,7 +3026,6 @@ async fn cmd_wait(
                     continue;
                 };
                 observed_snapshot = attempt.watermark_snapshot().clone();
-                next_authorization_change = attempt.next_authorization_change();
                 match attempt {
                     WaitFrameLoad::Ready(candidate) => {
                         view_pending = false;
@@ -3112,23 +3063,13 @@ async fn cmd_wait(
                             // undecidable, the old persona context cannot emit
                             // new time-driven reports.
                             current_habit_context_valid = false;
-                        } else if authorization_changed {
-                            // A global capability boundary is only a reload
-                            // trigger. It invalidates the retained Habit view
-                            // only when that view's own support lost admission.
-                            current_habit_context_valid &= retained_habit_support_is_admitted(
-                                &current,
-                                &sources,
-                                &pending.watermark,
-                            )?;
                         }
                     }
                 }
             }
 
-            // A frame whose persona selection is unresolved or whose Habit
-            // support actually lost admission remains only a presentation
-            // baseline until a readable replacement arrives.
+            // A frame whose persona selection is unresolved remains only a
+            // presentation baseline until a readable replacement arrives.
             if !current_habit_context_valid {
                 last_habit_sweep = Instant::now();
                 continue;
@@ -3219,7 +3160,7 @@ async fn cmd_wake(
     use std::fmt::Write as _;
 
     async {
-        // Register every descriptor before choosing the authorization instant.
+        // Register every descriptor before choosing the query instant.
         // Maintenance may append derived lattice nodes; all reads attach only
         // after that work, from one later immutable pile snapshot.
         let sources = OrientSources::open(storage, signer, false).await?;
@@ -3238,7 +3179,7 @@ async fn cmd_wake(
         }
         let watermark = storage
             .snapshot()
-            .map_err(|error| anyhow!("freeze shared wake authorization instant: {error}"))?;
+            .map_err(|error| anyhow!("freeze shared wake query instant: {error}"))?;
         memory_collection.maintain(storage, signer).await?;
         wiki_collection.maintain(storage, signer).await?;
         if wiki_latest

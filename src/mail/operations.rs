@@ -330,15 +330,14 @@ impl Storage {
                     pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
                 let relations_rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
-                // Ensure every root, then advance each ordinary fact chain before
-                // observing the views through one final snapshot.
+                // Advance ordinary fact chains, then observe them through the
+                // same final target snapshot as the configured Secrets view.
                 let secrets = pollster::block_on(async {
                     for (label, source) in [
                         ("Mail", mail_collection),
                         ("Files", files_collection),
                         ("Decide", decide_collection),
                         ("Relations", relations_collection),
-                        ("Secrets", secrets_collection.source()),
                     ] {
                         drop(
                             pile.ensure(source, &self.signer)
@@ -346,15 +345,6 @@ impl Storage {
                                 .with_context(|| format!("ensure {label} source collection"))?,
                         );
                     }
-                    let before = pile
-                        .snapshot()
-                        .context("freeze shared Mail support snapshot")?;
-                    let secrets_support = secrets_collection
-                        .source()
-                        .admitted(&before)
-                        .context("admit Secrets collection support")?;
-                    drop(before);
-
                     drop(
                         pile.maintain(mail_succinct, &self.signer)
                             .await
@@ -396,16 +386,13 @@ impl Storage {
                             .context("maintain Relations fact collection")?,
                     );
 
-                    let store_snapshot = secrets_collection
-                        .ensure_exact(pile, &self.signer, &secrets_support)
-                        .await
-                        .context("ensure configured Secrets collection")?;
-                    let secrets = secret_storage::snapshot_exact(
-                        store_snapshot,
+                    let secrets = secret_storage::ensure_and_snapshot(
+                        pile,
                         secrets_collection,
-                        secrets_support,
+                        &self.signer,
                     )
-                    .context("attach exact Secrets collection")?;
+                    .await
+                    .context("observe configured Secrets collection")?;
                     Ok::<_, anyhow::Error>(secrets)
                 })?;
                 // Secrets attachment owns the final immutable pile snapshot. Attach

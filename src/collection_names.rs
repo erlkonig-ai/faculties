@@ -332,9 +332,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
-    use triblespace::core::capability::{
-        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-    };
+    use triblespace::core::capability::{CapabilityProof, CapabilityResource};
     use triblespace::core::collection::grant_collection_read;
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -474,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_read_open_uses_the_snapshots_frozen_instant() {
+    fn exact_read_open_is_independent_of_the_snapshot_clock() {
         let operator = SigningKey::from_bytes(&[0x63; 32]);
         let reader = SigningKey::from_bytes(&[0x64; 32]);
         let mut store = MemoryRepo::default();
@@ -482,33 +480,23 @@ mod tests {
             .collection("wiki", private_policy(operator.verifying_key()))
             .unwrap();
         store
-            .insert_proof(CapabilityProof::issue_root(
-                &operator,
+            .insert_proof(CapabilityProof::new(
                 CapabilityResource::from(shared.handle()),
-                Capability::new(
-                    triblespace::core::collection::read_capability(),
-                    CapabilityMode::Invoke,
-                ),
-                Some(
-                    CapabilityValidity::new(
-                        Epoch::from_unix_seconds(10.0),
-                        Epoch::from_unix_seconds(20.0),
-                    )
-                    .unwrap(),
-                ),
+                &operator,
+                triblespace::core::collection::read_capability(),
                 reader.verifying_key(),
             ))
             .unwrap();
         let valid = store.snapshot_at(Epoch::from_unix_seconds(15.0)).unwrap();
-        let expired = store.snapshot_at(Epoch::from_unix_seconds(21.0)).unwrap();
-        assert!(expired.changes_since(&valid).is_empty());
+        let later = store.snapshot_at(Epoch::from_unix_seconds(21.0)).unwrap();
+        assert!(later.changes_since(&valid).is_empty());
         assert!(open_exact_read_in(
-            &expired,
+            &later,
             wiki::DEFAULT_SCOPE_ID,
             reader.verifying_key(),
             shared.handle(),
         )
-        .is_err());
+        .is_ok());
         assert_eq!(
             open_exact_read_in(
                 &valid.clone(),

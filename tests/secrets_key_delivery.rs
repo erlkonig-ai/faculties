@@ -4,15 +4,12 @@ use std::process::{Command, Output};
 
 use faculties::secrets::{self, storage::SecretsCollection};
 use hifitime::Epoch;
-use triblespace::core::capability::{
-    Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-};
 use triblespace::core::collection::{
-    read_capability, AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRealizationError,
+    AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRealizationError,
     CollectionStoreExt,
 };
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{CapabilityProofStore, SnapshotSource};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::signing_key_file;
 use triblespace::prelude::*;
 
@@ -63,7 +60,7 @@ fn default_local_owner_can_add_and_open() {
 }
 
 #[test]
-fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority() {
+fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("delivered.pile");
     let owner_path = dir.path().join("owner.key");
@@ -85,22 +82,6 @@ fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority()
         ),
     )
     .unwrap();
-    for capability in [read_capability(), secrets::key_delivery_capability()] {
-        pile.insert_proof(CapabilityProof::issue_root(
-            &owner,
-            CapabilityResource::from(collection.handle()),
-            Capability::new(capability, CapabilityMode::Invoke),
-            Some(
-                CapabilityValidity::new(
-                    Epoch::from_unix_seconds(0.0),
-                    Epoch::from_unix_seconds(1.0),
-                )
-                .unwrap(),
-            ),
-            recipient.verifying_key(),
-        ))
-        .unwrap();
-    }
     let instant = Epoch::from_unix_seconds(0.0);
     let sealed = secrets::seal_version(
         "already delivered",
@@ -118,17 +99,41 @@ fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority()
         .unwrap());
 
     // Possessing a delivered envelope does not grant the recipient WRITE on
-    // either derived collection. Missing physical encodings need a producer.
-    let error = pollster::block_on(secrets::storage::ensure_and_snapshot(
-        &mut pile, collection, &recipient,
-    ))
-    .err()
-    .expect("recipient cannot publish the missing Secrets cover");
+    // either derived collection. Explicit production still refuses that key.
+    let before = pile
+        .snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let error = pollster::block_on(collection.ensure(&mut pile, &recipient))
+        .err()
+        .expect("recipient cannot publish the missing Secrets cover");
     assert!(matches!(
         error.downcast_ref::<CollectionRealizationError>(),
         Some(CollectionRealizationError::UnauthorizedProducer { collection: target })
             if *target == collection.succinct().handle()
     ));
+
+    // Ordinary reads tolerate only that lack of production authority. The
+    // target is not realized yet, so its honest read-only view is empty.
+    let observed = pollster::block_on(secrets::storage::ensure_and_snapshot(
+        &mut pile, collection, &recipient,
+    ))
+    .unwrap();
+    assert!(observed.support().is_empty());
+    drop(observed);
+    assert_eq!(
+        pile.snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        before,
+        "read-only fallback publishes no derivations",
+    );
 
     // The actual owner publishes the encodings. Subsequent local readers
     // reuse that complete cover without new WRITE or current READ/delivery.
@@ -180,5 +185,112 @@ fn local_get_and_list_do_not_recheck_expired_replication_or_delivery_authority()
         produced_records,
         "foreign get/list reuse the owner's equations without publishing records",
     );
+    pile.close().unwrap();
+}
+
+#[test]
+fn cli_grant_and_selected_maintenance_do_not_grant_collection_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selected.pile");
+    let owner_path = dir.path().join("owner.key");
+    let recipient_path = dir.path().join("recipient.key");
+    std::fs::File::create(&path).unwrap();
+    let owner = signing_key_file::init(&owner_path).unwrap();
+    let recipient = signing_key_file::init(&recipient_path).unwrap();
+    let mut pile = Pile::open(&path).unwrap();
+    let collection = SecretsCollection::register(
+        &mut pile,
+        "secrets",
+        CollectionPolicy::new(
+            AdmissionPolicy::direct(owner.verifying_key()),
+            AdmissionPolicy::direct(owner.verifying_key()),
+        ),
+    )
+    .unwrap();
+    pile.close().unwrap();
+    let handle = hex::encode(collection.handle().raw);
+    let command = |key: &std::path::Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_secrets"));
+        command.args([
+            "--pile",
+            path.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ]);
+        command.env("TRIBLESPACE_COLLECTION_SECRETS", &handle);
+        command
+    };
+    let add = |value: &str| {
+        successful(
+            command(&owner_path)
+                .args(["add", "--name", "token", "--value", value])
+                .output()
+                .unwrap(),
+        )
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned()
+    };
+    let first = add("first");
+    let second = add("second");
+    let grant = successful(
+        command(&owner_path)
+            .args([
+                "grant",
+                "--secret",
+                &first,
+                "--recipient",
+                &hex::encode(recipient.verifying_key().to_bytes()),
+                "--expires-at",
+                "2099-01-01T00:00:00Z",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(grant.starts_with("AUTH blake3:"));
+    assert_eq!(
+        successful(
+            command(&owner_path)
+                .args(["maintain", "--secret", &first])
+                .output()
+                .unwrap()
+        )
+        .trim(),
+        "added 1 recipient envelope(s)"
+    );
+    // Let the owner realize the newly appended envelope before the read-only key attaches.
+    successful(
+        command(&owner_path)
+            .args(["maintain", "--secret", &first])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        successful(
+            command(&recipient_path)
+                .args(["get", "--secret", &first])
+                .output()
+                .unwrap()
+        ),
+        "first"
+    );
+    assert!(!command(&recipient_path)
+        .args(["get", "--secret", &second])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let mut pile = Pile::open(&path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    assert!(!collection
+        .source()
+        .reader_is_admitted(&snapshot, recipient.verifying_key())
+        .unwrap());
+    assert!(!collection
+        .source()
+        .writer_is_admitted(&snapshot, recipient.verifying_key())
+        .unwrap());
+    drop(snapshot);
     pile.close().unwrap();
 }

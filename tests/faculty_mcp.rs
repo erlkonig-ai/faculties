@@ -313,6 +313,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "reason_record",
         "relations_list",
         "secrets_list",
+        "secrets_grant",
         "status_list",
         "teams_read",
         "triage_scan",

@@ -44,6 +44,13 @@ pub fn key_delivery_capability() -> CapabilityHandle {
 pub const KIND_SECRET: Id = id_hex!("72B64C9F3644B8016B64820D7F3F23C1");
 pub const KIND_WRAP: Id = id_hex!("EB8549BAF679C5D11ECEDB416AAD76E3");
 
+/// An immutable resource descriptor binding one secret body to its delivery policy.
+/// Minted with `trible genid` on 2026-09-14.
+pub const KIND_SECRET_RESOURCE: Id = id_hex!("8DE676F5445D85A874435C68C9C387E4");
+
+/// Bound recipient-envelope format. Minted with `trible genid` on 2026-09-14.
+pub const BOUND_ENVELOPE_MAGIC: [u8; 16] = id_hex!("0AFF57FBB4533A0E74171F2B7893BDC9").raw();
+
 attributes! {
     "7FC38805FDC9FA4D8449497B298B51BB" unsafe as pub secret_body:
         inlineencodings::Handle<blobencodings::RawBytes>;
@@ -58,6 +65,14 @@ attributes! {
     /// `B511AAEB955CD121B6C5E72B3DCEC70F`.
     "B511AAEB955CD121B6C5E72B3DCEC70F" as pub wrap_recipient_key:
         inlineencodings::ED25519PublicKey;
+
+    /// Earliest delivery instant, inclusive. This constrains future envelopes,
+    /// never opening an envelope already delivered. Minted 2026-09-14.
+    "08CA9343966A09348C3C9B8369021DC0" as pub delivery_not_before:
+        inlineencodings::NsTAIInterval;
+    /// Latest delivery instant, exclusive. Minted 2026-09-14.
+    "17757D913DFEE244444735ED933953CE" as pub delivery_expires_at:
+        inlineencodings::NsTAIInterval;
 }
 
 #[cfg(test)]

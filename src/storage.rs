@@ -499,9 +499,8 @@ where
     })
 }
 
-/// Read one authorized SimpleArchive union through a caller-supplied coherent
-/// store snapshot at its frozen authorization instant, returning the foundational
-/// support used for maintained indexes.
+/// Read the realized SimpleArchive collection through one coherent store
+/// snapshot, returning the support certified by that actual target cover.
 pub fn read_fact_collection<S>(
     collection: Collection<SimpleArchive>,
     snapshot: &S,
@@ -509,12 +508,11 @@ pub fn read_fact_collection<S>(
 where
     S: StoreRead,
 {
-    let support = collection
-        .admitted(snapshot)
-        .context("discover authorized collection support")?;
-    let facts = snapshot
-        .collection_exact(collection, &support)
-        .context("attach authorized collection support")?
+    let observed = snapshot
+        .collection(collection)
+        .context("attach realized collection")?;
+    let support = observed.support().clone();
+    let facts = observed
         .view::<TribleSet>()
         .context("read authorized collection facts")?;
     Ok((facts, support))
@@ -1007,21 +1005,29 @@ mod tests {
         let target_merge = CollectionMerge::sign(
             &signer,
             target,
-            Inline::new([3; 32]),
-            Inline::new([4; 32]),
+            (target_commit.data(), target_commit.fingerprint()),
+            (target_commit.data(), target_commit.fingerprint()),
             Inline::new([5; 32]),
         );
         let other_merge = CollectionMerge::sign(
             &signer,
             other,
-            Inline::new([6; 32]),
-            Inline::new([7; 32]),
+            (other_commit.data(), other_commit.fingerprint()),
+            (other_commit.data(), other_commit.fingerprint()),
             Inline::new([8; 32]),
         );
-        let derive_to_target =
-            CollectionDerive::sign(&signer, target, Inline::new([9; 32]), Inline::new([10; 32]));
-        let derive_from_target =
-            CollectionDerive::sign(&signer, other, Inline::new([11; 32]), Inline::new([12; 32]));
+        let derive_to_target = CollectionDerive::sign(
+            &signer,
+            target,
+            (other_commit.data(), other_commit.fingerprint()),
+            Inline::new([10; 32]),
+        );
+        let derive_from_target = CollectionDerive::sign(
+            &signer,
+            other,
+            (target_commit.data(), target_commit.fingerprint()),
+            Inline::new([12; 32]),
+        );
 
         for record in [
             CollectionRecord::Commit(target_commit),
@@ -1084,6 +1090,60 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(observed.support().len(), 1);
         assert_eq!(view.segment_count(), 1);
+    }
+
+    #[test]
+    fn fact_read_uses_endorsed_rollup_without_ancestor_payloads_or_write_proofs() {
+        use triblespace::core::blob::IntoBlob;
+        use triblespace::core::repo::BlobStorePut;
+
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let author = SigningKey::from_bytes(&[8; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let left = entity! { metadata::name: "left" };
+        let right = entity! { metadata::name: "right" };
+        let expected = (left.clone() + right.clone()).facts().clone();
+        let commits: Vec<_> = [left, right]
+            .into_iter()
+            .map(|fragment| {
+                let blob = IntoBlob::<SimpleArchive>::to_blob(fragment.facts().clone());
+                CollectionCommit::sign(
+                    &author,
+                    collection.handle(),
+                    Handle::<SimpleArchive>::to_hash(blob.get_handle()),
+                    empty_metadata_handle(),
+                )
+            })
+            .collect();
+        for commit in &commits {
+            store.insert(CollectionRecord::Commit(*commit)).unwrap();
+        }
+        let joined = store.put::<SimpleArchive, _>(expected.clone()).unwrap();
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &owner,
+                collection.handle(),
+                (commits[0].data(), commits[0].fingerprint()),
+                (commits[1].data(), commits[1].fingerprint()),
+                Handle::<SimpleArchive>::to_hash(joined),
+            )))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(collection.admitted(&snapshot).unwrap().is_empty());
+        for commit in &commits {
+            assert!(!snapshot
+                .contains_blob(Handle::<SimpleArchive>::from_hash(commit.data()))
+                .unwrap());
+        }
+        let (facts, support) = read_fact_collection(collection, &snapshot).unwrap();
+        assert_eq!(facts, expected);
+        assert_eq!(support.len(), 2);
     }
 
     #[test]

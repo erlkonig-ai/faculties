@@ -393,7 +393,7 @@ descriptor, fact fragment, or selected payload is absent locally, they discover 
 through the blob DHT and cache its bytes. Files similarity and embedding
 commands retain their resident-only model/input paths for now.
 Live snapshots expose async exact-blob reads: fetching a selected handle caches
-its bytes without advancing the snapshot's records, authorization instant, or
+its bytes without advancing the snapshot's records, query instant, or
 selected collection covers. Relations uses this reader directly; the other
 live-enabled commands still use the shared payload-retry adapter. Neither path emits
 an implicit `WANT`.
@@ -540,7 +540,7 @@ schemas describe exact arguments and effects.
 | `posture` | Disclosure candidates, coverage and policy over resident documents |
 | `reason` | Reasoning notes and intended-action evidence |
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
-| `secrets` | Encrypted secret versions and explicit retrieval/maintenance |
+| `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |
 | `status` | Per-persona window status |
 | `teams` | Resident Graph archive, explicit sync/actions and professional context |
 | `triage` | Execution-loop, timeline and context diagnostics |
@@ -553,6 +553,42 @@ Thin binaries live under [`src/bin/`](src/bin/); domain logic, schemas and
 explicit frontend modules live in the library. `habit` uses the `habits`
 Rust module. The GUI family shares `viewer` composition instead of copying
 widget setup or invoking a capture subprocess.
+
+### Secrets: replication, publication, and key delivery
+
+Secrets keeps three rights separate: collection READ replicates encrypted
+evidence; collection WRITE publishes facts; a resource-specific key-delivery
+grant permits future delivery of that secret's data-encryption key (DEK).
+`secrets add` still returns one opaque version ID. It encrypts a fresh body and
+initially seals the DEK to the adding signer. The envelope binds an immutable
+resource descriptor containing that ID, ciphertext handle, exact containing
+collection, and the signer's delivery policy. Appending another policy fact
+about the same secret cannot change this binding.
+
+```sh
+secrets --pile ./self.pile add --name service-token --value @-
+secrets --pile ./self.pile grant --secret SECRET_ID --recipient ED25519_PUBLIC_KEY \
+  --expires-at 2030-01-01T00:00:00Z --delegate
+secrets --pile ./self.pile maintain --secret SECRET_ID
+secrets --pile ./self.pile get --secret SECRET_ID
+```
+
+`grant --resource blake3:HANDLE` selects the immutable resource directly and
+allows an authorized delegate to issue onward grants without opening its DEK.
+`--not-before` is inclusive and `--expires-at` exclusive; both constrain future
+delivery, including through descendant grants. They never disable an envelope
+already delivered. `--delegate` allows onward delegation of delivery, not
+collection READ or WRITE. A new version with the same name gets its own
+resource and does not inherit the previous version's grants.
+
+`maintain` accepts repeated `--secret` and `--resource` selections. With neither,
+it visits bound resources the configured key can open; unrelated writers'
+secrets are left alone. An authenticated existing envelope suppresses repeat
+delivery; a well-shaped but forged envelope does not. Legacy unbound envelopes
+remain decryptable but never gain new delivery roots from collection facts.
+CLI and MCP use the same operations: `secrets_grant` accepts `secret` or
+`resource`, and `secrets_maintain` accepts `secrets` and `resources` arrays.
+No command here silently grants replication access or creates a new inbox.
 
 ## Notes on piles & collections
 
@@ -577,8 +613,9 @@ For the READ/WRITE-policy epoch immediately before resource capabilities, run
 the planned successors. `--authority` defaults to the signer's public key. Check
 the printed exact old/new handles against the configured live collections;
 equal names alone do not select a predecessor. Only standard direct-policy
-roots for that authority are selected. Secrets' successor explicitly binds key
-delivery to the owner. `--inventory` optionally reports other resident
+roots for that authority are selected. Secrets' historical collection delivery
+binding is retained as descriptor identity; new delivery authority is bound to
+each secret resource as described above. `--inventory` optionally reports other resident
 predecessor roots without treating unrelated history as an error.
 
 Each pass re-signs only its own author's COMMITs and preserves their exact data
@@ -593,10 +630,18 @@ coverage on each author host and combined coverage after replication before
 claiming the shared collection has fully transitioned.
 
 Old AUTH signatures cannot be relabeled. Reissue grants separately against the
-exact new descriptor and current capability grammar, preserving the intended
-recipient, mode, and validity. The current `trible pile collection grant-read`
-and `grant-write` commands create unbounded Invoke grants; they do not preserve
-bounded or delegable grants automatically and do not grant Secrets key delivery.
+exact resource and current capability grammar. This proof-format change itself
+preserves existing collection descriptors and standard READ/WRITE definitions;
+it is not another collection re-identification. Each edge now signs a capability
+definition handle, delegate key, and the preceding proof prefix. Definitions
+carry independent invocation and delegation action sets: a child may invoke or
+delegate only actions its parent permits delegating, and its handle may differ.
+Generic collection admission has no clock. Application-specific restrictions
+such as Secrets delivery deadlines are interpreted before counting each root's
+prefix, not as proof validity or COMMIT expiry. The current `trible pile
+collection grant-read` and `grant-write` commands issue invoke-only standard
+grants; they do not automatically reconstruct delegation or application-specific
+restrictions and do not grant Secrets key delivery.
 The older `migrations collection-policy` verb consumes the mandatory-authority
 epoch, not this transition. Neither verb is the historical branch-to-collection
 cutover.

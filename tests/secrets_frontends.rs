@@ -100,7 +100,7 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("absent.pile");
     let adapter = secrets::mcp::Secrets::new(pile.clone(), None);
-    assert_eq!(adapter.tools().len(), 4);
+    assert_eq!(adapter.tools().len(), 5);
     for (name, input) in [
         ("secrets_add", r#"{"name":"x"}"#),
         (
@@ -115,6 +115,17 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
             r#"{"secret":"00000000000000000000000000000000"}"#,
         ),
         ("secrets_list", r#"{"show_secrets":true}"#),
+        ("secrets_grant", r#"{"recipient":"00"}"#),
+        (
+            "secrets_grant",
+            r#"{"secret":"01010101010101010101010101010101","resource":"02","recipient":"00"}"#,
+        ),
+        (
+            "secrets_grant",
+            r#"{"secret":"01010101010101010101010101010101","recipient":"invalid"}"#,
+        ),
+        ("secrets_maintain", r#"{"secrets":["not-an-id"]}"#),
+        ("secrets_maintain", r#"{"resources":["not-a-handle"]}"#),
     ] {
         let error = adapter
             .call(
@@ -129,6 +140,104 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
         );
         assert!(!pile.exists());
     }
+}
+
+#[test]
+fn mcp_and_cli_grant_the_same_exact_resource_and_maintain_only_selected_secrets() {
+    use triblespace::core::capability::CapabilityResource;
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::{CapabilityProofRead, SnapshotSource};
+    let (_directory, pile, key) = fixture();
+    let operations = Secrets::new(pile.clone(), Some(key.clone()));
+    let adapter = secrets::mcp::Secrets::new(pile.clone(), Some(key.clone()));
+    let first = operations.add("token", b"first").unwrap();
+    let second = operations.add("token", b"second").unwrap();
+    let recipient = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key();
+    let recipient_hex = hex::encode(recipient.to_bytes());
+    let first_hex = format!("{first:x}");
+    let expiry = "2099-01-01T00:00:00Z";
+    let receipts = call(
+        &adapter,
+        "secrets_grant",
+        json!({
+            "secret": first_hex, "recipient": recipient_hex,
+            "expires_at": expiry, "delegate": true,
+        }),
+    );
+    let receipt = receipts
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.as_str(),
+            _ => panic!("grant receipt must not export a secret"),
+        })
+        .collect::<String>();
+    assert!(receipt.starts_with("AUTH blake3:"));
+    let mut opened = Pile::open(&pile).unwrap();
+    let snapshot = opened.snapshot().unwrap();
+    let proofs = snapshot
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let proof = proofs
+        .iter()
+        .find(|proof| proof.leaf_key() == recipient)
+        .unwrap();
+    let resource = hex::encode(proof.resource().into_bytes());
+    assert_eq!(proofs.len(), 1);
+    assert_ne!(proof.resource(), CapabilityResource::new([0; 32]));
+    drop(snapshot);
+    opened.close().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_secrets"))
+        .arg("--pile")
+        .arg(&pile)
+        .arg("--key")
+        .arg(&key)
+        .args([
+            "grant",
+            "--resource",
+            &resource,
+            "--recipient",
+            &recipient_hex,
+            "--expires-at",
+            expiry,
+            "--delegate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        receipt.trim()
+    );
+    let mut opened = Pile::open(&pile).unwrap();
+    assert_eq!(
+        opened.snapshot().unwrap().proofs().unwrap().count(),
+        1,
+        "CLI and MCP repeat the same signed grant"
+    );
+    opened.close().unwrap();
+    let parts = call(
+        &adapter,
+        "secrets_maintain",
+        json!({"secrets":[format!("{second:x}")]}),
+    );
+    assert!(parts
+        .iter()
+        .any(|part| matches!(part, Part::Text {text} if text.contains("added 0"))));
+    let parts = call(
+        &adapter,
+        "secrets_maintain",
+        json!({"resources":[resource]}),
+    );
+    assert!(parts
+        .iter()
+        .any(|part| matches!(part, Part::Text {text} if text.contains("added 1"))));
 }
 
 #[test]

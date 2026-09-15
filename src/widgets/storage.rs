@@ -724,30 +724,6 @@ async fn load_inputs_from_pile(
                     .map_err(|error| format!("ensure {label} source collection: {error:#}"))?,
             );
         }
-        if let Some(collection) = secrets_collection {
-            drop(
-                pile.ensure(collection.source(), signer)
-                    .await
-                    .map_err(|error| format!("ensure Secrets source collection: {error:#}"))?,
-            );
-        }
-
-        // Keep the Secrets credential path pinned to its existing explicit
-        // support boundary after root acquisition.
-        let before = pile
-            .snapshot()
-            .map_err(|error| format!("freeze shared viewer support snapshot: {error}"))?;
-        let secrets_support = secrets_collection
-            .map(|collection| {
-                collection
-                    .source()
-                    .admitted(&before)
-                    .map(|support| (collection, support))
-                    .map_err(|error| format!("admit Secrets collection support: {error:#}"))
-            })
-            .transpose()?;
-        drop(before);
-
         for (_, label, _, succinct, rank9) in &collections {
             drop(
                 pile.maintain(*succinct, signer).await.map_err(|error| {
@@ -783,13 +759,10 @@ async fn load_inputs_from_pile(
             );
         }
 
-        let secrets = if let Some((collection, support)) = secrets_support {
-            let store_snapshot = collection
-                .ensure_exact(pile, signer, &support)
+        let secrets = if let Some(collection) = secrets_collection {
+            let snapshot = secret_storage::ensure_and_snapshot(pile, collection, signer)
                 .await
-                .map_err(|error| format!("ensure configured Secrets collection: {error:#}"))?;
-            let snapshot = secret_storage::snapshot_exact(store_snapshot, collection, support)
-                .map_err(|error| format!("attach exact Secrets collection: {error:#}"))?;
+                .map_err(|error| format!("observe configured Secrets collection: {error:#}"))?;
             Some(LoadedSecrets::new(snapshot))
         } else {
             None

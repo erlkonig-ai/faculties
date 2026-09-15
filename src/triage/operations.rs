@@ -172,20 +172,6 @@ impl TriageSnapshot {
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
             }
-            drop(
-                pile.ensure(secrets_collection.source(), signer)
-                    .await
-                    .context("ensure Secrets source collection")?,
-            );
-            let before = pile
-                .snapshot()
-                .context("freeze shared Triage support snapshot")?;
-            let secrets_support = secrets_collection
-                .source()
-                .admitted(&before)
-                .context("admit Secrets collection support")?;
-            drop(before);
-
             for (index, (_, label)) in registered.iter().enumerate() {
                 drop(
                     pile.maintain(succinct[index], signer)
@@ -198,13 +184,9 @@ impl TriageSnapshot {
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
             }
-            let store_snapshot = secrets_collection
-                .ensure_exact(pile, signer, &secrets_support)
+            let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                 .await
-                .context("ensure configured Secrets collection")?;
-            let secrets =
-                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
-                    .context("attach exact Secrets collection")?;
+                .context("observe configured Secrets collection")?;
             Ok::<_, anyhow::Error>(secrets)
         })?;
 
