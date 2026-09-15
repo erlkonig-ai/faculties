@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::lww_register::LwwQuery;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
@@ -289,7 +289,7 @@ impl CompassStorage<'_> {
     /// reader. Printing and other effects belong after this returns.
     fn with_view<T>(
         &self,
-        mut f: impl FnMut(&FactArchive, &PileSnapshot, &LwwIndex) -> Result<T>,
+        mut f: impl FnMut(&FactArchive, &PileSnapshot, &LwwQuery) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
             runtime.block_on(async {
@@ -500,7 +500,7 @@ fn task_created_at<P: TriblePattern>(space: &P, task_id: Id) -> Option<IntervalV
 /// Latest status for a task.
 fn task_latest_status<P: TriblePattern>(
     space: &P,
-    status_register: &LwwIndex,
+    status_register: &LwwQuery,
     task_id: Id,
 ) -> Option<(String, IntervalValue)> {
     latest_status_event(space, status_register, task_id).map(|(_, status, at)| (status, at))
@@ -627,7 +627,7 @@ fn note_supersedes<P: TriblePattern>(space: &P, note_id: Id) -> Vec<Id> {
 fn render_board<P: TriblePattern>(
     reader: &PileSnapshot,
     space: &P,
-    status_register: &LwwIndex,
+    status_register: &LwwQuery,
     status_filter: &[String],
     tag_filter: &[String],
     show_done: bool,
@@ -1018,7 +1018,7 @@ fn add_note(
 fn render_goal<P: TriblePattern>(
     reader: &PileSnapshot,
     space: &P,
-    status_register: &LwwIndex,
+    status_register: &LwwQuery,
     task_id: Id,
 ) -> Result<String> {
     let mut output = String::new();

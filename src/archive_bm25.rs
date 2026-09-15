@@ -36,7 +36,7 @@ use triblespace::core::trible::TribleSet;
 use triblespace::macros::entity;
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::{find, pattern};
-use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index, PortableBM25View};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::schemas::blockdag as schema;
@@ -54,6 +54,8 @@ use crate::schemas::blockdag as schema;
 pub const ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1: Id = id_hex!("4EC6991611EF484A37FBD95F6E108FC6");
 
 pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;
+/// Shared carrier views for one logical Archive search cover.
+pub type ArchiveBM25View = PortableBM25View<GenId, WordHash>;
 
 #[derive(Debug)]
 enum DeriveValidation {
@@ -503,7 +505,7 @@ mod tests {
         let index = parse(derive(&store.reader, source));
         let document: Inline<GenId> = block_id.to_inline();
         let term = hash_tokens("echo")[0];
-        assert_eq!(index.term_frequency(&document, &term), 2);
+        assert_eq!(index.term_frequency(&document, &term).unwrap(), 2);
         assert_eq!(index.merged(&index).unwrap(), index);
     }
 

@@ -379,7 +379,7 @@ pub struct Bm25IndexReport {
 
 struct EnsuredBm25 {
     report: Bm25IndexReport,
-    index: archive_bm25::ArchiveBM25Index,
+    index: archive_bm25::ArchiveBM25View,
 }
 
 /// Maintain the BM25 representation for one explicit foundational support.
@@ -404,7 +404,7 @@ async fn ensure_bm25_exact(
         .collection_exact(target, support)
         .context("attach exact Archive BM25 cover")?;
     let index = attached
-        .view::<archive_bm25::ArchiveBM25Index>()
+        .view::<archive_bm25::ArchiveBM25View>()
         .context("read exact Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
@@ -443,13 +443,14 @@ pub fn ensure_bm25_index_with_storage(
 
 /// Prepare fact and search values for the same exact support. The returned
 /// collection snapshot exposes the usual fact view and blob reader; callers
-/// query BM25 and join document ids to whatever facts their operation needs.
+/// explicitly prepare a BM25 query and join document ids to whatever facts
+/// their operation needs. Attaching the search cover does not serialize its union.
 pub async fn ensure_search_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<(
     CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
-    archive_bm25::ArchiveBM25Index,
+    archive_bm25::ArchiveBM25View,
 )> {
     ensure_search_local_with_storage(&crate::storage::Storage::new(
         pile_path.to_owned(),
@@ -461,7 +462,7 @@ pub fn ensure_search_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<(
     CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
-    archive_bm25::ArchiveBM25Index,
+    archive_bm25::ArchiveBM25View,
 )> {
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
@@ -1292,7 +1293,12 @@ mod tests {
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert!(search.0.support().is_empty());
-        assert!(search.1.query_multi(&hash_tokens("anything")).is_empty());
+        assert!(search
+            .1
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("anything"))
+            .is_empty());
     }
 
     #[test]
@@ -1336,7 +1342,12 @@ mod tests {
         assert!(projection_ids(&snapshot.view::<FactArchive>().unwrap()).is_empty());
         drop(snapshot);
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert!(search.1.query_multi(&hash_tokens("anything")).is_empty());
+        assert!(search
+            .1
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("anything"))
+            .is_empty());
     }
 
     #[test]
@@ -1555,8 +1566,9 @@ mod tests {
         pile.close().unwrap();
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(search.1.query_multi(&hash_tokens("alpha")).len(), 1);
-        assert_eq!(search.1.query_multi(&hash_tokens("beta")).len(), 1);
+        let query = search.1.query().unwrap();
+        assert_eq!(query.query_multi(&hash_tokens("alpha")).len(), 1);
+        assert_eq!(query.query_multi(&hash_tokens("beta")).len(), 1);
     }
 
     #[test]
@@ -1579,7 +1591,11 @@ mod tests {
         let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!(report.source_elements, 2);
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        let hits = search.1.query_multi(&hash_tokens("shared closure needle"));
+        let hits = search
+            .1
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("shared closure needle"));
         assert_eq!(hits.len(), 1);
     }
 
@@ -1597,7 +1613,15 @@ mod tests {
         writer.stage_fragment(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
         let first = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(first.1.query_multi(&hash_tokens("alpha")).len(), 1);
+        assert_eq!(
+            first
+                .1
+                .query()
+                .unwrap()
+                .query_multi(&hash_tokens("alpha"))
+                .len(),
+            1
+        );
         drop(first);
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
@@ -1607,9 +1631,12 @@ mod tests {
         writer.finish(Ok(())).unwrap();
 
         let extended = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(extended.1.query_multi(&hash_tokens("alpha")).len(), 1);
-        assert_eq!(extended.1.query_multi(&hash_tokens("beta")).len(), 1);
-        assert_eq!(extended.1.query_multi(&hash_tokens("🛰️")).len(), 1);
+        {
+            let query = extended.1.query().unwrap();
+            assert_eq!(query.query_multi(&hash_tokens("alpha")).len(), 1);
+            assert_eq!(query.query_multi(&hash_tokens("beta")).len(), 1);
+            assert_eq!(query.query_multi(&hash_tokens("🛰️")).len(), 1);
+        }
         drop(extended);
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
@@ -1618,7 +1645,15 @@ mod tests {
         retry.stage_fragment(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
         let after_retry = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(after_retry.1.query_multi(&hash_tokens("beta")).len(), 1);
+        assert_eq!(
+            after_retry
+                .1
+                .query()
+                .unwrap()
+                .query_multi(&hash_tokens("beta"))
+                .len(),
+            1
+        );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
     }
 
@@ -1734,7 +1769,11 @@ mod tests {
         pile.close().unwrap();
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        let hits = search.1.query_multi(&hash_tokens("routed needle"));
+        let hits = search
+            .1
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("routed needle"));
         assert_eq!(hits.len(), 1);
         let projections = projection_ids(&search.0.view::<FactArchive>().unwrap());
         assert_eq!(projections.len(), 1);

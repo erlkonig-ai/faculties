@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Adapt maintained register and Archive search readers to typed backing views.
+  LWW winner preparation and BM25 scoring preparation are explicit query steps;
+  Archive search keeps a cover of shared carriers rather than serializing a
+  temporary union. Source writes, maintenance policy and collection identities
+  are unchanged. Release checkouts pin the tested TribleSpace/Mary/GORBIE
+  cohort and both required CubeCL sibling paths.
+
 - Orient no longer performs collection maintenance on reads, including its
   health-first and wake inputs, regardless of WRITE authority. It attaches one
   frozen resident target snapshot and leaves upkeep to explicitly selected

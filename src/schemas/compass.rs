@@ -4,7 +4,7 @@
 //! pile. Status names are intentionally open-ended; the defaults only define
 //! the lanes presented first by clients.
 
-use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::lww_register::LwwQuery;
 use triblespace::core::metadata;
 use triblespace::core::query::intersectionconstraint::and;
 use triblespace::macros::{find, id_hex, pattern};
@@ -93,7 +93,7 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
 /// `(created_at, event-id)` total order leaves exactly one per register.
 pub fn latest_status_event<P: TriblePattern>(
     space: &P,
-    register: &LwwIndex,
+    register: &LwwQuery,
     goal_id: Id,
 ) -> Option<(Id, String, IntervalValue)> {
     let current = find!(

@@ -1103,7 +1103,8 @@ fn run_search(
 ) -> Result<()> {
     let (observed, index) = archive_collection::ensure_search_local_with_storage(storage.storage)?;
     let facts = observed.view::<FactArchive>()?;
-    for (document, score) in index
+    let query = index.query().context("prepare Archive BM25 query")?;
+    for (document, score) in query
         .query_multi(&hash_tokens(&text))
         .into_iter()
         .take(limit)
@@ -1778,7 +1779,11 @@ mod tests {
             Some(&fixture.key),
         ))
         .unwrap();
-        let hits = search.1.query_multi(&hash_tokens("quasar"));
+        let hits = search
+            .1
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("quasar"));
         assert_eq!(hits.len(), 1);
         let block = Id::try_from_inline(&hits[0].0).unwrap();
         let found: Vec<_> = find!(
