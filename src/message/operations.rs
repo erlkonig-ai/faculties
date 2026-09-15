@@ -214,10 +214,15 @@ where
     let bytes = store
         .acquire(handle.transmute())
         .await
-        .context("acquire Message text")?
-        .context("Message text is unavailable")?;
+        .with_context(|| format!("acquire Message text blake3:{}", hex::encode(handle.raw)))?
+        .with_context(|| {
+            format!(
+                "Message text is unavailable (blake3:{})",
+                hex::encode(handle.raw)
+            )
+        })?;
     Ok(std::str::from_utf8(&bytes)
-        .context("decode Message text")?
+        .with_context(|| format!("decode Message text blake3:{}", hex::encode(handle.raw)))?
         .to_owned())
 }
 
@@ -254,7 +259,12 @@ where
         None => person_label(store, facts, row.to).await,
         Some(snapshot) => {
             let snapshot = relations::group_snapshot(facts, snapshot)?;
-            acquire_text(store, snapshot.name).await
+            acquire_text(store, snapshot.name).await.with_context(|| {
+                format!(
+                    "read name of group snapshot {:x} for Message {:x}",
+                    snapshot.id, row.id
+                )
+            })
         }
     }
 }
@@ -416,7 +426,9 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
         } else {
             MessageStatus::Sent
         };
-        let body = acquire_text(storage.pile, row.body).await?;
+        let body = acquire_text(storage.pile, row.body)
+            .await
+            .with_context(|| format!("read body of Message {:x}", row.id))?;
         entries.push(MessageObservation {
             row,
             body,
@@ -571,8 +583,8 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
-    use std::convert::Infallible;
     use std::future::{ready, Future};
+    use std::io;
 
     use anybytes::Bytes;
     use hifitime::Epoch;
@@ -590,6 +602,7 @@ mod tests {
         pile: Pile,
         remote: MemoryBlobStoreSnapshot,
         requested: Vec<Inline<inlineencodings::Handle<UnknownBlob>>>,
+        failure: Option<io::ErrorKind>,
         arriving: Option<(Collection<SimpleArchive>, SigningKey, Fragment)>,
         _file: tempfile::NamedTempFile,
     }
@@ -601,6 +614,7 @@ mod tests {
                 pile: Pile::open(file.path()).unwrap(),
                 remote: remote.snapshot().unwrap(),
                 requested: Vec::new(),
+                failure: None,
                 arriving: None,
                 _file: file,
             }
@@ -617,17 +631,23 @@ mod tests {
     }
 
     impl AsyncBlobStoreAcquire for AcquiringPile {
-        type AcquireError = Infallible;
+        type AcquireError = io::Error;
 
         fn acquire(
             &mut self,
             handle: Inline<inlineencodings::Handle<UnknownBlob>>,
-        ) -> impl Future<Output = Result<Option<Bytes>, Infallible>> + Send {
+        ) -> impl Future<Output = Result<Option<Bytes>, io::Error>> + Send {
             let resident = self.pile.snapshot().unwrap();
             if resident.contains_blob(handle).unwrap() {
                 return ready(Ok(Some(resident.get(handle).unwrap())));
             }
             self.requested.push(handle);
+            if let Some(kind) = self.failure {
+                return ready(Err(io::Error::new(
+                    kind,
+                    "injected Message acquisition failure",
+                )));
+            }
             if let Some((collection, signer, fragment)) = self.arriving.take() {
                 self.pile.commit(collection, &signer, fragment).unwrap();
             }
@@ -1519,6 +1539,131 @@ mod tests {
     }
 
     #[test]
+    fn group_name_acquisition_errors_identify_snapshot_message_and_handle() {
+        let group = test_id(13);
+        let (relations, snapshot) =
+            relations::group_create_fragment(group, "unavailable group name").unwrap();
+        let name = relations::group_snapshot(relations.facts(), snapshot)
+            .unwrap()
+            .name;
+        let (envelope, id) = message::message_fragment(
+            test_id(14),
+            &message::Recipient::Group {
+                anchor: group,
+                snapshot,
+                basis: crate::schemas::message::GROUP_SNAPSHOT_BASIS_WITNESSED,
+            },
+            "not the unavailable attachment",
+            (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
+                .try_to_inline()
+                .unwrap(),
+        );
+        let row = message::row_by_id(envelope.facts(), id).unwrap();
+        for failure in [None, Some(io::ErrorKind::TimedOut)] {
+            let mut store = AcquiringPile::new(MemoryBlobStore::new());
+            store.failure = failure;
+            let error = pollster::block_on(recipient_label(&mut store, relations.facts(), &row))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("read name of group snapshot {snapshot:x} for Message {id:x}")
+            );
+            let report = format!("{error:#}");
+            assert!(report.contains(&format!("blake3:{}", hex::encode(name.raw))));
+            assert!(!report.contains("read body of Message"));
+            match failure {
+                None => {
+                    assert!(report.contains("Message text is unavailable"));
+                    assert!(error.downcast_ref::<io::Error>().is_none());
+                }
+                Some(kind) => {
+                    assert!(report.contains("acquire Message text"));
+                    assert!(!report.contains("Message text is unavailable"));
+                    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+                }
+            }
+            assert_eq!(store.requested, vec![name.transmute()]);
+        }
+    }
+
+    #[test]
+    fn list_body_decode_error_identifies_message_and_handle() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[98; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let person = test_id(15);
+        pile.commit(
+            relations_source,
+            &owner,
+            relations::person_fragment(
+                person,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        // Keep the malformed body resident: this exercises the real list
+        // caller without starting the lazy network host or changing visibility.
+        let bytes: Inline<inlineencodings::Handle<UnknownBlob>> =
+            pile.put(Bytes::from_source(vec![0xff_u8])).unwrap();
+        let body: TextHandle = bytes.transmute();
+        let envelope = message::envelope_fragment(
+            person,
+            person,
+            body,
+            clock::point_now().unwrap(),
+            None,
+            None,
+        );
+        let id = envelope.root().unwrap();
+        pile.commit(message_source, &owner, envelope).unwrap();
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let error = runtime
+            .block_on(list(&mut input, &ListOptions::new("reader")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), format!("read body of Message {id:x}"));
+        let report = format!("{error:#}");
+        assert!(report.contains(&format!(
+            "decode Message text blake3:{}",
+            hex::encode(body.raw)
+        )));
+        assert!(!report.contains("Message text is unavailable"));
+        assert!(!report.contains("group snapshot"));
+        assert!(error.downcast_ref::<std::str::Utf8Error>().is_some());
+        assert!(pile.health().started_at.is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn acquiring_a_selected_body_leaves_other_bodies_and_old_snapshot_untouched() {
         let mut remote = MemoryBlobStore::new();
         let selected: TextHandle = remote.put("selected body").unwrap();
@@ -1539,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_does_not_turn_missing_or_invalid_text_into_empty_text() {
+    fn acquisition_distinguishes_missing_failed_and_invalid_text() {
         let mut remote = MemoryBlobStore::new();
         let invalid = remote.insert(Blob::<blobencodings::UTF8String>::new(Bytes::from_source(
             vec![0xff_u8],
@@ -1548,9 +1693,38 @@ mod tests {
         let mut store = AcquiringPile::new(remote);
 
         let missing = pollster::block_on(acquire_text(&mut store, absent)).unwrap_err();
-        assert!(missing.to_string().contains("unavailable"));
+        assert_eq!(
+            missing.to_string(),
+            format!(
+                "Message text is unavailable (blake3:{})",
+                hex::encode(absent.raw)
+            )
+        );
+        assert!(missing.downcast_ref::<io::Error>().is_none());
+
+        store.failure = Some(io::ErrorKind::PermissionDenied);
+        let failed = pollster::block_on(acquire_text(&mut store, absent)).unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            format!("acquire Message text blake3:{}", hex::encode(absent.raw))
+        );
+        assert_eq!(
+            failed.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            failed.root_cause().to_string(),
+            "injected Message acquisition failure"
+        );
+        assert!(!format!("{failed:#}").contains("Message text is unavailable"));
+
+        store.failure = None;
         let malformed = pollster::block_on(acquire_text(&mut store, invalid)).unwrap_err();
-        assert!(malformed.to_string().contains("decode Message text"));
+        assert_eq!(
+            malformed.to_string(),
+            format!("decode Message text blake3:{}", hex::encode(invalid.raw))
+        );
+        assert!(malformed.downcast_ref::<std::str::Utf8Error>().is_some());
 
         let person = test_id(12);
         let profile = entity! {

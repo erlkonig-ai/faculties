@@ -213,8 +213,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
-    admitted_record_witnesses, Collection, CollectionRealizationError, CollectionSnapshot,
-    CollectionSnapshotExt, CollectionStoreExt, Support,
+    admitted_record_witnesses, Collection, CollectionEncoding, CollectionRealizationError,
+    CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, Cover, Support,
 };
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -225,6 +225,213 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+
+// Temporary, opt-in diagnostics. These retain only existing cover roots and
+// report to stderr; they never choose a view or change a retry decision.
+fn trace_refresh_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ORIENT_TRACE_REFRESH").is_some_and(|v| v == "1"))
+}
+
+fn trace_refresh_line(fields: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    // A closed diagnostic pipe must not turn a successful observation into a
+    // failed command (or interrupt receipt publication).
+    let _ = writeln!(std::io::stderr().lock(), "ORIENT_TRACE_REFRESH {fields}");
+}
+
+fn trace_refresh_call<T, E>(
+    target: &'static str,
+    stage: &'static str,
+    operation: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    if !trace_refresh_enabled() {
+        return operation();
+    }
+    let started = Instant::now();
+    let result = operation();
+    // Attachment/view/query stages are synchronous. In one `wait` command
+    // they occur in order inside the enclosing refresh begin/end pair, before
+    // ordinary payload acquisition can yield to another health poll.
+    trace_refresh_line(format_args!(
+        "event=stage target={target:?} stage={stage} elapsed_us={} ok={}",
+        started.elapsed().as_micros(),
+        result.is_ok(),
+    ));
+    result
+}
+
+struct RefreshProbe {
+    id: u64,
+    scope: &'static str,
+    started: Instant,
+}
+
+impl RefreshProbe {
+    fn begin(
+        scope: &'static str,
+        sampled: &FacultySnapshot,
+        previous: Option<&FacultySnapshot>,
+        pending: Option<&PendingWaitFrame>,
+    ) -> Option<Self> {
+        if !trace_refresh_enabled() {
+            return None;
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let probe = Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            scope,
+            started: Instant::now(),
+        };
+        let changes = previous.map(|previous| sampled.changes_since(previous));
+        trace_refresh_line(format_args!(
+            "event=begin refresh={} scope={} initial={} blobs={:?} records={:?} proofs={:?} wants={:?} pending={:?} exact_missing={}",
+            probe.id,
+            scope,
+            previous.is_none(),
+            changes.map(|c| c.contains(StoreChanges::BLOBS)),
+            changes.map(|c| c.contains(StoreChanges::COLLECTION_RECORDS)),
+            changes.map(|c| c.contains(StoreChanges::CAPABILITY_PROOFS)),
+            changes.map(|c| c.contains(StoreChanges::WANTS)),
+            pending.map(|p| p.reason),
+            pending.is_some_and(|p| p.missing.is_some()),
+        ));
+        Some(probe)
+    }
+
+    fn finish(&self, outcome: &'static str) {
+        trace_refresh_line(format_args!(
+            "event=end refresh={} scope={} outcome={} elapsed_us={}",
+            self.id,
+            self.scope,
+            outcome,
+            self.started.elapsed().as_micros(),
+        ));
+    }
+
+    fn cover<E: CollectionEncoding>(
+        &self,
+        target: &'static str,
+        previous: Option<(&Cover<E>, &Support)>,
+        cover: &Cover<E>,
+        support: &Support,
+    ) {
+        trace_refresh_line(format_args!(
+            "event=target refresh={} scope={} target={target:?} cover_equal={:?} support_equal={:?} cover_before={:?} cover_after={} support_before={:?} support_after={}",
+            self.id,
+            self.scope,
+            previous.map(|(old, _)| old == cover),
+            previous.map(|(_, old)| old == support),
+            previous.map(|(old, _)| old.len()),
+            cover.len(),
+            previous.map(|(_, old)| old.len()),
+            support.len(),
+        ));
+    }
+
+    fn fact(&self, target: &'static str, previous: Option<&OrientFact>, current: &OrientFact) {
+        self.cover(
+            target,
+            previous.map(|old| (old.collection.cover(), old.collection.support())),
+            current.collection.cover(),
+            current.collection.support(),
+        );
+    }
+
+    fn ordinary(&self, previous: Option<&OrientObservation>, current: &OrientObservation) {
+        for (target, old, new) in [
+            (
+                "Message",
+                previous.map(|p| &p.facts.messages),
+                &current.facts.messages,
+            ),
+            ("Mail", previous.map(|p| &p.facts.mail), &current.facts.mail),
+            (
+                "Teams",
+                previous.map(|p| &p.facts.teams),
+                &current.facts.teams,
+            ),
+            (
+                "Compass",
+                previous.map(|p| &p.facts.compass),
+                &current.facts.compass,
+            ),
+            (
+                "Relations",
+                previous.map(|p| &p.facts.relations),
+                &current.facts.relations,
+            ),
+            (
+                "Status",
+                previous.map(|p| &p.facts.status),
+                &current.facts.status,
+            ),
+            (
+                "Orient",
+                previous.map(|p| &p.facts.presentations),
+                &current.facts.presentations,
+            ),
+        ] {
+            self.fact(target, old, new);
+        }
+        if let Some(habits) = &current.facts.habits {
+            self.fact(
+                "Habit",
+                previous.and_then(|p| p.facts.habits.as_ref()),
+                habits,
+            );
+        }
+        if let Some((cover, support)) = &current.compass_status_trace {
+            self.cover(
+                "Compass status",
+                previous
+                    .and_then(|p| p.compass_status_trace.as_ref())
+                    .map(|(c, s)| (c, s)),
+                cover,
+                support,
+            );
+        }
+    }
+
+    fn frame(&self, previous: Option<&OrientObservation>, result: &Result<Option<WaitFrameLoad>>) {
+        // Initial pending attempts have no comparison baseline. Later pending
+        // frames compare to the last ready observation, not to one another;
+        // never clone their prepared queries just for this diagnostic.
+        trace_refresh_line(format_args!(
+            "event=baseline refresh={} scope={} baseline={}",
+            self.id,
+            self.scope,
+            if previous.is_some() {
+                "last_ready"
+            } else {
+                "absent"
+            },
+        ));
+        let outcome = match result {
+            Ok(Some(WaitFrameLoad::Ready(frame))) => {
+                self.ordinary(previous, &frame.observation);
+                "ready"
+            }
+            Ok(Some(WaitFrameLoad::Pending(pending))) => {
+                if let Some(observation) = &pending.observation {
+                    self.ordinary(previous, observation);
+                }
+                trace_refresh_line(format_args!(
+                    "event=pending refresh={} scope={} reason={:?} observation={} exact_missing={}",
+                    self.id,
+                    self.scope,
+                    pending.reason,
+                    pending.observation.is_some(),
+                    pending.missing.is_some(),
+                ));
+                "pending"
+            }
+            Ok(None) => "health_deadline",
+            Err(_) => "error",
+        };
+        self.finish(outcome);
+    }
+}
 
 fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
@@ -405,11 +612,10 @@ impl OrientSource {
     }
 
     fn observe(&self, snapshot: &FacultySnapshot) -> Result<OrientFact> {
-        let collection = snapshot
-            .collection(self.rank9)
-            .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
-        let view = collection
-            .view::<FactArchive>()
+        let collection =
+            trace_refresh_call(self.label, "attach", || snapshot.collection(self.rank9))
+                .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
+        let view = trace_refresh_call(self.label, "view", || collection.view::<FactArchive>())
             .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
         Ok(OrientFact { collection, view })
     }
@@ -520,6 +726,8 @@ struct OrientObservation {
     snapshot: FacultySnapshot,
     facts: OrientFacts,
     compass_status: LwwQuery,
+    // No additional roots are retained unless the diagnostic is enabled.
+    compass_status_trace: Option<(Cover<LwwRegisterBlob>, Support)>,
 }
 
 impl OrientObservation {
@@ -595,12 +803,21 @@ fn observe_sources(
     let presentations = sources.presentations.observe(&snapshot)?;
     // Positive known-winner membership is an ordinary relation: it does not
     // require the fact and register collections to have identical support.
-    let compass_status = snapshot
-        .collection(sources.compass_status)
-        .map_err(|error| anyhow!("observe Compass status register: {error}"))?
-        .view::<LwwIndex>()
-        .map_err(|error| anyhow!("read Compass status register: {error}"))?
-        .query()
+    let status_collection = trace_refresh_call("Compass status", "attach", || {
+        snapshot.collection(sources.compass_status)
+    })
+    .map_err(|error| anyhow!("observe Compass status register: {error}"))?;
+    let compass_status_trace = trace_refresh_enabled().then(|| {
+        (
+            status_collection.cover().clone(),
+            status_collection.support().clone(),
+        )
+    });
+    let status_index = trace_refresh_call("Compass status", "view", || {
+        status_collection.view::<LwwIndex>()
+    })
+    .map_err(|error| anyhow!("read Compass status register: {error}"))?;
+    let compass_status = trace_refresh_call("Compass status", "query", || status_index.query())
         .map_err(|error| anyhow!("prepare Compass status register query: {error}"))?;
     Ok(OrientObservation {
         snapshot,
@@ -615,6 +832,7 @@ fn observe_sources(
             presentations,
         },
         compass_status,
+        compass_status_trace,
     })
 }
 
@@ -3037,7 +3255,7 @@ async fn cmd_wait(
         let start = Instant::now();
         let mut view_pending;
         let mut next_health_change;
-        let mut pending_frame = None;
+        let mut pending_frame: Option<PendingWaitFrame> = None;
 
         let sources = loop {
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
@@ -3068,7 +3286,13 @@ async fn cmd_wait(
                 });
             }
             let sampled = pile.snapshot()?;
-            if let Some(attempt) = load_wait_frame_before_health_deadline(
+            let probe = RefreshProbe::begin(
+                "ordinary",
+                &sampled,
+                pending_frame.as_ref().map(|pending| &pending.watermark),
+                pending_frame.as_ref(),
+            );
+            let attempt = load_wait_frame_before_health_deadline(
                 pile,
                 &sources,
                 sampled,
@@ -3077,8 +3301,11 @@ async fn cmd_wait(
                 persona_input,
                 next_health_change,
             )
-            .await?
-            {
+            .await;
+            if let Some(probe) = &probe {
+                probe.frame(None, &attempt);
+            }
+            if let Some(attempt) = attempt? {
                 match attempt {
                     WaitFrameLoad::Ready(frame) => {
                         pending_frame = None;
@@ -3162,6 +3389,12 @@ async fn cmd_wait(
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
             let storage_changed = wait_storage_changed(&sampled, &observed_snapshot);
+            let probe = RefreshProbe::begin(
+                "ordinary",
+                &sampled,
+                Some(&observed_snapshot),
+                pending_frame.as_ref(),
+            );
             let now = sampled.instant();
             let now_secs = epoch_seconds(now);
             let cooldown_elapsed = habit_seen
@@ -3169,11 +3402,14 @@ async fn cmd_wait(
                 .is_some_and(|deadline| now_secs >= deadline);
             let periodic_condition_check = last_habit_sweep.elapsed() >= Duration::from_secs(60);
             if !storage_changed && !view_pending && !cooldown_elapsed && !periodic_condition_check {
+                if let Some(probe) = &probe {
+                    probe.finish("unchanged");
+                }
                 continue;
             }
 
             if storage_changed || view_pending {
-                let Some(attempt) = load_wait_frame_before_health_deadline(
+                let attempt = load_wait_frame_before_health_deadline(
                     pile,
                     &sources,
                     sampled,
@@ -3182,8 +3418,11 @@ async fn cmd_wait(
                     persona_input,
                     next_health_change,
                 )
-                .await?
-                else {
+                .await;
+                if let Some(probe) = &probe {
+                    probe.frame(Some(&current), &attempt);
+                }
+                let Some(attempt) = attempt? else {
                     view_pending = true;
                     continue;
                 };
@@ -3233,6 +3472,8 @@ async fn cmd_wait(
                         pending_frame = Some(pending);
                     }
                 }
+            } else if let Some(probe) = &probe {
+                probe.finish("clock_only");
             }
 
             // A frame whose persona selection is unresolved remains only a

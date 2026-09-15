@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add an opt-in `ORIENT_TRACE_REFRESH=1` diagnostic for Orient: stderr-only
+  refresh triggers, attachment/view/query timings, and equality of already
+  selected covers/support. Disabled diagnostics retain no extra cover roots;
+  observation, pending retries, authority and receipt behavior are unchanged.
+
 - Adapt maintained register and Archive search readers to typed backing views.
   LWW winner preparation and BM25 scoring preparation are explicit query steps;
   Archive search keeps a cover of shared carriers rather than serializing a

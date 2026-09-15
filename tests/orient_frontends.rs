@@ -51,6 +51,22 @@ impl Fixture {
     fn who(&self) -> String {
         format!("{:x}", self.persona)
     }
+    fn process(&self, trace: Option<&str>) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_orient"));
+        command
+            .args([
+                "--pile",
+                self.pile.to_str().unwrap(),
+                "--key",
+                self.key.to_str().unwrap(),
+            ])
+            .args(["--persona", &self.who()])
+            .env_remove("ORIENT_TRACE_REFRESH");
+        if let Some(trace) = trace {
+            command.env("ORIENT_TRACE_REFRESH", trace);
+        }
+        command
+    }
     fn cli(&self, args: &[&str]) -> Vec<Part> {
         let mut argv = vec![
             "orient",
@@ -244,6 +260,110 @@ fn text(parts: &[Part]) -> String {
             _ => panic!("text expected"),
         })
         .collect()
+}
+
+#[test]
+fn refresh_probe_is_opt_in_stderr_only_and_preserves_peek() {
+    let f = Fixture::new();
+    f.message("diagnostic must not change the report", f.persona);
+    f.maintain();
+    let before = f.records();
+    let plain = f.process(None).args(["poll", "--peek"]).output().unwrap();
+    let disabled = f
+        .process(Some("0"))
+        .args(["poll", "--peek"])
+        .output()
+        .unwrap();
+    let traced = f
+        .process(Some("1"))
+        .args(["poll", "--peek"])
+        .output()
+        .unwrap();
+    for result in [&plain, &disabled, &traced] {
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(plain.stdout, traced.stdout);
+    assert_eq!(plain.stdout, disabled.stdout);
+    assert!(!String::from_utf8_lossy(&plain.stderr).contains("ORIENT_TRACE_REFRESH"));
+    assert!(!String::from_utf8_lossy(&disabled.stderr).contains("ORIENT_TRACE_REFRESH"));
+    let stderr = String::from_utf8(traced.stderr).unwrap();
+    for stage in ["stage=attach", "stage=view", "stage=query"] {
+        assert!(stderr.contains(stage), "{stderr}");
+    }
+    assert!(!stderr.contains("diagnostic must not change the report"));
+    assert_eq!(f.records(), before);
+}
+
+#[test]
+fn refresh_probe_reports_blob_only_refresh_with_unchanged_targets() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use triblespace::core::blob::encodings::UnknownBlob;
+
+    let f = Fixture::new();
+    f.maintain();
+    let before = f.records();
+    let mut child = f
+        .process(Some("1"))
+        .args(["wait", "--poll-ms", "20", "for", "2s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready, received) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        let mut signalled = false;
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if !signalled
+                && line.contains("event=end")
+                && line.contains("scope=ordinary outcome=ready")
+            {
+                let _ = ready.send(());
+                signalled = true;
+            }
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output
+    });
+    if received.recv_timeout(Duration::from_secs(10)).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("wait did not become ready: {}", reader.join().unwrap());
+    }
+    // Only the synthetic pile's physical blob set changes: no collection
+    // member, proof, or presentation is added.
+    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    pile.put::<UnknownBlob, _>(Bytes::from(b"unrelated hydration probe".to_vec()))
+        .unwrap();
+    pile.close().unwrap();
+    let result = child.wait_with_output().unwrap();
+    let stderr = reader.join().unwrap();
+    assert!(result.status.success(), "{stderr}");
+    assert!(String::from_utf8_lossy(&result.stdout).contains("No change detected"));
+    assert!(
+        stderr.lines().any(|line| line.contains("event=begin")
+            && line.contains("scope=ordinary")
+            && line.contains("blobs=Some(true) records=Some(false) proofs=Some(false)")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.contains("event=target")
+            && line.contains("scope=ordinary")
+            && line.contains("cover_equal=Some(true) support_equal=Some(true)")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("baseline=last_ready"), "{stderr}");
+    assert!(stderr.contains("outcome=unchanged"), "{stderr}");
+    assert_eq!(f.records(), before);
 }
 
 #[test]

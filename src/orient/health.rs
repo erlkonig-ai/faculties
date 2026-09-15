@@ -135,11 +135,58 @@ impl HealthSources {
     }
 
     fn refresh_poll_view(&mut self, sampled: FacultySnapshot) -> Result<()> {
+        let probe = RefreshProbe::begin(
+            "health",
+            &sampled,
+            self.poll_view.as_ref().map(|(watermark, _)| watermark),
+            None,
+        );
         let changed = self.poll_view.as_ref().map_or(true, |(watermark, _)| {
             wait_storage_changed(&sampled, watermark)
         });
         if changed {
-            let observation = self.at(sampled.clone())?;
+            let observation = self.at(sampled.clone());
+            if let Some(probe) = &probe {
+                if let Ok(current) = &observation {
+                    let previous = self.poll_view.as_ref().map(|(_, observation)| observation);
+                    trace_refresh_line(format_args!(
+                        "event=baseline refresh={} scope=health baseline={}",
+                        probe.id,
+                        if previous.is_some() {
+                            "previous_observation"
+                        } else {
+                            "absent"
+                        },
+                    ));
+                    probe.fact("Swarm health", previous.map(|p| &p.facts), &current.facts);
+                    probe.fact(
+                        "Relations",
+                        previous.map(|p| &p.relations),
+                        &current.relations,
+                    );
+                    probe.fact(
+                        "Orient",
+                        previous.map(|p| &p.presentations),
+                        &current.presentations,
+                    );
+                    if let Some((cover, support)) = &current.latest_trace {
+                        probe.cover(
+                            "Swarm health latest",
+                            previous
+                                .and_then(|p| p.latest_trace.as_ref())
+                                .map(|(c, s)| (c, s)),
+                            cover,
+                            support,
+                        );
+                    }
+                }
+                probe.finish(if observation.is_ok() {
+                    "ready"
+                } else {
+                    "error"
+                });
+            }
+            let observation = observation?;
             self.poll_view = Some((sampled, observation));
             #[cfg(test)]
             {
@@ -154,22 +201,35 @@ impl HealthSources {
                 .expect("an unchanged poll has a selected health view")
                 .1
                 .snapshot = sampled;
+            if let Some(probe) = &probe {
+                probe.finish("clock_only");
+            }
         }
         Ok(())
     }
 
     fn at(&self, snapshot: FacultySnapshot) -> Result<HealthObservation> {
         let facts = self.health.observe(&snapshot)?;
-        let latest = snapshot
-            .collection(self.latest)?
-            .view::<LwwIndex>()?
-            .query()?;
+        let latest_collection = trace_refresh_call("Swarm health latest", "attach", || {
+            snapshot.collection(self.latest)
+        })?;
+        let latest_trace = trace_refresh_enabled().then(|| {
+            (
+                latest_collection.cover().clone(),
+                latest_collection.support().clone(),
+            )
+        });
+        let latest_index = trace_refresh_call("Swarm health latest", "view", || {
+            latest_collection.view::<LwwIndex>()
+        })?;
+        let latest = trace_refresh_call("Swarm health latest", "query", || latest_index.query())?;
         let relations = self.relations.observe(&snapshot)?;
         let presentations = self.presentations.observe(&snapshot)?;
         Ok(HealthObservation {
             snapshot,
             facts,
             latest,
+            latest_trace,
             relations,
             presentations,
             max_age: self.max_age,
@@ -198,6 +258,7 @@ pub(super) struct HealthObservation {
     snapshot: FacultySnapshot,
     facts: OrientFact,
     latest: LwwQuery,
+    latest_trace: Option<(Cover<LwwRegisterBlob>, Support)>,
     relations: OrientFact,
     presentations: OrientFact,
     max_age: Duration,
