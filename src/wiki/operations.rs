@@ -278,6 +278,16 @@ impl WikiStorage<'_> {
                 schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             ))?;
+            let snapshot = pile
+                .snapshot()
+                .context("freeze Wiki publication authority")?;
+            anyhow::ensure!(
+                collection
+                    .writer_is_admitted(&snapshot, signer.verifying_key())
+                    .context("check Wiki source WRITE admission")?,
+                "publishing a Wiki fragment requires source collection WRITE"
+            );
+            drop(snapshot);
             pile.commit(collection, signer, fragment)
                 .context("publish Wiki fragment")
         })
@@ -869,17 +879,13 @@ fn cmd_create(
     force: bool,
 ) -> Result<Id> {
     let raw = content;
-    let (content, tags, mut fragment) = storage.view_with_scope(
-        Preparation::Update,
-        FILES_SCOPE_ID,
-        "Files",
-        |view, files| {
+    let (content, tags, mut fragment) =
+        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
             let content = prepare_content(&raw, &view.facts, Some(files), force)?;
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((content, tags, fragment))
-        },
-    )?;
+        })?;
     let revision = stage_revision(storage, &mut fragment, None, title, content, tags)?;
     storage.publish(fragment)?;
     Ok(revision)
@@ -1661,16 +1667,12 @@ fn cmd_import(
     documents: Vec<ImportDocument>,
     tags: Vec<String>,
 ) -> Result<Vec<Id>> {
-    let (view, files_catalog, tags, mut fragment) = storage.view_with_scope(
-        Preparation::Update,
-        FILES_SCOPE_ID,
-        "Files",
-        |view, files| {
+    let (view, files_catalog, tags, mut fragment) =
+        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((view.clone(), files.clone(), tags, fragment))
-        },
-    )?;
+        })?;
     let mut ids = Vec::new();
     for document in documents {
         let content = document.content;

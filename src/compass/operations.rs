@@ -255,6 +255,14 @@ struct CompassStorage<'a> {
     storage: &'a Storage,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Preparation {
+    /// Append an event referring only to entities in the resident view.
+    Resident,
+    /// Preserve complete-source checks for priority-graph changes.
+    Complete,
+}
+
 impl CompassStorage<'_> {
     fn with_pile<T>(
         &self,
@@ -299,6 +307,7 @@ impl CompassStorage<'_> {
     /// be repeated by a missing attachment. `None` is a genuine no-op.
     fn update<P, T>(
         &self,
+        preparation: Preparation,
         persona: Option<&str>,
         mut prepare: impl FnMut(&FactArchive, &PileSnapshot, Option<Id>) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
@@ -348,40 +357,69 @@ impl CompassStorage<'_> {
                 None
             };
 
+            let (maintain_compass, maintain_relations) = if preparation == Preparation::Complete {
+                (true, relation_collections.is_some())
+            } else {
+                let snapshot = pile
+                    .snapshot()
+                    .context("freeze Compass mutation admission snapshot")?;
+                let subject = signer.verifying_key();
+                let compass = compass_succinct
+                    .writer_is_admitted(&snapshot, subject)
+                    .context("check Compass Succinct WRITE admission")?
+                    && compass_rank9
+                        .writer_is_admitted(&snapshot, subject)
+                        .context("check Compass Rank9 WRITE admission")?;
+                let relations = if let Some((_, succinct, rank9)) = relation_collections {
+                    succinct
+                        .writer_is_admitted(&snapshot, subject)
+                        .context("check Relations Succinct WRITE admission for Compass")?
+                        && rank9
+                            .writer_is_admitted(&snapshot, subject)
+                            .context("check Relations Rank9 WRITE admission for Compass")?
+                } else {
+                    false
+                };
+                (compass, relations)
+            };
             runtime.block_on(async {
-                drop(
-                    pile.ensure(compass_source, signer)
-                        .await
-                        .context("ensure Compass source collection")?,
-                );
-                if let Some((source, _, _)) = relation_collections {
+                if preparation == Preparation::Complete {
                     drop(
-                        pile.ensure(source, signer)
+                        pile.ensure(compass_source, signer)
                             .await
-                            .context("ensure Relations source collection for Compass persona")?,
+                            .context("ensure Compass source collection")?,
+                    );
+                    if let Some((source, _, _)) = relation_collections {
+                        drop(
+                            pile.ensure(source, signer).await.context(
+                                "ensure Relations source collection for Compass persona",
+                            )?,
+                        );
+                    }
+                }
+                if maintain_compass {
+                    drop(
+                        pile.maintain(compass_succinct, signer)
+                            .await
+                            .context("maintain Compass Succinct collection")?,
+                    );
+                    drop(
+                        pile.maintain(compass_rank9, signer)
+                            .await
+                            .context("maintain Compass Rank9 collection")?,
                     );
                 }
-                drop(
-                    pile.maintain(compass_succinct, signer)
-                        .await
-                        .context("maintain Compass Succinct collection")?,
-                );
-                drop(
-                    pile.maintain(compass_rank9, signer)
-                        .await
-                        .context("maintain Compass Rank9 collection")?,
-                );
-                if let Some((_, succinct, rank9)) = relation_collections {
-                    drop(
-                        pile.maintain(succinct, signer).await.context(
+                if maintain_relations {
+                    if let Some((_, succinct, rank9)) = relation_collections {
+                        drop(pile.maintain(succinct, signer).await.context(
                             "maintain Relations Succinct collection for Compass persona",
-                        )?,
-                    );
-                    drop(
-                        pile.maintain(rank9, signer)
-                            .await
-                            .context("maintain Relations Rank9 collection for Compass persona")?,
-                    );
+                        )?);
+                        drop(
+                            pile.maintain(rank9, signer).await.context(
+                                "maintain Relations Rank9 collection for Compass persona",
+                            )?,
+                        );
+                    }
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
@@ -415,6 +453,16 @@ impl CompassStorage<'_> {
             }))?;
             let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
+                let snapshot = pile
+                    .snapshot()
+                    .context("freeze Compass publication authority")?;
+                anyhow::ensure!(
+                    compass_source
+                        .writer_is_admitted(&snapshot, signer.verifying_key())
+                        .context("check Compass source WRITE admission")?,
+                    "publishing a Compass fragment requires source collection WRITE"
+                );
+                drop(snapshot);
                 compass::commit_collection(pile, signer, fragment)?;
             }
             Ok(value)
@@ -822,6 +870,7 @@ fn add_goal(
     let status = compass::canonical_status(status)?;
     let tags = compass::canonical_tags(tags)?;
     storage.update(
+        Preparation::Resident,
         persona,
         |space, _reader, by_id| {
             let parent_id = parent
@@ -891,6 +940,7 @@ fn move_goal(
     let status = compass::canonical_status(status)?;
     let rendered_status = status.clone();
     storage.update(
+        Preparation::Resident,
         persona,
         |space, _reader, by_id| Ok((resolve_task_id(&id, space)?, by_id)),
         |(task_id, by_id)| {
@@ -931,6 +981,7 @@ fn add_note(
     references.dedup();
 
     storage.update(
+        Preparation::Resident,
         persona,
         |space, _reader, by_id| {
             let task_id = resolve_task_id(&id, space)?;
@@ -1131,6 +1182,7 @@ fn prioritize(
     lower_input: String,
 ) -> Result<PriorityChange> {
     storage.update(
+        Preparation::Complete,
         None,
         |space, reader, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
@@ -1186,6 +1238,7 @@ fn deprioritize(
     lower_input: String,
 ) -> Result<PriorityChange> {
     storage.update(
+        Preparation::Complete,
         None,
         |space, reader, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;

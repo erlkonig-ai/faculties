@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Wiki create/import and Compass add/move/note prepare from resident rollups
+  when their signer cannot maintain those targets. Publication checks source
+  WRITE independently; selected references and bodies are still checked, and
+  only the source COMMIT is required. Wiki frontier edits and Compass priority
+  changes retain their complete-source preparation in this bounded change.
+
 - Pin the build root to AnyBytes `066c32a7` so temporary archive sections
   freeze without a per-section durability flush, including during resident
   rollup reads. Explicit `ByteArea::persist` retains its synchronization

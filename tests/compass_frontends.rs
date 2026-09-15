@@ -94,6 +94,270 @@ fn clean_child(command: &mut Command) {
     }
 }
 
+#[test]
+fn source_writer_appends_actions_with_lagging_read_only_rollups() {
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, CollectionRecord,
+    };
+
+    let fixture = Fixture::new();
+    let first = fixture
+        .operations()
+        .add("resident goal", AddOptions::default())
+        .unwrap();
+    let first_id = format!("{:x}", first.goal);
+    let person = genid().id;
+    let (fragment, _, _) = faculties::relations::person_fragment(
+        person,
+        faculties::relations::ProfileInput {
+            label: "source-writer".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    publish_fragment(
+        &fixture.pile,
+        Some(&fixture.key),
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        fragment,
+    )
+    .unwrap();
+    fixture
+        .operations()
+        .note(
+            &first_id,
+            "warm both input chains",
+            NoteOptions {
+                persona: Some("source-writer"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture.operations().list(ListOptions::default()).unwrap();
+    let pending = fixture
+        .operations()
+        .add("not projected yet", AddOptions::default())
+        .unwrap();
+
+    let owner = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+    let writer_key = fixture.directory.path().join("source-writer.key");
+    initialize_signer(&fixture.pile, Some(&writer_key)).unwrap();
+    let writer = load_signer(&fixture.pile, Some(&writer_key)).unwrap();
+    let denied_key = fixture.directory.path().join("ungranted.key");
+    initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let source = faculties::collection_names::open_configured(
+        &mut pile,
+        faculties::schemas::compass::DEFAULT_SCOPE_ID,
+        owner.verifying_key(),
+    )
+    .unwrap();
+    let relations = faculties::collection_names::open_configured(
+        &mut pile,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        owner.verifying_key(),
+    )
+    .unwrap();
+    grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
+    for input in [source, relations] {
+        let policy = input.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(input, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for target in [succinct.handle(), rank9.handle()] {
+            grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+        }
+        let snapshot = pile.snapshot().unwrap();
+        assert!(!succinct
+            .writer_is_admitted(&snapshot, writer.verifying_key())
+            .unwrap());
+        assert!(!rank9
+            .writer_is_admitted(&snapshot, writer.verifying_key())
+            .unwrap());
+        if input == source {
+            let facts = snapshot
+                .collection(rank9)
+                .unwrap()
+                .view::<faculties::storage::FactArchive>()
+                .unwrap();
+            assert!(compass::goal_ids(&facts).contains(&first.goal));
+            assert!(!compass::goal_ids(&facts).contains(&pending.goal));
+        }
+    }
+    let status = compass::status_register_collection(&mut pile, owner.verifying_key()).unwrap();
+    grant_collection_read(&mut pile, status.handle(), &owner, writer.verifying_key()).unwrap();
+    assert!(!status
+        .writer_is_admitted(&pile.snapshot().unwrap(), writer.verifying_key())
+        .unwrap());
+    pile.close().unwrap();
+
+    let records = || {
+        let mut pile = Pile::open(&fixture.pile).unwrap();
+        let records = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect::<BTreeSet<_>>();
+        pile.close().unwrap();
+        records
+    };
+    let command = |key: &std::path::Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_compass"));
+        clean_child(&mut command);
+        command
+            .arg("--pile")
+            .arg(&fixture.pile)
+            .arg("--key")
+            .arg(key)
+            .args(["--persona", "source-writer"])
+            .env(
+                "TRIBLESPACE_COLLECTION_COMPASS",
+                hex::encode(source.handle().raw),
+            )
+            .env(
+                "TRIBLESPACE_COLLECTION_RELATIONS",
+                hex::encode(relations.handle().raw),
+            );
+        command
+    };
+    let before = records();
+    let added = command(&writer_key)
+        .args([
+            "add",
+            "appended child",
+            "--parent",
+            &first_id,
+            "--note",
+            "initial child note",
+        ])
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{added:?}");
+    let added_text = String::from_utf8(added.stdout).unwrap();
+    let child = added_text
+        .lines()
+        .find_map(|line| line.strip_prefix("Added goal "))
+        .unwrap();
+    let moved = command(&writer_key)
+        .args(["move", &first_id, "doing"])
+        .output()
+        .unwrap();
+    assert!(moved.status.success(), "{moved:?}");
+    let noted = command(&writer_key)
+        .args(["note", &first_id, "source-only research note"])
+        .output()
+        .unwrap();
+    assert!(noted.status.success(), "{noted:?}");
+    let after = records();
+    let added_records: Vec<_> = after.difference(&before).copied().collect();
+    assert_eq!(
+        added_records.len(),
+        3,
+        "append preparation must publish no rollup equations"
+    );
+    assert!(added_records.iter().all(|record| matches!(record,
+        CollectionRecord::Commit(commit)
+            if commit.collection() == source.handle()
+                && commit.public_key().raw == writer.verifying_key().to_bytes()
+    )));
+
+    let unknown = format!("{:x}", genid().id);
+    let missing_goal = command(&writer_key)
+        .args(["move", &unknown[..16], "doing"])
+        .output()
+        .unwrap();
+    assert!(!missing_goal.status.success());
+    let missing_note = command(&writer_key)
+        .args([
+            "note",
+            &first_id,
+            "invalid supersession",
+            "--supersedes",
+            &unknown,
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_note.status.success());
+    let denied = command(&denied_key)
+        .args(["add", "no source grant"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    // Prefixes resolve against resident rows, unlike complete IDs, which
+    // deliberately support forward references without proving membership.
+    let child_prefix = &child[..16];
+    let not_yet_visible = command(&writer_key)
+        .args(["note", child_prefix, "wait for the projection"])
+        .output()
+        .unwrap();
+    assert!(!not_yet_visible.status.success());
+    assert_eq!(records(), after);
+
+    let forward_reference = command(&writer_key)
+        .args(["note", child, "explicit full-ID forward reference"])
+        .output()
+        .unwrap();
+    assert!(forward_reference.status.success(), "{forward_reference:?}");
+    let after_forward_reference = records();
+    let forwarded: Vec<_> = after_forward_reference
+        .difference(&after)
+        .copied()
+        .collect();
+    assert_eq!(forwarded.len(), 1);
+    assert!(matches!(forwarded[0],
+        CollectionRecord::Commit(commit)
+            if commit.collection() == source.handle()
+                && commit.public_key().raw == writer.verifying_key().to_bytes()
+    ));
+    let after = after_forward_reference;
+
+    let priority = command(&writer_key)
+        .args([
+            "prioritize",
+            &first_id,
+            "--over",
+            &format!("{:x}", pending.goal),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !priority.status.success(),
+        "priority changes retain complete-source preparation"
+    );
+    assert!(
+        String::from_utf8_lossy(&priority.stderr).contains("maintain Compass Succinct collection")
+    );
+    assert_eq!(records(), after);
+
+    let listing = fixture
+        .operations()
+        .list(ListOptions {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(listing.contains("appended child"));
+    assert!(fixture
+        .operations()
+        .show(&first_id)
+        .unwrap()
+        .contains("source-only research note"));
+    let now_visible = command(&writer_key)
+        .args(["note", child_prefix, "after remote maintenance"])
+        .output()
+        .unwrap();
+    assert!(now_visible.status.success(), "{now_visible:?}");
+}
+
 fn collect(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<String> {
     let mut text = String::new();
     operation(&mut Out::new(&mut |part| {

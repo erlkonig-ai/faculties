@@ -420,3 +420,185 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     let registered: [&dyn Faculty; 1] = [&faculty];
     Server::new(&registered).unwrap();
 }
+
+#[test]
+fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
+    use std::collections::BTreeSet;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, CollectionRecord,
+    };
+    use triblespace::prelude::*;
+
+    let fixture = Fixture::new();
+    let first = fixture
+        .wiki()
+        .create("resident reference", "A readable body.", &[], false)
+        .unwrap();
+    fixture.wiki().list(&ListOptions::default()).unwrap();
+    fixture
+        .wiki()
+        .create("not projected yet", "New source support.", &[], false)
+        .unwrap();
+    let owner = faculties::storage::load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+    let writer_key = fixture.directory.path().join("source-writer.key");
+    initialize_signer(&fixture.pile, Some(&writer_key)).unwrap();
+    let writer = faculties::storage::load_signer(&fixture.pile, Some(&writer_key)).unwrap();
+    let denied_key = fixture.directory.path().join("ungranted.key");
+    initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
+
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let source = faculties::collection_names::open_configured(
+        &mut pile,
+        faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+        owner.verifying_key(),
+    )
+    .unwrap();
+    let files = faculties::collection_names::open_configured(
+        &mut pile,
+        faculties::schemas::files::DEFAULT_SCOPE_ID,
+        owner.verifying_key(),
+    )
+    .unwrap();
+    grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
+    for input in [source, files] {
+        let policy = input.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(input, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for target in [succinct.handle(), rank9.handle()] {
+            grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+        }
+        let snapshot = pile.snapshot().unwrap();
+        assert!(!succinct
+            .writer_is_admitted(&snapshot, writer.verifying_key())
+            .unwrap());
+        assert!(!rank9
+            .writer_is_admitted(&snapshot, writer.verifying_key())
+            .unwrap());
+        if input == source {
+            assert_eq!(snapshot.collection(rank9).unwrap().support().len(), 1);
+            assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
+        }
+    }
+    let latest = faculties::wiki::latest_collection(&mut pile, owner.verifying_key()).unwrap();
+    grant_collection_read(&mut pile, latest.handle(), &owner, writer.verifying_key()).unwrap();
+    assert!(!latest
+        .writer_is_admitted(&pile.snapshot().unwrap(), writer.verifying_key())
+        .unwrap());
+    pile.close().unwrap();
+
+    let records = || {
+        let mut pile = Pile::open(&fixture.pile).unwrap();
+        let records = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<BTreeSet<_>>();
+        pile.close().unwrap();
+        records
+    };
+    let command = |key: &std::path::Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wiki"));
+        for (name, _) in std::env::vars_os() {
+            let text = name.to_string_lossy();
+            if text.starts_with("TRIBLESPACE_")
+                || text.starts_with("DRIVE_")
+                || matches!(text.as_ref(), "PILE" | "PERSONA")
+            {
+                command.env_remove(name);
+            }
+        }
+        command
+            .arg("--pile")
+            .arg(&fixture.pile)
+            .arg("--key")
+            .arg(key)
+            .env(
+                "TRIBLESPACE_COLLECTION_WIKI",
+                hex::encode(source.handle().raw),
+            )
+            .env(
+                "TRIBLESPACE_COLLECTION_FILES",
+                hex::encode(files.handle().raw),
+            );
+        command
+    };
+    let before = records();
+    let body = format!("#link(\"wiki:{first:x}\")[the resident revision]");
+    let created = command(&writer_key)
+        .args(["create", "source writer", &body])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let imported_file = fixture.directory.path().join("imported.typ");
+    fs::write(
+        &imported_file,
+        "= imported by source writer\nA literal body.",
+    )
+    .unwrap();
+    let imported = command(&writer_key)
+        .arg("import")
+        .arg(&imported_file)
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    let after = records();
+    let added: Vec<_> = after.difference(&before).copied().collect();
+    assert_eq!(
+        added.len(),
+        2,
+        "append preparation must publish no rollup equations"
+    );
+    assert!(added.iter().all(|record| matches!(record,
+        CollectionRecord::Commit(commit)
+            if commit.collection() == source.handle()
+                && commit.public_key().raw == writer.verifying_key().to_bytes()
+    )));
+
+    let missing = genid().id;
+    let body = format!("#link(\"wiki:{missing:x}\")[unresolved]");
+    let broken = command(&writer_key)
+        .args(["create", "invalid reference", &body])
+        .output()
+        .unwrap();
+    assert!(
+        !broken.status.success(),
+        "references still require a matching resident entity"
+    );
+    let denied = command(&denied_key)
+        .args(["create", "no source grant", "body"])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    assert_eq!(
+        records(),
+        after,
+        "failed append operations must publish no records"
+    );
+
+    // Frontier-changing edits retain the stricter contract in this slice.
+    let edited = command(&writer_key)
+        .args([
+            "edit",
+            &format!("{first:x}"),
+            "do not edit from a stale frontier",
+        ])
+        .output()
+        .unwrap();
+    assert!(!edited.status.success());
+    assert!(String::from_utf8_lossy(&edited.stderr).contains("maintain Wiki Succinct collection"));
+    assert_eq!(records(), after);
+
+    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
+    assert!(listing.contains("source writer"));
+    assert!(listing.contains("imported by source writer"));
+}
