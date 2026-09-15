@@ -219,7 +219,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, StoreSnapshot,
+    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, StoreChanges, StoreSnapshot,
 };
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
@@ -423,6 +423,8 @@ struct OrientSources {
     presentations: OrientSource,
     receipt_boundary: Support,
     compass_status: Collection<LwwRegisterBlob>,
+    #[cfg(test)]
+    observations: std::sync::atomic::AtomicUsize,
 }
 
 impl OrientSources {
@@ -463,6 +465,8 @@ impl OrientSources {
             presentations,
             receipt_boundary,
             compass_status,
+            #[cfg(test)]
+            observations: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }
@@ -621,6 +625,10 @@ async fn maintain_and_observe_snapshot(
     sources: &OrientSources,
     consuming: bool,
 ) -> Result<OrientObservation> {
+    #[cfg(test)]
+    sources
+        .observations
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     maintain_sources(pile, signer, sources).await?;
     let snapshot = pile
         .snapshot_at(watermark.instant())
@@ -2726,7 +2734,7 @@ async fn cmd_poll(
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let health = HealthSources::open(pile, signer, health_max_age)?;
+        let mut health = HealthSources::open(pile, signer, health_max_age)?;
         if health.poll(pile, signer, input, peek, output)?.0 {
             return Ok(());
         }
@@ -2772,6 +2780,12 @@ struct WaitFrame {
 struct PendingWaitFrame {
     watermark: FacultySnapshot,
     reason: PendingWaitReason,
+    /// An exact failed read can make progress when a provider appears even
+    /// though the pile prefix is unchanged. Projection absence cannot.
+    missing: Option<MissingBlob>,
+    /// Keep the actual immutable targets selected before payload acquisition.
+    /// Retrying a body or persona label must not run collection upkeep again.
+    observation: Option<OrientObservation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2786,8 +2800,29 @@ enum PendingWaitReason {
 
 impl PendingWaitFrame {
     fn awaiting_view(watermark: FacultySnapshot, reason: PendingWaitReason) -> Self {
-        Self { watermark, reason }
+        Self {
+            watermark,
+            reason,
+            missing: None,
+            observation: None,
+        }
     }
+}
+
+fn wait_storage_changed(sampled: &FacultySnapshot, previous: &FacultySnapshot) -> bool {
+    let changes = sampled.changes_since(previous);
+    // Blob changes stay conservative: a new fallback occurrence can repair a
+    // previously unusable member even when no new content hash was added.
+    // Generic authority has no clock expiry, and WANT is not a query input.
+    changes.contains(StoreChanges::BLOBS)
+        || changes.contains(StoreChanges::COLLECTION_RECORDS)
+        || changes.contains(StoreChanges::CAPABILITY_PROOFS)
+}
+
+fn pending_blob(error: &anyhow::Error) -> Option<MissingBlob> {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<MissingBlob>().copied())
 }
 
 enum WaitFrameLoad {
@@ -2816,17 +2851,42 @@ async fn load_wait_frame(
     // observation selects resident targets once; subsequent payload retries
     // keep those views fixed without replacing this change-detection baseline.
     let instant = snapshot.instant();
-    let mut observation =
+    let observation =
         match maintain_and_observe_snapshot(pile, signer, &snapshot, sources, true).await {
             Ok(observation) => observation,
             Err(error) if is_preparation_pending(&error) => {
-                return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
-                    snapshot,
-                    PendingWaitReason::Preparation,
-                )));
+                let mut pending =
+                    PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Preparation);
+                pending.missing = pending_blob(&error);
+                return Ok(WaitFrameLoad::Pending(pending));
             }
             Err(error) => return Err(error),
         };
+    let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
+    pending.observation = Some(observation);
+    match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, instant).await? {
+        Some(frame) => Ok(WaitFrameLoad::Ready(frame)),
+        None => Ok(WaitFrameLoad::Pending(pending)),
+    }
+}
+
+/// Retry only the selected immutable inputs. This borrows the cached view so a
+/// health deadline can cancel the network read without losing that selection.
+async fn resume_wait_payloads<S>(
+    pile: &mut S,
+    pending: &mut PendingWaitFrame,
+    pile_path: &Path,
+    persona_input: &str,
+    instant: Epoch,
+) -> Result<Option<WaitFrame>>
+where
+    S: SnapshotSource<Snapshot = FacultySnapshot>
+        + triblespace::core::repo::async_store::AsyncBlobStoreAcquire,
+{
+    let observation = pending
+        .observation
+        .as_mut()
+        .expect("payload continuation retains its selected views");
     let (persona, reader) = match read(pile, &observation.snapshot, |reader| {
         let persona = resolve_native_persona(&observation.query(reader), persona_input)?;
         Ok((persona, reader.clone()))
@@ -2835,10 +2895,12 @@ async fn load_wait_frame(
     {
         Ok(persona) => persona,
         Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
-            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
-                snapshot,
-                PendingWaitReason::PersonaSelection,
-            )));
+            pending.reason = PendingWaitReason::PersonaSelection;
+            pending.missing = pending_blob(&error);
+            if pending.missing.is_none() {
+                pending.observation = None;
+            }
+            return Ok(None);
         }
         Err(error) => return Err(error),
     };
@@ -2859,10 +2921,9 @@ async fn load_wait_frame(
     let (reader, habits, news) = match prepared {
         Ok(prepared) => prepared,
         Err(error) if is_payload_pending(&error) => {
-            return Ok(WaitFrameLoad::Pending(PendingWaitFrame::awaiting_view(
-                snapshot,
-                PendingWaitReason::Payload,
-            )));
+            pending.reason = PendingWaitReason::Payload;
+            pending.missing = pending_blob(&error);
+            return Ok(None);
         }
         Err(error) => return Err(error),
     };
@@ -2870,9 +2931,12 @@ async fn load_wait_frame(
     // selected target views and polling watermark remain untouched.
     observation.snapshot = reader;
     let habits = observe_habits(habits, pile_path, epoch_seconds(instant))?;
-    Ok(WaitFrameLoad::Ready(WaitFrame {
-        watermark: snapshot,
-        observation,
+    Ok(Some(WaitFrame {
+        watermark: pending.watermark.clone(),
+        observation: pending
+            .observation
+            .take()
+            .expect("selected payloads are ready"),
         persona,
         habits,
         news,
@@ -2905,10 +2969,54 @@ async fn load_wait_frame_before_health_deadline(
     signer: &SigningKey,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
+    pending: &mut Option<PendingWaitFrame>,
     pile_path: &Path,
     persona_input: &str,
     next_health_change: Option<Epoch>,
 ) -> Result<Option<WaitFrameLoad>> {
+    let unchanged = pending
+        .as_ref()
+        .is_some_and(|pending| !wait_storage_changed(&snapshot, &pending.watermark));
+    if unchanged {
+        let cached = pending.as_mut().expect("unchanged pending frame exists");
+        if let Some(missing) = cached.missing {
+            if cached.observation.is_some() {
+                let ready = tokio::select! {
+                    boundary = health::deadline(next_health_change) => {
+                        boundary?;
+                        return Ok(None);
+                    }
+                    frame = resume_wait_payloads(
+                        pile, cached, pile_path, persona_input, snapshot.instant(),
+                    ) => frame?,
+                };
+                return Ok(Some(match ready {
+                    Some(frame) => WaitFrameLoad::Ready(frame),
+                    None => WaitFrameLoad::Pending(pending.take().expect("pending payload")),
+                }));
+            }
+            // An exact preparation dependency can also become available from
+            // a new provider. Retry that handle, not the entire preparation.
+            let acquired = tokio::select! {
+                boundary = health::deadline(next_health_change) => {
+                    boundary?;
+                    return Ok(None);
+                }
+                bytes = pile.acquire(missing.handle) => bytes?,
+            };
+            if acquired.is_none() {
+                return Ok(Some(WaitFrameLoad::Pending(
+                    pending.take().expect("pending preparation dependency"),
+                )));
+            }
+        } else {
+            // Nothing in this outcome performs I/O: absent projection records
+            // or an absent persona require a different store observation.
+            return Ok(Some(WaitFrameLoad::Pending(
+                pending.take().expect("unchanged pending observation"),
+            )));
+        }
+    }
     tokio::select! {
         boundary = health::deadline(next_health_change) => {
             boundary?;
@@ -2932,11 +3040,12 @@ async fn cmd_wait(
     };
     let timeout = options.timeout;
     let result: Result<WaitOutcome> = async {
-        let health = HealthSources::open(pile, signer, health_max_age)?;
+        let mut health = HealthSources::open(pile, signer, health_max_age)?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let mut view_pending;
         let mut next_health_change;
+        let mut pending_frame = None;
 
         let sources = loop {
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
@@ -2973,15 +3082,20 @@ async fn cmd_wait(
                 signer,
                 &sources,
                 sampled,
+                &mut pending_frame,
                 pile_path,
                 persona_input,
                 next_health_change,
             )
             .await?
             {
-                if let WaitFrameLoad::Ready(frame) = attempt {
-                    view_pending = false;
-                    break frame;
+                match attempt {
+                    WaitFrameLoad::Ready(frame) => {
+                        pending_frame = None;
+                        view_pending = false;
+                        break frame;
+                    }
+                    WaitFrameLoad::Pending(pending) => pending_frame = Some(pending),
                 }
             }
             view_pending = true;
@@ -2999,8 +3113,9 @@ async fn cmd_wait(
                 sleep.min(timeout.saturating_sub(start.elapsed()))
             });
             tokio::time::sleep(sleep).await;
-            // Provider availability can change without an appended record.
-            // Retry maintenance and choose a new resident target observation.
+            // The next poll only retries an exact failed payload read unless
+            // storage changed. Provider appearance does not require rebuilding
+            // an otherwise identical collection observation.
         };
 
         let mut observed_snapshot = initial.watermark.clone();
@@ -3056,7 +3171,7 @@ async fn cmd_wait(
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
-            let storage_changed = !sampled.changes_since(&observed_snapshot).is_empty();
+            let storage_changed = wait_storage_changed(&sampled, &observed_snapshot);
             let now = sampled.instant();
             let now_secs = epoch_seconds(now);
             let cooldown_elapsed = habit_seen
@@ -3073,6 +3188,7 @@ async fn cmd_wait(
                     signer,
                     &sources,
                     sampled,
+                    &mut pending_frame,
                     pile_path,
                     persona_input,
                     next_health_change,
@@ -3085,6 +3201,7 @@ async fn cmd_wait(
                 observed_snapshot = attempt.watermark_snapshot().clone();
                 match attempt {
                     WaitFrameLoad::Ready(candidate) => {
+                        pending_frame = None;
                         view_pending = false;
                         current_habit_context_valid = true;
                         let habit_report = render_habit_transitions(&habit_seen, &candidate.habits)
@@ -3124,6 +3241,7 @@ async fn cmd_wait(
                             // new time-driven reports.
                             current_habit_context_valid = false;
                         }
+                        pending_frame = Some(pending);
                     }
                 }
             }
@@ -3132,6 +3250,9 @@ async fn cmd_wait(
             // presentation baseline until a readable replacement arrives.
             if !current_habit_context_valid {
                 last_habit_sweep = Instant::now();
+                continue;
+            }
+            if !cooldown_elapsed && !periodic_condition_check {
                 continue;
             }
 
@@ -3206,8 +3327,8 @@ fn render_tags(tags: &[String]) -> String {
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
-/// goals. Semantically read-only: it publishes no authoritative collection
-/// commits, though derived indexes may be maintained as cache exhaust.
+/// goals. A supplied persona records shown attention events after output
+/// acceptance; previous presentation history does not filter this overview.
 async fn cmd_wake(
     storage: &mut FacultyStore,
     signer: &SigningKey,
@@ -3246,9 +3367,11 @@ async fn cmd_wake(
                     .context("maintain Wiki supersession index")?,
             );
         }
+        // Wake renders the requested overview, not unseen news. Its output
+        // does not depend on prior Presented facts; recording what this wake
+        // shows afterward must not impose a historical receipt-read barrier.
         let observation =
-            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, persona.is_some())
-                .await?;
+            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, false).await?;
         drop(watermark);
         let memory_facts = observation
             .snapshot
@@ -3712,6 +3835,120 @@ mod tests {
     }
 
     #[test]
+    fn persona_wake_ignores_unrelated_historical_receipt_projection_lag() {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let persona = id(86);
+            let prior_event = id(87);
+            let (person, _, _) = relations::person_fragment(
+                persona,
+                relations::ProfileInput {
+                    label: "wake-reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, person)
+                .unwrap();
+            let (goal, goal_id) = compass::goal_fragment(
+                "a resident goal for this wake",
+                vec!["wake-reader".to_owned()],
+                None,
+                clock::point_now().unwrap(),
+            )
+            .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, goal)
+                .unwrap();
+            pile.commit(
+                sources.presentations.source,
+                &fixture.signer,
+                orient_model::presented_fragment(persona, [prior_event]),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+
+            // Another persona's historical receipt record arrives without its
+            // archive. The existing projection remains readable but cannot
+            // certify the newly frozen whole-source receipt boundary.
+            let cold = orient_model::presented_fragment(id(88), [id(89)]);
+            let cold = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
+            let arriving = CollectionCommit::sign(
+                &fixture.signer,
+                sources.presentations.source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+                empty_metadata_handle(),
+            );
+            pile.insert(CollectionRecord::Commit(arriving)).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let before = sources
+                .presentations
+                .observe(&pile.snapshot().unwrap())
+                .unwrap();
+            assert_eq!(
+                presented_events(before.view(), persona),
+                BTreeSet::from([prior_event]),
+            );
+            let missing = sources
+                .receipt_boundary
+                .difference(before.support())
+                .unwrap();
+            assert_eq!(missing.len(), 1);
+            assert!(missing.contains(cold.get_handle()));
+
+            let mut report = String::new();
+            cmd_wake(
+                &mut pile,
+                &fixture.signer,
+                Some("wake-reader"),
+                0,
+                5,
+                5,
+                &mut Out::new(&mut |part| {
+                    let crate::out::Part::Text { text } = part else {
+                        bail!("expected wake text")
+                    };
+                    report.push_str(&text);
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(report.contains("Beliefs (cover):"));
+            assert!(report.contains("a resident goal for this wake"));
+
+            // The accepted overview still publishes its shown goal receipt.
+            // Making that new receipt visible does not fill the historical gap
+            // or relax the guard used by consuming poll/wait observations.
+            sources
+                .presentations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let after = sources.presentations.observe(&snapshot).unwrap();
+            assert_eq!(
+                presented_events(after.view(), persona),
+                BTreeSet::from([prior_event, goal_id]),
+            );
+            assert!(require_receipts(&sources.receipt_boundary, &after)
+                .unwrap_err()
+                .is::<PresentationReceiptsPending>());
+            assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
+            assert!(snapshot.wants().unwrap().next().is_none());
+            assert!(pile.health().started_at.is_none());
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
     fn compact_receipt_targets_do_not_need_original_payloads_or_metadata() {
         pollster::block_on(async {
             let fixture = TestPile::new();
@@ -3870,6 +4107,136 @@ mod tests {
             vec![CollectionRecord::Commit(commit)],
         );
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn unchanged_pending_receipts_and_persona_do_not_repeat_preparation() {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let mut sources = OrientSources::open(&mut pile, &fixture.signer, true)
+                .await
+                .unwrap();
+            let persona = id(86);
+            let (person, _, _) = relations::person_fragment(
+                persona,
+                relations::ProfileInput {
+                    label: "waiting-reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, person)
+                .unwrap();
+            sources
+                .relations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let receipt = orient_model::presented_fragment(persona, [id(87)]);
+            let bytes = IntoBlob::<SimpleArchive>::to_blob(receipt.facts().clone());
+            let commit = CollectionCommit::sign(
+                &fixture.signer,
+                sources.presentations.source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(bytes.get_handle()),
+                empty_metadata_handle(),
+            );
+            pile.insert(CollectionRecord::Commit(commit)).unwrap();
+            sources.receipt_boundary = sources
+                .presentations
+                .receipt_support(&pile.snapshot().unwrap())
+                .unwrap();
+            let mut pending = None;
+            let watermark = pile.snapshot().unwrap();
+            for _ in 0..6 {
+                let sampled = pile.snapshot().unwrap();
+                assert!(!wait_storage_changed(&sampled, &watermark));
+                let attempt = load_wait_frame_before_health_deadline(
+                    &mut pile,
+                    &fixture.signer,
+                    &sources,
+                    sampled,
+                    &mut pending,
+                    &fixture.path,
+                    "waiting-reader",
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let WaitFrameLoad::Pending(frame) = attempt else {
+                    panic!("an unprojected receipt must remain pending")
+                };
+                assert_eq!(frame.reason, PendingWaitReason::Preparation);
+                assert!(frame.missing.is_none());
+                pending = Some(frame);
+            }
+            assert_eq!(
+                sources
+                    .observations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            assert!(pile.health().started_at.is_none());
+
+            // No new COMMIT: blob residency alone enables local projection of
+            // the receipt and must invalidate the cached pending attempt.
+            pile.put::<SimpleArchive, _>(bytes).unwrap();
+            let sampled = pile.snapshot().unwrap();
+            let attempt = load_wait_frame_before_health_deadline(
+                &mut pile,
+                &fixture.signer,
+                &sources,
+                sampled,
+                &mut pending,
+                &fixture.path,
+                "waiting-reader",
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(attempt, WaitFrameLoad::Ready(_)));
+            assert_eq!(
+                sources
+                    .observations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+
+            pending = None;
+            for _ in 0..6 {
+                let sampled = pile.snapshot().unwrap();
+                let attempt = load_wait_frame_before_health_deadline(
+                    &mut pile,
+                    &fixture.signer,
+                    &sources,
+                    sampled,
+                    &mut pending,
+                    &fixture.path,
+                    "not-a-resident-persona",
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let WaitFrameLoad::Pending(frame) = attempt else {
+                    panic!("an absent persona must remain pending")
+                };
+                assert_eq!(frame.reason, PendingWaitReason::PersonaSelection);
+                assert!(frame.missing.is_none());
+                assert!(frame.observation.is_none());
+                pending = Some(frame);
+            }
+            assert_eq!(
+                sources
+                    .observations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                3
+            );
+            assert!(pile.health().started_at.is_none());
+            pile.close().unwrap();
+        });
     }
 
     #[test]
@@ -4380,7 +4747,7 @@ mod tests {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store(&fixture.path).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let persona = id(43);
@@ -4429,6 +4796,9 @@ mod tests {
                 ),
             )
             .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
             let watermark = pile.snapshot_at(instant).unwrap();
             let observation = maintain_and_observe_snapshot(
                 &mut pile,
@@ -4453,29 +4823,56 @@ mod tests {
                 requested: Vec::new(),
             };
 
-            let pending = read(&mut supply, &observation.snapshot, |reader| {
-                prepare_news_once(&observation.query(reader), persona)
-            })
-            .await;
-            let Err(error) = pending else {
-                panic!("an unavailable selected body must not prepare an acknowledgment")
-            };
-            assert!(is_payload_pending(&error));
+            let frozen = observation.snapshot.clone();
+            let mut pending =
+                PendingWaitFrame::awaiting_view(watermark.clone(), PendingWaitReason::Payload);
+            pending.observation = Some(observation);
+            assert!(resume_wait_payloads(
+                &mut supply,
+                &mut pending,
+                &fixture.path,
+                "lazy-reader",
+                instant,
+            )
+            .await
+            .unwrap()
+            .is_none());
+            assert_eq!(pending.reason, PendingWaitReason::Payload);
+            assert_eq!(pending.missing.unwrap().handle, handle);
             assert!(stored_presentations(&mut supply.store, &fixture.signer, persona).is_empty());
 
+            let before_provider = supply.snapshot_at(instant).unwrap();
+            assert!(!wait_storage_changed(&before_provider, &pending.watermark));
             supply.available = true;
-            let (reader, news) = read(&mut supply, &observation.snapshot, |reader| {
-                assert_eq!(reader.instant(), instant);
-                let query = observation.query(reader);
-                let selected = resolve_native_persona(&query, "lazy-reader")?;
-                Ok((reader.clone(), prepare_news_once(&query, selected)?))
-            })
+            assert!(!wait_storage_changed(
+                &supply.snapshot_at(instant).unwrap(),
+                &before_provider
+            ));
+            let frame = resume_wait_payloads(
+                &mut supply,
+                &mut pending,
+                &fixture.path,
+                "lazy-reader",
+                instant,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("a provider-only change must complete the selected read");
+            let reader = &frame.observation.snapshot;
+            let news = frame.news;
+            assert_eq!(frame.persona, persona);
+            assert_eq!(reader.instant(), instant);
+            assert!(!wait_storage_changed(&frame.watermark, &watermark));
+            assert_eq!(
+                sources
+                    .observations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
             assert_eq!(supply.requested, [handle, handle]);
-            assert!(!observation.snapshot.contains_blob(handle).unwrap());
+            assert!(!frozen.contains_blob(handle).unwrap());
             assert!(!reader.contains_blob(unrelated).unwrap());
-            assert_eq!(observation.facts.messages.support(), &support);
+            assert_eq!(frame.observation.facts.messages.support(), &support);
             assert_ne!(reader.collection(supply.rank9).unwrap().support(), &support);
             assert!(reader.wants().unwrap().next().is_none());
             let News::Report { text, events } = &news else {

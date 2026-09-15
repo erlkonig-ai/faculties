@@ -14,6 +14,11 @@ pub(super) struct HealthSources {
     presentations: OrientSource,
     pub(super) receipt_boundary: Support,
     max_age: Duration,
+    // One process-local observation, not another persisted health model. Keep
+    // its pre-maintenance prefix so concurrent appends still cause a catch-up.
+    poll_view: Option<(FacultySnapshot, HealthObservation)>,
+    #[cfg(test)]
+    poll_observations: usize,
 }
 
 impl HealthSources {
@@ -45,6 +50,9 @@ impl HealthSources {
             presentations,
             receipt_boundary,
             max_age,
+            poll_view: None,
+            #[cfg(test)]
+            poll_observations: 0,
         })
     }
 
@@ -91,15 +99,19 @@ impl HealthSources {
     /// Health is delivered before any ordinary source or payload acquisition.
     /// An unresolved resident persona leaves the normal resolution path intact.
     pub(super) fn poll(
-        &self,
+        &mut self,
         pile: &mut FacultyStore,
         signer: &SigningKey,
         input: &str,
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        self.maintain(pile, signer)?;
-        let observation = self.at(pile.snapshot()?)?;
+        let sampled = pile.snapshot()?;
+        self.refresh_poll_view(pile, signer, sampled)?;
+        let (_, observation) = self
+            .poll_view
+            .as_ref()
+            .expect("poll selected a health view");
         let report = observation.report();
         if report.attention.is_empty() {
             return Ok((false, report.next_change));
@@ -124,6 +136,36 @@ impl HealthSources {
         }
         apply_prepared_news(pile, signer, persona, peek, &news, "", output)?;
         Ok((fired, report.next_change))
+    }
+
+    fn refresh_poll_view(
+        &mut self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        sampled: FacultySnapshot,
+    ) -> Result<()> {
+        let changed = self.poll_view.as_ref().map_or(true, |(watermark, _)| {
+            wait_storage_changed(&sampled, watermark)
+        });
+        if changed {
+            self.maintain(pile, signer)?;
+            let observation = self.at(pile.snapshot_at(sampled.instant())?)?;
+            self.poll_view = Some((sampled, observation));
+            #[cfg(test)]
+            {
+                self.poll_observations += 1;
+            }
+        } else {
+            // Time alone can make a report stale (or future-dated after clock
+            // rollback). Reuse the immutable target views at the new instant;
+            // neither upkeep nor attachment is needed to evaluate its age.
+            self.poll_view
+                .as_mut()
+                .expect("an unchanged poll has a selected health view")
+                .1
+                .snapshot = sampled;
+        }
+        Ok(())
     }
 
     fn at(&self, snapshot: FacultySnapshot) -> Result<HealthObservation> {
@@ -673,6 +715,38 @@ mod tests {
         let next = f.observe_at(at(100.0));
         assert!(matches!(next.news(persona, &next.report()), News::Quiet));
         assert!(next.snapshot.wants().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn health_poll_reuses_views_through_expiry_and_clock_rollback() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        let report = recorder
+            .record(at(0.0), [condition(State::Current, false)])
+            .unwrap();
+        let report_id = report.root().unwrap();
+        f.publish(report);
+        // Complete local production before the counted polling observation.
+        f.sources.maintain(&f.store, &f.signer).unwrap();
+        let watermark = f.store.snapshot_at(at(59.0)).unwrap();
+        for (instant, stale, next) in [
+            (59.0, false, Some(60.0)),
+            (59.5, false, Some(60.0)),
+            (60.0, true, None),
+            (61.0, true, None),
+            (-1.0, false, Some(0.0)),
+            (0.0, false, Some(60.0)),
+        ] {
+            let sampled = f.store.snapshot_at(at(instant)).unwrap();
+            assert!(!wait_storage_changed(&sampled, &watermark));
+            f.sources
+                .refresh_poll_view(&mut f.store, &f.signer, sampled)
+                .unwrap();
+            let report = f.sources.poll_view.as_ref().unwrap().1.report();
+            assert_eq!(report.attention.ids().any(|id| id == report_id), stale);
+            assert_eq!(report.next_change, next.map(at));
+            assert_eq!(f.sources.poll_observations, 1);
+        }
     }
 
     #[test]

@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Pin the build root to AnyBytes `066c32a7` so temporary archive sections
+  freeze without a per-section durability flush, including during resident
+  rollup reads. Explicit `ByteArea::persist` retains its synchronization
+  barrier. Stored facts, collection handles, and faculty behavior are unchanged.
+
+- Persona-bound Orient wake no longer waits for historical Presented rollups:
+  its requested overview does not filter already-shown events. Shown-event
+  receipts still publish after output acceptance; poll/wait dedup is unchanged.
+
+- Orient wait retains pending observations at their exact store watermark.
+  Unchanged receipt/projection gaps and absent personas do not repeat upkeep
+  or attachment; failed exact payload reads retry against the selected views.
+  Health polling reuses its targets while freshness and Habit deadlines keep
+  advancing. Blob changes remain conservatively invalidating, including new
+  fallback occurrences; this does not promise idle work under ongoing hydration.
+
 - Memory prepares ordinary journal, context, cursor, and provenance operations
   from resident maintained targets, without requiring complete historical root
   payloads. Each authorized mapping hop can still catch up from resident input;
