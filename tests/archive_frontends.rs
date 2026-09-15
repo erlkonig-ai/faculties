@@ -89,6 +89,7 @@ impl Fixture {
         .unwrap();
         observed
             .support()
+            .unwrap()
             .commits(observed.snapshot())
             .unwrap()
             .len()

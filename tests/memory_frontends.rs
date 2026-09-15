@@ -153,8 +153,16 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
             let snapshot = pile.snapshot()?;
             assert!(source.admitted(&snapshot)?.contains(cold));
             assert!(!snapshot.contains_blob(cold)?);
-            assert!(snapshot.collection(succinct)?.support().contains(warm));
-            assert!(snapshot.collection(rank9)?.support().contains(warm));
+            assert!(snapshot
+                .collection(succinct)?
+                .support()
+                .unwrap()
+                .contains(warm));
+            assert!(snapshot
+                .collection(rank9)?
+                .support()
+                .unwrap()
+                .contains(warm));
             assert!(!source.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert!(!succinct.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert!(!rank9.writer_is_admitted(&snapshot, reader.verifying_key())?);

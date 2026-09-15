@@ -12,7 +12,12 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-11.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("F53E5FE10DC419D59973C668ACF018B4");
 
-/// One intrinsic `(persona, event)` presentation atom.
+/// Key-private receipt facts. This deliberately differs from the legacy
+/// mixed-persona `orient` collection: its owner is the descriptor's authority.
+pub const RECEIPT_COLLECTION_NAME: &str = "orient-receipts";
+
+/// One presented-event receipt. Legacy mixed ledgers also carry a persona;
+/// current private collections take their observer from descriptor authority.
 ///
 /// Minted with `trible genid` on 2026-09-02:
 /// `66825BD9E1D9F71615855A96C4C60DB7`.

@@ -18,12 +18,12 @@ pub struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Persona identity for the message inbox (relations label or
-    /// 32-char hex id). Per-process so multiple agents can share one pile
-    /// under distinct identities.
+    /// Contact/routing selector for directed news (Relations label or
+    /// 32-char hex ID). Receipt history belongs to the signing zooid's key,
+    /// not to this selector.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
-    /// Durable collection signing key. Defaults to the pile-adjacent key.
+    /// Zooid identity and durable signing key. Defaults to the pile-adjacent key.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
     /// Maximum age of a current local health report, in seconds (reader policy).
@@ -108,17 +108,27 @@ enum Command {
         /// Print news WITHOUT recording it as presented. For harnesses that
         /// fire hooks identically
         /// for root and subagents (e.g. Codex, openai/codex#16226): a
-        /// peeking hook can never consume the root persona's attention
-        /// events from a worker turn. Peek may re-print the same news on
+        /// peeking hook can never consume the root watcher's receipt
+        /// history from a worker turn. Peek may re-print the same news on
         /// consecutive turns until the watcher fires or messages are
         /// acked — lossless by design; acks are the real handled-marker.
         #[arg(long)]
         peek: bool,
     },
-    /// Mark every attention event currently visible to this persona as
-    /// presented. This is an explicit subscription baseline for cutovers or
-    /// operators who do not want existing backlog reported on first use.
+    /// Mark every attention event currently visible to this routing selector
+    /// in the signing zooid's receipt history. This is an explicit subscription
+    /// baseline for operators who do not want existing backlog reported.
     Baseline,
+    /// Import resident legacy receipt facts into this key's private history.
+    /// Keeps existing IDs and timestamps; does not baseline unseen events or
+    /// maintain either projection.
+    ImportReceipts {
+        /// Exact legacy routing selector (Relations label or 32-char hex ID).
+        /// Required explicitly here; neither PERSONA nor the top-level
+        /// --persona supplies the historical ownership choice.
+        #[arg(long, value_name = "LEGACY_SELECTOR")]
+        persona: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -294,6 +304,12 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 receipt.events
             ))
         }
+        Command::ImportReceipts { persona } => {
+            let events = orient.import_receipts(&persona)?;
+            out.line(format!(
+                "Imported {events} distinct resident legacy event(s) for {persona} into this key's receipt source. Projection maintenance remains separate."
+            ))
+        }
         Command::Wait { target, poll_ms } => orient.wait(
             cli.persona.as_deref().ok_or_else(|| {
                 anyhow!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
@@ -315,4 +331,44 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     crate::cli::with_output("orient", |out| execute(cli, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_import_requires_its_own_explicit_persona() {
+        let missing = Cli::try_parse_from([
+            "orient",
+            "--pile",
+            "unused.pile",
+            "--persona",
+            "ordinary-routing-selector",
+            "import-receipts",
+        ])
+        .err()
+        .expect("top-level routing selection cannot choose a legacy import");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn receipt_import_accepts_the_explicit_legacy_selector() {
+        let cli = Cli::try_parse_from([
+            "orient",
+            "--pile",
+            "unused.pile",
+            "import-receipts",
+            "--persona",
+            "legacy-alias",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::ImportReceipts { persona }) if persona == "legacy-alias"
+        ));
+    }
 }

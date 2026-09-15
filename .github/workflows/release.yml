@@ -45,14 +45,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: triblespace/triblespace-rs
-          ref: 8256bf48ffb386834341f37e22a5997357c62c8e
+          ref: 256898f23e8400a92804d406e1701d1394743abe
           path: triblespace-rs
 
       - name: Check out Mary cohort
         uses: actions/checkout@v4
         with:
           repository: erlkonig-ai/mary
-          ref: b943ea6e7eb8263dc15a8e6c728c9d664bfa0b02
+          ref: f194a0f306879fabc4fdd1a0a409dcd0f65daeeb
           path: mary
 
       - name: Check out GORBIE cohort

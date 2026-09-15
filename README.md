@@ -32,9 +32,9 @@ Install a Rust toolchain (if you don't have one):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Faculties is developed with TribleSpace, Mary, Soma, GORBIE, and a small CubeCL
-fork as one source cohort. The pinned Mary and GORBIE revisions include resident
-audio decoding and PNG capture. Clone the siblings, then install every faculty CLI
+Faculties is developed with TribleSpace, Mary, Soma, GORBIE, and two pinned CubeCL
+checkouts as one source cohort. These revisions include the target-first collection
+API, resident audio decoding, and PNG capture. Clone the siblings, then install every faculty CLI
 (and the GUI viewer) onto `$PATH`:
 
 ```sh
@@ -44,12 +44,16 @@ git clone https://github.com/triblespace/triblespace-rs
 git clone https://github.com/erlkonig-ai/mary
 git clone https://github.com/erlkonig-ai/soma
 git clone https://github.com/erlkonig-ai/GORBIE
-git clone --branch graph-capture https://github.com/erlkonig-ai/cubecl cubecl-fork
-git -C triblespace-rs checkout 9c82f23f84b515c105234e2cd5319f081c0e1430
-git -C mary checkout 9d47178082a5a346524f873352dfa5ab6fbef110
-git -C GORBIE checkout 22a31671bb5b2591b69ae13c1d0069cbf963c17b
+git clone https://github.com/erlkonig-ai/cubecl cubecl-fork
+git clone --no-checkout https://github.com/erlkonig-ai/cubecl cubecl-graph
+# Keep historical tracked compiler output out of the graph source checkout.
+git -C cubecl-graph sparse-checkout set --no-cone '/*' '!**/target/' '!**/target-*/'
+git -C triblespace-rs checkout 256898f23e8400a92804d406e1701d1394743abe
+git -C mary checkout f194a0f306879fabc4fdd1a0a409dcd0f65daeeb
+git -C GORBIE checkout 09a82ff3a729093ea6941bd677f589b0e123c0cb
 git -C soma checkout 6cdb487c93b10bb183d62f9d547dc1627782c228
-git -C cubecl-fork checkout 1fc64da1fba7f9609d19a569000bdd6a6eaea2cd
+git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
+git -C cubecl-graph checkout 1fc64da1fba7f9609d19a569000bdd6a6eaea2cd
 cd faculties
 RUSTFLAGS='-Ctarget-cpu=native' cargo build --release --workspace --bins --locked
 scripts/install-release-cohort target/release
@@ -677,25 +681,41 @@ Orient is entirely passive about collection maintenance, even when its key has
 WRITE. `wake`, `show`, `poll`, and `wait` attach the maintained targets already
 readable in one frozen snapshot; newer source data becomes visible after an
 independent producer advances those targets. Selected attachment bodies may
-still be fetched lazily. Accepted output may publish Presented receipt COMMITs,
-but never MERGE or DERIVE records. Consuming news waits for the operation's
-initial receipt support to become readable, so a lagging receipt rollup does
-not replay old notifications.
+still be fetched lazily. Accepted output may publish receipt COMMITs, but never
+MERGE or DERIVE records. A retained observation tracks the exact collection and
+blob dependencies it consulted; unrelated hydration does not reattach it.
+Historical support is an explicit `support()` request, not part of these reads.
+
+Receipt history belongs to the signing zooid, not its routing alias or host.
+Ordinary `orient-receipts` facts retain event IDs and `created_at` annotations;
+a derived EntityIdSet on `presentation::event` supplies fast membership tests.
+Both descriptors have READ and WRITE rooted only at that key, independently of
+the old `TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
+key share receipt history; separate zooids need separate keys. A lagging ID-set
+projection can repeat an event, but never holds the waiter behind a whole-ledger
+completeness barrier. The source facts keep the richer historical query.
 
 Run `trible pile collection maintain-all PILE TARGET... --watch` separately for
 the selected Orient targets and their dependencies. Include each node's local
-health/latest targets and the Presented chain as well as the shared inputs;
+health/latest targets and its private receipt ID-set target as well as shared inputs;
 keeping only message and goal indexes current is insufficient. Explicit target
 selection avoids reviving obsolete index descriptors. Each author's public key
 biases independent target priority, while every selected chain remains
 dependency-first and signed results are reusable through ordinary replication.
 
 State-dependent edits and Message acknowledgements retain their pre-action
-maintenance. Orient also keeps strict maintenance for its own Presented
-receipt rollups when consuming notifications; those receipts still need a
-correctly configured local writer. `poll --peek` is non-consuming and may use
-the resident receipt view. Moving all upkeep out of authorized reads is a
-separate handoff to autonomous maintenance, not part of this reader recovery.
+maintenance. `poll --peek` never records presentation. To carry one existing
+observer's history into the private source, explicitly run
+`orient import-receipts --persona LEGACY_SELECTOR`, then maintain its ID-set
+target. This imports only matching resident legacy receipts, preserving their
+opaque IDs and existing timestamps without changing the old ledger. It does not
+mark unseen events as presented or fabricate a historical `seen at` time. A
+partial legacy projection gives a partial, safely repeatable import.
+
+`cargo run --example orient_receipt_targets -- PUBLIC_KEY_HEX` prints that
+key's source and membership-target handles using the same descriptor constructors
+in memory. It needs no private key and does not read or change a pile; use the
+target handle to configure the background maintainer.
 
 This source uses the signed-equation TribleSpace cohort. Historical unsigned
 equations stay inert and are not silently signed by whichever reader encounters

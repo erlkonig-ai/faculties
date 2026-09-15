@@ -1062,7 +1062,10 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let facts = store_snapshot
+        .collection(collection)
+        .context("attach Compass collection")?
+        .view::<TribleSet>()
         .context("read Compass collection")?;
     validate_known_payloads(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))

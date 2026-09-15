@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use triblespace::core::blob::encodings::entity_id_set::EntityIdSetBlob;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
+use triblespace::core::collection::CollectionStoreExt;
+use triblespace::prelude::*;
 
 static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +33,55 @@ impl TestPile {
         fs::File::create(&path).unwrap();
         faculties::storage::initialize_signer(&path, None).unwrap();
         Self { dir, path }
+    }
+
+    /// Model the independent projection worker, never an Orient read.
+    fn maintain_attention(&self) {
+        let signer = faculties::storage::load_signer(&self.path, None).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&self.path).unwrap();
+        pollster::block_on(async {
+            for scope in [
+                faculties::schemas::relations::DEFAULT_SCOPE_ID,
+                faculties::schemas::compass::DEFAULT_SCOPE_ID,
+            ] {
+                let source = faculties::collection_names::open_configured(
+                    &mut pile,
+                    scope,
+                    signer.verifying_key(),
+                )
+                .unwrap();
+                let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .unwrap();
+                let rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .unwrap();
+                drop(pile.maintain(succinct, &signer).await.unwrap());
+                drop(pile.maintain(rank9, &signer).await.unwrap());
+            }
+            let status =
+                faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
+                    .unwrap();
+            drop(pile.maintain(status, &signer).await.unwrap());
+
+            let policy = faculties::collection_names::private_policy(signer.verifying_key());
+            let receipts = pile
+                .collection(
+                    faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                    policy.clone(),
+                )
+                .unwrap();
+            let ids = pile
+                .derive::<EntityIdSetBlob>(
+                    receipts,
+                    faculties::schemas::orient::presentation::event.id(),
+                    policy,
+                )
+                .unwrap();
+            drop(pile.maintain(ids, &signer).await.unwrap());
+        });
+        pile.close().unwrap();
     }
 }
 
@@ -176,6 +231,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     ));
     let goal_id = id_after("Added goal ", &added);
 
+    pile.maintain_attention();
     let baseline = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(baseline.is_empty());
 
@@ -192,11 +248,15 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         ],
     ));
     let addressed_goal = id_after("Added goal ", &addressed);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
         news.contains(&format!("goal [{addressed_goal}] is now todo")),
         "unexpected news: {news}"
     );
+    // Accepted output appends a receipt; suppression begins once its
+    // independent projection has caught up.
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     let foreign = stdout(run(
@@ -205,8 +265,10 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &["--persona", "peer", "note", &goal_id, "foreign observation"],
     ));
     let foreign_id = id_after("Added note ", &foreign);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(news.contains(&format!("new note [{foreign_id}] on goal [{goal_id}]")));
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     stdout(run(
@@ -214,6 +276,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &pile.path,
         &["--persona", "me", "note", &goal_id, "my own note"],
     ));
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     let unattributed = stdout(run(
@@ -222,6 +285,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &["note", &goal_id, "unattributed observation"],
     ));
     let unattributed_id = id_after("Added note ", &unattributed);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(news.contains(&format!("new note [{unattributed_id}] on goal [{goal_id}]")));
 
@@ -231,6 +295,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &["--persona", "peer", "add", "Unrelated goal"],
     ));
     let unrelated_goal = id_after("Added goal ", &unrelated);
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let direct = stdout(run(
         compass,
@@ -246,6 +311,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         ],
     ));
     let direct_id = id_after("Added note ", &direct);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(news.contains(&format!(
         "new note [{direct_id}] on goal [{unrelated_goal}]"
@@ -257,6 +323,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &["--persona", "peer", "add", "Participated goal"],
     ));
     let participated_goal = id_after("Added goal ", &participated);
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let joining = stdout(run(
         compass,
@@ -270,6 +337,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         ],
     ));
     let joining_id = id_after("Added note ", &joining);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
         news.contains(&format!("goal [{participated_goal}] is now todo")),
@@ -279,6 +347,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         !news.contains(&format!("new note [{joining_id}]")),
         "own note was presented: {news}"
     );
+    pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let response = stdout(run(
         compass,
@@ -292,8 +361,11 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         ],
     ));
     let response_id = id_after("Added note ", &response);
+    pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(news.contains(&format!(
         "new note [{response_id}] on goal [{participated_goal}]"
     )));
+    pile.maintain_attention();
+    assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 }

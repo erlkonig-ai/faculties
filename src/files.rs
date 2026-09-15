@@ -25,7 +25,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -988,7 +988,10 @@ pub fn materialize_collection(
         signer.verifying_key(),
     )?;
     let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let facts = store_snapshot
+        .collection(collection)
+        .context("attach Files collection")?
+        .view::<TribleSet>()
         .context("read Files collection")?;
     Ok((facts, store_snapshot))
 }

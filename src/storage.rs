@@ -511,7 +511,10 @@ where
     let observed = snapshot
         .collection(collection)
         .context("attach realized collection")?;
-    let support = observed.support().clone();
+    let support = observed
+        .support()
+        .context("resolve realized fact collection support")?
+        .clone();
     let facts = observed
         .view::<TribleSet>()
         .context("read authorized collection facts")?;
@@ -1088,7 +1091,7 @@ mod tests {
         let actual: TribleSet = view.iter().collect();
 
         assert_eq!(actual, expected);
-        assert_eq!(observed.support().len(), 1);
+        assert_eq!(observed.support().unwrap().len(), 1);
         assert_eq!(view.segment_count(), 1);
     }
 

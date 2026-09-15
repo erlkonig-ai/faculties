@@ -26,7 +26,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::latest::LatestIndex;
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
+    Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt,
+    Cover,
 };
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
@@ -137,44 +138,52 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 ///
 /// Widgets compare revisions for equality; the storage backend owns their
 /// construction. The digest includes each attached relation's descriptor and
-/// its own resident support. It is a widget cache token, not a durable
-/// collection record or an authorization proof, and physical Succinct
-/// compaction cannot perturb it.
+/// its already-attached resident cover. It is a widget cache token, not a
+/// durable collection record or an authorization proof. Equivalent physical
+/// compaction may invalidate a cached projection, but computing the token
+/// never resolves the cover's historical support.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DatasetRevision([u8; 32]);
 
 impl DatasetRevision {
-    fn hash_collection_support(
+    fn hash_collection_cover<E: CollectionEncoding>(
         hasher: &mut blake3::Hasher,
         collection: CollectionHandle,
-        support: &Support,
+        cover: &Cover<E>,
     ) {
         hasher.update(&collection.raw);
-        for member in support.members() {
+        for member in cover.members() {
             hasher.update(&member.raw);
         }
-        hasher.update(&(support.len() as u128).to_le_bytes());
+        hasher.update(&(cover.len() as u128).to_le_bytes());
     }
 
-    fn from_collection(collection: CollectionHandle, support: &Support) -> Self {
+    fn from_collection<E: CollectionEncoding>(
+        collection: CollectionHandle,
+        cover: &Cover<E>,
+    ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.dataset-revision.v3");
-        Self::hash_collection_support(&mut hasher, collection, support);
+        Self::hash_collection_cover(&mut hasher, collection, cover);
         Self(*hasher.finalize().as_bytes())
     }
 
-    fn include_collection(&mut self, collection: CollectionHandle, support: &Support) {
+    fn include_collection<E: CollectionEncoding>(
+        &mut self,
+        collection: CollectionHandle,
+        cover: &Cover<E>,
+    ) {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.dataset-relation.v1");
         hasher.update(&self.0);
-        Self::hash_collection_support(&mut hasher, collection, support);
+        Self::hash_collection_cover(&mut hasher, collection, cover);
         self.0 = *hasher.finalize().as_bytes();
     }
 
     fn from_secrets(snapshot: &SecretsSnapshot<PileSnapshot>) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"faculties.viewer.secrets-revision.v3");
-        Self::hash_collection_support(&mut hasher, snapshot.collection(), snapshot.support());
+        Self::hash_collection_cover(&mut hasher, snapshot.collection(), snapshot.support());
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -795,7 +804,7 @@ async fn load_inputs_from_pile(
                 .map_err(|error| format!("read maintained {label} collection: {error}"))?;
             revisions_by_scope.insert(
                 *scope,
-                DatasetRevision::from_collection(rank9.handle(), collection.support()),
+                DatasetRevision::from_collection(rank9.handle(), collection.cover()),
             );
             facts_by_scope.insert(*scope, facts);
         }
@@ -812,7 +821,7 @@ async fn load_inputs_from_pile(
             revisions_by_scope
                 .get_mut(&COMPASS_SCOPE_ID)
                 .expect("Compass facts were attached")
-                .include_collection(target.handle(), collection.support());
+                .include_collection(target.handle(), collection.cover());
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -832,7 +841,7 @@ async fn load_inputs_from_pile(
             revisions_by_scope
                 .get_mut(&WIKI_SCOPE_ID)
                 .expect("Wiki facts were attached")
-                .include_collection(target.handle(), collection.support());
+                .include_collection(target.handle(), collection.cover());
             latest_by_scope
                 .entry(WIKI_SCOPE_ID)
                 .or_default()
@@ -1115,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_revision_changes_when_only_latest_support_advances() {
+    fn dataset_revision_changes_when_only_latest_cover_advances() {
         pollster::block_on(async {
             use triblespace::core::collection::latest::LatestBlob;
 
@@ -1150,18 +1159,18 @@ mod tests {
                 .unwrap();
             let snapshot = store.snapshot().unwrap();
             let facts = snapshot.collection(source).unwrap();
-            let mut before = DatasetRevision::from_collection(source.handle(), facts.support());
-            before.include_collection(target.handle(), lagging.support());
+            let mut before = DatasetRevision::from_collection(source.handle(), facts.cover());
+            before.include_collection(target.handle(), lagging.cover());
 
             let ready = store.maintain(target, &signer).await.unwrap();
             let advanced = ready.collection(target).unwrap();
-            let mut after = DatasetRevision::from_collection(source.handle(), facts.support());
-            after.include_collection(target.handle(), advanced.support());
+            let mut after = DatasetRevision::from_collection(source.handle(), facts.cover());
+            after.include_collection(target.handle(), advanced.cover());
             assert_ne!(
                 before, after,
                 "index-only progress invalidates widget projections"
             );
-            assert_eq!(facts.support(), ready.collection(source).unwrap().support());
+            assert_eq!(facts.cover(), ready.collection(source).unwrap().cover());
         });
     }
 

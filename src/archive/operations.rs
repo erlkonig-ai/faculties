@@ -1130,7 +1130,10 @@ fn run_search(
 
 fn run_index(storage: ArchiveStorage<'_>, out: &mut Out<'_>) -> Result<()> {
     let observed = archive_collection::ensure_local_with_storage(storage.storage)?;
-    let source_elements = observed.support().len();
+    let source_elements = observed
+        .support()
+        .context("resolve indexed Archive support")?
+        .len();
     let bm25 = archive_collection::ensure_bm25_index_with_storage(storage.storage)?;
     out.line(format!(
         "Archive: {} distinct source element(s) covered by accelerated-Succinct",
@@ -1360,6 +1363,7 @@ mod tests {
         let observed = storage(fixture).load().unwrap();
         observed
             .support()
+            .unwrap()
             .commits(observed.snapshot())
             .unwrap()
             .len()
@@ -1475,7 +1479,7 @@ mod tests {
             .unwrap();
         assert!(receipt.commit.is_some());
         let before = archive.storage().load().unwrap();
-        assert_eq!(before.support().len(), 1);
+        assert_eq!(before.support().unwrap().len(), 1);
 
         // A later operation cannot reopen this pathname, but it can borrow the
         // retained owner. Its explicit key remains at the configured location.
@@ -1499,7 +1503,10 @@ mod tests {
                 &BTreeMap::new(),
             )
             .is_err());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 1);
+        assert_eq!(
+            archive.storage().load().unwrap().support().unwrap().len(),
+            1
+        );
 
         let second = archive.import(
             ImportSource::ClaudeWeb,
@@ -1508,9 +1515,12 @@ mod tests {
             &BTreeMap::new(),
         ).unwrap();
         assert!(second.commit.is_some());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
         assert_eq!(
-            before.support().len(),
+            archive.storage().load().unwrap().support().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            before.support().unwrap().len(),
             1,
             "the earlier observation stays frozen"
         );

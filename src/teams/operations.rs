@@ -687,7 +687,10 @@ impl TeamsSession {
             None => reader.collection(self.rank9),
         }
         .context("attach Teams through Secrets snapshot")?;
-        let support = observed.support().clone();
+        let support = observed
+            .support()
+            .context("resolve Teams support through Secrets snapshot")?
+            .clone();
         let facts = observed
             .view::<FactArchive>()
             .context("read Teams through Secrets snapshot")?;
@@ -768,7 +771,10 @@ impl TeamsStorage {
                 let observed = reader
                     .collection(maintained_rank9)
                     .context("observe Teams through Secrets snapshot")?;
-                let support = observed.support().clone();
+                let support = observed
+                    .support()
+                    .context("resolve Teams session support")?
+                    .clone();
                 let facts = observed
                     .view::<FactArchive>()
                     .context("read Teams through Secrets snapshot")?;
@@ -3806,7 +3812,7 @@ mod tests {
                             .map_err(Into::into)
                     })
                 })?;
-                assert_ne!(later.collection(session.rank9)?.support(), &support);
+                assert_ne!(later.collection(session.rank9)?.support()?, &support);
                 drop(later);
                 let observed_at = clock::point_now()?;
                 let secret =

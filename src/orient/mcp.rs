@@ -1,4 +1,6 @@
 //! Finite explicit Orient tools; no watcher, wall-clock wait or ambient persona.
+//! Persona selects routing; receipt history belongs to the storage signing key.
+//! Exact event membership may lag its independently maintained ID-set target.
 use super::{ShowOptions, WakeOptions};
 use crate::mcp::{decode_arguments, Faculty, Tool};
 use crate::out::Out;

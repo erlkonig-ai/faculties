@@ -1617,7 +1617,10 @@ pub fn materialize_collection(
 ) -> Result<(TribleSet, PileSnapshot)> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
+    let facts = store_snapshot
+        .collection(collection)
+        .context("attach Wiki collection")?
+        .view::<TribleSet>()
         .context("read Wiki collection")?;
     validate_catalog(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
@@ -1921,8 +1924,8 @@ mod tests {
                 .unwrap();
             let current = snapshot.collection(target).unwrap();
             assert_ne!(
-                current.support(),
-                snapshot.collection(source).unwrap().support()
+                current.support().unwrap(),
+                snapshot.collection(source).unwrap().support().unwrap()
             );
             let current = current.view::<LatestIndex>().unwrap();
             assert_eq!(

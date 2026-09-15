@@ -1776,7 +1776,7 @@ mod tests {
         });
         let observed = before.collection(rank9).unwrap();
         let facts = observed.view::<FactArchive>().unwrap();
-        let original_support = observed.support().clone();
+        let original_support = observed.support().unwrap().clone();
         let successor = relations::profile_fragment(
             person,
             relations::ProfileInput {
@@ -1796,7 +1796,7 @@ mod tests {
 
         assert_eq!(outcome, relations::SelectorOutcome::Unique(person));
         assert_eq!(store.requested.len(), 1);
-        assert_eq!(observed.support(), &original_support);
+        assert_eq!(observed.support().unwrap(), &original_support);
         assert_eq!(original_support.len(), 1);
         let after = store.snapshot().unwrap();
         assert_eq!(source.admitted(&after).unwrap().len(), 2);

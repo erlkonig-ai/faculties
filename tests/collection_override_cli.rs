@@ -105,7 +105,7 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
     let unadmitted = frozen
         .collection(collection)
         .expect("observe collection before the grant");
-    assert!(unadmitted.support().is_empty());
+    assert!(unadmitted.support().unwrap().is_empty());
     assert!(unadmitted.cover().is_empty());
     eprintln!("before grant: retained_commits=1 admitted_members=0");
 
@@ -122,8 +122,8 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
     let admitted = after
         .collection(collection)
         .expect("observe collection after the grant");
-    assert_eq!(admitted.support().len(), 1);
-    assert!(admitted.support().contains(member));
+    assert_eq!(admitted.support().unwrap().len(), 1);
+    assert!(admitted.support().unwrap().contains(member));
     assert_eq!(admitted.cover().len(), 1);
     assert!(admitted.cover().contains(member));
     assert!(after
@@ -139,8 +139,9 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
         .collection(collection)
         .expect("reobserve the frozen pre-grant evidence")
         .support()
+        .unwrap()
         .is_empty());
-    assert!(unadmitted.support().is_empty());
+    assert!(unadmitted.support().unwrap().is_empty());
     assert!(unadmitted.cover().is_empty());
     eprintln!("after grant: retained_commits=1 admitted_members=1");
     pile.close().expect("close granted fixture pile");

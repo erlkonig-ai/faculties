@@ -4,10 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Use Bash for the OOM-expendable Rust compiler wrapper so Cargo's hyphenated
+  executable-path variables reach integration tests unchanged; retain the
+  existing Linux OOM guard and child exit status.
+
+- Orient retains target-first collection snapshots and checks their consulted
+  record, proof, and blob dependencies before refreshing. Unrelated hydration
+  no longer rebuilds the attention and health views; exact missing-body retries,
+  health freshness, and Habit deadlines remain independent. Ordinary traces and
+  widget cache tokens use physical covers without expanding historical support.
+- Receipt facts now live in the signing zooid's private `orient-receipts`
+  collection. An ordinary EntityIdSet derivation over event values supplies
+  membership checks; `created_at` annotates the receipt without changing its
+  identity. Output acceptance still precedes its COMMIT. Lagging projections may
+  repeat events, never block the waiter. `orient import-receipts --persona X`
+  explicitly imports only X's resident legacy receipts, preserving their IDs and
+  existing times, without baselining unseen events or altering the old ledger.
+
 - Add an opt-in `ORIENT_TRACE_REFRESH=1` diagnostic for Orient: stderr-only
   refresh triggers, attachment/view/query timings, and equality of already
-  selected covers/support. Disabled diagnostics retain no extra cover roots;
-  observation, pending retries, authority and receipt behavior are unchanged.
+  selected physical covers. Diagnostics never request historical support.
 
 - Adapt maintained register and Archive search readers to typed backing views.
   LWW winner preparation and BM25 scoring preparation are explicit query steps;
@@ -20,8 +36,8 @@ All notable changes to this project will be documented in this file.
   health-first and wake inputs, regardless of WRITE authority. It attaches one
   frozen resident target snapshot and leaves upkeep to explicitly selected
   background maintainers. Presented receipt publication remains explicit;
-  consuming news still waits for its captured receipt boundary, preventing
-  duplicates while those rollups lag. Add authorized-reader and external-upkeep
+  consuming news uses its resident ID-set projection without a completeness
+  barrier. Add authorized-reader and external-upkeep
   regressions, including frozen views and health freshness.
 
 - Wiki create/import and Compass add/move/note prepare from resident rollups
@@ -40,11 +56,10 @@ All notable changes to this project will be documented in this file.
   receipts still publish after output acceptance; poll/wait dedup is unchanged.
 
 - Orient wait retains pending observations at their exact store watermark.
-  Unchanged receipt/projection gaps and absent personas do not repeat upkeep
-  or attachment; failed exact payload reads retry against the selected views.
-  Health polling reuses its targets while freshness and Habit deadlines keep
-  advancing. Blob changes remain conservatively invalidating, including new
-  fallback occurrences; this does not promise idle work under ongoing hydration.
+  Absent selectors do not repeat attachment without relevant changes; failed
+  exact payload reads retry against selected views even when only a provider
+  appeared. Health polling reuses its targets while freshness and Habit
+  deadlines keep advancing.
 
 - Memory prepares ordinary journal, context, cursor, and provenance operations
   from resident maintained targets, without requiring complete historical root
@@ -53,13 +68,6 @@ All notable changes to this project will be documented in this file.
   the same normal read path and preserves hard-reference checks and publication.
   Explicit `memory embed` enumerates that resident observed journal; selected
   summary/image reads and embedding publication still report their real errors.
-
-- Orient consumes resident receipt rollups after they cover the operation's
-  fixed initial support, without acquiring historical root payloads. Remote
-  maintenance can satisfy that boundary while other personas keep writing;
-  incomplete receipt views stay pending at the normal wait cadence. Receipt
-  publication still requires source WRITE, checked before delivering news,
-  while projection WRITE remains optional and selected bodies fetch lazily.
 
 - Message, Compass, and Wiki ordinary readers no longer acquire whole source
   collections before attaching resident rollups. A cold new COMMIT does not

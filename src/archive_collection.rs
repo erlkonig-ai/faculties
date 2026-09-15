@@ -361,9 +361,12 @@ pub async fn ensure_succinct_index(
     key_path: Option<&std::path::Path>,
 ) -> Result<SuccinctIndexReport> {
     let observed = ensure_local(pile_path, key_path).await?;
+    let support = observed
+        .support()
+        .context("resolve indexed Archive support")?;
     Ok(SuccinctIndexReport {
-        source_elements: observed.support().len(),
-        source_collection: observed.support().collection().handle(),
+        source_elements: support.len(),
+        source_collection: support.collection().handle(),
         target_collection: observed.cover().collection().handle(),
     })
 }
@@ -434,9 +437,10 @@ pub fn ensure_bm25_index_with_storage(
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let observed = ensure_facts(pile, source, signer).await?;
-            Ok(ensure_bm25_exact(pile, observed.support(), signer)
-                .await?
-                .report)
+            let support = observed
+                .support()
+                .context("resolve Archive support for BM25 indexing")?;
+            Ok(ensure_bm25_exact(pile, support, signer).await?.report)
         })
     })
 }
@@ -468,14 +472,17 @@ pub fn ensure_search_local_with_storage(
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let observed = ensure_facts(pile, source, signer).await?;
-            let ensured = ensure_bm25_exact(pile, observed.support(), signer).await?;
+            let support = observed
+                .support()
+                .context("resolve exact Archive search support")?;
+            let ensured = ensure_bm25_exact(pile, support, signer).await?;
             // Search maintenance may have acquired referenced text payloads. Attach
             // the fact view through the final reader while retaining exact support.
             let after = pile
                 .snapshot()
                 .context("freeze prepared Archive search snapshot")?;
             let observed = after
-                .collection_exact(observed.cover().collection(), observed.support())
+                .collection_exact(observed.cover().collection(), support)
                 .context("reattach exact Archive search facts")?;
             Ok((observed, ensured.index))
         })
@@ -919,7 +926,7 @@ mod tests {
         drop(reader);
         physical.close().unwrap();
         let before = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert!(before.support().is_empty());
+        assert!(before.support().unwrap().is_empty());
         assert!(before
             .view::<FactArchive>()
             .unwrap()
@@ -930,9 +937,10 @@ mod tests {
 
         let commit = writer.finish(Ok(())).unwrap().1.unwrap();
         let after = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(after.support().len(), 1);
+        assert_eq!(after.support().unwrap().len(), 1);
         assert!(after
             .support()
+            .unwrap()
             .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
         assert_eq!(
             projection_ids(&after.view::<FactArchive>().unwrap()).len(),
@@ -962,7 +970,7 @@ mod tests {
         // sound, no semantic edge escaped, and the dependency is merely an
         // unreachable content-addressed record available for later GC.
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert!(snapshot.support().is_empty());
+        assert!(snapshot.support().unwrap().is_empty());
         assert!(snapshot
             .view::<FactArchive>()
             .unwrap()
@@ -1008,7 +1016,7 @@ mod tests {
         assert!(writer.finish(Ok(())).unwrap().1.is_some());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(snapshot.support().unwrap().len(), 2);
         let facts = snapshot.view::<FactArchive>().unwrap();
         let tags: BTreeSet<_> = find!(
             tag: Id,
@@ -1122,9 +1130,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 1);
+        assert_eq!(snapshot.support().unwrap().len(), 1);
         assert!(snapshot
             .support()
+            .unwrap()
             .contains(Handle::<SimpleArchive>::from_hash(first.data())));
         assert_eq!(
             projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
@@ -1151,15 +1160,16 @@ mod tests {
         pile.close().unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key_path))).unwrap();
-        assert_eq!(snapshot.support().len(), 1);
+        assert_eq!(snapshot.support().unwrap().len(), 1);
         assert!(snapshot
             .support()
+            .unwrap()
             .contains(Handle::<SimpleArchive>::from_hash(admitted.data())));
         assert_eq!(
             projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
             1
         );
-        let support = snapshot.support().clone();
+        let support = snapshot.support().unwrap().clone();
         drop(snapshot);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -1272,7 +1282,7 @@ mod tests {
         assert_ne!(first.data(), second.data());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(snapshot.support().unwrap().len(), 2);
         assert_eq!(
             projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
             2
@@ -1292,7 +1302,7 @@ mod tests {
         assert_eq!((report.source_elements, report.cover_segments), (0, 0));
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert!(search.0.support().is_empty());
+        assert!(search.0.support().unwrap().is_empty());
         assert!(search
             .1
             .query()
@@ -1335,9 +1345,10 @@ mod tests {
         pile.close().unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 1);
+        assert_eq!(snapshot.support().unwrap().len(), 1);
         assert!(snapshot
             .support()
+            .unwrap()
             .contains(Handle::<SimpleArchive>::from_hash(commit.data())));
         assert!(projection_ids(&snapshot.view::<FactArchive>().unwrap()).is_empty());
         drop(snapshot);
@@ -1558,7 +1569,12 @@ mod tests {
         assert_eq!(derives.len(), 2);
         assert_eq!(merges.len(), 1);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_support = store_snapshot.collection(source).unwrap().support().clone();
+        let source_support = store_snapshot
+            .collection(source)
+            .unwrap()
+            .support()
+            .unwrap()
+            .clone();
         let attached = store_snapshot
             .collection_exact(target, &source_support)
             .unwrap();
@@ -1682,7 +1698,7 @@ mod tests {
         pile.close().unwrap();
 
         let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(archive.support().len(), 2);
+        assert_eq!(archive.support().unwrap().len(), 2);
         assert_eq!(
             projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
             1
@@ -1811,8 +1827,12 @@ mod tests {
         let later = commit_projection(&pile_path, &key, "session:later", "later needle");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let ensured =
-            pollster::block_on(ensure_bm25_exact(&mut pile, frozen.support(), &signer)).unwrap();
+        let ensured = pollster::block_on(ensure_bm25_exact(
+            &mut pile,
+            frozen.support().unwrap(),
+            &signer,
+        ))
+        .unwrap();
 
         assert_eq!(ensured.report.source_elements, 1);
         drop(ensured);
@@ -1846,11 +1866,11 @@ mod tests {
         let signer = initialize_archive_fixture(&pile_path, &key);
         commit_projection(&pile_path, &key, "session:first", "first residual");
         let first_archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let first_support = first_archive.support().clone();
+        let first_support = first_archive.support().unwrap().clone();
         drop(first_archive);
         commit_projection(&pile_path, &key, "session:second", "second residual");
         let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let full_support = archive.support().clone();
+        let full_support = archive.support().unwrap().clone();
         drop(archive);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
@@ -1951,7 +1971,12 @@ mod tests {
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let store_snapshot = pile.snapshot().unwrap();
-        let source_support = store_snapshot.collection(source).unwrap().support().clone();
+        let source_support = store_snapshot
+            .collection(source)
+            .unwrap()
+            .support()
+            .unwrap()
+            .clone();
         let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();

@@ -482,7 +482,10 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
             .writer_is_admitted(&snapshot, writer.verifying_key())
             .unwrap());
         if input == source {
-            assert_eq!(snapshot.collection(rank9).unwrap().support().len(), 1);
+            assert_eq!(
+                snapshot.collection(rank9).unwrap().support().unwrap().len(),
+                1
+            );
             assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
         }
     }

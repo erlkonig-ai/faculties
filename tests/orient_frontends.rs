@@ -6,13 +6,17 @@ use faculties::out::{Out, Part};
 use faculties::schemas::swarm_health::{self as health, Component, Condition, Recorder, State};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use triblespace::core::blob::encodings::entity_id_set::EntityIdSetBlob;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::LwwRegisterBlob;
-use triblespace::core::collection::{CollectionRead, CollectionRecord, CollectionStoreExt};
+use triblespace::core::collection::{
+    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
+};
+use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 struct Fixture {
@@ -52,16 +56,27 @@ impl Fixture {
         format!("{:x}", self.persona)
     }
     fn process(&self, trace: Option<&str>) -> std::process::Command {
+        self.process_with_key(&self.key, trace)
+    }
+    fn process_with_key(&self, key: &Path, trace: Option<&str>) -> std::process::Command {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_orient"));
         command
             .args([
                 "--pile",
                 self.pile.to_str().unwrap(),
                 "--key",
-                self.key.to_str().unwrap(),
+                key.to_str().unwrap(),
             ])
             .args(["--persona", &self.who()])
             .env_remove("ORIENT_TRACE_REFRESH");
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_string_lossy()
+                .starts_with(faculties::collection_names::COLLECTION_OVERRIDE_PREFIX)
+            {
+                command.env_remove(name);
+            }
+        }
         if let Some(trace) = trace {
             command.env("ORIENT_TRACE_REFRESH", trace);
         }
@@ -111,7 +126,6 @@ impl Fixture {
                 faculties::schemas::relations::DEFAULT_SCOPE_ID,
                 faculties::schemas::status::DEFAULT_SCOPE_ID,
                 faculties::schemas::habit::DEFAULT_SCOPE_ID,
-                faculties::schemas::orient::DEFAULT_SCOPE_ID,
                 faculties::schemas::memory::DEFAULT_SCOPE_ID,
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,
                 health::DEFAULT_SCOPE_ID,
@@ -153,6 +167,28 @@ impl Fixture {
                 faculties::wiki::latest_collection(&mut pile, signer.verifying_key()).unwrap();
             drop(pile.maintain(latest, &signer).await.unwrap());
         });
+        pile.close().unwrap();
+        self.maintain_receipts(&self.key);
+    }
+
+    fn maintain_receipts(&self, key: &Path) {
+        let signer = faculties::storage::load_signer(&self.pile, Some(key)).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let policy = faculties::collection_names::private_policy(signer.verifying_key());
+        let source = pile
+            .collection(
+                faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                policy.clone(),
+            )
+            .unwrap();
+        let ids = pile
+            .derive::<EntityIdSetBlob>(
+                source,
+                faculties::schemas::orient::presentation::event.id(),
+                policy,
+            )
+            .unwrap();
+        drop(pollster::block_on(pile.maintain(ids, &signer)).unwrap());
         pile.close().unwrap();
     }
 
@@ -239,17 +275,24 @@ impl Fixture {
     }
 
     fn presented(&self) -> std::collections::BTreeSet<Id> {
-        let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        self.presented_by(&self.key)
+    }
+
+    fn presented_by(&self, key: &Path) -> std::collections::BTreeSet<Id> {
+        let signer = faculties::storage::load_signer(&self.pile, Some(key)).unwrap();
         let mut store = faculties::storage::open_pile_strict(&self.pile).unwrap();
-        let collection = faculties::collection_names::open_configured(
-            &mut store,
-            faculties::schemas::orient::DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-        )
-        .unwrap();
+        let collection = store
+            .collection(
+                faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                faculties::collection_names::private_policy(signer.verifying_key()),
+            )
+            .unwrap();
         let snapshot = store.snapshot().unwrap();
         let (facts, _) = faculties::storage::read_fact_collection(collection, &snapshot).unwrap();
-        faculties::orient::presented_events(&facts, self.persona)
+        find!(event: Id, pattern!(&facts, [{
+            _?receipt @ faculties::schemas::orient::presentation::event: ?event,
+        }]))
+        .collect()
     }
 }
 fn text(parts: &[Part]) -> String {
@@ -299,7 +342,7 @@ fn refresh_probe_is_opt_in_stderr_only_and_preserves_peek() {
 }
 
 #[test]
-fn refresh_probe_reports_blob_only_refresh_with_unchanged_targets() {
+fn refresh_probe_skips_unrelated_blobs_and_collection_records() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -339,31 +382,102 @@ fn refresh_probe_reports_blob_only_refresh_with_unchanged_targets() {
         let _ = child.wait();
         panic!("wait did not become ready: {}", reader.join().unwrap());
     }
-    // Only the synthetic pile's physical blob set changes: no collection
-    // member, proof, or presentation is added.
+    // Neither append changes any collection this observation consulted.
     let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
     pile.put::<UnknownBlob, _>(Bytes::from(b"unrelated hydration probe".to_vec()))
+        .unwrap();
+    let signer = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
+    let unrelated = pile
+        .collection(
+            "unrelated-refresh-probe",
+            faculties::collection_names::private_policy(signer.verifying_key()),
+        )
+        .unwrap();
+    let appended = pile
+        .commit(unrelated, &signer, entity! { metadata::tag: f.persona })
         .unwrap();
     pile.close().unwrap();
     let result = child.wait_with_output().unwrap();
     let stderr = reader.join().unwrap();
     assert!(result.status.success(), "{stderr}");
     assert!(String::from_utf8_lossy(&result.stdout).contains("No change detected"));
-    assert!(
-        stderr.lines().any(|line| line.contains("event=begin")
-            && line.contains("scope=ordinary")
-            && line.contains("blobs=Some(true) records=Some(false) proofs=Some(false)")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.lines().any(|line| line.contains("event=target")
-            && line.contains("scope=ordinary")
-            && line.contains("cover_equal=Some(true) support_equal=Some(true)")),
-        "{stderr}"
-    );
-    assert!(stderr.contains("baseline=last_ready"), "{stderr}");
-    assert!(stderr.contains("outcome=unchanged"), "{stderr}");
-    assert_eq!(f.records(), before);
+    for target in ["Message", "Swarm health"] {
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.contains("event=stage")
+                    && line.contains(&format!("target={target:?}"))
+                    && line.contains("stage=attach"))
+                .count(),
+            1,
+            "an unrelated append must not repeat {target} attachment: {stderr}"
+        );
+    }
+    let after = f.records();
+    assert_eq!(after.len(), before.len() + 1);
+    assert!(after.contains(&CollectionRecord::Commit(appended)));
+    assert!(before.iter().all(|record| after.contains(record)));
+}
+
+#[test]
+fn wait_refreshes_an_arriving_message_target_without_rebuilding_health() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let f = Fixture::new();
+    f.maintain();
+    let mut child = f
+        .process(Some("1"))
+        .args(["wait", "--poll-ms", "20", "for", "10s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready, received) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        let mut signalled = false;
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if !signalled
+                && line.contains("event=end")
+                && line.contains("scope=ordinary outcome=ready")
+            {
+                let _ = ready.send(());
+                signalled = true;
+            }
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output
+    });
+    if received.recv_timeout(Duration::from_secs(10)).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("wait did not become ready: {}", reader.join().unwrap());
+    }
+    let event = f.message("this target arrived after the wait observation", f.persona);
+    f.maintain();
+    let result = child.wait_with_output().unwrap();
+    let stderr = reader.join().unwrap();
+    assert!(result.status.success(), "{stderr}");
+    assert!(String::from_utf8_lossy(&result.stdout)
+        .contains("this target arrived after the wait observation"));
+    for (target, count) in [("Message", 2), ("Swarm health", 1)] {
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.contains("event=stage")
+                    && line.contains(&format!("target={target:?}"))
+                    && line.contains("stage=attach"))
+                .count(),
+            count,
+            "only the changed target should be attached again: {stderr}"
+        );
+    }
+    assert!(f.presented().contains(&event));
 }
 
 #[test]
@@ -444,11 +558,12 @@ fn authorized_readers_leave_lagging_targets_to_external_maintenance() {
     assert_eq!(appended.len(), 1);
     assert!(matches!(appended[0], CollectionRecord::Commit(_)));
 
-    // The next operation freezes the receipt COMMIT even while its target is
-    // behind. It must wait, not replay the message or derive its own receipt.
-    assert!(f
-        .call("orient_poll", json!({"persona": f.who(), "peek": false}))
-        .is_empty());
+    // Receipt projection is asynchronous. Another accepted delivery may
+    // repeat the event until the external producer updates its ID set.
+    assert!(
+        text(&f.call("orient_poll", json!({"persona": f.who(), "peek": false})))
+            .contains("visible only after external upkeep")
+    );
     parts.clear();
     f.orient()
         .wait(
@@ -460,9 +575,15 @@ fn authorized_readers_leave_lagging_targets_to_external_maintenance() {
             }),
         )
         .unwrap();
-    assert!(text(&parts).contains("No fully readable attention view"));
-    assert!(!text(&parts).contains("visible only after external upkeep"));
-    assert_eq!(f.records(), after_delivery);
+    assert!(text(&parts).contains("visible only after external upkeep"));
+    let after_repeats = f.records();
+    assert!(after_delivery
+        .iter()
+        .all(|record| after_repeats.contains(record)));
+    assert!(after_repeats
+        .iter()
+        .filter(|record| !after_delivery.contains(record))
+        .all(|record| matches!(record, CollectionRecord::Commit(_))));
 
     f.maintain();
     let after_upkeep = f.records();
@@ -485,7 +606,7 @@ fn authorized_readers_leave_lagging_targets_to_external_maintenance() {
 }
 
 #[test]
-fn poll_defaults_to_peek_and_consumption_is_exact_persona_scoped() {
+fn poll_defaults_to_peek_and_contact_routing_remains_exact() {
     let f = Fixture::new();
     let body = "@literal pending news";
     f.message(body, f.persona);
@@ -528,6 +649,7 @@ fn rejected_complete_report_is_retryable_and_does_not_present() {
     let f = Fixture::new();
     f.message("delivery must succeed", f.persona);
     f.maintain();
+    let before = f.records();
     let expected = f.call("orient_poll", json!({"persona":f.who()}));
     let mut attempted = Vec::new();
     let error = f
@@ -543,13 +665,242 @@ fn rejected_complete_report_is_retryable_and_does_not_present() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("rejected delivery"));
     assert_eq!(attempted, expected);
+    assert_eq!(f.records(), before);
+    assert!(f.presented().is_empty());
     assert_eq!(expected, f.call("orient_poll", json!({"persona":f.who()})));
-    assert_eq!(
-        expected,
-        f.call("orient_poll", json!({"persona":f.who(),"peek":false}))
-    );
+    let mut accepted = Vec::new();
+    f.orient()
+        .poll(
+            &f.who(),
+            false,
+            &mut Out::new(&mut |part| {
+                assert_eq!(f.records(), before, "receipt COMMIT must follow acceptance");
+                accepted.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert_eq!(expected, accepted);
+    let after = f.records();
+    let appended: Vec<_> = after
+        .iter()
+        .filter(|record| !before.contains(record))
+        .collect();
+    assert_eq!(appended.len(), 1);
+    assert!(matches!(appended[0], CollectionRecord::Commit(_)));
     f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
+}
+
+#[test]
+fn routing_aliases_under_one_signer_share_projected_health_receipts() {
+    let f = Fixture::new();
+    let other = *fucid();
+    f.person(other);
+    let mut recorder = f.health_recorder();
+    f.health(
+        &mut recorder,
+        faculties::clock::now().unwrap(),
+        State::Stalled,
+        true,
+    );
+    f.maintain();
+    let alias = format!("{other:x}");
+    for persona in [f.who(), alias.clone()] {
+        assert!(text(&f.call("orient_poll", json!({"persona": persona})))
+            .contains("DHT publication: stalled"));
+    }
+    f.call("orient_poll", json!({"persona": f.who(), "peek": false}));
+    // The same zooid can see a duplicate through another routing alias while
+    // its asynchronous projection still predates the accepted output.
+    assert!(text(&f.call("orient_poll", json!({"persona": alias})))
+        .contains("DHT publication: stalled"));
+    f.maintain_receipts(&f.key);
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who()}))
+        .is_empty());
+    assert!(f.call("orient_poll", json!({"persona": alias})).is_empty());
+}
+
+#[test]
+fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
+    use triblespace::core::collection::grant_collection_read;
+
+    let f = Fixture::new();
+    let event = f.message("one shared inbox, two zooids", f.persona);
+    f.maintain();
+    let other_key = f.directory.path().join("other-zooid.key");
+    let other = faculties::storage::initialize_signer(&f.pile, Some(&other_key)).unwrap();
+    let owner = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
+    assert_ne!(owner.verifying_key(), other.verifying_key());
+    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    let mut overrides = Vec::new();
+    for scope in [
+        faculties::schemas::message::DEFAULT_SCOPE_ID,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+    ] {
+        let source =
+            faculties::collection_names::open(&mut pile, scope, owner.verifying_key()).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for handle in [source.handle(), succinct.handle(), rank9.handle()] {
+            grant_collection_read(&mut pile, handle, &owner, other.verifying_key()).unwrap();
+        }
+        overrides.push((
+            faculties::collection_names::override_env_name(scope),
+            hex::encode(source.handle().raw),
+        ));
+    }
+    let first_receipts = pile
+        .collection(
+            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::private_policy(owner.verifying_key()),
+        )
+        .unwrap();
+    let second_receipts = pile
+        .collection(
+            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::private_policy(other.verifying_key()),
+        )
+        .unwrap();
+    assert_ne!(first_receipts, second_receipts);
+    let snapshot = pile.snapshot().unwrap();
+    for (collection, stranger) in [
+        (first_receipts, other.verifying_key()),
+        (second_receipts, owner.verifying_key()),
+    ] {
+        assert!(!collection.reader_is_admitted(&snapshot, stranger).unwrap());
+        assert!(!collection.writer_is_admitted(&snapshot, stranger).unwrap());
+    }
+
+    // A readable old mixed-persona ledger is not the new zooid's receipt
+    // source, even if deployment still supplies the legacy override.
+    let legacy = faculties::collection_names::open(
+        &mut pile,
+        faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        owner.verifying_key(),
+    )
+    .unwrap();
+    pile.commit(
+        legacy,
+        &owner,
+        faculties::orient::presented_fragment(f.persona, [event]),
+    )
+    .unwrap();
+    let policy = legacy.policy(&pile.snapshot().unwrap()).unwrap();
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(legacy, (), policy.clone())
+        .unwrap();
+    let rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    pollster::block_on(async {
+        drop(pile.maintain(succinct, &owner).await.unwrap());
+        drop(pile.maintain(rank9, &owner).await.unwrap());
+    });
+    overrides.push((
+        faculties::collection_names::override_env_name(
+            faculties::schemas::orient::DEFAULT_SCOPE_ID,
+        ),
+        hex::encode(legacy.handle().raw),
+    ));
+    pile.close().unwrap();
+
+    f.call("orient_poll", json!({"persona": f.who(), "peek": false}));
+    f.maintain_receipts(&f.key);
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who()}))
+        .is_empty());
+    let run_other = |consume: bool| {
+        let mut command = f.process_with_key(&other_key, None);
+        command.envs(overrides.iter().map(|(name, value)| (name, value)));
+        command.arg("poll");
+        if !consume {
+            command.arg("--peek");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+    assert!(run_other(false).contains("one shared inbox, two zooids"));
+    assert!(f.presented_by(&other_key).is_empty());
+    assert!(run_other(true).contains("one shared inbox, two zooids"));
+    assert_eq!(f.presented(), std::collections::BTreeSet::from([event]));
+    assert_eq!(
+        f.presented_by(&other_key),
+        std::collections::BTreeSet::from([event])
+    );
+    f.maintain_receipts(&other_key);
+    assert!(run_other(false).is_empty());
+}
+
+#[test]
+fn missing_historical_receipt_payload_does_not_block_accepted_news() {
+    use triblespace::core::collection::{records::empty_metadata_handle, CollectionCommit};
+    use triblespace::core::repo::WantRead;
+
+    let f = Fixture::new();
+    let event = f.message("history is not a receipt barrier", f.persona);
+    let signer = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
+    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    let receipts = pile
+        .collection(
+            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::private_policy(signer.verifying_key()),
+        )
+        .unwrap();
+    let earlier = *fucid();
+    pile.commit(
+        receipts,
+        &signer,
+        faculties::orient::receipt_fragment([earlier], faculties::clock::point_now().unwrap()),
+    )
+    .unwrap();
+    pile.close().unwrap();
+    f.maintain();
+
+    let cold =
+        faculties::orient::receipt_fragment([*fucid()], faculties::clock::point_now().unwrap());
+    let cold = IntoBlob::<blobencodings::SimpleArchive>::to_blob(cold.facts().clone());
+    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+        &signer,
+        receipts.handle(),
+        inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(cold.get_handle()),
+        empty_metadata_handle(),
+    )))
+    .unwrap();
+    pile.close().unwrap();
+    let before = f.records();
+    let report = f.call("orient_poll", json!({"persona": f.who(), "peek": false}));
+    assert!(text(&report).contains("history is not a receipt barrier"));
+    assert_eq!(
+        f.presented(),
+        std::collections::BTreeSet::from([earlier, event])
+    );
+    let after = f.records();
+    let appended: Vec<_> = after
+        .iter()
+        .filter(|record| !before.contains(record))
+        .collect();
+    assert_eq!(appended.len(), 1);
+    assert!(
+        matches!(appended[0], CollectionRecord::Commit(commit) if commit.collection() == receipts.handle())
+    );
+    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
+    assert!(snapshot.wants().unwrap().next().is_none());
+    pile.close().unwrap();
 }
 
 #[test]

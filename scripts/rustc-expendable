@@ -1,5 +1,8 @@
-#!/bin/sh
+#!/bin/bash
 # Keep compiler/linker memory pressure expendable on Linux build hosts.
+#
+# Bash preserves Cargo's hyphenated CARGO_BIN_EXE_* environment names; dash
+# (the Sparks' /bin/sh) drops them before rustc can expand env! in tests.
 #
 # ssh.service is intentionally OOM-protected on the Sparks. Interactive agent
 # processes used to inherit that protection all the way into rustc and GNU ld,

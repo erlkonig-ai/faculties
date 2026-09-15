@@ -1,8 +1,10 @@
 //! Orient's grow-only presentation ledger.
 //!
 //! Source faculties define which events deserve attention. Orient records only
-//! the irreducible observer state: whether one exact persona has already been
-//! presented one exact event. Store snapshots and collection covers are local
+//! the irreducible observer state: whether one signing zooid has already been
+//! presented one exact event. New receipts belong to the signing zooid's private
+//! collection; the persona field below is only the legacy import vocabulary.
+//! Store snapshots and collection covers are local
 //! continuation tokens, not durable facts, and therefore do not live here.
 
 use std::collections::BTreeSet;
@@ -18,6 +20,26 @@ pub mod mcp;
 mod operations;
 pub use operations::{BaselineReceipt, Orient, ShowOptions, WaitOptions, WakeOptions};
 
+/// Receipt facts for a key-private source collection. Event identity is stable
+/// across retries; observation times annotate that identity, never qualify the
+/// derived ID set. The collection descriptor identifies the observing zooid.
+pub fn receipt_fragment(
+    events: impl IntoIterator<Item = Id>,
+    created_at: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    for event in events {
+        let receipt = entity! {
+            metadata::tag: &KIND_PRESENTED,
+            presentation::event: &event,
+        };
+        let id = receipt.root().expect("one receipt entity");
+        fragment += receipt;
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: &created_at };
+    }
+    fragment
+}
+
 fn presented_record(persona: Id, event: Id) -> Fragment {
     entity! {
         metadata::tag: &KIND_PRESENTED,
@@ -26,6 +48,7 @@ fn presented_record(persona: Id, event: Id) -> Fragment {
     }
 }
 
+/// Legacy mixed-persona receipt facts, retained for explicit imports.
 /// Build intrinsic grow-only facts saying that `persona` was presented each
 /// supplied event.
 ///
@@ -40,7 +63,7 @@ pub fn presented_fragment(persona: Id, events: impl IntoIterator<Item = Id>) -> 
     fragment
 }
 
-/// Exact event identities already presented to one persona.
+/// Exact event identities in a legacy mixed-persona receipt collection.
 pub fn presented_events(facts: &TribleSet, persona: Id) -> BTreeSet<Id> {
     find!(
         event: Id,
@@ -57,6 +80,34 @@ pub fn presented_events(facts: &TribleSet, persona: Id) -> BTreeSet<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_time_annotates_identity_without_qualifying_membership() {
+        let event = Id::new([8; 16]).unwrap();
+        let first_time = crate::clock::point(hifitime::Epoch::from_unix_seconds(10.0)).unwrap();
+        let next_time = crate::clock::point(hifitime::Epoch::from_unix_seconds(20.0)).unwrap();
+        let first = receipt_fragment([event], first_time);
+        let next = receipt_fragment([event, event], next_time);
+        let subjects = |facts: &TribleSet| {
+            find!(id: Id, pattern!(facts, [{ ?id @ presentation::event: &event }]))
+                .collect::<BTreeSet<_>>()
+        };
+        let identities = subjects(first.facts());
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities, subjects(next.facts()));
+        let mut both = first;
+        both += next;
+        let receipt = *identities.first().unwrap();
+        let times: BTreeSet<Inline<inlineencodings::NsTAIInterval>> = find!(
+            at: Inline<inlineencodings::NsTAIInterval>,
+            pattern!(both.facts(), [{ receipt @ metadata::created_at: ?at }])
+        )
+        .collect();
+        assert_eq!(times, BTreeSet::from([first_time, next_time]));
+        assert!(!exists!(
+            pattern!(both.facts(), [{ _?receipt @ presentation::persona: _?persona }])
+        ));
+    }
 
     #[test]
     fn presentation_atoms_are_intrinsic_and_idempotent() {

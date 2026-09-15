@@ -135,11 +135,13 @@ impl SecretsCollection {
             .collection(self.succinct)
             .context("observe resident Succinct Secrets support")?
             .support()
+            .context("resolve resident Succinct Secrets support")?
             .clone();
         let rank9 = before
             .collection(self.rank9)
             .context("observe resident Rank9 Secrets support")?
             .support()
+            .context("resolve resident Rank9 Secrets support")?
             .clone();
         let resident = succinct.union(&rank9)?;
         let missing = admitted.difference(&resident)?;
@@ -198,11 +200,13 @@ impl SecretsCollection {
             .collection(self.succinct)
             .context("observe resident Succinct Secrets support")?
             .support()
+            .context("resolve resident Succinct Secrets support")?
             .clone();
         let rank9 = before
             .collection(self.rank9)
             .context("observe resident Rank9 Secrets support")?
             .support()
+            .context("resolve resident Rank9 Secrets support")?
             .clone();
         let resident = succinct.union(&rank9)?;
         let missing = admitted.difference(&resident)?;
@@ -236,7 +240,10 @@ where
     let observed = store_snapshot
         .collection(collection.rank9)
         .context("observe maintained Secrets collection")?;
-    let support = observed.support().clone();
+    let support = observed
+        .support()
+        .context("resolve maintained Secrets snapshot support")?
+        .clone();
     let facts = if observed.cover().is_empty() {
         None
     } else {
@@ -270,7 +277,10 @@ where
     let observed = store_snapshot
         .collection_exact(collection.rank9, &support)
         .context("attach exact maintained Secrets collection")?;
-    let support = observed.support().clone();
+    let support = observed
+        .support()
+        .context("resolve exact Secrets snapshot support")?
+        .clone();
     let facts = if observed.cover().is_empty() {
         None
     } else {
@@ -714,7 +724,8 @@ mod tests {
                 before
                     .collection_exact(collection.rank9(), &right_support)
                     .unwrap()
-                    .support(),
+                    .support()
+                    .unwrap(),
                 &right_support,
             );
             assert!(snapshot(before, collection).unwrap().contains(right_secret));
