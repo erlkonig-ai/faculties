@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Memory prepares ordinary journal, context, cursor, and provenance operations
+  from resident maintained targets, without requiring complete historical root
+  payloads. Each authorized mapping hop can still catch up from resident input;
+  readers without derived WRITE reuse the existing rollups. Creation follows
+  the same normal read path and preserves hard-reference checks and publication.
+  Explicit `memory embed` enumerates that resident observed journal; selected
+  summary/image reads and embedding publication still report their real errors.
+
 - Orient consumes resident receipt rollups after they cover the operation's
   fixed initial support, without acquiring historical root payloads. Remote
   maintenance can satisfy that boundary while other personas keep writing;

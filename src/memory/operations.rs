@@ -424,20 +424,34 @@ impl MemoryStorage<'_> {
                 let collection = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Rank9 Memory collection")?;
-                drop(
-                    pile.ensure(source, signer)
-                        .await
-                        .context("ensure Memory source")?,
-                );
-                drop(
-                    pile.maintain(succinct, signer)
-                        .await
-                        .context("maintain Succinct Memory collection")?,
-                );
+                // Read the resident target, not a complete historical root.
+                // Each authorized hop may catch up from its resident source;
+                // another producer's already-maintained view needs no WRITE.
+                let admission = pile.snapshot().context("freeze Memory WRITE admission")?;
+                let subject = signer.verifying_key();
+                if succinct
+                    .writer_is_admitted(&admission, subject)
+                    .context("check Succinct Memory WRITE admission")?
+                {
+                    drop(
+                        pile.maintain(succinct, signer)
+                            .await
+                            .context("maintain Succinct Memory collection")?,
+                    );
+                }
+                if collection
+                    .writer_is_admitted(&admission, subject)
+                    .context("check Rank9 Memory WRITE admission")?
+                {
+                    drop(
+                        pile.maintain(collection, signer)
+                            .await
+                            .context("maintain Rank9 Memory collection")?,
+                    );
+                }
                 let store_snapshot = pile
-                    .maintain(collection, signer)
-                    .await
-                    .context("maintain Rank9 Memory collection")?;
+                    .snapshot()
+                    .context("freeze maintained Memory snapshot")?;
                 Self::load_memory_from_snapshot(collection, &store_snapshot)
             });
             result
@@ -483,42 +497,48 @@ impl MemoryStorage<'_> {
                     let rank9 = pile
                         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                         .context("register Rank9 shared Embeddings collection")?;
-                    Some((source, succinct, rank9))
+                    Some((succinct, rank9))
                 } else {
                     None
                 };
-                drop(pile.ensure(memory_source, signer).await?);
-                if let Some((source, _, _)) = embeddings_collections {
-                    drop(pile.ensure(source, signer).await?);
-                }
-                drop(
-                    pile.maintain(memory_succinct, signer)
-                        .await
-                        .context("maintain Succinct Memory collection")?,
-                );
-                drop(
-                    pile.maintain(memory_collection, signer)
-                        .await
-                        .context("maintain Rank9 Memory collection")?,
-                );
-                if let Some((_, succinct, rank9)) = embeddings_collections {
-                    drop(
-                        pile.maintain(succinct, signer)
-                            .await
-                            .context("maintain Succinct shared Embeddings collection")?,
-                    );
-                    drop(
-                        pile.maintain(rank9, signer)
-                            .await
-                            .context("maintain Rank9 shared Embeddings collection")?,
-                    );
+                let admission = pile
+                    .snapshot()
+                    .context("freeze Memory/Embeddings WRITE admission")?;
+                let subject = signer.verifying_key();
+                for (succinct, rank9, label) in [(memory_succinct, memory_collection, "Memory")]
+                    .into_iter()
+                    .chain(
+                        embeddings_collections
+                            .map(|(succinct, rank9)| (succinct, rank9, "shared Embeddings")),
+                    )
+                {
+                    if succinct
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(succinct, signer)
+                                .await
+                                .with_context(|| format!("maintain Succinct {label} collection"))?,
+                        );
+                    }
+                    if rank9
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(rank9, signer)
+                                .await
+                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
+                        );
+                    }
                 }
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Memory/Embeddings snapshot")?;
                 let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
                 let embeddings = match embeddings_collections {
-                    Some((_, _, collection)) => Some(Self::attach_collection(
+                    Some((_, collection)) => Some(Self::attach_collection(
                         collection,
                         &store_snapshot,
                         "shared Embeddings",
@@ -564,28 +584,35 @@ impl MemoryStorage<'_> {
                 let comb_collection = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
                     .context("register Rank9 Comb collection")?;
-                drop(pile.ensure(memory_source, signer).await?);
-                drop(pile.ensure(comb_source, signer).await?);
-                drop(
-                    pile.maintain(memory_succinct, signer)
-                        .await
-                        .context("maintain Succinct Memory collection")?,
-                );
-                drop(
-                    pile.maintain(memory_collection, signer)
-                        .await
-                        .context("maintain Rank9 Memory collection")?,
-                );
-                drop(
-                    pile.maintain(comb_succinct, signer)
-                        .await
-                        .context("maintain Succinct Comb collection")?,
-                );
-                drop(
-                    pile.maintain(comb_collection, signer)
-                        .await
-                        .context("maintain Rank9 Comb collection")?,
-                );
+                let admission = pile
+                    .snapshot()
+                    .context("freeze Memory/Comb WRITE admission")?;
+                let subject = signer.verifying_key();
+                for (succinct, rank9, label) in [
+                    (memory_succinct, memory_collection, "Memory"),
+                    (comb_succinct, comb_collection, "Comb"),
+                ] {
+                    if succinct
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(succinct, signer)
+                                .await
+                                .with_context(|| format!("maintain Succinct {label} collection"))?,
+                        );
+                    }
+                    if rank9
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(rank9, signer)
+                                .await
+                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
+                        );
+                    }
+                }
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Memory/Comb snapshot")?;
@@ -664,24 +691,35 @@ impl MemoryStorage<'_> {
                         archive_policy,
                     )
                     .context("register Rank9 Archive collection")?;
-                for source in [memory_source, cognition_source, archive_source] {
-                    drop(pile.ensure(source, signer).await?);
-                }
+                let admission = pile
+                    .snapshot()
+                    .context("freeze Memory/Cognition/Archive WRITE admission")?;
+                let subject = signer.verifying_key();
                 for (succinct, collection, label) in [
                     (memory_succinct, memory_collection, "Memory"),
                     (cognition_succinct, cognition_collection, "Cognition"),
                     (archive_succinct, archive_collection, "Archive"),
                 ] {
-                    drop(
-                        pile.maintain(succinct, signer)
-                            .await
-                            .with_context(|| format!("maintain Succinct {label} collection"))?,
-                    );
-                    drop(
-                        pile.maintain(collection, signer)
-                            .await
-                            .with_context(|| format!("maintain Rank9 {label} collection"))?,
-                    );
+                    if succinct
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(succinct, signer)
+                                .await
+                                .with_context(|| format!("maintain Succinct {label} collection"))?,
+                        );
+                    }
+                    if collection
+                        .writer_is_admitted(&admission, subject)
+                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
+                    {
+                        drop(
+                            pile.maintain(collection, signer)
+                                .await
+                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
+                        );
+                    }
                 }
                 let store_snapshot = pile
                     .snapshot()
@@ -2789,6 +2827,11 @@ mod tests {
     use super::super::cli_cover::*;
     use super::*;
     use std::fs::File;
+    use triblespace::core::collection::{
+        CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    };
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::{BlobStoreList, WantRead};
 
     struct TestPile {
         pile: PathBuf,
@@ -2851,6 +2894,200 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resident_memory_reads_and_creates_ignore_an_unavailable_root_member() {
+        let fixture = TestPile::new();
+        let storage = fixture.storage();
+        let memory = Memory::with_storage(fixture.storage.clone());
+        let warm = publish_chunk(
+            storage,
+            text_draft(
+                "already resident history",
+                "2026-09-01T00:00:00",
+                "2026-09-01T01:00:00",
+            ),
+        );
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{warm:x}")).unwrap(),
+            warm
+        );
+        let (source, cold) = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let (fragment, _) = memory_model::chunk_fragment(text_draft(
+                    "unavailable historical member",
+                    "2026-08-01T00:00:00",
+                    "2026-08-01T01:00:00",
+                ))?;
+                let mut remote = MemoryRepo::default();
+                let arriving = remote.commit(source, signer, fragment)?;
+                let cold = Handle::<blobencodings::SimpleArchive>::from_hash(arriving.data());
+                // Only the genuine signed record arrives, not its archive or
+                // attachments. The warm target is still a complete local view.
+                pile.insert(CollectionRecord::Commit(arriving))?;
+                let snapshot = pile.snapshot()?;
+                assert!(source.admitted(&snapshot)?.contains(cold));
+                assert!(!snapshot.contains_blob(cold)?);
+                Ok((source, cold))
+            })
+            .unwrap();
+
+        let mut shown = String::new();
+        memory
+            .show(
+                &format!("{warm:x}"),
+                &mut Out::new(&mut |part| {
+                    match part {
+                        crate::out::Part::Text { text } => shown.push_str(&text),
+                        other => panic!("expected journal text, got {other:?}"),
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert_eq!(shown, "already resident history\n");
+        let range = parse_time_range("2026-09-15T05:50:00Z..2026-09-15T06:10:00Z").unwrap();
+        let plain = memory
+            .create("a new journal entry", Some(range), None)
+            .unwrap();
+        let linked = memory
+            .create(&format!("[earlier](memory:{warm:x})"), Some(range), None)
+            .unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{:x}", plain.id)).unwrap(),
+            plain.id
+        );
+        assert_eq!(
+            chunk_references(&loaded.memory.facts, linked.id),
+            vec![warm]
+        );
+
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(source.handle())]);
+        let before = fixture
+            .storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
+            .unwrap();
+        let unknown = ufoid();
+        let error = memory
+            .create(
+                &format!("[missing](memory:{:x})", unknown.id),
+                Some(range),
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("hard reference"));
+        assert!(format!("{error:#}").contains("no chunk id matches"));
+        fixture
+            .storage
+            .with_pile(|pile, _| {
+                let after = pile.snapshot()?;
+                assert_eq!(after.select_records(&selectors)?, before);
+                assert!(!after.contains_blob(cold)?);
+                assert_eq!(after.wants()?.count(), 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn resident_memory_auxiliary_views_ignore_unavailable_root_members() {
+        let fixture = TestPile::new();
+        let storage = fixture.storage();
+        let warm = publish_chunk(
+            storage,
+            text_draft(
+                "resident auxiliary view test",
+                "2026-09-01T00:00:00",
+                "2026-09-01T01:00:00",
+            ),
+        );
+        let marker = ufoid();
+        let scopes = [
+            MEMORY_SCOPE_ID,
+            EMBEDDINGS_SCOPE_ID,
+            DEFAULT_COMB_SCOPE_ID,
+            cognition_schema::DEFAULT_SCOPE_ID,
+            archive_schema::DEFAULT_SCOPE_ID,
+        ];
+        let sources = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                scopes
+                    .into_iter()
+                    .map(|scope| {
+                        let source = open_configured(pile, scope, signer.verifying_key())?;
+                        pile.commit(source, signer, entity! { &marker @ metadata::tag: &marker })?;
+                        Ok(source)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .unwrap();
+        drop(storage.load_context(true).unwrap());
+        drop(storage.load_comb().unwrap());
+        drop(storage.load_provenance().unwrap());
+
+        let (cold, before) = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let mut cold = Vec::new();
+                let mut remote = MemoryRepo::default();
+                for source in &sources {
+                    let unrelated = ufoid();
+                    let arriving = remote.commit(
+                        *source,
+                        signer,
+                        entity! { &unrelated @ metadata::tag: &unrelated },
+                    )?;
+                    pile.insert(CollectionRecord::Commit(arriving))?;
+                    cold.push(Handle::<blobencodings::SimpleArchive>::from_hash(
+                        arriving.data(),
+                    ));
+                }
+                let snapshot = pile.snapshot()?;
+                for handle in &cold {
+                    assert!(!snapshot.contains_blob(*handle)?);
+                }
+                let records = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
+                Ok((cold, records))
+            })
+            .unwrap();
+        let context = storage.load_context(true).unwrap();
+        let comb = storage.load_comb().unwrap();
+        let provenance = storage.load_provenance().unwrap();
+        for loaded in [&context.memory, &comb.memory, &provenance.memory] {
+            assert_eq!(
+                resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(),
+                warm
+            );
+        }
+        for facts in [
+            &context.embeddings.as_ref().unwrap().facts,
+            &comb.comb.facts,
+            &provenance.cognition.facts,
+            &provenance.archive.facts,
+        ] {
+            assert_eq!(
+                find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &marker }]))
+                    .collect::<Vec<_>>(),
+                vec![*marker],
+            );
+        }
+        fixture
+            .storage
+            .with_pile(|pile, _| {
+                let snapshot = pile.snapshot()?;
+                assert_eq!(snapshot.records()?.collect::<Result<Vec<_>, _>>()?, before);
+                for handle in cold {
+                    assert!(!snapshot.contains_blob(handle)?);
+                }
+                assert_eq!(snapshot.wants()?.count(), 0);
+                Ok(())
+            })
+            .unwrap();
+    }
     #[test]
     fn replay_batch_never_splits_one_start_coordinate() {
         let ids: Vec<Id> = (1u8..=5).map(|byte| Id::new([byte; 16]).unwrap()).collect();

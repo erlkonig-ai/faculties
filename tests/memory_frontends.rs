@@ -91,6 +91,114 @@ fn receipt_id(parts: &[Part]) -> String {
 const RANGE: &str = "2026-09-01T00:00:00..2026-09-02T00:00:00";
 
 #[test]
+fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    use faculties::collection_names::{open, override_env_name};
+    use faculties::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+    use faculties::schemas::memory::DEFAULT_SCOPE_ID;
+    use faculties::storage::Storage;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{
+        CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+        CollectionStoreExt,
+    };
+    use triblespace::core::metadata;
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::{BlobStoreList, WantRead};
+    use triblespace::prelude::inlineencodings::Handle;
+    use triblespace::prelude::*;
+
+    let fixture = Fixture::new();
+    let reader_key = fixture.directory.path().join("reader.key");
+    let reader = initialize_signer(&fixture.pile, Some(&reader_key)).unwrap();
+    let storage = Storage::new(fixture.pile.clone(), Some(fixture.key.clone()));
+    let (source, cold, before, warm_id) = storage
+        .with_pile(|pile, owner| {
+            assert_ne!(reader.verifying_key(), owner.verifying_key());
+            let source = open(pile, DEFAULT_SCOPE_ID, owner.verifying_key())?;
+            let (start, end) = parse_time_range(RANGE)?;
+            let start_at = (start, start).try_to_inline().unwrap();
+            let end_at = (end, end).try_to_inline().unwrap();
+            let (fragment, warm_id) = chunk_fragment(ChunkDraft {
+                content: ChunkDraftContent::Text("already resident history".to_owned()),
+                start_at,
+                end_at,
+                lens: None,
+                references: BTreeSet::new(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: BTreeSet::from([end_at]),
+                aliases: BTreeSet::new(),
+            })?;
+            let warm = pile.commit(source, owner, fragment)?;
+            let warm = Handle::<blobencodings::SimpleArchive>::from_hash(warm.data());
+            let policy = source.policy(&pile.snapshot()?)?;
+            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+            drop(pollster::block_on(pile.maintain(succinct, owner))?);
+            drop(pollster::block_on(pile.maintain(rank9, owner))?);
+
+            let mut remote = MemoryRepo::default();
+            let cold_record = remote.commit(
+                source,
+                owner,
+                entity! { metadata::name: "unavailable historical member" },
+            )?;
+            let cold = Handle::<blobencodings::SimpleArchive>::from_hash(cold_record.data());
+            pile.insert(CollectionRecord::Commit(cold_record))?;
+            let snapshot = pile.snapshot()?;
+            assert!(source.admitted(&snapshot)?.contains(cold));
+            assert!(!snapshot.contains_blob(cold)?);
+            assert!(snapshot.collection(succinct)?.support().contains(warm));
+            assert!(snapshot.collection(rank9)?.support().contains(warm));
+            assert!(!source.writer_is_admitted(&snapshot, reader.verifying_key())?);
+            assert!(!succinct.writer_is_admitted(&snapshot, reader.verifying_key())?);
+            assert!(!rank9.writer_is_admitted(&snapshot, reader.verifying_key())?);
+            assert_eq!(snapshot.wants()?.count(), 0);
+            let before = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
+            Ok((source, cold, before, warm_id))
+        })
+        .unwrap();
+
+    // The override belongs only to this child. Both keys address exactly the
+    // same resident descriptors, without a process-global environment change.
+    let output = Command::new(env!("CARGO_BIN_EXE_memory"))
+        .arg("--pile")
+        .arg(&fixture.pile)
+        .arg("--key")
+        .arg(&reader_key)
+        .arg(format!("{warm_id:x}"))
+        .env(
+            override_env_name(DEFAULT_SCOPE_ID),
+            hex::encode(source.handle().raw),
+        )
+        .env_remove("DRIVE_ENDPOINT")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "memory show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"already resident history\n");
+    storage
+        .with_pile(|pile, _| {
+            let after = pile.snapshot()?;
+            // Compare all native records, not just this collection's COMMITs:
+            // a read must not publish a new MERGE, DERIVE, or unrelated record.
+            assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, before);
+            assert_eq!(after.wants()?.count(), 0);
+            assert!(!after.contains_blob(cold)?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn library_cli_and_mcp_agree_on_resident_reads_and_exact_cover_text() {
     let fixture = Fixture::new();
     let memory = fixture.memory();
