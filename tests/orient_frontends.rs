@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
+use triblespace::core::collection::lww_register::LwwRegisterBlob;
+use triblespace::core::collection::{CollectionRead, CollectionRecord, CollectionStoreExt};
 use triblespace::prelude::*;
 
 struct Fixture {
@@ -76,6 +80,77 @@ impl Fixture {
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         pile.close().unwrap();
+    }
+
+    /// Model the independent maintenance worker, never an Orient call.
+    fn maintain(&self) {
+        let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        pollster::block_on(async {
+            for scope in [
+                faculties::schemas::message::DEFAULT_SCOPE_ID,
+                faculties::schemas::mail::DEFAULT_SCOPE_ID,
+                faculties::schemas::teams::DEFAULT_SCOPE_ID,
+                faculties::schemas::compass::DEFAULT_SCOPE_ID,
+                faculties::schemas::relations::DEFAULT_SCOPE_ID,
+                faculties::schemas::status::DEFAULT_SCOPE_ID,
+                faculties::schemas::habit::DEFAULT_SCOPE_ID,
+                faculties::schemas::orient::DEFAULT_SCOPE_ID,
+                faculties::schemas::memory::DEFAULT_SCOPE_ID,
+                faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+                health::DEFAULT_SCOPE_ID,
+            ] {
+                let source = faculties::collection_names::open_configured(
+                    &mut pile,
+                    scope,
+                    signer.verifying_key(),
+                )
+                .unwrap();
+                let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+                let succinct = pile
+                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .unwrap();
+                let rank9 = pile
+                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy.clone())
+                    .unwrap();
+                drop(pile.maintain(succinct, &signer).await.unwrap());
+                drop(pile.maintain(rank9, &signer).await.unwrap());
+                if scope == health::DEFAULT_SCOPE_ID {
+                    let latest = pile
+                        .derive::<LwwRegisterBlob>(
+                            source,
+                            (
+                                health::attrs::node.id(),
+                                triblespace::core::metadata::created_at.id(),
+                            ),
+                            policy,
+                        )
+                        .unwrap();
+                    drop(pile.maintain(latest, &signer).await.unwrap());
+                }
+            }
+            let status =
+                faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
+                    .unwrap();
+            drop(pile.maintain(status, &signer).await.unwrap());
+            let latest =
+                faculties::wiki::latest_collection(&mut pile, signer.verifying_key()).unwrap();
+            drop(pile.maintain(latest, &signer).await.unwrap());
+        });
+        pile.close().unwrap();
+    }
+
+    fn records(&self) -> Vec<CollectionRecord> {
+        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let records = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        pile.close().unwrap();
+        records
     }
     fn message(&self, text: &str, to: Id) -> Id {
         let mut fragment = Fragment::empty();
@@ -172,10 +247,129 @@ fn text(parts: &[Part]) -> String {
 }
 
 #[test]
+fn authorized_readers_leave_lagging_targets_to_external_maintenance() {
+    let f = Fixture::new();
+    // Register and maintain the private projections under this same signer:
+    // these reads have WRITE, but that is not a request to produce equations.
+    f.maintain();
+    let event = f.message("visible only after external upkeep", f.persona);
+    let (goal, _) = faculties::compass::goal_fragment(
+        "a goal still outside the resident projection",
+        Vec::new(),
+        None,
+        faculties::clock::point_now().unwrap(),
+    )
+    .unwrap();
+    f.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, goal);
+    let before = f.records();
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who()}))
+        .is_empty());
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who(), "peek": false}))
+        .is_empty());
+    let show = text(&f.call("orient_show", json!({})));
+    let wake = text(&f.call("orient_wake", json!({"chars": 0})));
+    for report in [&show, &wake] {
+        assert!(!report.contains("visible only after external upkeep"));
+        assert!(!report.contains("a goal still outside the resident projection"));
+    }
+    let options = WaitOptions {
+        timeout: Some(Duration::from_millis(10)),
+        poll_interval: Duration::from_millis(2),
+    };
+    let mut parts = Vec::new();
+    f.orient()
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("No change detected"));
+    assert_eq!(
+        f.records(),
+        before,
+        "ordinary reads must append no COMMIT, MERGE or DERIVE"
+    );
+
+    // A separate producer catches up the targets. The next one-shot wait can
+    // deliver the message; its only signed output is the explicit receipt.
+    f.maintain();
+    let before_delivery = f.records();
+    let peek = f.call("orient_poll", json!({"persona": f.who()}));
+    assert!(text(&peek).contains("visible only after external upkeep"));
+    assert_eq!(f.records(), before_delivery);
+    parts.clear();
+    f.orient()
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("visible only after external upkeep"));
+    assert!(f.presented().contains(&event));
+    let after_delivery = f.records();
+    let appended: Vec<_> = after_delivery
+        .iter()
+        .filter(|record| !before_delivery.contains(record))
+        .collect();
+    assert_eq!(appended.len(), 1);
+    assert!(matches!(appended[0], CollectionRecord::Commit(_)));
+
+    // The next operation freezes the receipt COMMIT even while its target is
+    // behind. It must wait, not replay the message or derive its own receipt.
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who(), "peek": false}))
+        .is_empty());
+    parts.clear();
+    f.orient()
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("No fully readable attention view"));
+    assert!(!text(&parts).contains("visible only after external upkeep"));
+    assert_eq!(f.records(), after_delivery);
+
+    f.maintain();
+    let after_upkeep = f.records();
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who()}))
+        .is_empty());
+    parts.clear();
+    f.orient()
+        .wait(
+            &f.who(),
+            &options,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(text(&parts).contains("No change detected"));
+    assert_eq!(f.records(), after_upkeep);
+}
+
+#[test]
 fn poll_defaults_to_peek_and_consumption_is_exact_persona_scoped() {
     let f = Fixture::new();
     let body = "@literal pending news";
     f.message(body, f.persona);
+    f.maintain();
     let first = f.call("orient_poll", json!({"persona":f.who()}));
     assert!(text(&first).contains(body));
     assert_eq!(first, f.call("orient_poll", json!({"persona":f.who()})));
@@ -196,10 +390,12 @@ fn poll_defaults_to_peek_and_consumption_is_exact_persona_scoped() {
         first,
         f.call("orient_poll", json!({"persona":f.who(),"peek":false}))
     );
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
     let other = *fucid();
     f.person(other);
     f.message("another observer", other);
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
     assert!(
         text(&f.call("orient_poll", json!({"persona":format!("{other:x}")})))
@@ -211,6 +407,7 @@ fn poll_defaults_to_peek_and_consumption_is_exact_persona_scoped() {
 fn rejected_complete_report_is_retryable_and_does_not_present() {
     let f = Fixture::new();
     f.message("delivery must succeed", f.persona);
+    f.maintain();
     let expected = f.call("orient_poll", json!({"persona":f.who()}));
     let mut attempted = Vec::new();
     let error = f
@@ -231,6 +428,7 @@ fn rejected_complete_report_is_retryable_and_does_not_present() {
         expected,
         f.call("orient_poll", json!({"persona":f.who(),"peek":false}))
     );
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }
 
@@ -248,6 +446,7 @@ fn passive_show_never_executes_habit_conditions_and_opt_in_evaluates_once() {
     )
     .unwrap();
     f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
+    f.maintain();
     let passive = f.call("orient_show", json!({}));
     assert!(text(&passive).contains("probe (not evaluated)"));
     assert!(!marker.exists());
@@ -297,6 +496,7 @@ fn show_only_loads_and_evaluates_global_or_matching_persona_habits() {
         .unwrap();
         f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
     }
+    f.maintain();
     let passive = text(&f.call("orient_show", json!({"persona": f.who()})));
     assert!(passive.contains("global-clock (not evaluated)"));
     assert!(passive.contains("my-clock (not evaluated)"));
@@ -312,6 +512,7 @@ fn show_only_loads_and_evaluates_global_or_matching_persona_habits() {
         "orient_show",
         json!({"persona": f.who(), "evaluate_habits": true}),
     );
+    f.maintain();
     let cli = f.cli(&["--persona", &f.who(), "show"]);
     assert_eq!(active, cli);
     assert!(text(&active).contains("my-clock due"));
@@ -332,6 +533,7 @@ fn show_limits_present_only_selected_events_and_baseline_discards_backlog_explic
     let f = Fixture::new();
     f.message("first item", f.persona);
     f.message("second item", f.persona);
+    f.maintain();
     let report = f.call(
         "orient_show",
         json!({"persona":f.who(),"message_limit":1,"doing_limit":0,"todo_limit":0}),
@@ -341,6 +543,7 @@ fn show_limits_present_only_selected_events_and_baseline_discards_backlog_explic
         usize::from(shown.contains("first item")) + usize::from(shown.contains("second item")),
         1
     );
+    f.maintain();
     let pending = text(&f.call("orient_poll", json!({"persona":f.who()})));
     assert_eq!(
         usize::from(pending.contains("first item")) + usize::from(pending.contains("second item")),
@@ -352,6 +555,7 @@ fn show_limits_present_only_selected_events_and_baseline_discards_backlog_explic
         receipt.events, 2,
         "baseline records the complete current attention set, including already presented entries"
     );
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }
 
@@ -362,6 +566,7 @@ fn a_one_shot_wait_reports_once_and_missing_persona_poll_remains_quiet() {
         .call("orient_poll", json!({"persona":"not-yet-resident"}))
         .is_empty());
     f.message("ready before wait", f.persona);
+    f.maintain();
     let mut parts = Vec::new();
     f.orient()
         .wait(
@@ -378,6 +583,7 @@ fn a_one_shot_wait_reports_once_and_missing_persona_poll_remains_quiet() {
         .unwrap();
     assert_eq!(parts.len(), 1);
     assert!(text(&parts).contains("ready before wait"));
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
     let mut wake = Vec::new();
     f.orient()
@@ -440,6 +646,7 @@ fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger(
     }]))
     .collect();
     assert_eq!(issues.len(), 1);
+    f.maintain();
     let cli = f.cli(&["--persona", &f.who(), "poll", "--peek"]);
     assert!(text(&cli).contains("DHT publication: stalled"));
     assert!(!text(&cli).contains("Swarm health (local observations)"));
@@ -452,12 +659,15 @@ fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger(
     assert_eq!(f.presented(), issues);
 
     f.health(&mut recorder, at + -20.0, State::Stalled, true);
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
     f.health(&mut recorder, at + -10.0, State::Current, false);
+    f.maintain();
     assert!(f
         .call("orient_poll", json!({"persona":f.who(),"peek":false}))
         .is_empty());
     f.health(&mut recorder, at, State::Current, false);
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }
 
@@ -486,6 +696,7 @@ fn health_is_visible_before_unavailable_message_bodies_and_wait_records_only_wha
     );
     let message = envelope.root().unwrap();
     f.publish(faculties::schemas::message::DEFAULT_SCOPE_ID, envelope);
+    f.maintain();
     let news = f.call("orient_poll", json!({"persona":f.who()}));
     assert!(text(&news).contains("report exceeds reader maximum age; current health unknown"));
     assert!(!text(&news).contains("unavailable body"));
@@ -521,6 +732,7 @@ fn health_max_age_is_reader_owned_across_native_cli_mcp_and_baseline() {
     );
     let report = facts.root().unwrap();
 
+    f.maintain();
     assert!(f
         .cli(&[
             "--persona",
@@ -603,6 +815,7 @@ fn wait_uses_the_same_reader_max_age_as_poll_and_show() {
         )
         .root()
         .unwrap();
+    f.maintain();
     let options = WaitOptions {
         timeout: Some(Duration::ZERO),
         poll_interval: Duration::from_millis(1),
@@ -644,6 +857,7 @@ fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() 
     let at = faculties::clock::now().unwrap();
     let mut recorder = f.health_recorder();
     f.health(&mut recorder, at + -10.0, State::Current, false);
+    f.maintain();
     let mut parts = Vec::new();
     f.orient()
         .wait(
@@ -662,6 +876,7 @@ fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() 
     assert!(!text(&parts).contains("News:"));
 
     f.health(&mut recorder, at, State::Stalled, true);
+    f.maintain();
     let error = f
         .orient()
         .show(
@@ -679,5 +894,6 @@ fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() 
     assert!(text(&show).starts_with("\nSwarm health (local observations):"));
     assert!(text(&show).contains("DHT publication: stalled"));
     assert_eq!(f.presented().len(), 1);
+    f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }

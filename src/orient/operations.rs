@@ -297,6 +297,7 @@ fn visible_notes<P: TriblePattern>(
 /// One Orient input's authored collection and explicit query projections.
 struct OrientSource {
     source: Collection<SimpleArchive>,
+    #[cfg(test)]
     succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &'static str,
@@ -346,12 +347,14 @@ impl OrientSource {
             .with_context(|| format!("register {label} Rank9 collection"))?;
         Ok(Self {
             source,
+            #[cfg(test)]
             succinct,
             rank9,
             label,
         })
     }
 
+    #[cfg(test)]
     fn can_maintain<S>(&self, snapshot: &S, signer: &SigningKey) -> Result<bool>
     where
         S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
@@ -367,8 +370,8 @@ impl OrientSource {
                 .with_context(|| format!("check {} Rank9 WRITE admission", self.label))?)
     }
 
-    /// Readers without production authority use the target as it stands.
-    /// An authorized local producer still catches up its own recent writes.
+    /// Test fixtures explicitly model an authorized background producer.
+    #[cfg(test)]
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         if !self.can_maintain(&pile.snapshot()?, signer)? {
             return Ok(());
@@ -376,7 +379,7 @@ impl OrientSource {
         self.maintain_local(pile, signer).await
     }
 
-    /// Only an admitted local producer computes these optional projections.
+    #[cfg(test)]
     async fn maintain_local(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         drop(
             pile.maintain(self.succinct, signer)
@@ -536,8 +539,8 @@ impl OrientObservation {
     }
 }
 
-/// Advance each explicit mapping hop from its currently resident source.
-/// Readers select their target views only after this optional cache work.
+/// Explicit fixture upkeep, separate from every production reader.
+#[cfg(test)]
 async fn maintain_sources(
     pile: &mut FacultyStore,
     signer: &SigningKey,
@@ -613,15 +616,11 @@ fn observe_sources(
     })
 }
 
-/// Maintain each hop, then observe the targets resident at one later boundary.
-/// `watermark` remains the caller's change-detection baseline, not a support
-/// vector imposed on the target collections.
-/// The timestamp remains useful to time-sensitive domain queries, but ordinary
-/// collection admission changes only when proof or descriptor evidence changes.
-async fn maintain_and_observe_snapshot(
-    pile: &mut FacultyStore,
-    signer: &SigningKey,
-    watermark: &FacultySnapshot,
+/// Observe the resident targets at the caller's exact immutable boundary.
+/// Only consuming attention needs its captured receipt boundary to be visible;
+/// ordinary input projections impose no source-support catch-up requirement.
+fn observe_snapshot(
+    snapshot: FacultySnapshot,
     sources: &OrientSources,
     consuming: bool,
 ) -> Result<OrientObservation> {
@@ -629,10 +628,6 @@ async fn maintain_and_observe_snapshot(
     sources
         .observations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    maintain_sources(pile, signer, sources).await?;
-    let snapshot = pile
-        .snapshot_at(watermark.instant())
-        .map_err(|error| anyhow!("freeze maintained Orient snapshot: {error}"))?;
     let observation = observe_sources(snapshot, sources)?;
     if consuming {
         require_receipts(&sources.receipt_boundary, &observation.facts.presentations)?;
@@ -640,16 +635,15 @@ async fn maintain_and_observe_snapshot(
     Ok(observation)
 }
 
-async fn maintain_and_observe_sources(
+fn observe_current_sources(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
     sources: &OrientSources,
     consuming: bool,
 ) -> Result<OrientObservation> {
-    let watermark = pile
+    let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    maintain_and_observe_snapshot(pile, signer, &watermark, sources, consuming).await
+    observe_snapshot(snapshot, sources, consuming)
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2415,10 +2409,10 @@ async fn cmd_baseline(
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
         let health_events = health.report().attention;
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = maintain_and_observe_sources(pile, signer, &sources, true).await?;
+        let observation = observe_current_sources(pile, &sources, true)?;
         let (persona, events) = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             let persona = resolve_native_persona(&query, input)?;
@@ -2459,7 +2453,7 @@ async fn cmd_show(
     async {
         let health_sources = HealthSources::open(pile, signer, health_max_age)?;
         let receipt_boundary = health_sources.receipt_boundary.clone();
-        let health = health_sources.observe(pile, signer)?;
+        let health = health_sources.observe(pile)?;
         let health_report = health.report();
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
@@ -2475,7 +2469,7 @@ async fn cmd_show(
         // The overview already delivered its health section. Its own receipt
         // must not become a new dependency on a remote maintainer mid-show.
         sources.receipt_boundary = receipt_boundary;
-        let observation = maintain_and_observe_sources(pile, signer, &sources, true).await?;
+        let observation = observe_current_sources(pile, &sources, true)?;
         let instant = observation.snapshot.instant();
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
             read(pile, &observation.snapshot, |reader| {
@@ -2739,7 +2733,7 @@ async fn cmd_poll(
             return Ok(());
         }
         let sources = OrientSources::open(pile, signer, false).await?;
-        let observation = match maintain_and_observe_sources(pile, signer, &sources, !peek).await {
+        let observation = match observe_current_sources(pile, &sources, !peek) {
             Ok(observation) => observation,
             Err(error) if is_preparation_pending(&error) => return Ok(()),
             Err(error) => return Err(error),
@@ -2784,7 +2778,7 @@ struct PendingWaitFrame {
     /// though the pile prefix is unchanged. Projection absence cannot.
     missing: Option<MissingBlob>,
     /// Keep the actual immutable targets selected before payload acquisition.
-    /// Retrying a body or persona label must not run collection upkeep again.
+    /// Retrying a body or persona label must not replace these target views.
     observation: Option<OrientObservation>,
 }
 
@@ -2841,27 +2835,24 @@ impl WaitFrameLoad {
 
 async fn load_wait_frame(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
-    // The caller chooses the polling baseline before maintenance. The later
-    // observation selects resident targets once; subsequent payload retries
-    // keep those views fixed without replacing this change-detection baseline.
+    // The observation and polling baseline are the same immutable prefix.
+    // Later selected-payload acquisition cannot swallow a concurrent append.
     let instant = snapshot.instant();
-    let observation =
-        match maintain_and_observe_snapshot(pile, signer, &snapshot, sources, true).await {
-            Ok(observation) => observation,
-            Err(error) if is_preparation_pending(&error) => {
-                let mut pending =
-                    PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Preparation);
-                pending.missing = pending_blob(&error);
-                return Ok(WaitFrameLoad::Pending(pending));
-            }
-            Err(error) => return Err(error),
-        };
+    let observation = match observe_snapshot(snapshot.clone(), sources, true) {
+        Ok(observation) => observation,
+        Err(error) if is_preparation_pending(&error) => {
+            let mut pending =
+                PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Preparation);
+            pending.missing = pending_blob(&error);
+            return Ok(WaitFrameLoad::Pending(pending));
+        }
+        Err(error) => return Err(error),
+    };
     let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
     pending.observation = Some(observation);
     match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, instant).await? {
@@ -2961,12 +2952,11 @@ fn observe_habits_in_observation(
     )
 }
 
-/// Selected payload acquisition and optional upkeep yield at a local health
+/// Selected payload acquisition yields at a local health
 /// validity boundary. Completed cache work remains reusable when the caller
 /// re-observes health before resuming this attention view.
 async fn load_wait_frame_before_health_deadline(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
     pending: &mut Option<PendingWaitFrame>,
@@ -3022,7 +3012,7 @@ async fn load_wait_frame_before_health_deadline(
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, signer, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
     }
 }
 
@@ -3063,9 +3053,8 @@ async fn cmd_wait(
             }
         };
 
-        // `observed_snapshot` is the pre-maintenance prefix we attempted. It
-        // deliberately remains the polling watermark after derived writes so
-        // a concurrent source append cannot be swallowed by those writes.
+        // Keep the prefix which selected these target views as the polling
+        // watermark, including while their lazy payload reads are pending.
         let initial = loop {
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
@@ -3079,7 +3068,6 @@ async fn cmd_wait(
             let sampled = pile.snapshot()?;
             if let Some(attempt) = load_wait_frame_before_health_deadline(
                 pile,
-                signer,
                 &sources,
                 sampled,
                 &mut pending_frame,
@@ -3185,7 +3173,6 @@ async fn cmd_wait(
             if storage_changed || view_pending {
                 let Some(attempt) = load_wait_frame_before_health_deadline(
                     pile,
-                    signer,
                     &sources,
                     sampled,
                     &mut pending_frame,
@@ -3341,56 +3328,39 @@ async fn cmd_wake(
     use std::fmt::Write as _;
 
     async {
-        // Register every descriptor before choosing the query instant.
-        // Maintenance may append derived lattice nodes; all reads attach only
-        // after that work, from one later immutable pile snapshot.
+        // Register descriptors before freezing one resident query boundary.
+        // Background workers alone produce the projections selected here.
         let sources = OrientSources::open(storage, signer, false).await?;
         let memory_collection =
             OrientSource::open(storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
         let wiki_collection = OrientSource::open(storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
         let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
-            .context("register maintained Wiki supersession index")?;
-        let admission = storage.snapshot()?;
-        let watermark = storage
+            .context("register Wiki supersession index")?;
+        let snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake query instant: {error}"))?;
-        memory_collection.maintain(storage, signer).await?;
-        wiki_collection.maintain(storage, signer).await?;
-        if wiki_latest
-            .writer_is_admitted(&admission, signer.verifying_key())
-            .context("check Wiki supersession WRITE admission")?
-        {
-            drop(
-                storage
-                    .maintain(wiki_latest, signer)
-                    .await
-                    .context("maintain Wiki supersession index")?,
-            );
-        }
         // Wake renders the requested overview, not unseen news. Its output
         // does not depend on prior Presented facts; recording what this wake
         // shows afterward must not impose a historical receipt-read barrier.
-        let observation =
-            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, false).await?;
-        drop(watermark);
+        let observation = observe_snapshot(snapshot, &sources, false)?;
         let memory_facts = observation
             .snapshot
             .collection(memory_collection.rank9)
-            .context("observe maintained Memory collection")?
+            .context("observe resident Memory collection")?
             .view::<FactArchive>()
-            .context("attach maintained Memory collection")?;
+            .context("attach resident Memory collection")?;
         let wiki_facts = observation
             .snapshot
             .collection(wiki_collection.rank9)
-            .context("observe maintained Wiki collection")?
+            .context("observe resident Wiki collection")?
             .view::<FactArchive>()
-            .context("attach maintained Wiki collection")?;
+            .context("attach resident Wiki collection")?;
         let wiki_order = observation
             .snapshot
             .collection(wiki_latest)
-            .context("observe maintained Wiki supersession index")?
+            .context("observe resident Wiki supersession index")?
             .view::<triblespace::core::collection::latest::LatestIndex>()
-            .context("attach maintained Wiki supersession index")?;
+            .context("attach resident Wiki supersession index")?;
         let persona_id = read(storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             persona
@@ -3614,9 +3584,7 @@ mod tests {
             .unwrap();
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-            let observation = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
-                .await
-                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources, true).unwrap();
             assert_eq!(
                 person_anchors(observation.facts.relations.view()),
                 BTreeSet::from([known]),
@@ -3634,24 +3602,25 @@ mod tests {
 
             let event = id(74);
             save_presentations(&mut pile, &reader_key, known, [event]).unwrap();
-            let next = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
+            sources
+                .presentations
+                .maintain(&mut pile, &reader_key)
                 .await
                 .unwrap();
+            let next = observe_current_sources(&mut pile, &sources, true).unwrap();
             assert!(presented_events(next.facts.presentations.view(), known).contains(&event));
             assert_eq!(
                 person_anchors(next.facts.relations.view()),
                 BTreeSet::from([known])
             );
 
-            // A producer's next observation still catches up without a daemon.
+            // External upkeep makes the new input visible to the next read.
             sources
                 .relations
                 .maintain(&mut pile, &fixture.signer)
                 .await
                 .unwrap();
-            let caught_up = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
-                .await
-                .unwrap();
+            let caught_up = observe_current_sources(&mut pile, &sources, true).unwrap();
             assert_eq!(
                 person_anchors(caught_up.facts.relations.view()),
                 BTreeSet::from([known, pending]),
@@ -3695,14 +3664,11 @@ mod tests {
                 .map(Result::unwrap)
                 .collect();
             // A non-consuming peek may use the earlier receipt view.
-            maintain_and_observe_sources(&mut pile, &reader_key, &sources, false)
-                .await
-                .unwrap();
-            let error =
-                match maintain_and_observe_sources(&mut pile, &reader_key, &sources, true).await {
-                    Ok(_) => panic!("missing own receipt images must not silently fall back"),
-                    Err(error) => error,
-                };
+            observe_current_sources(&mut pile, &sources, false).unwrap();
+            let error = match observe_current_sources(&mut pile, &sources, true) {
+                Ok(_) => panic!("missing own receipt images must not silently fall back"),
+                Err(error) => error,
+            };
             assert!(error.is::<PresentationReceiptsPending>());
             assert!(is_preparation_pending(&error));
             assert_eq!(
@@ -3720,9 +3686,7 @@ mod tests {
                 .maintain(&mut pile, &fixture.signer)
                 .await
                 .unwrap();
-            let ready = maintain_and_observe_sources(&mut pile, &reader_key, &sources, true)
-                .await
-                .unwrap();
+            let ready = observe_current_sources(&mut pile, &sources, true).unwrap();
             assert!(presented_events(ready.facts.presentations.view(), id(75)).contains(&id(76)));
             pile.close().unwrap();
         });
@@ -3783,7 +3747,7 @@ mod tests {
                 .unwrap()
                 .map(Result::unwrap)
                 .collect();
-            let result = maintain_and_observe_sources(&mut pile, &reader, &sources, true).await;
+            let result = observe_current_sources(&mut pile, &sources, true);
             assert!(matches!(result, Err(error) if error.is::<PresentationReceiptsPending>()));
             assert_eq!(
                 pile.snapshot()
@@ -3800,9 +3764,7 @@ mod tests {
                 .maintain(&mut pile, &fixture.signer)
                 .await
                 .unwrap();
-            let ready = maintain_and_observe_sources(&mut pile, &reader, &sources, true)
-                .await
-                .unwrap();
+            let ready = observe_current_sources(&mut pile, &sources, true).unwrap();
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
             let presented = presented_events(ready.facts.presentations.view(), persona);
@@ -3823,9 +3785,7 @@ mod tests {
                 .difference(&sources.receipt_boundary)
                 .unwrap()
                 .is_empty());
-            let still_ready = maintain_and_observe_sources(&mut pile, &reader, &sources, true)
-                .await
-                .unwrap();
+            let still_ready = observe_current_sources(&mut pile, &sources, true).unwrap();
             require_receipts(&sources.receipt_boundary, &still_ready.facts.presentations).unwrap();
             assert!(require_receipts(&newer, &still_ready.facts.presentations)
                 .unwrap_err()
@@ -3999,10 +3959,7 @@ mod tests {
                     .unwrap());
             }
             let records: Vec<_> = snapshot.records().unwrap().map(Result::unwrap).collect();
-            let observation =
-                maintain_and_observe_sources(&mut copied, &fixture.signer, &sources, true)
-                    .await
-                    .unwrap();
+            let observation = observe_current_sources(&mut copied, &sources, true).unwrap();
             let observed = &observation.facts.presentations;
             require_receipts(&required, observed).unwrap();
             assert_eq!(
@@ -4153,7 +4110,6 @@ mod tests {
                 assert!(!wait_storage_changed(&sampled, &watermark));
                 let attempt = load_wait_frame_before_health_deadline(
                     &mut pile,
-                    &fixture.signer,
                     &sources,
                     sampled,
                     &mut pending,
@@ -4179,13 +4135,17 @@ mod tests {
             );
             assert!(pile.health().started_at.is_none());
 
-            // No new COMMIT: blob residency alone enables local projection of
-            // the receipt and must invalidate the cached pending attempt.
+            // No new COMMIT: an external producer realizes the newly resident
+            // receipt and invalidates the cached pending observation.
             pile.put::<SimpleArchive, _>(bytes).unwrap();
+            sources
+                .presentations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
             let sampled = pile.snapshot().unwrap();
             let attempt = load_wait_frame_before_health_deadline(
                 &mut pile,
-                &fixture.signer,
                 &sources,
                 sampled,
                 &mut pending,
@@ -4209,7 +4169,6 @@ mod tests {
                 let sampled = pile.snapshot().unwrap();
                 let attempt = load_wait_frame_before_health_deadline(
                     &mut pile,
-                    &fixture.signer,
                     &sources,
                     sampled,
                     &mut pending,
@@ -4376,17 +4335,15 @@ mod tests {
                 clock + done + other,
             )
             .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
             let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
-            let WaitFrameLoad::Ready(frame) = load_wait_frame(
-                &mut pile,
-                &fixture.signer,
-                &sources,
-                watermark,
-                &fixture.path,
-                "gpt",
-            )
-            .await
-            .unwrap() else {
+            let WaitFrameLoad::Ready(frame) =
+                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
+                    .await
+                    .unwrap()
+            else {
                 panic!("complete local inputs must be ready")
             };
             assert_eq!(frame.persona, gpt);
@@ -4452,16 +4409,11 @@ mod tests {
             let initial_id = initial.root().unwrap();
             pile.commit(sources.compass.source, &fixture.signer, initial)
                 .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
             let watermark = pile.snapshot().unwrap();
-            let observation = maintain_and_observe_snapshot(
-                &mut pile,
-                &fixture.signer,
-                &watermark,
-                &sources,
-                true,
-            )
-            .await
-            .unwrap();
+            let observation = observe_snapshot(watermark, &sources, true).unwrap();
 
             let next = compass::status_fragment(
                 goal,
@@ -4542,6 +4494,11 @@ mod tests {
         let (person, _, _) = relations::person_fragment(persona, profile).unwrap();
         pile.commit(sources.relations.source, &fixture.signer, person)
             .unwrap();
+        sources
+            .relations
+            .maintain(&mut pile, &fixture.signer)
+            .await
+            .unwrap();
         let watermark = pile.snapshot_at(Epoch::from_tai_seconds(42.0)).unwrap();
         let expected_support = watermark
             .collection(sources.messages.source)
@@ -4551,8 +4508,8 @@ mod tests {
 
         // This commit arrives after the wait watermark was frozen. Another
         // maintainer also realizes that newer support before this reader runs.
-        // The read must select that resident target progress while keeping the
-        // original watermark solely as its polling and authorization baseline.
+        // The selected view must still belong to the supplied snapshot. A new
+        // polling sample will see the externally produced target progress.
         let message_collection = sources.messages.source;
         pile.commit(
             message_collection,
@@ -4560,11 +4517,6 @@ mod tests {
             entity! { metadata::tag: &KIND_MESSAGE_ID },
         )
         .unwrap();
-        drop(
-            pile.ensure(sources.messages.source, &fixture.signer)
-                .await
-                .unwrap(),
-        );
         drop(
             pile.maintain(sources.messages.succinct, &fixture.signer)
                 .await
@@ -4577,7 +4529,6 @@ mod tests {
         );
         let attempt = load_wait_frame(
             &mut pile,
-            &fixture.signer,
             &sources,
             watermark.clone(),
             &fixture.path,
@@ -4595,17 +4546,17 @@ mod tests {
             .collection(sources.messages.rank9)
             .unwrap();
         assert_eq!(frame.observation.snapshot.instant(), watermark.instant());
-        assert_ne!(
+        assert_eq!(
             frame.observation.facts.messages.support(),
             &expected_support,
-            "a source watermark must not exclude already-resident target progress",
+            "later target progress cannot alter the selected immutable snapshot",
         );
         assert_eq!(
             frame.observation.facts.messages.support(),
             resident_after.support(),
             "the selected view must be the resident target at the observation snapshot",
         );
-        assert_eq!(frame.observation.facts.messages.view().iter().count(), 1);
+        assert_eq!(frame.observation.facts.messages.view().iter().count(), 0);
         assert!(frame.observation.snapshot.wants().unwrap().next().is_none());
         assert!(
             frame.watermark.changes_since(&watermark).is_empty()
@@ -4613,13 +4564,24 @@ mod tests {
             "the production wait frame must retain the exact input watermark",
         );
         assert!(
-            !frame
+            frame
                 .observation
                 .snapshot
                 .changes_since(&frame.watermark)
                 .is_empty(),
-            "the post-maintenance observation must not replace its polling watermark",
+            "passive attachment must use the exact polling snapshot",
         );
+        let sampled = pile.snapshot_at(watermark.instant()).unwrap();
+        assert!(wait_storage_changed(&sampled, &frame.watermark));
+        let WaitFrameLoad::Ready(next) =
+            load_wait_frame(&mut pile, &sources, sampled, &fixture.path, "test-persona")
+                .await
+                .unwrap()
+        else {
+            panic!("externally maintained target must be readable")
+        };
+        assert_eq!(next.observation.facts.messages.view().iter().count(), 1);
+        assert_ne!(next.observation.facts.messages.support(), &expected_support);
         pile.close().unwrap();
     }
 
@@ -4800,15 +4762,7 @@ mod tests {
                 .await
                 .unwrap();
             let watermark = pile.snapshot_at(instant).unwrap();
-            let observation = maintain_and_observe_snapshot(
-                &mut pile,
-                &fixture.signer,
-                &watermark,
-                &sources,
-                true,
-            )
-            .await
-            .unwrap();
+            let observation = observe_snapshot(watermark.clone(), &sources, true).unwrap();
             let support = observation.facts.messages.support().clone();
             let handle = Inline::new(body.raw);
             let mut supply = Supply {
@@ -4919,7 +4873,6 @@ mod tests {
 
         let attempt = load_wait_frame(
             &mut pile,
-            &fixture.signer,
             &sources,
             watermark.clone(),
             &fixture.path,

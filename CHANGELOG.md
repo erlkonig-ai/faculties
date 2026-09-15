@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient no longer performs collection maintenance on reads, including its
+  health-first and wake inputs, regardless of WRITE authority. It attaches one
+  frozen resident target snapshot and leaves upkeep to explicitly selected
+  background maintainers. Presented receipt publication remains explicit;
+  consuming news still waits for its captured receipt boundary, preventing
+  duplicates while those rollups lag. Add authorized-reader and external-upkeep
+  regressions, including frozen views and health freshness.
+
 - Wiki create/import and Compass add/move/note prepare from resident rollups
   when their signer cannot maintain those targets. Publication checks source
   WRITE independently; selected references and bodies are still checked, and

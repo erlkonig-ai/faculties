@@ -1,4 +1,4 @@
-//! Resident-only health input. No source ensure, host activation, or blob fetch.
+//! Resident-only health input. No maintenance, host activation, or blob fetch.
 //!
 //! The maintained targets remain the query sources. The values built below
 //! are just one report's output and attention IDs, never a second health store.
@@ -14,8 +14,8 @@ pub(super) struct HealthSources {
     presentations: OrientSource,
     pub(super) receipt_boundary: Support,
     max_age: Duration,
-    // One process-local observation, not another persisted health model. Keep
-    // its pre-maintenance prefix so concurrent appends still cause a catch-up.
+    // One process-local observation, not another persisted health model. The
+    // cached views and watermark belong to exactly the same sampled prefix.
     poll_view: Option<(FacultySnapshot, HealthObservation)>,
     #[cfg(test)]
     poll_observations: usize,
@@ -56,6 +56,7 @@ impl HealthSources {
         })
     }
 
+    #[cfg(test)]
     fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<()> {
         let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
@@ -87,12 +88,7 @@ impl HealthSources {
         })
     }
 
-    pub(super) fn observe(
-        &self,
-        pile: &mut FacultyStore,
-        signer: &SigningKey,
-    ) -> Result<HealthObservation> {
-        self.maintain(pile, signer)?;
+    pub(super) fn observe(&self, pile: &mut FacultyStore) -> Result<HealthObservation> {
         self.at(pile.snapshot()?)
     }
 
@@ -107,7 +103,7 @@ impl HealthSources {
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
         let sampled = pile.snapshot()?;
-        self.refresh_poll_view(pile, signer, sampled)?;
+        self.refresh_poll_view(sampled)?;
         let (_, observation) = self
             .poll_view
             .as_ref()
@@ -138,18 +134,12 @@ impl HealthSources {
         Ok((fired, report.next_change))
     }
 
-    fn refresh_poll_view(
-        &mut self,
-        pile: &mut FacultyStore,
-        signer: &SigningKey,
-        sampled: FacultySnapshot,
-    ) -> Result<()> {
+    fn refresh_poll_view(&mut self, sampled: FacultySnapshot) -> Result<()> {
         let changed = self.poll_view.as_ref().map_or(true, |(watermark, _)| {
             wait_storage_changed(&sampled, watermark)
         });
         if changed {
-            self.maintain(pile, signer)?;
-            let observation = self.at(pile.snapshot_at(sampled.instant())?)?;
+            let observation = self.at(sampled.clone())?;
             self.poll_view = Some((sampled, observation));
             #[cfg(test)]
             {
@@ -548,7 +538,7 @@ mod tests {
         .unwrap();
         let before = f.store.snapshot().unwrap();
         let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-        let observed = f.sources.observe(&mut f.store, &reader_key).unwrap();
+        let observed = f.sources.observe(&mut f.store).unwrap();
         let reports = find!(
             report: Id,
             pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
@@ -569,6 +559,91 @@ mod tests {
     }
 
     #[test]
+    fn health_reads_with_write_authority_wait_for_external_maintenance() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        let first = recorder
+            .record(at(0.0), [condition(State::Current, false)])
+            .unwrap();
+        let first_id = first.root().unwrap();
+        f.publish(first);
+
+        let before = f.store.snapshot_at(at(1.0)).unwrap();
+        assert!(f.sources.health.can_maintain(&before, &f.signer).unwrap());
+        assert!(f
+            .sources
+            .latest
+            .writer_is_admitted(&before, f.signer.verifying_key())
+            .unwrap());
+        f.sources.refresh_poll_view(before.clone()).unwrap();
+        let pending = &f.sources.poll_view.as_ref().unwrap().1;
+        assert!(pending.facts.collection.cover().is_empty());
+        assert!(pending
+            .report()
+            .text
+            .contains("not observed / not configured"));
+        assert!(f
+            .store
+            .snapshot()
+            .unwrap()
+            .changes_since(&before)
+            .is_empty());
+
+        // The independent producer advances the targets. The next sampled
+        // prefix sees that work without mutating the earlier observation.
+        f.sources.maintain(&f.store, &f.signer).unwrap();
+        let ready = f.store.snapshot_at(at(1.0)).unwrap();
+        f.sources.refresh_poll_view(ready.clone()).unwrap();
+        assert_eq!(f.sources.poll_observations, 2);
+        assert!(f.store.snapshot().unwrap().changes_since(&ready).is_empty());
+        assert!(f
+            .sources
+            .at(before)
+            .unwrap()
+            .facts
+            .collection
+            .cover()
+            .is_empty());
+
+        let second = recorder
+            .record(at(2.0), [condition(State::Stalled, true)])
+            .unwrap();
+        let second_id = second.root().unwrap();
+        f.publish(second);
+        let lagging = f.store.snapshot_at(at(3.0)).unwrap();
+        f.sources.refresh_poll_view(lagging.clone()).unwrap();
+        let observed = &f.sources.poll_view.as_ref().unwrap().1;
+        let reports: BTreeSet<_> = find!(
+            report: Id,
+            pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
+        )
+        .collect();
+        assert_eq!(reports, BTreeSet::from([first_id]));
+        assert!(observed.report().attention.is_empty());
+        assert!(f
+            .store
+            .snapshot()
+            .unwrap()
+            .changes_since(&lagging)
+            .is_empty());
+
+        f.sources.maintain(&f.store, &f.signer).unwrap();
+        let caught_up = f.store.snapshot_at(at(3.0)).unwrap();
+        f.sources.refresh_poll_view(caught_up.clone()).unwrap();
+        let observed = &f.sources.poll_view.as_ref().unwrap().1;
+        assert!(exists!(pattern!(observed.facts.view(), [
+            { second_id @ metadata::tag: &schema::KIND_REPORT }
+        ])));
+        assert!(!observed.report().attention.is_empty());
+        assert!(f
+            .store
+            .snapshot()
+            .unwrap()
+            .changes_since(&caught_up)
+            .is_empty());
+    }
+
+    #[test]
     fn consuming_health_waits_for_remote_receipt_indexes_without_write_authority() {
         let mut f = Fixture::new();
         let persona = *fucid();
@@ -578,7 +653,8 @@ mod tests {
                 .record(clock::now().unwrap(), [condition(State::Stalled, true)])
                 .unwrap(),
         );
-        let health = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        f.sources.maintain(&f.store, &f.signer).unwrap();
+        let health = f.sources.observe(&mut f.store).unwrap();
         let events: Vec<_> = health.report().attention.ids().collect();
         assert!(!events.is_empty());
 
@@ -739,9 +815,7 @@ mod tests {
         ] {
             let sampled = f.store.snapshot_at(at(instant)).unwrap();
             assert!(!wait_storage_changed(&sampled, &watermark));
-            f.sources
-                .refresh_poll_view(&mut f.store, &f.signer, sampled)
-                .unwrap();
+            f.sources.refresh_poll_view(sampled).unwrap();
             let report = f.sources.poll_view.as_ref().unwrap().1.report();
             assert_eq!(report.attention.ids().any(|id| id == report_id), stale);
             assert_eq!(report.next_change, next.map(at));

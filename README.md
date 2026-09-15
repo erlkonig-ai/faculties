@@ -665,13 +665,30 @@ discovery trusts local record signatures, while snapshot admission still checks
 each producer's WRITE authority. Audit unfamiliar piles explicitly before
 accepting them as trusted local storage.
 
-Relations, Message, Compass, Wiki, and Orient do not require a reader to be a
+Relations, Message, Compass, and Wiki do not require a reader to be a
 producer. At their read boundaries, a signer admitted to the needed targets
 still performs inline upkeep; other readers attach the resident rollups,
 including a partial view while newer source commits await derivation or
 replication. This preserves local read-your-writes without making WRITE a
 prerequisite for reading shared data. Transport READ must independently cover
 the exact derived collections being replicated, not just their foundation.
+
+Orient is entirely passive about collection maintenance, even when its key has
+WRITE. `wake`, `show`, `poll`, and `wait` attach the maintained targets already
+readable in one frozen snapshot; newer source data becomes visible after an
+independent producer advances those targets. Selected attachment bodies may
+still be fetched lazily. Accepted output may publish Presented receipt COMMITs,
+but never MERGE or DERIVE records. Consuming news waits for the operation's
+initial receipt support to become readable, so a lagging receipt rollup does
+not replay old notifications.
+
+Run `trible pile collection maintain-all PILE TARGET... --watch` separately for
+the selected Orient targets and their dependencies. Include each node's local
+health/latest targets and the Presented chain as well as the shared inputs;
+keeping only message and goal indexes current is insufficient. Explicit target
+selection avoids reviving obsolete index descriptors. Each author's public key
+biases independent target priority, while every selected chain remains
+dependency-first and signed results are reusable through ordinary replication.
 
 State-dependent edits and Message acknowledgements retain their pre-action
 maintenance. Orient also keeps strict maintenance for its own Presented

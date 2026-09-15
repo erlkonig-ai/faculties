@@ -57,6 +57,11 @@ pub struct Cli {
 /// long and short versions of one thing. `wake` answers "who am I", `show`
 /// answers "what is happening" — which is why the belief set lives in one and
 /// is out of place in the other however cheap it would be to add.
+///
+/// These modes read resident maintained targets; none performs collection
+/// maintenance, even with WRITE authority. Run a separate
+/// `trible pile collection maintain-all ... --watch` for the selected targets.
+/// Accepted output may still publish Presented receipt COMMITs.
 #[derive(Subcommand)]
 enum Command {
     /// Mid-session overview, with resident local swarm health first (no memories, no wiki)
