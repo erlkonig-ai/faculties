@@ -521,6 +521,8 @@ async fn message_views(
     message_source: Collection<SimpleArchive>,
     intent: ViewIntent,
 ) -> Result<(FacultySnapshot, MessageFacts, MessageFacts)> {
+    let trace = std::env::var_os("MESSAGE_RESIDUAL_TRACE").is_some();
+    let started = std::time::Instant::now();
     // Preparing a read, send, or acknowledgement reuses the chains as the
     // maintenance worker left them. Publication checks source WRITE
     // independently; nothing here maintains.
@@ -544,6 +546,7 @@ async fn message_views(
     let message_rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
         .context("register Message Rank9 collection")?;
+    let registered_at = started.elapsed();
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
     let reader = pile.snapshot().context("freeze Message observation")?;
@@ -559,6 +562,7 @@ async fn message_views(
     let message_facts = message_collection
         .view::<FactArchive>()
         .context("read Message Rank9 projection")?;
+    let attached_at = started.elapsed();
     let (relation_facts, message_facts) = match intent {
         ViewIntent::Read => (
             PatternUnion::new(relation_facts, PatternUnion::new(None, Vec::new())),
@@ -575,6 +579,14 @@ async fn message_views(
             ),
         ),
     };
+    if trace {
+        eprintln!(
+            "views: registered in {:.2?}, attached in {:.2?}, residual arms in {:.2?}",
+            registered_at,
+            attached_at - registered_at,
+            started.elapsed() - attached_at
+        );
+    }
     Ok((reader, relation_facts, message_facts))
 }
 
@@ -591,11 +603,16 @@ fn residual_arms(
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &str,
 ) -> Result<PatternUnion<Option<FactArchive>, Vec<TribleSet>>> {
-    let mut segments = Vec::new();
-    for (member, blob, _) in reader
+    let trace = std::env::var_os("MESSAGE_RESIDUAL_TRACE").is_some();
+    let started = std::time::Instant::now();
+    let selected = reader
         .uncovered_source_members(rank9)
-        .with_context(|| format!("select {label} Succinct members the Rank9 view lacks"))?
-    {
+        .with_context(|| format!("select {label} Succinct members the Rank9 view lacks"))?;
+    let selected_at = started.elapsed();
+    let mut segment_bytes = 0usize;
+    let mut segments = Vec::new();
+    for (member, blob, _) in selected {
+        segment_bytes += blob.bytes.len();
         segments.push(
             SuccinctArchive::<OrderedUniverse>::try_from_blob(blob).with_context(|| {
                 format!(
@@ -605,18 +622,39 @@ fn residual_arms(
             })?,
         );
     }
+    if trace {
+        eprintln!(
+            "residual {label}: {} Succinct member(s) the Rank9 view lacks ({segment_bytes} bytes); selected in {:.2?}, opened in {:.2?}",
+            segments.len(),
+            selected_at,
+            started.elapsed() - selected_at
+        );
+    }
     let accelerated_gap = (!segments.is_empty()).then(|| UnionArchive::new(segments));
-    let mut raw = Vec::new();
-    for (member, blob, _) in reader
+    let started = std::time::Instant::now();
+    let selected = reader
         .uncovered_source_members(succinct)
-        .with_context(|| format!("select {label} source members the Succinct view lacks"))?
-    {
+        .with_context(|| format!("select {label} source members the Succinct view lacks"))?;
+    let selected_at = started.elapsed();
+    let mut raw_bytes = 0usize;
+    let mut raw = Vec::new();
+    for (member, blob, _) in selected {
+        raw_bytes += blob.bytes.len();
         raw.push(TribleSet::try_from_blob(blob).with_context(|| {
             format!(
                 "read residual {label} source member {}",
                 hex::encode_upper(member.raw)
             )
         })?);
+    }
+    if trace {
+        eprintln!(
+            "residual {label}: {} raw source member(s) the Succinct view lacks ({raw_bytes} bytes, {} tribles); selected in {:.2?}, decoded in {:.2?}",
+            raw.len(),
+            raw.iter().map(TribleSet::len).sum::<usize>(),
+            selected_at,
+            started.elapsed() - selected_at
+        );
     }
     Ok(PatternUnion::new(accelerated_gap, raw))
 }
