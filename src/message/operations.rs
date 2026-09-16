@@ -499,7 +499,7 @@ fn with_storage<T>(
                 open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
             let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let (reader, relation_facts, message_facts) =
-                message_views(pile, signer, relations_source, message_source, intent).await?;
+                message_views(pile, relations_source, message_source, intent).await?;
             Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
         })?;
         let mut storage = MessageStorage {
@@ -516,7 +516,6 @@ fn with_storage<T>(
 
 async fn message_views(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
     intent: ViewIntent,
@@ -855,7 +854,6 @@ mod tests {
             let (snapshot, relation_facts, message_facts) = runtime
                 .block_on(message_views(
                     &mut pile,
-                    &observer,
                     relations_source,
                     message_source,
                     ViewIntent::Read,
@@ -886,7 +884,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &observer,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -924,7 +921,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -948,7 +944,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -976,7 +971,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -1055,7 +1049,6 @@ mod tests {
             runtime
                 .block_on(message_views(
                     &mut pile,
-                    &owner,
                     relations_source,
                     message_source,
                     ViewIntent::Edit,
@@ -1095,7 +1088,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &sender,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -1146,7 +1138,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -1252,7 +1243,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -1370,7 +1360,6 @@ mod tests {
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &message_owner,
                 relations_source,
                 message_source,
                 ViewIntent::Read,
@@ -1397,7 +1386,6 @@ mod tests {
             let (_, relation_facts, message_facts) = runtime
                 .block_on(message_views(
                     &mut pile,
-                    signer,
                     relations_source,
                     message_source,
                     ViewIntent::Edit,
@@ -1782,7 +1770,6 @@ mod tests {
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
@@ -2032,7 +2019,6 @@ mod tests {
         let (_, _relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Read,
@@ -2067,7 +2053,6 @@ mod tests {
         let (_, _relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
-                &owner,
                 relations_source,
                 message_source,
                 ViewIntent::Edit,
