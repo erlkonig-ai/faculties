@@ -1382,7 +1382,7 @@ mod tests {
         // An edit sees the fresh raw records of both chains through the
         // residual arms, whichever chain its signer may write, and still
         // publishes nothing by itself.
-        for signer in [&message_owner, &relations_owner] {
+        for _signer in [&message_owner, &relations_owner] {
             let (_, relation_facts, message_facts) = runtime
                 .block_on(message_views(
                     &mut pile,
