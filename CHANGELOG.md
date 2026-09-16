@@ -30,10 +30,18 @@ All notable changes to this project will be documented in this file.
   Message selection, maintenance policy or bearer-protocol change is included.
 
 - Orient wait reports already-due habits addressed to its persona from the
-  first readable frame after each arm, until completion is visible in the
+  first Habit-ready observation after each arm, until completion is visible in the
   maintained Habit view. Untargeted habits retain their quiet initial baseline;
   a changed completion-relative cooldown identifies a new due transition.
   Habit reports add neither presentation receipts nor inline maintenance.
+  A missing directed-news body no longer discards a prepared Habit observation
+  or withholds its cooldown sweep. Timer evaluations refresh the pending
+  observation's own Habit context, so later body delivery cannot resurrect an
+  older Due result. News remains unacknowledged until its selected bodies are ready.
+
+- Pin the release source cohort to explicit application clocks, scoped watched
+  maintenance and the CPU-parallel Trible build. CUDA remains an opt-in backend;
+  runtime pool size and deployment quotas are separate from compiled availability.
 
 - Message reads attach the resident indexed views without maintenance or raw
   source fallback. Edits explicitly maintain the Message Succinct/Rank9 chain

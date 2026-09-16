@@ -48,8 +48,8 @@ git clone https://github.com/erlkonig-ai/cubecl cubecl-fork
 git clone --no-checkout https://github.com/erlkonig-ai/cubecl cubecl-graph
 # Keep historical tracked compiler output out of the graph source checkout.
 git -C cubecl-graph sparse-checkout set --no-cone '/*' '!**/target/' '!**/target-*/'
-git -C triblespace-rs checkout 256898f23e8400a92804d406e1701d1394743abe
-git -C mary checkout f194a0f306879fabc4fdd1a0a409dcd0f65daeeb
+git -C triblespace-rs checkout d4164a9ddab775e0749259fac4fff2e93ee29052
+git -C mary checkout c08c7fa1ca76f83180125de326b2c7dd70e0a18b
 git -C GORBIE checkout 09a82ff3a729093ea6941bd677f589b0e123c0cb
 git -C soma checkout 6cdb487c93b10bb183d62f9d547dc1627782c228
 git -C cubecl-fork checkout 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
