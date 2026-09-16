@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Remove the generic storage-snapshot clock. Health freshness, Habit evaluation
+  and Secrets delivery deadlines use explicit application times; immutable
+  facts, proof evidence and selected frontiers remain frozen across payload
+  retries. Generic `storage::read` callers retain their existing interface.
+
 - Own a `Leech<Pile>` for foreground Faculty storage. Snapshots and exact
   payload acquisitions retain the existing interfaces without building a
   serving inventory. Local authored writes and close remain available; no

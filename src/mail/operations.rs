@@ -1377,7 +1377,6 @@ mod tests {
         ] {
             assert!(reader.changes_since(secrets_snapshot).is_empty());
             assert!(secrets_snapshot.changes_since(reader).is_empty());
-            assert_eq!(reader.instant(), secrets_snapshot.instant());
         }
     }
 

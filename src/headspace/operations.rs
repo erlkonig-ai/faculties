@@ -968,7 +968,6 @@ mod tests {
         assert!(secrets_reader
             .changes_since(&views.headspace.reader)
             .is_empty());
-        assert_eq!(views.headspace.reader.instant(), secrets_reader.instant());
         storage.close().unwrap();
     }
 

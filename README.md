@@ -397,10 +397,11 @@ descriptor, fact fragment, or selected payload is absent locally, they discover 
 through the blob DHT and cache its bytes. Files similarity and embedding
 commands retain their resident-only model/input paths for now.
 Live snapshots expose async exact-blob reads: fetching a selected handle caches
-its bytes without advancing the snapshot's records, query instant, or
-selected collection covers. Relations uses this reader directly; the other
-live-enabled commands still use the shared payload-retry adapter. Neither path emits
-an implicit `WANT`.
+its bytes without advancing the snapshot's records, proof evidence, or
+selected collection covers. Application deadlines use an explicit evaluation
+time, independent of the storage snapshot. Relations uses this reader directly;
+the other live-enabled commands still use the shared payload-retry adapter.
+Neither path emits an implicit `WANT`.
 Configure one or more bootstrap routes as comma-separated Iroh endpoint
 tickets or endpoint IDs:
 

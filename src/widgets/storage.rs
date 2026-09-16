@@ -1075,7 +1075,6 @@ mod tests {
         let secrets = context.secrets().unwrap();
         let secrets_reader = secrets.snapshot.store_snapshot();
         for reader in [reason.reader, triage.reader] {
-            assert_eq!(reader.instant(), secrets_reader.instant());
             assert!(reader.changes_since(secrets_reader).is_empty());
             assert!(secrets_reader.changes_since(reader).is_empty());
         }

@@ -2715,8 +2715,8 @@ mod tests {
         type Snapshot = PileSnapshot;
         type SnapshotError = <Pile as SnapshotSource>::SnapshotError;
 
-        fn snapshot_at(&mut self, instant: Epoch) -> Result<PileSnapshot, Self::SnapshotError> {
-            self.pile.snapshot_at(instant)
+        fn snapshot(&mut self) -> Result<PileSnapshot, Self::SnapshotError> {
+            self.pile.snapshot()
         }
     }
 

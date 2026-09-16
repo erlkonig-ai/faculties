@@ -1410,10 +1410,14 @@ mod tests {
         );
         let snapshot = fixture.snapshot();
         snapshot.cognition().unwrap();
-        assert_eq!(
-            snapshot.store_snapshot.instant(),
-            snapshot.secrets.instant()
-        );
+        let secrets_reader = snapshot.secrets.store_snapshot();
+        assert!(snapshot
+            .store_snapshot
+            .changes_since(secrets_reader)
+            .is_empty());
+        assert!(secrets_reader
+            .changes_since(&snapshot.store_snapshot)
+            .is_empty());
         drop(snapshot);
         let maintained = std::fs::metadata(&fixture.pile).unwrap().len();
 

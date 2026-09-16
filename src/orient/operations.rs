@@ -1,7 +1,8 @@
 //! Reusable Orient observations and one-shot waiting, independent of argv and stdout.
 //!
-//! Facts, query instants and selected event IDs remain frozen while
-//! exact payloads are acquired. Condition scripts run only after acquisition,
+//! Facts, proof evidence and selected event IDs remain frozen while
+//! exact payloads are acquired. Application evaluation time is explicit.
+//! Condition scripts run only after acquisition,
 //! once per evaluation. Presentation follows successful output acceptance.
 
 #[path = "health.rs"]
@@ -748,8 +749,8 @@ struct OrientFacts {
 /// target collection and Rank9 query view; shared vocabulary never turns those
 /// authority boundaries into an accidental global fact union.
 struct OrientObservation {
-    /// Resident payload reader at the observation's frozen authorization
-    /// instant. Exact acquisition may advance its blob residency without
+    /// Resident payload reader for the selected observation.
+    /// Exact acquisition may advance its blob residency without
     /// changing any selected fact view, support, or authorization boundary.
     snapshot: FacultySnapshot,
     facts: OrientFacts,
@@ -831,7 +832,8 @@ async fn maintain_sources(
 }
 
 /// Read every target collection as it actually exists at one immutable store
-/// boundary and one query instant. This function performs no writes.
+/// boundary. Application evaluation time is supplied separately; this function
+/// performs no writes and reads no clock.
 fn observe_sources(
     snapshot: FacultySnapshot,
     sources: &OrientSources,
@@ -2733,8 +2735,8 @@ async fn cmd_show(
             }
         }
         let sources = OrientSources::open(pile, signer, true).await?;
+        let instant = clock::now()?;
         let observation = observe_current_sources(pile, &sources)?;
-        let instant = observation.snapshot.instant();
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
             read(pile, &observation.snapshot, |reader| {
                 let query = observation.query(reader);
@@ -3101,10 +3103,10 @@ async fn load_wait_frame(
     snapshot: FacultySnapshot,
     pile_path: &Path,
     persona_input: &str,
+    evaluated_at: Epoch,
 ) -> Result<WaitFrameLoad> {
     // The observation and polling baseline are the same immutable prefix.
     // Later selected-payload acquisition cannot swallow a concurrent append.
-    let instant = snapshot.instant();
     let observation = match observe_snapshot(snapshot.clone(), sources) {
         Ok(observation) => observation,
         Err(error) if is_preparation_pending(&error) => {
@@ -3117,7 +3119,7 @@ async fn load_wait_frame(
     };
     let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
     pending.observation = Some(observation);
-    match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, instant).await? {
+    match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, evaluated_at).await? {
         Some(frame) => Ok(WaitFrameLoad::Ready(frame)),
         None => Ok(WaitFrameLoad::Pending(pending)),
     }
@@ -3222,6 +3224,7 @@ async fn load_wait_frame_before_health_deadline(
     pile_path: &Path,
     persona_input: &str,
     next_health_change: Option<Epoch>,
+    mut evaluated_at: Epoch,
 ) -> Result<Option<WaitFrameLoad>> {
     let unchanged = pending.as_ref().is_some_and(|pending| {
         pending.observation.as_ref().map_or_else(
@@ -3239,7 +3242,7 @@ async fn load_wait_frame_before_health_deadline(
                         return Ok(None);
                     }
                     frame = resume_wait_payloads(
-                        pile, cached, pile_path, persona_input, snapshot.instant(),
+                        pile, cached, pile_path, persona_input, evaluated_at,
                     ) => frame?,
                 };
                 return Ok(Some(match ready {
@@ -3263,7 +3266,9 @@ async fn load_wait_frame_before_health_deadline(
             }
             // No observation was selected yet. Retry preparation at the
             // prefix containing the acquired dependency, not the old snapshot
-            // which necessarily still lacks it.
+            // which necessarily still lacks it. This starts a fresh application
+            // evaluation as well; selected-payload retries above keep their time.
+            evaluated_at = clock::now()?;
             snapshot = pile.snapshot()?;
         } else {
             // Nothing in this outcome performs I/O: absent projection records
@@ -3278,7 +3283,7 @@ async fn load_wait_frame_before_health_deadline(
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input, evaluated_at) => frame.map(Some),
     }
 }
 
@@ -3331,6 +3336,7 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
+            let evaluated_at = clock::now()?;
             let sampled = pile.snapshot()?;
             let probe = RefreshProbe::begin(
                 "ordinary",
@@ -3346,6 +3352,7 @@ async fn cmd_wait(
                 pile_path,
                 persona_input,
                 next_health_change,
+                evaluated_at,
             )
             .await;
             if let Some(probe) = &probe {
@@ -3436,6 +3443,7 @@ async fn cmd_wait(
                     had_ready_frame: true,
                 });
             }
+            let now = clock::now()?;
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
@@ -3446,7 +3454,6 @@ async fn cmd_wait(
                 Some(&observed_snapshot),
                 pending_frame.as_ref(),
             );
-            let now = sampled.instant();
             let now_secs = epoch_seconds(now);
             let cooldown_elapsed = habit_seen
                 .next_cooldown_at
@@ -3468,6 +3475,7 @@ async fn cmd_wait(
                     pile_path,
                     persona_input,
                     next_health_change,
+                    now,
                 )
                 .await;
                 if let Some(probe) = &probe {
@@ -3631,7 +3639,7 @@ async fn cmd_wake(
             .context("register Wiki supersession index")?;
         let snapshot = storage
             .snapshot()
-            .map_err(|error| anyhow!("freeze shared wake query instant: {error}"))?;
+            .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
         // Wake renders the requested overview, not unseen news. Its output
         // does not depend on prior Presented facts; recording what this wake
         // shows afterward must not impose a historical receipt-read barrier.
@@ -4451,6 +4459,21 @@ mod tests {
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
+            // This older application time was still cooling. Once preparation
+            // can select a fresh prefix, it must evaluate at a fresh time too.
+            let earlier = clock::now().unwrap() - hifitime::Duration::from_seconds(7200.0);
+            let (habit, habit_id) =
+                habits::habit_fragment("preparation-clock", "every 1h", "due now", None, &[], &[])
+                    .unwrap();
+            let (done, _) =
+                habits::completion_fragment(habit_id, clock::point(earlier).unwrap()).unwrap();
+            let habit_source = sources.habits.as_ref().unwrap();
+            pile.commit(habit_source.source, &fixture.signer, habit + done)
+                .unwrap();
+            habit_source
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
             let descriptor = Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(
                 sources.messages.rank9.handle().raw,
             );
@@ -4473,6 +4496,7 @@ mod tests {
                 &fixture.path,
                 &fmt_id(persona),
                 None,
+                earlier,
             )
             .await
             .unwrap()
@@ -4482,6 +4506,15 @@ mod tests {
             };
             assert_eq!(frame.persona, persona);
             assert!(matches!(frame.news, News::Quiet));
+            assert!(frame.habits.due.contains_key(&habit_id));
+            let old_evaluation = observe_habits_in_observation(
+                &frame.observation,
+                &fixture.path,
+                epoch_seconds(earlier),
+                persona,
+            )
+            .unwrap();
+            assert!(!old_evaluation.due.contains_key(&habit_id));
             assert_eq!(sources.observations.load(Ordering::Relaxed), 1);
             assert!(frame.watermark.contains_blob(descriptor).unwrap());
             assert!(frame
@@ -4532,6 +4565,7 @@ mod tests {
                     &fixture.path,
                     "waiting-reader",
                     None,
+                    Epoch::from_tai_seconds(42.0),
                 )
                 .await
                 .unwrap()
@@ -4574,6 +4608,7 @@ mod tests {
                 &fixture.path,
                 "waiting-reader",
                 None,
+                Epoch::from_tai_seconds(42.0),
             )
             .await
             .unwrap()
@@ -4728,12 +4763,17 @@ mod tests {
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await
                 .unwrap();
-            let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
-            let WaitFrameLoad::Ready(frame) =
-                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
-                    .await
-                    .unwrap()
-            else {
+            let watermark = pile.snapshot().unwrap();
+            let WaitFrameLoad::Ready(frame) = load_wait_frame(
+                &mut pile,
+                &sources,
+                watermark,
+                &fixture.path,
+                "gpt",
+                Epoch::from_tai_seconds(100.0),
+            )
+            .await
+            .unwrap() else {
                 panic!("complete local inputs must be ready")
             };
             assert_eq!(frame.persona, gpt);
@@ -4984,7 +5024,7 @@ mod tests {
             .maintain(&mut pile, &fixture.signer)
             .await
             .unwrap();
-        let watermark = pile.snapshot_at(Epoch::from_tai_seconds(42.0)).unwrap();
+        let watermark = pile.snapshot().unwrap();
         let expected_support = watermark
             .collection(sources.messages.source)
             .unwrap()
@@ -5019,6 +5059,7 @@ mod tests {
             watermark.clone(),
             &fixture.path,
             "test-persona",
+            Epoch::from_tai_seconds(42.0),
         )
         .await
         .unwrap();
@@ -5031,7 +5072,6 @@ mod tests {
             .snapshot
             .collection(sources.messages.rank9)
             .unwrap();
-        assert_eq!(frame.observation.snapshot.instant(), watermark.instant());
         assert_eq!(
             frame.observation.facts.messages.support(),
             &expected_support,
@@ -5057,13 +5097,18 @@ mod tests {
                 .is_empty(),
             "passive attachment must use the exact polling snapshot",
         );
-        let sampled = pile.snapshot_at(watermark.instant()).unwrap();
+        let sampled = pile.snapshot().unwrap();
         assert!(wait_storage_changed(&sampled, &frame.watermark));
-        let WaitFrameLoad::Ready(next) =
-            load_wait_frame(&mut pile, &sources, sampled, &fixture.path, "test-persona")
-                .await
-                .unwrap()
-        else {
+        let WaitFrameLoad::Ready(next) = load_wait_frame(
+            &mut pile,
+            &sources,
+            sampled,
+            &fixture.path,
+            "test-persona",
+            Epoch::from_tai_seconds(42.0),
+        )
+        .await
+        .unwrap() else {
             panic!("externally maintained target must be readable")
         };
         assert_eq!(next.observation.facts.messages.view().iter().count(), 1);
@@ -5145,11 +5190,8 @@ mod tests {
             type Snapshot = FacultySnapshot;
             type SnapshotError = <FacultyStore as SnapshotSource>::SnapshotError;
 
-            fn snapshot_at(
-                &mut self,
-                instant: Epoch,
-            ) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
-                self.store.snapshot_at(instant)
+            fn snapshot(&mut self) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+                self.store.snapshot()
             }
         }
 
@@ -5246,7 +5288,7 @@ mod tests {
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await
                 .unwrap();
-            let watermark = pile.snapshot_at(instant).unwrap();
+            let watermark = pile.snapshot().unwrap();
             let observation = observe_snapshot(watermark.clone(), &sources).unwrap();
             let support = observation.facts.messages.support().clone();
             let handle = Inline::new(body.raw);
@@ -5280,11 +5322,11 @@ mod tests {
             assert_eq!(pending.missing.unwrap().handle, handle);
             assert!(stored_presentations(&mut supply.store, &fixture.signer, persona).is_empty());
 
-            let before_provider = supply.snapshot_at(instant).unwrap();
+            let before_provider = supply.snapshot().unwrap();
             assert!(!wait_storage_changed(&before_provider, &pending.watermark));
             supply.available = true;
             assert!(!wait_storage_changed(
-                &supply.snapshot_at(instant).unwrap(),
+                &supply.snapshot().unwrap(),
                 &before_provider
             ));
             let frame = resume_wait_payloads(
@@ -5300,7 +5342,6 @@ mod tests {
             let reader = &frame.observation.snapshot;
             let news = frame.news;
             assert_eq!(frame.persona, persona);
-            assert_eq!(reader.instant(), instant);
             assert!(!wait_storage_changed(&frame.watermark, &watermark));
             assert_eq!(
                 sources
@@ -5365,6 +5406,7 @@ mod tests {
             watermark.clone(),
             &fixture.path,
             "not-yet-resident",
+            Epoch::from_tai_seconds(42.0),
         )
         .await
         .unwrap();

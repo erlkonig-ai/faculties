@@ -569,14 +569,13 @@ pub async fn materialize_indexed_collection(
         .maintain(rank9, signer)
         .await
         .context("maintain Body fact collection")?;
-    let instant = ready.instant();
     drop(ready);
     drop(
         pile.maintain(target, signer)
             .await
             .map_err(|error| anyhow!("maintain Body intent register: {error}"))?,
     );
-    let store_snapshot = pile.snapshot_at(instant)?;
+    let store_snapshot = pile.snapshot()?;
     let facts = store_snapshot
         .collection(rank9)
         .context("observe maintained Body fact collection")?

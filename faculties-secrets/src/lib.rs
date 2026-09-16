@@ -23,7 +23,7 @@ use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, Union
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::{BlobStoreGet, StoreSnapshot};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -90,14 +90,6 @@ impl<R> SecretsSnapshot<R> {
 
     pub fn store_snapshot(&self) -> &R {
         &self.store_snapshot
-    }
-
-    /// Authorization instant of this immutable observation.
-    pub fn instant(&self) -> Epoch
-    where
-        R: StoreSnapshot,
-    {
-        self.store_snapshot.instant()
     }
 
     pub const fn collection(&self) -> CollectionHandle {

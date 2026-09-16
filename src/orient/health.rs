@@ -86,7 +86,8 @@ impl HealthSources {
     }
 
     pub(super) fn observe(&self, pile: &mut FacultyStore) -> Result<HealthObservation> {
-        self.at(pile.snapshot()?)
+        let now = clock::now()?;
+        self.at(pile.snapshot()?, now)
     }
 
     /// Health is delivered before any ordinary source or payload acquisition.
@@ -99,8 +100,9 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
+        let now = clock::now()?;
         let sampled = pile.snapshot()?;
-        self.refresh_poll_view(sampled)?;
+        self.refresh_poll_view(sampled, now)?;
         let (_, observation) = self
             .poll_view
             .as_ref()
@@ -122,7 +124,7 @@ impl HealthSources {
         Ok((fired, report.next_change))
     }
 
-    fn refresh_poll_view(&mut self, sampled: FacultySnapshot) -> Result<()> {
+    fn refresh_poll_view(&mut self, sampled: FacultySnapshot, now: Epoch) -> Result<()> {
         let probe = RefreshProbe::begin(
             "health",
             &sampled,
@@ -134,7 +136,7 @@ impl HealthSources {
             .as_ref()
             .map_or(true, |(_, observation)| !observation.is_current(&sampled));
         if changed {
-            let observation = self.at(sampled.clone());
+            let observation = self.at(sampled.clone(), now);
             if let Some(probe) = &probe {
                 if let Ok(current) = &observation {
                     let previous = self.poll_view.as_ref().map(|(_, observation)| observation);
@@ -178,13 +180,15 @@ impl HealthSources {
             }
         } else {
             // Unrelated appends and time alone leave these target views valid.
-            // Refresh the payload reader and query instant so newly resident
-            // labels, expiry and clock rollback do not require reattachment.
-            self.poll_view
+            // Refresh the payload reader and health evaluation time so newly
+            // resident labels, expiry and clock rollback need no reattachment.
+            let observation = &mut self
+                .poll_view
                 .as_mut()
                 .expect("an unchanged poll has a selected health view")
-                .1
-                .snapshot = sampled;
+                .1;
+            observation.snapshot = sampled;
+            observation.evaluated_at = now;
             if let Some(probe) = &probe {
                 probe.finish("retained");
             }
@@ -192,7 +196,7 @@ impl HealthSources {
         Ok(())
     }
 
-    fn at(&self, snapshot: FacultySnapshot) -> Result<HealthObservation> {
+    fn at(&self, snapshot: FacultySnapshot, now: Epoch) -> Result<HealthObservation> {
         let facts = self.health.observe(&snapshot)?;
         let latest_collection = trace_refresh_call("Swarm health latest", "attach", || {
             snapshot.collection(self.latest)
@@ -205,6 +209,7 @@ impl HealthSources {
         let presentations = self.presentations.observe(&snapshot)?;
         Ok(HealthObservation {
             snapshot,
+            evaluated_at: now,
             facts,
             latest,
             latest_collection,
@@ -234,6 +239,9 @@ pub(super) async fn deadline(deadline: Option<Epoch>) -> Result<()> {
 
 pub(super) struct HealthObservation {
     snapshot: FacultySnapshot,
+    // Health freshness is evaluated at this explicit application time, not a
+    // property of the immutable storage observation.
+    evaluated_at: Epoch,
     facts: OrientFact,
     latest: LwwQuery,
     latest_collection: CollectionSnapshot<FacultySnapshot, LwwRegisterBlob>,
@@ -261,6 +269,7 @@ impl HealthObservation {
             self.facts.view(),
             &self.latest,
             &self.snapshot,
+            self.evaluated_at,
             self.max_age,
         )
     }
@@ -365,11 +374,11 @@ fn render_health(
     facts: &FactArchive,
     latest: &LwwQuery,
     snapshot: &FacultySnapshot,
+    now: Epoch,
     max_age: Duration,
 ) -> HealthReport {
     use std::fmt::Write as _;
 
-    let now = snapshot.instant();
     let now_key = now.to_tai_duration().total_nanoseconds();
     let mut text = String::from("\nSwarm health (local observations):\n");
     let mut attention = AttentionView::default();
@@ -539,9 +548,7 @@ mod tests {
 
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
             self.sources.maintain(&self.store, &self.signer).unwrap();
-            self.sources
-                .at(self.store.snapshot_at(at).unwrap())
-                .unwrap()
+            self.sources.at(self.store.snapshot().unwrap(), at).unwrap()
         }
     }
 
@@ -613,14 +620,16 @@ mod tests {
         let first_id = first.root().unwrap();
         f.publish(first);
 
-        let before = f.store.snapshot_at(at(1.0)).unwrap();
+        let before = f.store.snapshot().unwrap();
         assert!(f.sources.health.can_maintain(&before, &f.signer).unwrap());
         assert!(f
             .sources
             .latest
             .writer_is_admitted(&before, f.signer.verifying_key())
             .unwrap());
-        f.sources.refresh_poll_view(before.clone()).unwrap();
+        f.sources
+            .refresh_poll_view(before.clone(), at(1.0))
+            .unwrap();
         let pending = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(pending.facts.collection.cover().is_empty());
         assert!(pending
@@ -637,13 +646,13 @@ mod tests {
         // The independent producer advances the targets. The next sampled
         // prefix sees that work without mutating the earlier observation.
         f.sources.maintain(&f.store, &f.signer).unwrap();
-        let ready = f.store.snapshot_at(at(1.0)).unwrap();
-        f.sources.refresh_poll_view(ready.clone()).unwrap();
+        let ready = f.store.snapshot().unwrap();
+        f.sources.refresh_poll_view(ready.clone(), at(1.0)).unwrap();
         assert_eq!(f.sources.poll_observations, 2);
         assert!(f.store.snapshot().unwrap().changes_since(&ready).is_empty());
         assert!(f
             .sources
-            .at(before)
+            .at(before, at(1.0))
             .unwrap()
             .facts
             .collection
@@ -655,8 +664,10 @@ mod tests {
             .unwrap();
         let second_id = second.root().unwrap();
         f.publish(second);
-        let lagging = f.store.snapshot_at(at(3.0)).unwrap();
-        f.sources.refresh_poll_view(lagging.clone()).unwrap();
+        let lagging = f.store.snapshot().unwrap();
+        f.sources
+            .refresh_poll_view(lagging.clone(), at(3.0))
+            .unwrap();
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         let reports: BTreeSet<_> = find!(
             report: Id,
@@ -673,8 +684,10 @@ mod tests {
             .is_empty());
 
         f.sources.maintain(&f.store, &f.signer).unwrap();
-        let caught_up = f.store.snapshot_at(at(3.0)).unwrap();
-        f.sources.refresh_poll_view(caught_up.clone()).unwrap();
+        let caught_up = f.store.snapshot().unwrap();
+        f.sources
+            .refresh_poll_view(caught_up.clone(), at(3.0))
+            .unwrap();
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(exists!(pattern!(observed.facts.view(), [
             { second_id @ metadata::tag: &schema::KIND_REPORT }
@@ -798,10 +811,7 @@ mod tests {
         );
 
         // Same stored records and resident targets: time is the only difference.
-        let expired = f
-            .sources
-            .at(f.store.snapshot_at(at(60.0)).unwrap())
-            .unwrap();
+        let expired = f.sources.at(f.store.snapshot().unwrap(), at(60.0)).unwrap();
         assert!(expired.snapshot.changes_since(&fresh.snapshot).is_empty());
         let after = expired.report();
         assert_eq!(after.attention.ids().collect::<Vec<_>>(), vec![report_id]);
@@ -826,7 +836,7 @@ mod tests {
         f.publish(report);
         // Complete local production before the counted polling observation.
         f.sources.maintain(&f.store, &f.signer).unwrap();
-        let watermark = f.store.snapshot_at(at(59.0)).unwrap();
+        let watermark = f.store.snapshot().unwrap();
         for (instant, stale, next) in [
             (59.0, false, Some(60.0)),
             (59.5, false, Some(60.0)),
@@ -835,9 +845,9 @@ mod tests {
             (-1.0, false, Some(0.0)),
             (0.0, false, Some(60.0)),
         ] {
-            let sampled = f.store.snapshot_at(at(instant)).unwrap();
+            let sampled = f.store.snapshot().unwrap();
             assert!(sampled.changes_since(&watermark).is_empty());
-            f.sources.refresh_poll_view(sampled).unwrap();
+            f.sources.refresh_poll_view(sampled, at(instant)).unwrap();
             let report = f.sources.poll_view.as_ref().unwrap().1.report();
             assert_eq!(report.attention.ids().any(|id| id == report_id), stale);
             assert_eq!(report.next_change, next.map(at));
@@ -855,8 +865,10 @@ mod tests {
                 .unwrap(),
         );
         f.sources.maintain(&f.store, &f.signer).unwrap();
-        let before = f.store.snapshot_at(at(1.0)).unwrap();
-        f.sources.refresh_poll_view(before.clone()).unwrap();
+        let before = f.store.snapshot().unwrap();
+        f.sources
+            .refresh_poll_view(before.clone(), at(1.0))
+            .unwrap();
         assert_eq!(f.sources.poll_observations, 1);
 
         f.store
@@ -871,16 +883,18 @@ mod tests {
                 entity! { metadata::tag: &metadata::KIND_MULTI },
             )
             .unwrap();
-        let sampled = f.store.snapshot_at(at(2.0)).unwrap();
+        let sampled = f.store.snapshot().unwrap();
         let changes = sampled.changes_since(&before);
         assert!(changes.contains(StoreChanges::BLOBS));
         assert!(changes.contains(StoreChanges::COLLECTION_RECORDS));
         assert!(f.sources.poll_view.as_ref().unwrap().1.is_current(&sampled));
 
-        f.sources.refresh_poll_view(sampled.clone()).unwrap();
+        f.sources
+            .refresh_poll_view(sampled.clone(), at(2.0))
+            .unwrap();
         assert_eq!(f.sources.poll_observations, 1);
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
-        assert_eq!(observed.snapshot.instant(), at(2.0));
+        assert_eq!(observed.evaluated_at, at(2.0));
         assert!(observed.report().attention.is_empty());
         assert!(f
             .store
@@ -901,7 +915,7 @@ mod tests {
         );
         f.sources.maintain(&f.store, &f.signer).unwrap();
         f.sources
-            .refresh_poll_view(f.store.snapshot_at(at(1.0)).unwrap())
+            .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();
         let original_facts = f
             .sources
@@ -932,11 +946,13 @@ mod tests {
             let mut local = f.store.store();
             drop(pollster::block_on(local.maintain(f.sources.latest, &f.signer)).unwrap());
         }
-        let sampled = f.store.snapshot_at(at(3.0)).unwrap();
+        let sampled = f.store.snapshot().unwrap();
         let prior = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(prior.facts.is_current(&sampled));
         assert!(!prior.latest_collection.is_current(&sampled));
-        f.sources.refresh_poll_view(sampled.clone()).unwrap();
+        f.sources
+            .refresh_poll_view(sampled.clone(), at(3.0))
+            .unwrap();
         assert_eq!(f.sources.poll_observations, 2);
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert_eq!(observed.facts.collection.cover(), &original_facts);
@@ -965,7 +981,7 @@ mod tests {
         );
         f.sources.maintain(&f.store, &f.signer).unwrap();
         f.sources
-            .refresh_poll_view(f.store.snapshot_at(at(1.0)).unwrap())
+            .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();
         let events: Vec<_> = f
             .sources
@@ -988,9 +1004,11 @@ mod tests {
                 },
             )
             .unwrap();
-        let lagging = f.store.snapshot_at(at(2.0)).unwrap();
+        let lagging = f.store.snapshot().unwrap();
         assert!(f.sources.poll_view.as_ref().unwrap().1.is_current(&lagging));
-        f.sources.refresh_poll_view(lagging.clone()).unwrap();
+        f.sources
+            .refresh_poll_view(lagging.clone(), at(2.0))
+            .unwrap();
         assert_eq!(f.sources.poll_observations, 1);
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(matches!(
@@ -1010,12 +1028,14 @@ mod tests {
                 pollster::block_on(local.maintain(f.sources.presentations.ids, &f.signer)).unwrap(),
             );
         }
-        let caught_up = f.store.snapshot_at(at(3.0)).unwrap();
+        let caught_up = f.store.snapshot().unwrap();
         let prior = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(prior.facts.is_current(&caught_up));
         assert!(prior.latest_collection.is_current(&caught_up));
         assert!(!prior.presentations.is_current(&caught_up));
-        f.sources.refresh_poll_view(caught_up.clone()).unwrap();
+        f.sources
+            .refresh_poll_view(caught_up.clone(), at(3.0))
+            .unwrap();
         assert_eq!(f.sources.poll_observations, 2);
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(events
@@ -1231,10 +1251,7 @@ mod tests {
                 );
             });
         }
-        let lagging = f
-            .sources
-            .at(f.store.snapshot_at(at(11.0)).unwrap())
-            .unwrap();
+        let lagging = f.sources.at(f.store.snapshot().unwrap(), at(11.0)).unwrap();
         assert_ne!(
             lagging.facts.collection.support().unwrap(),
             lagging.latest_collection.support().unwrap(),
@@ -1269,7 +1286,10 @@ mod tests {
         assert_eq!(short.report().attention.ids().collect::<Vec<_>>(), vec![id]);
 
         f.sources.max_age = Duration::from_secs(120);
-        let long = f.sources.at(short.snapshot.clone()).unwrap();
+        let long = f
+            .sources
+            .at(short.snapshot.clone(), short.evaluated_at)
+            .unwrap();
         assert!(long.report().attention.is_empty());
         assert_eq!(long.report().next_change, Some(at(120.0)));
         assert!(long.snapshot.changes_since(&short.snapshot).is_empty());

@@ -1333,7 +1333,6 @@ mod tests {
                 pile.maintain(rank9, &signer).await
             })
             .unwrap();
-        let instant = frozen.instant();
         assert!(!frozen.contains_blob(label).unwrap());
         let observed = frozen.collection(rank9).unwrap();
         let view = observed.view::<FactArchive>().unwrap();
@@ -1385,7 +1384,6 @@ mod tests {
         drop(storage);
 
         let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
-        assert_eq!(frozen.instant(), instant);
         assert!(!frozen.contains_blob(label).unwrap());
         assert_eq!(
             frozen.select_records(&selectors).unwrap(),

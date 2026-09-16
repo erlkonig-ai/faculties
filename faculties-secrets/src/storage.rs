@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -19,7 +20,7 @@ use triblespace::core::collection::{
 };
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::SnapshotSource;
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreRead, StoreSnapshot};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreRead};
 use triblespace::macros::{find, pattern};
 
 use super::resource::SecretTarget;
@@ -377,19 +378,21 @@ where
 ///
 /// The supplied snapshot fixes both the secrets and self-contained key-delivery
 /// proofs to inspect. Concurrent grants and secrets wait for the next additive
-/// maintenance call.
+/// maintenance call. `now` is the caller's explicit delivery evaluation time,
+/// independent of when that storage observation was acquired.
 pub fn maintain_recipient_envelopes<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
     secrets: &SecretsSnapshot<R>,
     collection: SecretsCollection,
     holder: &SigningKey,
+    now: Epoch,
 ) -> Result<usize>
 where
     S: Store + CollectionStoreExt,
-    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + CapabilityProofRead,
 {
-    maintain_selected_recipient_envelopes(store, signing_key, secrets, collection, holder, &[])
+    maintain_selected_recipient_envelopes(store, signing_key, secrets, collection, holder, &[], now)
 }
 
 /// Maintain only the selected versions/resources; an empty selection visits
@@ -402,10 +405,11 @@ pub fn maintain_selected_recipient_envelopes<S, R>(
     collection: SecretsCollection,
     holder: &SigningKey,
     selected: &[SecretTarget],
+    now: Epoch,
 ) -> Result<usize>
 where
     S: Store + CollectionStoreExt,
-    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + CapabilityProofRead,
 {
     if secrets.collection() != collection.handle() {
         bail!("Secrets snapshot belongs to a different collection");
@@ -436,6 +440,7 @@ where
                 secrets.store_snapshot(),
                 collection.handle(),
                 &binding,
+                now,
             )?;
             let envelopes =
                 super::envelope::missing(secrets.store_snapshot(), facts, &binding, recipients)?;
@@ -519,11 +524,8 @@ mod tests {
         type Snapshot = MemoryRepoSnapshot;
         type SnapshotError = Infallible;
 
-        fn snapshot_at(
-            &mut self,
-            instant: Epoch,
-        ) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
-            self.inner.snapshot_at(instant)
+        fn snapshot(&mut self) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot()
         }
     }
 
@@ -983,14 +985,9 @@ mod tests {
         store: &mut MemoryRepo,
         collection: SecretsCollection,
         owner: &SigningKey,
-        second: f64,
     ) -> SecretsSnapshot<MemoryRepoSnapshot> {
         drop(pollster::block_on(ensure_and_snapshot(store, collection, owner)).unwrap());
-        snapshot(
-            store.snapshot_at(Epoch::from_unix_seconds(second)).unwrap(),
-            collection,
-        )
-        .unwrap()
+        snapshot(store.snapshot().unwrap(), collection).unwrap()
     }
 
     fn resource_of(
@@ -1033,11 +1030,19 @@ mod tests {
         )
         .unwrap();
         let secret = add_secret(&mut store, &owner, collection, "token", b"value", at(1)).unwrap();
-        let before = observed(&mut store, collection, &owner, 10.0);
+        let before = observed(&mut store, collection, &owner);
         assert_eq!(before.open(secret, &owner).unwrap(), b"value");
         assert!(before.open(secret, &bob).is_err());
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &before, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &before,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0
         );
         assert!(collection
@@ -1055,19 +1060,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &before, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &before,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0,
             "frozen AUTH frontier"
         );
-        let current = observed(&mut store, collection, &owner, 11.0);
+        let current = observed(&mut store, collection, &owner);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &current, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &current,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(11.0),
+            )
+            .unwrap(),
             1
         );
-        let after = observed(&mut store, collection, &owner, 12.0);
+        let after = observed(&mut store, collection, &owner);
         assert_eq!(after.open(secret, &bob).unwrap(), b"value");
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &after, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &after,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(12.0),
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -1095,7 +1124,7 @@ mod tests {
         let secret =
             add_secret(&mut store, &owner, collection, "token", b"private", at(2)).unwrap();
         assert_eq!(
-            observed(&mut store, collection, &owner, 20.0)
+            observed(&mut store, collection, &owner)
                 .open(secret, &owner)
                 .unwrap(),
             b"private"
@@ -1121,10 +1150,18 @@ mod tests {
         store
             .commit(collection.source(), &owner, sealed.fragment)
             .unwrap();
-        let current = observed(&mut store, collection, &owner, 500.0);
+        let current = observed(&mut store, collection, &owner);
         assert_eq!(current.open(secret, &bob).unwrap(), b"already delivered");
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &current, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &current,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(500.0),
+            )
+            .unwrap(),
             0
         );
         assert!(resource::grant(
@@ -1152,7 +1189,7 @@ mod tests {
         .unwrap();
         let secret =
             add_secret(&mut store, &writer, collection, "token", b"offline", at(3)).unwrap();
-        assert!(!observed(&mut store, collection, &owner, 10.0).contains(secret));
+        assert!(!observed(&mut store, collection, &owner).contains(secret));
         grant_collection_write(
             &mut store,
             collection.handle(),
@@ -1160,14 +1197,22 @@ mod tests {
             writer.verifying_key(),
         )
         .unwrap();
-        let after = observed(&mut store, collection, &owner, 10.0);
+        let after = observed(&mut store, collection, &owner);
         assert_eq!(after.open(secret, &writer).unwrap(), b"offline");
         assert!(
             after.open(secret, &owner).is_err(),
             "collection owner is not every secret's recipient"
         );
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &owner, &after, collection, &owner).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &owner,
+                &after,
+                collection,
+                &owner,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0
         );
     }
@@ -1185,7 +1230,7 @@ mod tests {
         .unwrap();
         let first = add_secret(&mut store, &alice, collection, "token", b"first", at(1)).unwrap();
         let second = add_secret(&mut store, &alice, collection, "token", b"second", at(2)).unwrap();
-        let before = observed(&mut store, collection, &alice, 10.0);
+        let before = observed(&mut store, collection, &alice);
         for secret in [first, second] {
             resource::grant(
                 &mut store,
@@ -1198,7 +1243,7 @@ mod tests {
             )
             .unwrap();
         }
-        let current = observed(&mut store, collection, &alice, 10.0);
+        let current = observed(&mut store, collection, &alice);
         assert_eq!(
             maintain_selected_recipient_envelopes(
                 &mut store,
@@ -1206,12 +1251,13 @@ mod tests {
                 &current,
                 collection,
                 &alice,
-                &[SecretTarget::Secret(first)]
+                &[SecretTarget::Secret(first)],
+                Epoch::from_unix_seconds(10.0),
             )
             .unwrap(),
             1
         );
-        let after = observed(&mut store, collection, &alice, 10.0);
+        let after = observed(&mut store, collection, &alice);
         assert_eq!(after.open(first, &bob).unwrap(), b"first");
         assert!(after.open(second, &bob).is_err());
         let resource = resource_of(&after, second, &alice);
@@ -1222,15 +1268,24 @@ mod tests {
                 &after,
                 collection,
                 &alice,
-                &[SecretTarget::Resource(resource)]
+                &[SecretTarget::Resource(resource)],
+                Epoch::from_unix_seconds(10.0),
             )
             .unwrap(),
             1
         );
         let third = add_secret(&mut store, &alice, collection, "token", b"third", at(3)).unwrap();
-        let current = observed(&mut store, collection, &alice, 10.0);
+        let current = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0
         );
         assert!(current.open(third, &bob).is_err());
@@ -1247,7 +1302,7 @@ mod tests {
             SecretsCollection::register(&mut store, "expiry", direct_policy(alice.verifying_key()))
                 .unwrap();
         let secret = add_secret(&mut store, &alice, collection, "token", b"kept", at(1)).unwrap();
-        let before = observed(&mut store, collection, &alice, 100.0);
+        let before = observed(&mut store, collection, &alice);
         let resource = resource_of(&before, secret, &alice);
         resource::grant(
             &mut store,
@@ -1262,7 +1317,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let delegated = observed(&mut store, collection, &alice, 100.0);
+        let delegated = observed(&mut store, collection, &alice);
         assert!(delegated.open(secret, &bob).is_err());
         resource::grant(
             &mut store,
@@ -1274,23 +1329,47 @@ mod tests {
             false,
         )
         .unwrap();
-        let early = observed(&mut store, collection, &alice, 49.0);
+        let early = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &early, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &early,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(49.0),
+            )
+            .unwrap(),
             0
         );
-        let expired = observed(&mut store, collection, &alice, 150.0);
+        let expired = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &expired, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &expired,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(150.0),
+            )
+            .unwrap(),
             0
         );
-        let current = observed(&mut store, collection, &alice, 100.0);
+        let current = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(100.0),
+            )
+            .unwrap(),
             2
         );
         // A child without bounds cannot erase its parent's restriction.
-        let later = observed(&mut store, collection, &alice, 200.0);
+        let later = observed(&mut store, collection, &alice);
         resource::grant(
             &mut store,
             &bob,
@@ -1301,9 +1380,17 @@ mod tests {
             false,
         )
         .unwrap();
-        let later = observed(&mut store, collection, &alice, 200.0);
+        let later = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &later, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &later,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(200.0),
+            )
+            .unwrap(),
             0
         );
         assert_eq!(later.open(secret, &bob).unwrap(), b"kept");
@@ -1329,7 +1416,7 @@ mod tests {
             SecretsCollection::register(&mut store, "invoke", direct_policy(alice.verifying_key()))
                 .unwrap();
         let secret = add_secret(&mut store, &alice, collection, "token", b"value", at(1)).unwrap();
-        let before = observed(&mut store, collection, &alice, 100.0);
+        let before = observed(&mut store, collection, &alice);
         let resource = resource_of(&before, secret, &alice);
         resource::grant(
             &mut store,
@@ -1341,7 +1428,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let current = observed(&mut store, collection, &alice, 100.0);
+        let current = observed(&mut store, collection, &alice);
         assert!(resource::grant(
             &mut store,
             &bob,
@@ -1381,7 +1468,7 @@ mod tests {
             at(1),
         )
         .unwrap();
-        let before = observed(&mut store, collection, &alice, 10.0);
+        let before = observed(&mut store, collection, &alice);
         let binding = super::super::envelope::recover(
             before.store_snapshot(),
             before.facts().unwrap(),
@@ -1437,9 +1524,17 @@ mod tests {
                 attacker.verifying_key(),
             ))
             .unwrap();
-        let current = observed(&mut store, collection, &alice, 10.0);
+        let current = observed(&mut store, collection, &alice);
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0
         );
         assert!(current.open(secret, &attacker).is_err());
@@ -1471,7 +1566,7 @@ mod tests {
         )
         .unwrap();
         let secret = add_secret(&mut store, &alice, collection, "token", b"value", at(1)).unwrap();
-        let before = observed(&mut store, collection, &alice, 10.0);
+        let before = observed(&mut store, collection, &alice);
         let binding = super::super::envelope::recover(
             before.store_snapshot(),
             before.facts().unwrap(),
@@ -1506,16 +1601,32 @@ mod tests {
             false,
         )
         .unwrap();
-        let current = observed(&mut store, collection, &alice, 10.0);
+        let current = observed(&mut store, collection, &alice);
         assert!(current.open(secret, &bob).is_err());
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &current, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             1
         );
-        let after = observed(&mut store, collection, &alice, 10.0);
+        let after = observed(&mut store, collection, &alice);
         assert_eq!(after.open(secret, &bob).unwrap(), b"value");
         assert_eq!(
-            maintain_recipient_envelopes(&mut store, &alice, &after, collection, &alice).unwrap(),
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &after,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
             0
         );
     }

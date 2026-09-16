@@ -1324,8 +1324,8 @@ mod tests {
         type Snapshot = PileSnapshot;
         type SnapshotError = ReadError;
 
-        fn snapshot_at(&mut self, instant: Epoch) -> Result<PileSnapshot, ReadError> {
-            self.pile.snapshot_at(instant)
+        fn snapshot(&mut self) -> Result<PileSnapshot, ReadError> {
+            self.pile.snapshot()
         }
     }
 
@@ -1628,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn render_retry_keeps_frozen_facts_status_support_and_instant() {
+    fn render_retry_keeps_frozen_facts_status_and_support() {
         let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
             .try_to_inline()
             .unwrap();
@@ -1647,7 +1647,6 @@ mod tests {
 
         let output =
             pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
-                assert_eq!(reader.instant(), view.store_snapshot().instant());
                 render_board(
                     reader,
                     view.facts(),
