@@ -4786,7 +4786,7 @@ mod tests {
     }
 
     #[test]
-    fn a_persona_clock_already_due_at_arm_is_reported_once_per_due() {
+    fn a_persona_clock_already_due_at_arm_is_reported_until_completed() {
         let fixture = TestPile::new();
         let mut pile = open_store(&fixture.path).unwrap();
         let sources =

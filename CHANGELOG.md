@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient wait reports already-due habits addressed to its persona from the
+  first readable frame after each arm, until completion is visible in the
+  maintained Habit view. Untargeted habits retain their quiet initial baseline;
+  a changed completion-relative cooldown identifies a new due transition.
+  Habit reports add neither presentation receipts nor inline maintenance.
+
 - Message operations never run maintenance. `message list` attaches the resident Succinct/Rank9 views as they stand; `send`, `ack` and `ack-all` additionally read, beside those views, the resident residual payloads the views do not carry yet (Succinct members the Rank9 target lacks, raw source payloads the Succinct target lacks), selected by the collection algebra and queried through `PatternUnion`; publication requires only source WRITE. Carrying the lattices belongs to the selected maintenance worker. On sky, 2026-09-16, Fac 92308e55 / Core 256898f2, one process, RAYON_NUM_THREADS unset: `message list --unread` cost 42.39 s wall / 171.24 s combined CPU through maintenance and 6.10 s wall / 6.40 s combined CPU without, listing the same messages; an already-read ack cost 156 s wall / 1,633 s combined CPU doing nothing but maintenance.
 - Use Bash for the OOM-expendable Rust compiler wrapper so Cargo's hyphenated
   executable-path variables reach integration tests unchanged; retain the
