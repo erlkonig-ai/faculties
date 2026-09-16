@@ -657,11 +657,50 @@ impl ReceiptSource {
         Ok(ReceiptObservation { collection, view })
     }
 
-    #[cfg(test)]
+    /// Carry this run's own receipts into the membership set. A run that is
+    /// about to report does this before observing, so a re-armed run does not
+    /// report an event it already reported. The background maintainer derives
+    /// the same set; this call only closes the window between the commit and
+    /// that maintainer's next pass. A signer without WRITE attaches the set as
+    /// it stands.
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
-        drop(pile.maintain(self.ids, signer).await?);
+        let snapshot = pile
+            .snapshot()
+            .context("freeze Orient receipt membership authority")?;
+        let admitted = self
+            .ids
+            .writer_is_admitted(&snapshot, signer.verifying_key())
+            .map_err(|error| anyhow!("check Orient receipt membership WRITE admission: {error}"))?;
+        drop(snapshot);
+        if !admitted {
+            return Ok(());
+        }
+        drop(
+            pile.maintain(self.ids, signer)
+                .await
+                .context("maintain Orient receipt membership set")?,
+        );
         Ok(())
     }
+}
+
+/// Refresh the receipt membership set before the observation that decides what
+/// to report. Best effort by construction: the projection makes the read exact,
+/// it is not a precondition of it, so a failure is reported and the run goes on
+/// — see `observe_snapshot`, where projection lag may repeat an event and never
+/// blocks one.
+async fn refresh_receipts_before_observation(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    sources: &OrientSources,
+    output: &mut Out<'_>,
+) -> Result<()> {
+    if let Err(error) = sources.presentations.maintain(pile, signer).await {
+        output.line(format!(
+            "note: Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
+        ))?;
+    }
+    Ok(())
 }
 
 struct ReceiptObservation {
@@ -2750,6 +2789,7 @@ async fn cmd_show(
             }
         }
         let sources = OrientSources::open(pile, signer, true).await?;
+        refresh_receipts_before_observation(pile, signer, &sources, output).await?;
         let instant = clock::now()?;
         let observation = observe_current_sources(pile, &sources)?;
         let (persona_id, messages, mail, habits, goals, window_status, shown) =
@@ -3012,6 +3052,9 @@ async fn cmd_poll(
             return Ok(());
         }
         let sources = OrientSources::open(pile, signer, false).await?;
+        if !peek {
+            refresh_receipts_before_observation(pile, signer, &sources, output).await?;
+        }
         let observation = match observe_current_sources(pile, &sources) {
             Ok(observation) => observation,
             Err(error) if is_preparation_pending(&error) => return Ok(()),
@@ -3420,6 +3463,7 @@ async fn cmd_wait(
                 sources = OrientSources::open(pile, signer, true) => break sources?,
             }
         };
+        refresh_receipts_before_observation(pile, signer, &sources, output).await?;
 
         // Keep the prefix which selected these target views as the polling
         // watermark, including while their lazy payload reads are pending.
