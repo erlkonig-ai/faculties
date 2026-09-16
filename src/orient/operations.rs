@@ -3123,6 +3123,7 @@ async fn load_wait_frame(
     pile: &mut FacultyStore,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
+    pending: &mut Option<PendingWaitFrame>,
     pile_path: &Path,
     persona_input: &str,
 ) -> Result<WaitFrameLoad> {
@@ -3132,18 +3133,27 @@ async fn load_wait_frame(
     let observation = match observe_snapshot(snapshot.clone(), sources) {
         Ok(observation) => observation,
         Err(error) if is_preparation_pending(&error) => {
-            let mut pending =
+            let mut fresh =
                 PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Preparation);
-            pending.missing = pending_blob(&error);
-            return Ok(WaitFrameLoad::Pending(pending));
+            fresh.missing = pending_blob(&error);
+            return Ok(WaitFrameLoad::Pending(fresh));
         }
         Err(error) => return Err(error),
     };
-    let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
-    pending.observation = Some(observation);
-    match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, instant).await? {
-        Some(frame) => Ok(WaitFrameLoad::Ready(frame)),
-        None => Ok(WaitFrameLoad::Pending(pending)),
+    // The fresh frame lives in the caller's slot while its payloads are read,
+    // so a boundary that cancels the read keeps what the read had already
+    // resolved: the persona and the habit observation.
+    let mut fresh = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
+    fresh.observation = Some(observation);
+    let slot = pending.insert(fresh);
+    match resume_wait_payloads(pile, slot, pile_path, persona_input, instant).await? {
+        Some(frame) => {
+            pending.take();
+            Ok(WaitFrameLoad::Ready(frame))
+        }
+        None => Ok(WaitFrameLoad::Pending(
+            pending.take().expect("pending payload frame"),
+        )),
     }
 }
 
@@ -3285,22 +3295,25 @@ async fn load_wait_frame_before_health_deadline(
     });
     if unchanged {
         let cached = pending.as_mut().expect("unchanged pending frame exists");
+        if cached.observation.is_some() {
+            // A selected observation whose payload read failed or was cut at
+            // a boundary is retried; the persona and habits it already
+            // resolved are reused.
+            let ready = tokio::select! {
+                boundary = health::deadline(next_health_change) => {
+                    boundary?;
+                    return Ok(None);
+                }
+                frame = resume_wait_payloads(
+                    pile, cached, pile_path, persona_input, snapshot.instant(),
+                ) => frame?,
+            };
+            return Ok(Some(match ready {
+                Some(frame) => WaitFrameLoad::Ready(frame),
+                None => WaitFrameLoad::Pending(pending.take().expect("pending payload")),
+            }));
+        }
         if let Some(missing) = cached.missing {
-            if cached.observation.is_some() {
-                let ready = tokio::select! {
-                    boundary = health::deadline(next_health_change) => {
-                        boundary?;
-                        return Ok(None);
-                    }
-                    frame = resume_wait_payloads(
-                        pile, cached, pile_path, persona_input, snapshot.instant(),
-                    ) => frame?,
-                };
-                return Ok(Some(match ready {
-                    Some(frame) => WaitFrameLoad::Ready(frame),
-                    None => WaitFrameLoad::Pending(pending.take().expect("pending payload")),
-                }));
-            }
             // An exact preparation dependency can also become available from
             // a new provider. Retry that handle, not the entire preparation.
             let acquired = tokio::select! {
@@ -3332,7 +3345,7 @@ async fn load_wait_frame_before_health_deadline(
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+        frame = load_wait_frame(pile, sources, snapshot, pending, pile_path, persona_input) => frame.map(Some),
     }
 }
 
@@ -3398,8 +3411,24 @@ async fn cmd_wait(
                 pending_frame.as_ref(),
             );
             // A pending body fetch yields at the next habit deadline as well
-            // as at the health boundary, so the clock gets its turn.
-            let boundary = earliest(next_health_change, habit_deadline(&pending_habits_seen));
+            // as at the health boundary, so the clock gets its turn. Before a
+            // habit baseline exists, a selected observation's first payload
+            // read gets one poll interval, so a stalled body cannot keep the
+            // persona's clocks unobserved; a pending preparation keeps the
+            // health boundary alone.
+            let boundary = match habit_deadline(&pending_habits_seen) {
+                Some(deadline) => earliest(next_health_change, Some(deadline)),
+                None if pending_frame
+                    .as_ref()
+                    .is_none_or(|pending| pending.observation.is_some()) =>
+                {
+                    let first_read = Epoch::from_tai_seconds(
+                        clock::now()?.to_tai_seconds() + poll.as_secs_f64(),
+                    );
+                    earliest(next_health_change, Some(first_read))
+                }
+                None => next_health_change,
+            };
             let attempt = load_wait_frame_before_health_deadline(
                 pile,
                 &sources,
@@ -3415,14 +3444,9 @@ async fn cmd_wait(
             }
             if let Some(attempt) = attempt? {
                 match attempt {
-                    WaitFrameLoad::Ready(mut frame) => {
+                    WaitFrameLoad::Ready(frame) => {
                         pending_frame = None;
                         view_pending = false;
-                        // Transitions already reported while news was pending
-                        // are not news again.
-                        if let Some(seen) = pending_habits_seen.take() {
-                            frame.habits = seen;
-                        }
                         break frame;
                     }
                     WaitFrameLoad::Pending(pending) => {
@@ -3433,69 +3457,69 @@ async fn cmd_wait(
                             // A different persona or observation would select
                             // different intentions: no habit context to keep.
                             pending_habits_seen = None;
-                        } else if let (Some(persona), Some(habits), Some(observation)) = (
-                            pending.persona,
-                            pending.habits.as_ref(),
-                            pending.observation.as_ref(),
-                        ) {
-                            match &pending_habits_seen {
-                                None => {
-                                    // An owned intention already due when the
-                                    // watcher arms is reported at once, even
-                                    // while a news body is still pending.
-                                    let owned_due =
-                                        render_habits_due_at_arm(habits).unwrap_or_default();
-                                    pending_habits_seen = Some(habits.clone());
-                                    if !owned_due.is_empty() {
-                                        write_complete_report(
-                                            output,
-                                            &owned_due,
-                                            "Orient habit report",
-                                        )?;
-                                        return Ok(WaitOutcome {
-                                            news_printed: true,
-                                            view_pending: true,
-                                            had_ready_frame: false,
-                                        });
-                                    }
-                                }
-                                Some(seen) => {
-                                    let now_secs = epoch_seconds(clock::now()?);
-                                    let cooldown_elapsed = seen
-                                        .next_cooldown_at
-                                        .is_some_and(|deadline| now_secs >= deadline);
-                                    let periodic_condition_check =
-                                        last_pending_sweep.elapsed() >= Duration::from_secs(60);
-                                    if cooldown_elapsed || periodic_condition_check {
-                                        let current_habits = observe_habits_in_observation(
-                                            observation,
-                                            pile_path,
-                                            now_secs,
-                                            persona,
-                                        )?;
-                                        let habit_report =
-                                            render_habit_transitions(seen, &current_habits)
-                                                .unwrap_or_default();
-                                        pending_habits_seen = Some(current_habits);
-                                        last_pending_sweep = Instant::now();
-                                        if !habit_report.is_empty() {
-                                            // A habit-only report acknowledges no news.
-                                            write_complete_report(
-                                                output,
-                                                &habit_report,
-                                                "Orient habit report",
-                                            )?;
-                                            return Ok(WaitOutcome {
-                                                news_printed: true,
-                                                view_pending: true,
-                                                had_ready_frame: false,
-                                            });
-                                        }
-                                    }
+                        }
+                        pending_frame = Some(pending);
+                    }
+                }
+            }
+            // Whether the read returned pending or was cut at the boundary,
+            // the retained frame is what the persona's clocks run against.
+            if let Some(pending) = pending_frame.as_ref() {
+                if let (Some(persona), Some(habits), Some(observation)) = (
+                    pending.persona,
+                    pending.habits.as_ref(),
+                    pending.observation.as_ref(),
+                ) {
+                    match &pending_habits_seen {
+                        None => {
+                            // An owned intention already due when the watcher
+                            // arms is reported at once, even while a news body
+                            // is still pending.
+                            let owned_due = render_habits_due_at_arm(habits).unwrap_or_default();
+                            pending_habits_seen = Some(habits.clone());
+                            last_pending_sweep = Instant::now();
+                            if !owned_due.is_empty() {
+                                write_complete_report(output, &owned_due, "Orient habit report")?;
+                                return Ok(WaitOutcome {
+                                    news_printed: true,
+                                    view_pending: true,
+                                    had_ready_frame: false,
+                                });
+                            }
+                        }
+                        Some(seen) => {
+                            let now_secs = epoch_seconds(clock::now()?);
+                            let cooldown_elapsed = seen
+                                .next_cooldown_at
+                                .is_some_and(|deadline| now_secs >= deadline);
+                            let periodic_condition_check =
+                                last_pending_sweep.elapsed() >= Duration::from_secs(60);
+                            if cooldown_elapsed || periodic_condition_check {
+                                let current_habits = observe_habits_in_observation(
+                                    observation,
+                                    pile_path,
+                                    now_secs,
+                                    persona,
+                                )?;
+                                let habit_report = render_habit_transitions(seen, &current_habits)
+                                    .unwrap_or_default();
+                                pending_habits_seen = Some(current_habits);
+                                last_pending_sweep = Instant::now();
+                                if !habit_report.is_empty() {
+                                    // A habit-only report acknowledges no news.
+                                    write_complete_report(
+                                        output,
+                                        &habit_report,
+                                        "Orient habit report",
+                                    )?;
+                                    return Ok(WaitOutcome {
+                                        news_printed: true,
+                                        view_pending: true,
+                                        had_ready_frame: false,
+                                    });
                                 }
                             }
                         }
-                        pending_frame = Some(pending);
                     }
                 }
             }
@@ -3539,10 +3563,17 @@ async fn cmd_wait(
         let mut current_habit_context_valid = true;
 
         let initial_report = matches!(news, News::Report { .. });
-        let owned_due = render_habits_due_at_arm(&habit_seen).unwrap_or_default();
-        let owned_fired = !owned_due.is_empty();
-        apply_prepared_news(pile, signer, false, &news, &owned_due, output)?;
-        if initial_report || owned_fired {
+        // With a baseline taken while news was pending, what fell due since is
+        // news at this frame and the fresh observation is kept; without one,
+        // an owned intention already due is reported at arm.
+        let arm_report = match pending_habits_seen.take() {
+            Some(seen) => render_habit_transitions(&seen, &habit_seen),
+            None => render_habits_due_at_arm(&habit_seen),
+        }
+        .unwrap_or_default();
+        let arm_fired = !arm_report.is_empty();
+        apply_prepared_news(pile, signer, false, &news, &arm_report, output)?;
+        if initial_report || arm_fired {
             return Ok(WaitOutcome {
                 news_printed: true,
                 view_pending: false,
@@ -4868,11 +4899,16 @@ mod tests {
                 .await
                 .unwrap();
             let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
-            let WaitFrameLoad::Ready(frame) =
-                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
-                    .await
-                    .unwrap()
-            else {
+            let WaitFrameLoad::Ready(frame) = load_wait_frame(
+                &mut pile,
+                &sources,
+                watermark,
+                &mut None,
+                &fixture.path,
+                "gpt",
+            )
+            .await
+            .unwrap() else {
                 panic!("complete local inputs must be ready")
             };
             assert_eq!(frame.persona, gpt);
@@ -4967,9 +5003,9 @@ mod tests {
             ),
         )
         .unwrap();
-        // An owned clock that falls due two seconds into the wait.
+        // An owned clock that falls due about three seconds into the wait.
         let now = clock::now().unwrap();
-        let done = clock::point(Epoch::from_tai_seconds(now.to_tai_seconds() - 1198.0)).unwrap();
+        let done = clock::point(Epoch::from_tai_seconds(now.to_tai_seconds() - 1197.0)).unwrap();
         let (owned, owned_id) =
             habits::habit_fragment("cc-clock", "every 20m", "mark it", None, &[], &[cc]).unwrap();
         let (owned_done, _) = habits::completion_fragment(owned_id, done).unwrap();
@@ -4978,11 +5014,12 @@ mod tests {
             .unwrap();
         pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
 
+        let started = Instant::now();
         let text = run_wait_for(
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_secs(6),
+            Duration::from_secs(8),
             Duration::from_millis(200),
         );
         assert!(
@@ -4991,6 +5028,10 @@ mod tests {
                 fmt_id(owned_id)
             )),
             "the clock must be reported while the body is still missing: {text}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "fixture setup ate the due margin: the clock was already due at arm"
         );
         assert!(!text.contains("News: new message"), "{text}");
         assert!(
@@ -5173,6 +5214,114 @@ mod tests {
         pile.close().unwrap();
     }
 
+    #[test]
+    fn an_owned_clock_gets_its_turn_while_a_body_fetch_stalls() {
+        use triblespace_net::peer::{Peer, ReconcileDirection, ReconcileQos};
+        let fixture = TestPile::new();
+        // A peer wired with no network capability: every body fetch stalls
+        // for its whole budget instead of failing fast. The wiring must stay
+        // alive, or the fetch would fail at once.
+        let (sender, receiver, wiring) =
+            triblespace_net::host::wire(iroh_base::SecretKey::from_bytes(&[7; 32]).public());
+        let mut pile: FacultyStore = Peer::with_wiring(
+            crate::storage::open_pile_strict(&fixture.path).unwrap(),
+            ReconcileQos {
+                direction: ReconcileDirection::ReadOnly,
+            },
+            sender,
+            receiver,
+        );
+        let sources =
+            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let cc = id(26);
+        let sender_id = id(27);
+        let (person, _, _) = relations::person_fragment(
+            cc,
+            crate::relations::ProfileInput {
+                label: "cc".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pile.commit(sources.relations.source, &fixture.signer, person)
+            .unwrap();
+        let mut remote = MemoryRepo::default();
+        let body = remote
+            .put::<blobencodings::UTF8String, _>("stalled on the wire".to_owned())
+            .unwrap();
+        pile.commit(
+            sources.messages.source,
+            &fixture.signer,
+            message::envelope_fragment(
+                sender_id,
+                cc,
+                body,
+                clock::point(Epoch::from_tai_seconds(42.0)).unwrap(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let now = clock::now().unwrap();
+        let done = clock::point(Epoch::from_tai_seconds(now.to_tai_seconds() - 1197.0)).unwrap();
+        let (owned, owned_id) =
+            habits::habit_fragment("cc-clock", "every 20m", "mark it", None, &[], &[cc]).unwrap();
+        let (owned_done, _) = habits::completion_fragment(owned_id, done).unwrap();
+        // A shared script intention counts its evaluations: once at the first
+        // preparation and once per timer sweep, never per cancelled retry.
+        let (probe, _) = habits::habit_fragment(
+            "evaluation-probe",
+            "when printf x >> evaluation-probe-invocations",
+            "probe",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        pile.commit(
+            sources.habits.as_ref().unwrap().source,
+            &fixture.signer,
+            owned + owned_done + probe,
+        )
+        .unwrap();
+        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+
+        let started = Instant::now();
+        let text = run_wait_for(
+            &mut pile,
+            &fixture,
+            "cc",
+            Duration::from_secs(8),
+            Duration::from_millis(200),
+        );
+        assert!(
+            text.contains(&format!(
+                "News: habit [{}] became due (cc-clock)",
+                fmt_id(owned_id)
+            )),
+            "the clock must get its turn while the fetch stalls: {text}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "fixture setup ate the due margin: the clock was already due at arm"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the clock must not wait for the stalled fetch budget"
+        );
+        assert!(!text.contains("evaluation-probe"), "{text}");
+        let evaluations = fs::read(fixture.dir.join("evaluation-probe-invocations"))
+            .unwrap()
+            .len();
+        assert!(
+            evaluations <= 2,
+            "condition scripts reran under cancelled body retries: {evaluations} evaluations"
+        );
+        assert!(stored_presentations(&mut pile, &fixture.signer, cc).is_empty());
+        pile.close().unwrap();
+        drop(wiring);
+    }
+
     fn stored_presentations(
         pile: &mut FacultyStore,
         signer: &SigningKey,
@@ -5347,6 +5496,7 @@ mod tests {
             &mut pile,
             &sources,
             watermark.clone(),
+            &mut None,
             &fixture.path,
             "test-persona",
         )
@@ -5389,11 +5539,16 @@ mod tests {
         );
         let sampled = pile.snapshot_at(watermark.instant()).unwrap();
         assert!(wait_storage_changed(&sampled, &frame.watermark));
-        let WaitFrameLoad::Ready(next) =
-            load_wait_frame(&mut pile, &sources, sampled, &fixture.path, "test-persona")
-                .await
-                .unwrap()
-        else {
+        let WaitFrameLoad::Ready(next) = load_wait_frame(
+            &mut pile,
+            &sources,
+            sampled,
+            &mut None,
+            &fixture.path,
+            "test-persona",
+        )
+        .await
+        .unwrap() else {
             panic!("externally maintained target must be readable")
         };
         assert_eq!(next.observation.facts.messages.view().iter().count(), 1);
@@ -5693,6 +5848,7 @@ mod tests {
             &mut pile,
             &sources,
             watermark.clone(),
+            &mut None,
             &fixture.path,
             "not-yet-resident",
         )
