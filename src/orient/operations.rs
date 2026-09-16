@@ -5392,6 +5392,44 @@ mod tests {
 
     #[test]
     fn ready_first_sweep_refreshes_the_pending_habit_context_before_body_ready() {
+        use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+
+        struct Supply<'a> {
+            store: &'a mut FacultyStore,
+            handle: Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>,
+            requested: usize,
+        }
+
+        impl SnapshotSource for Supply<'_> {
+            type Snapshot = FacultySnapshot;
+            type SnapshotError = <FacultyStore as SnapshotSource>::SnapshotError;
+
+            fn snapshot(&mut self) -> std::result::Result<Self::Snapshot, Self::SnapshotError> {
+                self.store.snapshot()
+            }
+        }
+
+        impl AsyncBlobStoreAcquire for Supply<'_> {
+            type AcquireError = io::Error;
+
+            async fn acquire(
+                &mut self,
+                handle: Inline<inlineencodings::Handle<blobencodings::UnknownBlob>>,
+            ) -> std::result::Result<Option<Bytes>, Self::AcquireError> {
+                self.requested += 1;
+                assert_eq!(handle, self.handle, "only the selected body is missing");
+                let snapshot = self.store.snapshot().unwrap();
+                if !snapshot.contains_blob(handle).unwrap() {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    snapshot
+                        .get::<Bytes, blobencodings::UnknownBlob>(handle)
+                        .unwrap(),
+                ))
+            }
+        }
+
         let fixture = TestPile::new();
         let mut pile = open_store(&fixture.path).unwrap();
         pollster::block_on(async {
@@ -5480,19 +5518,34 @@ mod tests {
                 .await
                 .unwrap();
             let selected = pile.snapshot().unwrap();
-            let WaitFrameLoad::Pending(frame) = load_wait_frame(
-                &mut pile,
-                &sources,
-                selected.clone(),
-                &mut None,
-                &fixture.path,
-                "ready-first",
-                Epoch::from_tai_seconds(120.0),
-            )
-            .await
-            .unwrap() else {
-                panic!("the later body is still missing")
-            };
+            let handle = Inline::new(body.raw);
+            assert!(!selected.contains_blob(handle).unwrap());
+            // Select exactly as load_wait_frame does, then inject a local-only
+            // reader at its generic continuation seam. No network timing or
+            // acquisition cancellation participates in this regression.
+            let observation = observe_snapshot(selected.clone(), &sources).unwrap();
+            let mut frame =
+                PendingWaitFrame::awaiting_view(selected.clone(), PendingWaitReason::Payload);
+            frame.observation = Some(observation);
+            {
+                let mut supply = Supply {
+                    store: &mut pile,
+                    handle,
+                    requested: 0,
+                };
+                assert!(resume_wait_payloads(
+                    &mut supply,
+                    &mut frame,
+                    &fixture.path,
+                    "ready-first",
+                    Epoch::from_tai_seconds(120.0),
+                )
+                .await
+                .unwrap()
+                .is_none());
+                assert_eq!(supply.requested, 1);
+            }
+            assert_eq!(frame.missing.unwrap().handle, handle);
             assert_eq!(frame.persona, Some(persona));
             assert!(frame.habits.as_ref().unwrap().due.contains_key(&probe_id));
             assert_eq!(frame.habits.as_ref().unwrap().next_cooldown_at, Some(1220));
@@ -5524,16 +5577,25 @@ mod tests {
 
             pile.put::<blobencodings::UTF8String, _>(body_text.to_owned())
                 .unwrap();
-            let ready = resume_wait_payloads(
-                &mut pile,
-                pending.as_mut().unwrap(),
-                &fixture.path,
-                "ready-first",
-                Epoch::from_tai_seconds(300.0),
-            )
-            .await
-            .unwrap()
-            .expect("only the selected body was missing");
+            let ready = {
+                let mut supply = Supply {
+                    store: &mut pile,
+                    handle,
+                    requested: 0,
+                };
+                let ready = resume_wait_payloads(
+                    &mut supply,
+                    pending.as_mut().unwrap(),
+                    &fixture.path,
+                    "ready-first",
+                    Epoch::from_tai_seconds(300.0),
+                )
+                .await
+                .unwrap()
+                .expect("only the selected body was missing");
+                assert_eq!(supply.requested, 1);
+                ready
+            };
             assert_eq!(ready.persona, persona);
             assert!(
                 render_habit_transitions(&seen, &ready.habits).is_none(),
