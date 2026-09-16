@@ -3411,17 +3411,15 @@ async fn cmd_wait(
                 pending_frame.as_ref(),
             );
             // A pending body fetch yields at the next habit deadline as well
-            // as at the health boundary, so the clock gets its turn. Before a
-            // habit baseline exists, a selected observation's first payload
-            // read gets one poll interval, so a stalled body cannot keep the
-            // persona's clocks unobserved; a pending preparation keeps the
-            // health boundary alone.
+            // as at the health boundary, so the clock gets its turn. The very
+            // first read, before any frame is retained, gets one poll interval,
+            // so a stalled body cannot keep the persona's clocks unobserved. A
+            // retry keeps the health boundary when its baseline has no deadline
+            // (empty or script-only intentions) or no baseline exists yet, so a
+            // body or preparation payload that answers within its budget lands.
             let boundary = match habit_deadline(&pending_habits_seen) {
                 Some(deadline) => earliest(next_health_change, Some(deadline)),
-                None if pending_frame
-                    .as_ref()
-                    .is_none_or(|pending| pending.observation.is_some()) =>
-                {
+                None if pending_frame.is_none() => {
                     let first_read = Epoch::from_tai_seconds(
                         clock::now()?.to_tai_seconds() + poll.as_secs_f64(),
                     );
@@ -3461,6 +3459,15 @@ async fn cmd_wait(
                         pending_frame = Some(pending);
                     }
                 }
+            }
+            // A retained frame without a habit observation (its intentions'
+            // own payloads are still missing) carries no clock: an older
+            // baseline's deadline must not keep cutting its reads.
+            if pending_frame
+                .as_ref()
+                .is_some_and(|pending| pending.habits.is_none())
+            {
+                pending_habits_seen = None;
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
