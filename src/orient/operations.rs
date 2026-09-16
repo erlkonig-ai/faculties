@@ -1871,12 +1871,20 @@ fn render_window_status(query: &OrientQuery<'_>) -> Result<(String, BTreeSet<Id>
 struct DueHabit {
     label: String,
     nudge: String,
+    /// The second this due began: the last completion plus the cooldown, or 0
+    /// for an intention never completed. It is the identity of one due event,
+    /// so a fresh completion and the due that follows it are a new event.
+    since: i64,
+    /// Addressed to the observing persona.
+    targeted: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct HabitObservation {
     due: BTreeMap<Id, DueHabit>,
     attention: BTreeMap<Id, String>,
+    /// Intentions addressed to the observing persona.
+    targeted: BTreeSet<Id>,
     /// Earliest completion-relative deadline that can change a cooling row.
     next_cooldown_at: Option<i64>,
 }
@@ -1923,6 +1931,9 @@ fn prepare_habits(
             })
         {
             continue;
+        }
+        if targeted {
+            observation.targeted.insert(habit);
         }
         let condition = read_utf8(snapshot, condition_handle, "Habit condition")?;
         let nudge = read_utf8(snapshot, nudge_handle, "Habit nudge")?;
@@ -2039,11 +2050,17 @@ fn observe_habits(
         let state = habits::evaluate(&row, now_secs, &at);
         match &state {
             habits::State::Due => {
+                let since = row
+                    .next_cooldown_at()
+                    .map_err(anyhow::Error::msg)?
+                    .unwrap_or(0);
                 observation.due.insert(
                     row.id,
                     DueHabit {
                         label: row.label.clone(),
                         nudge: row.nudge.clone(),
+                        since,
+                        targeted: observation.targeted.contains(&row.id),
                     },
                 );
             }
@@ -2138,7 +2155,12 @@ fn newly_due(previous: &HabitObservation, current: &HabitObservation) -> Vec<(Id
     current
         .due
         .iter()
-        .filter(|(id, _)| !previous.due.contains_key(*id))
+        .filter(|(id, habit)| {
+            previous
+                .due
+                .get(*id)
+                .is_none_or(|seen| seen.since != habit.since)
+        })
         .map(|(id, habit)| (*id, habit.clone()))
         .collect()
 }
@@ -2155,19 +2177,9 @@ fn newly_needing_attention(
         .collect()
 }
 
-fn render_habit_transitions(
-    previous: &HabitObservation,
-    current: &HabitObservation,
-) -> Option<String> {
+fn push_due_news(out: &mut String, due: &[(Id, DueHabit)]) {
     use std::fmt::Write as _;
-
-    let due = newly_due(previous, current);
-    let attention = newly_needing_attention(previous, current);
-    if due.is_empty() && attention.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    for (id, habit) in &due {
+    for (id, habit) in due {
         writeln!(
             out,
             "News: habit [{}] became due ({})",
@@ -2176,21 +2188,62 @@ fn render_habit_transitions(
         )
         .unwrap();
     }
+}
+
+fn push_due_detail(out: &mut String, due: &[(Id, DueHabit)]) {
+    use std::fmt::Write as _;
+    if due.is_empty() {
+        return;
+    }
+    writeln!(out, "\nHabits newly due:").unwrap();
+    for (_, habit) in due {
+        writeln!(out, "- {}: {}", habit.label, habit.nudge).unwrap();
+    }
+}
+
+fn render_habit_transitions(
+    previous: &HabitObservation,
+    current: &HabitObservation,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let due = newly_due(previous, current);
+    let attention = newly_needing_attention(previous, current);
+    if due.is_empty() && attention.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    push_due_news(&mut out, &due);
     for (id, _) in &attention {
         writeln!(out, "News: habit [{}] needs attention", fmt_id(*id)).unwrap();
     }
-    if !due.is_empty() {
-        writeln!(out, "\nHabits newly due:").unwrap();
-        for (_, habit) in due {
-            writeln!(out, "- {}: {}", habit.label, habit.nudge).unwrap();
-        }
-    }
+    push_due_detail(&mut out, &due);
     if !attention.is_empty() {
         writeln!(out, "\nHabit attention:").unwrap();
         for (_, warning) in attention {
             writeln!(out, "- {warning}").unwrap();
         }
     }
+    Some(out)
+}
+
+/// Intentions addressed to the observing persona that are already due when a
+/// watcher arms. Their due instant can fall between one wait's exit and the
+/// next arm, and nobody else will complete them, so they are reported at once
+/// instead of joining the quiet baseline that keeps a rearmed watcher from
+/// repeating every unsatisfied shared intention.
+fn render_habits_due_at_arm(current: &HabitObservation) -> Option<String> {
+    let owned: Vec<(Id, DueHabit)> = current
+        .due
+        .iter()
+        .filter(|(_, habit)| habit.targeted)
+        .map(|(id, habit)| (*id, habit.clone()))
+        .collect();
+    if owned.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    push_due_news(&mut out, &owned);
+    push_due_detail(&mut out, &owned);
     Some(out)
 }
 
@@ -3339,13 +3392,18 @@ async fn cmd_wait(
         } = initial;
         // Already-due habits establish a quiet, process-local baseline. A
         // rearmed one-shot watcher therefore waits for a transition instead
-        // of reporting the same unsatisfied intention forever.
+        // of reporting the same unsatisfied intention forever. An intention
+        // addressed to this persona is the exception: its due instant can
+        // fall between one wait's exit and the next arm, and nobody else will
+        // complete it, so it is reported at once.
         let mut last_habit_sweep = Instant::now();
         let mut current_habit_context_valid = true;
 
         let initial_report = matches!(news, News::Report { .. });
-        apply_prepared_news(pile, signer, false, &news, "", output)?;
-        if initial_report {
+        let owned_due = render_habits_due_at_arm(&habit_seen).unwrap_or_default();
+        let owned_fired = !owned_due.is_empty();
+        apply_prepared_news(pile, signer, false, &news, &owned_due, output)?;
+        if initial_report || owned_fired {
             return Ok(WaitOutcome {
                 news_printed: true,
                 view_pending: false,
@@ -3672,6 +3730,55 @@ async fn cmd_wake(
 
 #[cfg(test)]
 mod tests {
+    fn due_habit(label: &str, since: i64, targeted: bool) -> DueHabit {
+        DueHabit {
+            label: label.to_owned(),
+            nudge: "do it".to_owned(),
+            since,
+            targeted,
+        }
+    }
+
+    #[test]
+    fn a_fresh_completion_makes_the_next_due_a_new_event() {
+        let habit = Id::new([7; 16]).unwrap();
+        let mut previous = HabitObservation::default();
+        previous.due.insert(habit, due_habit("tick", 100, true));
+        let mut current = HabitObservation::default();
+        current.due.insert(habit, due_habit("tick", 100, true));
+        assert!(
+            newly_due(&previous, &current).is_empty(),
+            "the same due event is not news twice"
+        );
+        current.due.insert(habit, due_habit("tick", 1300, true));
+        assert_eq!(
+            newly_due(&previous, &current).len(),
+            1,
+            "the due after a fresh completion is a new event"
+        );
+    }
+
+    #[test]
+    fn only_owned_due_habits_are_reported_when_the_watcher_arms() {
+        let owned = Id::new([8; 16]).unwrap();
+        let shared = Id::new([9; 16]).unwrap();
+        let mut armed = HabitObservation::default();
+        armed
+            .due
+            .insert(shared, due_habit("stranded-work", 0, false));
+        assert!(
+            render_habits_due_at_arm(&armed).is_none(),
+            "an untargeted due intention stays a quiet baseline"
+        );
+        armed.due.insert(owned, due_habit("cc-tick", 1300, true));
+        let report = render_habits_due_at_arm(&armed).expect("an owned clock is reported at arm");
+        assert!(report.contains(&format!(
+            "News: habit [{}] became due (cc-tick)",
+            fmt_id(owned)
+        )));
+        assert!(!report.contains("stranded-work"));
+    }
+
     use super::super::cli::{parse_wait_target, WaitTarget};
     use super::*;
     use std::fs;
@@ -4643,6 +4750,97 @@ mod tests {
             assert_eq!(fs::read(marker).unwrap(), b"x");
             pile.close().unwrap();
         });
+    }
+
+    fn run_wait(pile: &mut FacultyStore, fixture: &TestPile, persona: &str) -> String {
+        let options = WaitOptions {
+            timeout: Some(Duration::from_millis(25)),
+            poll_interval: Duration::from_secs(1),
+        };
+        let mut text = String::new();
+        let mut emit = |part| {
+            let crate::out::Part::Text { text: part } = part else {
+                bail!("expected text")
+            };
+            text.push_str(&part);
+            Ok(())
+        };
+        runtime().unwrap().block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                cmd_wait(
+                    pile,
+                    &fixture.signer,
+                    &fixture.path,
+                    Some(persona),
+                    &options,
+                    Duration::from_secs(180),
+                    &mut Out::new(&mut emit),
+                ),
+            )
+            .await
+            .expect("wait honors its timeout")
+            .unwrap();
+        });
+        text
+    }
+
+    #[test]
+    fn a_persona_clock_already_due_at_arm_is_reported_once_per_due() {
+        let fixture = TestPile::new();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let sources =
+            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let cc = id(21);
+        let (person, _, _) = relations::person_fragment(
+            cc,
+            crate::relations::ProfileInput {
+                label: "cc".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pile.commit(sources.relations.source, &fixture.signer, person)
+            .unwrap();
+        let now = clock::now().unwrap();
+        let an_hour_ago =
+            clock::point(Epoch::from_tai_seconds(now.to_tai_seconds() - 3600.0)).unwrap();
+        let (owned, owned_id) =
+            habits::habit_fragment("cc-clock", "every 20m", "mark it", None, &[], &[cc]).unwrap();
+        let (owned_done, _) = habits::completion_fragment(owned_id, an_hour_ago).unwrap();
+        let (shared, shared_id) =
+            habits::habit_fragment("shared-clock", "every 20m", "anyone", None, &[], &[]).unwrap();
+        let (shared_done, _) = habits::completion_fragment(shared_id, an_hour_ago).unwrap();
+        let habit_source = sources.habits.as_ref().unwrap().source;
+        pile.commit(
+            habit_source,
+            &fixture.signer,
+            owned + owned_done + shared + shared_done,
+        )
+        .unwrap();
+        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+
+        // Both fell due before the watcher armed. The clock addressed to this
+        // persona is reported at once; the shared intention is a quiet baseline.
+        let armed = run_wait(&mut pile, &fixture, "cc");
+        assert!(
+            armed.contains(&format!(
+                "News: habit [{}] became due (cc-clock)",
+                fmt_id(owned_id)
+            )),
+            "{armed}"
+        );
+        assert!(!armed.contains("shared-clock"), "{armed}");
+
+        // Completed now: the rearmed watcher is quiet until the next due.
+        let (fresh, _) = habits::completion_fragment(owned_id, clock::point(now).unwrap()).unwrap();
+        pile.commit(habit_source, &fixture.signer, fresh).unwrap();
+        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+        let rearmed = run_wait(&mut pile, &fixture, "cc");
+        assert!(!rearmed.contains("became due"), "{rearmed}");
+        assert!(!rearmed.contains("shared-clock"), "{rearmed}");
+        assert!(rearmed.contains("No change detected"), "{rearmed}");
+        pile.close().unwrap();
     }
 
     fn stored_presentations(
