@@ -26,11 +26,15 @@
 use std::collections::HashMap;
 
 use triblespace::core::id::Id;
+use triblespace::core::metadata;
+use triblespace::macros::{find, pattern};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use crate::message as message_model;
+use crate::message::operations::{envelope_id, inbox, read_by, settled_identity};
 use crate::relations::{self, Head, ProfileInput, ProfileView};
+use crate::schemas::message::{local as message_attrs, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
 // ── ID / time helpers ────────────────────────────────────────────────
@@ -292,128 +296,121 @@ fn collect_messages(
     people: &HashMap<Id, Person>,
 ) -> (Vec<MessageRow>, Vec<String>) {
     let mut diagnostics = Vec::new();
-    let rows = match message_model::load_message_rows(view.facts) {
-        Ok(rows) => rows,
-        Err(error) => {
-            return (
-                Vec::new(),
-                vec![format!("Messages catalog is invalid: {error}")],
-            );
-        }
-    };
-    let domain_rows: HashMap<Id, message_model::MessageRow> =
-        rows.iter().map(|row| (row.id, *row)).collect();
 
-    let mut messages: HashMap<Id, MessageRow> = rows
-        .into_iter()
-        .map(|row| {
-            let body = match message_model::read_body(view.reader, row.body) {
-                Ok(body) => body,
-                Err(error) => {
-                    diagnostics.push(format!("Message {:x} body is unavailable: {error}", row.id));
-                    "⚠ body unavailable".to_owned()
-                }
-            };
-            let created_at = match row.created_at.try_from_inline::<(i128, i128)>() {
-                Ok((start, _)) => Some(start),
-                Err(error) => {
-                    diagnostics.push(format!(
-                        "Message {:x} has an invalid creation interval: {error:?}",
-                        row.id
-                    ));
-                    None
-                }
-            };
-            (
-                row.id,
-                MessageRow {
-                    id: row.id,
-                    from: row.from,
-                    to: row.to,
-                    body,
-                    created_at,
-                    reads: Vec::new(),
-                    is_inbox: false,
-                    is_unread: false,
-                },
-            )
+    // Every envelope this view answers with, and only the columns the panel
+    // draws. An entity carrying fields the panel does not model still shows;
+    // one missing a field it draws simply does not.
+    let envelopes: Vec<(
+        Id,
+        Id,
+        Id,
+        message_model::TextHandle,
+        message_model::IntervalValue,
+    )> = find!(
+        (
+            id: Id,
+            from: Id,
+            to: Id,
+            body: message_model::TextHandle,
+            created_at: message_model::IntervalValue
+        ),
+        pattern!(view.facts, [{ ?id @
+            metadata::tag: &KIND_MESSAGE_ID,
+            message_attrs::from: ?from,
+            message_attrs::to: ?to,
+            message_attrs::body: ?body,
+            metadata::created_at: ?created_at,
+        }])
+    )
+    .collect();
+
+    let mut messages: HashMap<Id, MessageRow> = HashMap::new();
+    for (id, from, to, body, created_at) in &envelopes {
+        let text = match message_model::read_body(view.reader, *body) {
+            Ok(text) => text,
+            Err(error) => {
+                diagnostics.push(format!("Message {id:x} body is unavailable: {error}"));
+                "⚠ body unavailable".to_owned()
+            }
+        };
+        let created_at = match created_at.try_from_inline::<(i128, i128)>() {
+            Ok((start, _)) => Some(start),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Message {id:x} has an invalid creation interval: {error:?}"
+                ));
+                None
+            }
+        };
+        messages.entry(*id).or_insert_with(|| MessageRow {
+            id: *id,
+            from: *from,
+            to: *to,
+            body: text,
+            created_at,
+            reads: Vec::new(),
+            is_inbox: false,
+            is_unread: false,
+        });
+    }
+
+    // Canonical `(message, reader)` markers, with every additive observation
+    // attached to them. Observations are a set, never a scalar winner.
+    let markers: Vec<(Id, Id, Id)> = find!(
+        (marker: Id, message: Id, reader: Id),
+        pattern!(view.facts, [{ ?marker @
+            metadata::tag: &KIND_READ_ID,
+            message_attrs::about_message: ?message,
+            message_attrs::reader: ?reader,
+        }])
+    )
+    .collect();
+
+    for &(marker, message, reader) in &markers {
+        let mut observations: Vec<i128> = find!(
+            at: message_model::IntervalValue,
+            pattern!(view.facts, [{ marker @ message_attrs::read_at: ?at }])
+        )
+        .filter_map(|at| match at.try_from_inline::<(i128, i128)>() {
+            Ok((start, _)) => Some(start),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Read marker {marker:x} has an invalid observation: {error:?}"
+                ));
+                None
+            }
         })
         .collect();
-
-    let mut domain_reads = Vec::new();
-    match message_model::load_read_receipts(view.facts) {
-        Ok(receipts) => {
-            for receipt in receipts {
-                let read = receipt.marker;
-                domain_reads.push(read);
-                let mut observations = Vec::new();
-                for observed_at in receipt.observed_at {
-                    match observed_at.try_from_inline::<(i128, i128)>() {
-                        Ok((start, _)) => observations.push(start),
-                        Err(error) => diagnostics.push(format!(
-                            "Read marker {:x} has an invalid observation: {error:?}",
-                            read.id
-                        )),
-                    }
-                }
-                observations.sort_unstable();
-                observations.dedup();
-                match messages.get_mut(&read.message) {
-                    Some(message) => message.reads.push(ReadReceipt {
-                        reader: read.reader,
-                        observations,
-                    }),
-                    None => diagnostics.push(format!(
-                        "Read marker {:x} names absent message {:x}",
-                        read.id, read.message
-                    )),
-                }
-            }
+        observations.sort_unstable();
+        observations.dedup();
+        match messages.get_mut(&message) {
+            Some(row) => row.reads.push(ReadReceipt {
+                reader,
+                observations,
+            }),
+            None => diagnostics.push(format!(
+                "Read marker {marker:x} names absent message {message:x}"
+            )),
         }
-        Err(error) => diagnostics.push(format!("Message read catalog is invalid: {error}")),
     }
 
     if let Some(relations_view) = relations_view {
         match relations::IdentityComponents::from_facts(relations_view.facts) {
             Ok(identities) => {
-                let operators: Vec<Id> = people
-                    .iter()
-                    .filter_map(|(id, person)| person.is_operator.then_some(*id))
-                    .collect();
-                for message in messages.values_mut() {
-                    let domain = domain_rows
-                        .get(&message.id)
-                        .expect("display message came from the canonical domain rows");
-                    let mut eligible = Vec::new();
-                    for operator in &operators {
-                        match message_model::is_inbox_message(
-                            domain,
-                            *operator,
-                            relations_view.facts,
-                            &identities,
-                        ) {
-                            Ok(true) => eligible.push(*operator),
-                            Ok(false) => {}
-                            Err(error) => diagnostics.push(format!(
-                                "Message {:x} inbox relation for operator {operator:x} is unsettled: {error}",
-                                message.id
-                            )),
-                        }
-                    }
-                    message.is_inbox = !eligible.is_empty();
-                    for operator in eligible {
-                        match message_model::is_read_by(
-                            &domain_reads,
-                            message.id,
-                            operator,
-                            &identities,
-                        ) {
-                            Ok(false) => message.is_unread = true,
-                            Ok(true) => {}
-                            Err(error) => diagnostics.push(format!(
-                                "Message {:x} read state for operator {operator:x} is unsettled: {error}",
-                                message.id
-                            )),
+                // Each operator as Relations has settled them, then the same
+                // question the Message operations ask: what was delivered to
+                // this identity, and has it acknowledged any of it. An
+                // operator's own envelopes are outgoing and never answer here.
+                for (operator, _) in people.iter().filter(|(_, person)| person.is_operator) {
+                    let anchors = settled_identity(&identities, *operator);
+                    for envelope in inbox(view.facts, relations_view.facts, &anchors) {
+                        let id = envelope_id(&envelope);
+                        let Some(row) = messages.get_mut(&id) else {
+                            continue;
+                        };
+                        row.is_inbox = true;
+                        if !read_by(view.facts, id, &anchors) {
+                            row.is_unread = true;
                         }
                     }
                 }

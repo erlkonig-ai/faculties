@@ -5,21 +5,28 @@ use std::path::PathBuf;
 
 use crate::clock;
 use crate::collection_names::{configured_handle, open_configured, open_exact_in};
-use crate::message::{self, IntervalValue, MessageRow};
+use crate::message::{self, IntervalValue};
 use crate::relations::{self, IdentityComponents, TextHandle};
-use crate::schemas::message::DEFAULT_SCOPE_ID;
-use crate::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
+use crate::schemas::message::{local, DEFAULT_SCOPE_ID, KIND_MESSAGE_ID, KIND_READ_ID};
+use crate::schemas::relations::{
+    group as relation_group, DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID,
+};
 use crate::storage::{self, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
+use itertools::Itertools;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::intersectionconstraint::and;
+use triblespace::core::query::sortedsliceconstraint::SortedSlice;
+use triblespace::core::query::temp;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+use triblespace::macros::{exists, find, pattern};
 use triblespace::prelude::*;
 
 /// A configured Message capability. Every call observes one frozen
@@ -90,11 +97,16 @@ pub enum MessageStatus {
     ReadByRecipient,
 }
 
-/// An owned observation, not a second catalog. Its envelope preserves exact
-/// attribution even when delivery/receipts use settled identity equivalence.
+/// One envelope as this reader saw it. Every field is a column of the query
+/// that selected it: nothing is loaded before a question is asked, and the
+/// exact sender and recipient anchors stay as written even when delivery and
+/// receipts use settled identity equivalence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageObservation {
-    pub row: MessageRow,
+    pub id: Id,
+    pub from: Id,
+    pub to: Id,
+    pub created_at: IntervalValue,
     pub body: String,
     pub from_label: String,
     pub to_label: String,
@@ -232,6 +244,124 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
+/// The columns of one envelope these operations read. Nothing else is
+/// selected, so a record carrying fields this reader does not model still
+/// answers, and one that is missing a field it does model simply does not.
+pub(crate) type Envelope = (Id, Id, Id, message::TextHandle, IntervalValue);
+
+pub(crate) fn envelope_id(envelope: &Envelope) -> Id {
+    envelope.0
+}
+
+/// Every anchor Relations has settled as this same person, ordered so a query
+/// can join on it directly. An unobserved or contradictory component still
+/// identifies its own anchor: settlement may widen who a reader is, but a
+/// stranger's unsettled verdict never erases them.
+pub(crate) fn settled_identity(identities: &IdentityComponents, person: Id) -> Vec<Id> {
+    identities
+        .component(person)
+        .map(|component| component.into_iter().collect())
+        .unwrap_or_else(|_| vec![person])
+}
+
+/// Envelopes delivered to one settled identity: addressed to it directly, or
+/// carried by the Relations group snapshot frozen at send time that names it as
+/// a member. Each arm is one join — the second across both views, on the
+/// snapshot — and a sender's own envelope is outgoing, never inbox.
+pub(crate) fn inbox<M, R>(message_facts: &M, relation_facts: &R, mine: &[Id]) -> Vec<Envelope>
+where
+    M: TriblePattern,
+    R: TriblePattern,
+{
+    let direct = find!(
+        (id: Id, from: Id, to: Id, body: message::TextHandle, created_at: IntervalValue),
+        and!(
+            SortedSlice::new_unchecked(mine).has(to),
+            pattern!(message_facts, [{ ?id @
+                metadata::tag: &KIND_MESSAGE_ID,
+                local::from: ?from,
+                local::to: ?to,
+                local::body: ?body,
+                metadata::created_at: ?created_at,
+            }])
+        )
+    );
+    let delivered = find!(
+        (id: Id, from: Id, to: Id, body: message::TextHandle, created_at: IntervalValue),
+        temp!(
+            (snapshot, member),
+            and!(
+                SortedSlice::new_unchecked(mine).has(member),
+                pattern!(message_facts, [{ ?id @
+                    metadata::tag: &KIND_MESSAGE_ID,
+                    local::from: ?from,
+                    local::to: ?to,
+                    local::body: ?body,
+                    metadata::created_at: ?created_at,
+                    local::group_snapshot: ?snapshot,
+                }]),
+                pattern!(relation_facts, [{ ?snapshot @ relation_group::member: ?member }])
+            )
+        )
+    );
+    direct
+        .chain(delivered)
+        .filter(|(_, from, ..)| mine.binary_search(from).is_err())
+        .collect()
+}
+
+/// Envelopes one settled identity sent.
+pub(crate) fn outbox<M>(message_facts: &M, mine: &[Id]) -> Vec<Envelope>
+where
+    M: TriblePattern,
+{
+    find!(
+        (id: Id, from: Id, to: Id, body: message::TextHandle, created_at: IntervalValue),
+        and!(
+            SortedSlice::new_unchecked(mine).has(from),
+            pattern!(message_facts, [{ ?id @
+                metadata::tag: &KIND_MESSAGE_ID,
+                local::from: ?from,
+                local::to: ?to,
+                local::body: ?body,
+                metadata::created_at: ?created_at,
+            }])
+        )
+    )
+    .collect()
+}
+
+/// The exact audience an envelope was delivered to, when it was a group send.
+fn delivery_snapshot<M>(message_facts: &M, message: Id) -> Option<Id>
+where
+    M: TriblePattern,
+{
+    find!(
+        snapshot: Id,
+        pattern!(message_facts, [{ message @ local::group_snapshot: ?snapshot }])
+    )
+    .next()
+}
+
+/// Whether any canonical read marker about this envelope belongs to one of
+/// these settled anchors. The first witness answers.
+pub(crate) fn read_by<M>(message_facts: &M, message: Id, readers: &[Id]) -> bool
+where
+    M: TriblePattern,
+{
+    exists!(
+        (reader: Id),
+        and!(
+            SortedSlice::new_unchecked(readers).has(reader),
+            pattern!(message_facts, [{ _?marker @
+                metadata::tag: &KIND_READ_ID,
+                local::about_message: &message,
+                local::reader: ?reader,
+            }])
+        )
+    )
+}
+
 async fn acquire_text<S>(store: &mut S, handle: TextHandle) -> Result<String>
 where
     S: AsyncBlobStoreAcquire,
@@ -275,19 +405,25 @@ where
         .to_owned())
 }
 
-async fn recipient_label<S, P>(store: &mut S, facts: &P, row: &MessageRow) -> Result<String>
+async fn recipient_label<S, P>(
+    store: &mut S,
+    facts: &P,
+    message: Id,
+    to: Id,
+    delivered_through: Option<Id>,
+) -> Result<String>
 where
     S: AsyncBlobStoreAcquire,
     P: TriblePattern,
 {
-    match row.group_snapshot {
-        None => person_label(store, facts, row.to).await,
+    match delivered_through {
+        None => person_label(store, facts, to).await,
         Some(snapshot) => {
             let snapshot = relations::group_snapshot(facts, snapshot)?;
             acquire_text(store, snapshot.name).await.with_context(|| {
                 format!(
                     "read name of group snapshot {:x} for Message {:x}",
-                    snapshot.id, row.id
+                    snapshot.id, message
                 )
             })
         }
@@ -325,18 +461,23 @@ async fn ack(storage: &mut MessageStorage<'_>, id: &str, by: &str) -> Result<Ack
     })
     .await?;
     storage.update("local message read", |message_facts, relation_facts| {
-        let message_id = message::resolve_message_id(message_facts, id)?;
-        let row = message::row_by_id(message_facts, message_id)?;
         let identities = IdentityComponents::from_facts(relation_facts)?;
-        if !message::is_inbox_message(&row, reader_id, relation_facts, &identities)? {
+        let mine = settled_identity(&identities, reader_id);
+        // The prefix resolves against exactly what this reader may
+        // acknowledge, so an id outside that inbox never names a message.
+        let delivered = inbox(message_facts, relation_facts, &mine);
+        let message_id = crate::resolve_id_prefix(id, delivered.iter().map(envelope_id))?;
+        if !delivered
+            .iter()
+            .any(|envelope| envelope_id(envelope) == message_id)
+        {
             bail!(
                 "message {} is not in {}'s inbox",
                 fmt_id(message_id),
                 fmt_id(reader_id)
             );
         }
-        let reads = message::load_read_rows(message_facts)?;
-        let already_read = message::is_read_by(&reads, message_id, reader_id, &identities)?;
+        let already_read = read_by(message_facts, message_id, &mine);
         let fragment = if already_read {
             None
         } else {
@@ -375,23 +516,25 @@ async fn ack_all(
         "local messages bulk read",
         |message_facts, relation_facts| {
             let identities = IdentityComponents::from_facts(relation_facts)?;
-            let reads = message::load_read_rows(message_facts)?;
+            let mine = settled_identity(&identities, reader_id);
+            let senders = from.map(|sender| settled_identity(&identities, sender));
             let observed_at = clock::point_now()?;
             let mut fragment = Fragment::empty();
             let mut message_ids = Vec::new();
-            for row in message::load_message_rows(message_facts)? {
-                if !message::is_inbox_message(&row, reader_id, relation_facts, &identities)?
-                    || message::is_read_by(&reads, row.id, reader_id, &identities)?
-                {
-                    continue;
-                }
-                if let Some(from) = from {
-                    if !identities.equivalent(row.from, from)? {
+            for (id, sender, ..) in inbox(message_facts, relation_facts, &mine)
+                .into_iter()
+                .unique_by(envelope_id)
+            {
+                if let Some(senders) = &senders {
+                    if senders.binary_search(&sender).is_err() {
                         continue;
                     }
                 }
-                fragment += message::read_fragment(row.id, reader_id, Some(observed_at)).0;
-                message_ids.push(row.id);
+                if read_by(message_facts, id, &mine) {
+                    continue;
+                }
+                fragment += message::read_fragment(id, reader_id, Some(observed_at)).0;
+                message_ids.push(id);
             }
             Ok((
                 (!message_ids.is_empty()).then_some(fragment),
@@ -413,54 +556,68 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
     })
     .await?;
     let identities = IdentityComponents::from_facts(relation_facts)?;
-    let reads = message::load_read_rows(message_facts)?;
-    let mut messages = message::load_message_rows(message_facts)?;
-    messages.sort_by(|left, right| {
-        interval_key(right.created_at)
-            .cmp(&interval_key(left.created_at))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    let mine = settled_identity(&identities, reader_id);
+
+    // Newest first, one entry per envelope: both views answer with a bag, so a
+    // repeated field or a person settled across two anchors is one more witness
+    // of the same envelope rather than another message. Inbox and outbox are
+    // disjoint, because an envelope this reader sent is never delivered to it.
+    let candidates: Vec<(bool, Envelope)> = inbox(message_facts, relation_facts, &mine)
+        .into_iter()
+        .map(|envelope| (true, envelope))
+        .chain(
+            outbox(message_facts, &mine)
+                .into_iter()
+                .map(|envelope| (false, envelope)),
+        )
+        .sorted_by(|(_, left), (_, right)| {
+            interval_key(right.4)
+                .cmp(&interval_key(left.4))
+                .then_with(|| left.0.cmp(&right.0))
+        })
+        .unique_by(|(_, envelope)| envelope_id(envelope))
+        .collect();
 
     let observed_at = clock::point_now()?;
     let mut entries = Vec::new();
-    for row in messages {
+    for (incoming, (id, from, to, body, created_at)) in candidates {
         if entries.len() >= options.limit {
             break;
         }
-        let incoming = message::is_inbox_message(&row, reader_id, relation_facts, &identities)?;
-        let outgoing = message::is_outgoing_message(&row, reader_id, &identities)?;
-        if !incoming && !outgoing {
-            continue;
-        }
-        let read = message::is_read_by(&reads, row.id, reader_id, &identities)?;
+        let read = read_by(message_facts, id, &mine);
         if options.unread && !(incoming && !read) {
             continue;
         }
-        let from_label = person_label(storage.pile, relation_facts, row.from).await?;
-        let to_label = recipient_label(storage.pile, relation_facts, &row).await?;
+        let delivered_through = delivery_snapshot(message_facts, id);
+        let from_label = person_label(storage.pile, relation_facts, from).await?;
+        let to_label =
+            recipient_label(storage.pile, relation_facts, id, to, delivered_through).await?;
         let status = if incoming {
             if read {
                 MessageStatus::Read
             } else {
                 MessageStatus::Unread
             }
-        } else if row.group_snapshot.is_none()
-            && message::is_read_by(&reads, row.id, row.to, &identities)?
+        } else if delivered_through.is_none()
+            && read_by(message_facts, id, &settled_identity(&identities, to))
         {
             MessageStatus::ReadByRecipient
         } else {
             MessageStatus::Sent
         };
-        let body = acquire_text(storage.pile, row.body)
+        let body = acquire_text(storage.pile, body)
             .await
-            .with_context(|| format!("read body of Message {:x}", row.id))?;
+            .with_context(|| format!("read body of Message {id:x}"))?;
         entries.push(MessageObservation {
-            row,
+            id,
+            from,
+            to,
+            created_at,
             body,
             from_label,
             to_label,
             incoming,
-            outgoing,
+            outgoing: !incoming,
             status,
         });
     }
@@ -692,6 +849,19 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    /// Every envelope this view answers with, asked the way the operations ask:
+    /// a typed pattern over the attributes, never a catalog.
+    fn visible<M>(message_facts: &M) -> BTreeSet<Id>
+    where
+        M: TriblePattern,
+    {
+        find!(
+            id: Id,
+            pattern!(message_facts, [{ ?id @ metadata::tag: &KIND_MESSAGE_ID }])
+        )
+        .collect()
+    }
+
     /// Stand-in for the maintenance worker: carry one source's Succinct and
     /// Rank9 targets, exactly what no operation does any more by itself.
     fn carry(
@@ -818,7 +988,7 @@ mod tests {
             let result = runtime.block_on(list(&mut input, &options)).unwrap();
             assert_eq!(result.reader, recipient);
             assert_eq!(result.entries.len(), 1);
-            assert_eq!(result.entries[0].row.id, first_id);
+            assert_eq!(result.entries[0].id, first_id);
             assert_eq!(result.entries[0].body, "first message");
             assert_eq!(result.entries[0].status, MessageStatus::Unread);
             assert_eq!(
@@ -941,7 +1111,7 @@ mod tests {
             result
                 .entries
                 .iter()
-                .find(|entry| entry.row.id == first_id)
+                .find(|entry| entry.id == first_id)
                 .unwrap()
                 .status,
             MessageStatus::Read
@@ -950,7 +1120,7 @@ mod tests {
             result
                 .entries
                 .iter()
-                .find(|entry| entry.row.id == second_id)
+                .find(|entry| entry.id == second_id)
                 .unwrap()
                 .status,
             MessageStatus::Unread
@@ -1118,7 +1288,7 @@ mod tests {
             listed
                 .entries
                 .iter()
-                .find(|entry| entry.row.id == sent.id)
+                .find(|entry| entry.id == sent.id)
                 .unwrap()
                 .body,
             "published without index WRITE"
@@ -1220,7 +1390,7 @@ mod tests {
             .block_on(list(&mut input, &ListOptions::new("reader")))
             .unwrap();
         assert_eq!(listed.entries.len(), 1);
-        assert_eq!(listed.entries[0].row.id, first_id);
+        assert_eq!(listed.entries[0].id, first_id);
         assert_eq!(listed.entries[0].body, "the resident message");
         let after = pile.snapshot().unwrap();
         assert_eq!(
@@ -1330,14 +1500,7 @@ mod tests {
             relations::person_anchors(&relation_facts),
             BTreeSet::from([first_person])
         );
-        assert_eq!(
-            message::load_message_rows(&message_facts)
-                .unwrap()
-                .iter()
-                .map(|row| row.id)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([first_message])
-        );
+        assert_eq!(visible(&message_facts), BTreeSet::from([first_message]));
         assert_eq!(records(&mut pile), before, "a read publishes nothing");
 
         // An edit by the Message owner maintains the Message chain first, so
@@ -1357,11 +1520,7 @@ mod tests {
             BTreeSet::from([first_person])
         );
         assert_eq!(
-            message::load_message_rows(&message_facts)
-                .unwrap()
-                .iter()
-                .map(|row| row.id)
-                .collect::<BTreeSet<_>>(),
+            visible(&message_facts),
             BTreeSet::from([first_message, second_message])
         );
         assert!(
@@ -1385,11 +1544,7 @@ mod tests {
             BTreeSet::from([first_person, second_person])
         );
         assert_eq!(
-            message::load_message_rows(&message_facts)
-                .unwrap()
-                .iter()
-                .map(|row| row.id)
-                .collect::<BTreeSet<_>>(),
+            visible(&message_facts),
             BTreeSet::from([first_message, second_message])
         );
         pile.close().unwrap();
@@ -1549,23 +1704,30 @@ mod tests {
                 .try_to_inline()
                 .unwrap(),
         );
-        let row = message::row_by_id(envelope.facts(), id).unwrap();
         let identities = IdentityComponents::from_facts(relations.facts()).unwrap();
-        assert!(message::is_inbox_message(&row, reader, relations.facts(), &identities).unwrap());
-        assert!(!message::is_outgoing_message(&row, reader, &identities).unwrap());
+        let mine = settled_identity(&identities, reader);
+        let delivered = inbox(envelope.facts(), relations.facts(), &mine);
+        assert_eq!(
+            delivered.iter().map(envelope_id).collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert!(outbox(envelope.facts(), &mine).is_empty());
+        let (_, from, to, body, _) = delivered[0];
         let mut store = AcquiringPile::new(envelope.blobs().clone());
 
         assert_eq!(
-            pollster::block_on(person_label(&mut store, relations.facts(), row.from)).unwrap(),
+            pollster::block_on(person_label(&mut store, relations.facts(), from)).unwrap(),
             format!("{sender:x} [profile unavailable]")
         );
         assert!(store.requested.is_empty());
         assert_eq!(
-            pollster::block_on(acquire_text(&mut store, row.body)).unwrap(),
+            pollster::block_on(acquire_text(&mut store, body)).unwrap(),
             "visible inbox body"
         );
-        assert_eq!((row.from, row.to), (sender, reader));
-        assert_eq!(store.requested, vec![row.body.transmute()]);
+        // The unobserved sender keeps its exact anchor; delivery equivalence
+        // never rewrites attribution.
+        assert_eq!((from, to), (sender, reader));
+        assert_eq!(store.requested, vec![body.transmute()]);
     }
 
     #[test]
@@ -1648,14 +1810,20 @@ mod tests {
                 .try_to_inline()
                 .unwrap(),
         );
-        let row = message::row_by_id(message.facts(), id).unwrap();
         fragment += message;
         fragment +=
             relations::group_snapshot_fragment(group, "renamed group", &[], &[original]).unwrap();
         let mut store = AcquiringPile::new(fragment.blobs().clone());
 
         assert_eq!(
-            pollster::block_on(recipient_label(&mut store, fragment.facts(), &row)).unwrap(),
+            pollster::block_on(recipient_label(
+                &mut store,
+                fragment.facts(),
+                id,
+                group,
+                Some(original)
+            ))
+            .unwrap(),
             "original group"
         );
         assert_eq!(store.requested, vec![original_name.transmute()]);
@@ -1669,7 +1837,7 @@ mod tests {
         let name = relations::group_snapshot(relations.facts(), snapshot)
             .unwrap()
             .name;
-        let (envelope, id) = message::message_fragment(
+        let (_envelope, id) = message::message_fragment(
             test_id(14),
             &message::Recipient::Group {
                 anchor: group,
@@ -1681,12 +1849,17 @@ mod tests {
                 .try_to_inline()
                 .unwrap(),
         );
-        let row = message::row_by_id(envelope.facts(), id).unwrap();
         for failure in [None, Some(io::ErrorKind::TimedOut)] {
             let mut store = AcquiringPile::new(MemoryBlobStore::new());
             store.failure = failure;
-            let error = pollster::block_on(recipient_label(&mut store, relations.facts(), &row))
-                .unwrap_err();
+            let error = pollster::block_on(recipient_label(
+                &mut store,
+                relations.facts(),
+                id,
+                group,
+                Some(snapshot),
+            ))
+            .unwrap_err();
             assert_eq!(
                 error.to_string(),
                 format!("read name of group snapshot {snapshot:x} for Message {id:x}")
@@ -2033,12 +2206,12 @@ mod tests {
             "a read after registration must not append to the pile"
         );
         assert!(
-            message::row_by_id(&message_facts, first_id).is_ok(),
+            visible(&message_facts).contains(&first_id),
             "the maintained message stays readable"
         );
         // The pure read sees the rollup as it stands; the fresh raw COMMIT
         // waits for the maintenance worker, for an edit exactly as for a read.
-        assert!(message::row_by_id(&message_facts, second_id).is_err());
+        assert!(!visible(&message_facts).contains(&second_id));
         carry(&mut pile, &runtime, message_source, &owner);
         let (_, _relation_facts, message_facts) = runtime
             .block_on(message_views(
@@ -2049,11 +2222,264 @@ mod tests {
                 ViewIntent::Edit,
             ))
             .unwrap();
-        assert!(message::row_by_id(&message_facts, first_id).is_ok());
+        let carried = visible(&message_facts);
+        assert!(carried.contains(&first_id));
         assert!(
-            message::row_by_id(&message_facts, second_id).is_ok(),
+            carried.contains(&second_id),
             "the carried message is readable by the same view"
         );
         pile.close().unwrap();
+    }
+
+    fn at(seconds: f64) -> IntervalValue {
+        let epoch = Epoch::from_tai_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    fn person_anchor(person: Id) -> TribleSet {
+        entity! { ExclusiveId::force_ref(&person) @
+            metadata::tag: &crate::schemas::relations::KIND_PERSON_ID
+        }
+        .into_facts()
+    }
+
+    fn test_body() -> message::TextHandle {
+        "body".to_owned().to_blob().get_handle()
+    }
+
+    fn delivered_ids<M, R>(message_facts: &M, relation_facts: &R, mine: &[Id]) -> Vec<Id>
+    where
+        M: TriblePattern,
+        R: TriblePattern,
+    {
+        inbox(message_facts, relation_facts, mine)
+            .iter()
+            .map(envelope_id)
+            .collect()
+    }
+
+    /// Delivery is decided by the audience frozen into the envelope at send
+    /// time, never by the group's later head.
+    #[test]
+    fn group_delivery_uses_the_frozen_snapshot_not_a_later_head() {
+        let sender = test_id(0x31);
+        let original_member = test_id(0x32);
+        let later_member = test_id(0x33);
+        let group = test_id(0x34);
+
+        let mut relation_facts = TribleSet::new();
+        for person in [sender, original_member, later_member] {
+            relation_facts += person_anchor(person);
+        }
+        relation_facts += entity! { ExclusiveId::force_ref(&group) @
+            metadata::tag: &crate::schemas::relations::KIND_GROUP
+        }
+        .into_facts();
+        let old =
+            relations::group_snapshot_fragment(group, "group", &[original_member], &[]).unwrap();
+        let old_id = old.root().unwrap();
+        relation_facts += old.into_facts();
+        relation_facts +=
+            relations::group_snapshot_fragment(group, "group", &[later_member], &[old_id])
+                .unwrap()
+                .into_facts();
+
+        let envelope = message::envelope_fragment(
+            sender,
+            group,
+            test_body(),
+            at(13.0),
+            Some(old_id),
+            Some(crate::schemas::message::GROUP_SNAPSHOT_BASIS_WITNESSED),
+        );
+        let id = envelope.root().unwrap();
+        let message_facts = envelope.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        assert_eq!(
+            delivered_ids(
+                &message_facts,
+                &relation_facts,
+                &settled_identity(&identities, original_member)
+            ),
+            vec![id]
+        );
+        assert!(delivered_ids(
+            &message_facts,
+            &relation_facts,
+            &settled_identity(&identities, later_member)
+        )
+        .is_empty());
+        assert_eq!(delivery_snapshot(&message_facts, id), Some(old_id));
+    }
+
+    /// People Relations has never observed still address each other. Their
+    /// envelopes are simply not this reader's, and none of them is an error.
+    #[test]
+    fn unobserved_senders_do_not_poison_exact_inbox_membership() {
+        let reader = test_id(0x70);
+        let unknown_sender = test_id(0x71);
+        let unknown_recipient = test_id(0x72);
+        let relation_facts = person_anchor(reader);
+
+        let mut message_facts = TribleSet::new();
+        let mut ids = Vec::new();
+        for (from, to, seconds) in [
+            (unknown_sender, unknown_recipient, 15.0),
+            (unknown_sender, reader, 14.0),
+            (reader, unknown_recipient, 13.0),
+        ] {
+            let envelope =
+                message::envelope_fragment(from, to, test_body(), at(seconds), None, None);
+            ids.push(envelope.root().unwrap());
+            message_facts += envelope.into_facts();
+        }
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, reader);
+        assert_eq!(
+            delivered_ids(&message_facts, &relation_facts, &mine),
+            vec![ids[1]]
+        );
+        assert_eq!(
+            outbox(&message_facts, &mine)
+                .iter()
+                .map(envelope_id)
+                .collect::<Vec<_>>(),
+            vec![ids[2]]
+        );
+    }
+
+    /// A receipt written by someone Relations has not observed neither marks
+    /// the message read for another reader nor hides that reader's own receipt.
+    #[test]
+    fn unobserved_receipt_readers_neither_acknowledge_nor_hide_an_exact_reader() {
+        let reader = test_id(0x73);
+        let absent = test_id(0x74);
+        let message = test_id(0x75);
+        let relation_facts = person_anchor(reader);
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, reader);
+        // An anchor with no Relations evidence still identifies itself.
+        let theirs = settled_identity(&identities, absent);
+        assert_eq!(theirs, vec![absent]);
+
+        let mut message_facts = message::read_fragment(message, absent, None).0.into_facts();
+        assert!(!read_by(&message_facts, message, &mine));
+        assert!(read_by(&message_facts, message, &theirs));
+        message_facts += message::read_fragment(message, reader, None).0.into_facts();
+        assert!(read_by(&message_facts, message, &mine));
+    }
+
+    /// Settled same-person evidence widens who may read and acknowledge an
+    /// envelope; it never rewrites the anchors the envelope names.
+    #[test]
+    fn settled_same_identity_delivers_without_rewriting_attribution() {
+        let sender = test_id(0x36);
+        let addressed = test_id(0x37);
+        let equivalent_reader = test_id(0x38);
+        let mut relation_facts = TribleSet::new();
+        for person in [sender, addressed, equivalent_reader] {
+            relation_facts += person_anchor(person);
+        }
+        relation_facts +=
+            relations::identity_verdict_fragment(addressed, equivalent_reader, true, &[])
+                .unwrap()
+                .into_facts();
+
+        let envelope =
+            message::envelope_fragment(sender, addressed, test_body(), at(13.5), None, None);
+        let id = envelope.root().unwrap();
+        let message_facts = envelope.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, equivalent_reader);
+        let delivered = inbox(&message_facts, &relation_facts, &mine);
+        assert_eq!(
+            delivered.iter().map(envelope_id).collect::<Vec<_>>(),
+            vec![id]
+        );
+        let (_, from, to, ..) = delivered[0];
+        assert_eq!((from, to), (sender, addressed));
+
+        // The receipt one anchor writes answers for the whole settled person.
+        let acknowledged = message::read_fragment(id, equivalent_reader, None)
+            .0
+            .into_facts();
+        assert!(read_by(
+            &acknowledged,
+            id,
+            &settled_identity(&identities, addressed)
+        ));
+    }
+
+    /// The sender's own envelope is outgoing, so `ack` has nothing to mark and
+    /// an unrelated person sees neither side of it.
+    #[test]
+    fn a_sender_never_finds_their_own_envelope_in_their_inbox() {
+        let sender = test_id(0x45);
+        let recipient = test_id(0x46);
+        let unrelated = test_id(0x47);
+        let mut relation_facts = TribleSet::new();
+        for person in [sender, recipient, unrelated] {
+            relation_facts += person_anchor(person);
+        }
+        let envelope =
+            message::envelope_fragment(sender, recipient, test_body(), at(13.75), None, None);
+        let id = envelope.root().unwrap();
+        let message_facts = envelope.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, sender);
+        assert!(delivered_ids(&message_facts, &relation_facts, &mine).is_empty());
+        assert_eq!(
+            outbox(&message_facts, &mine)
+                .iter()
+                .map(envelope_id)
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+
+        let stranger = settled_identity(&identities, unrelated);
+        assert!(delivered_ids(&message_facts, &relation_facts, &stranger).is_empty());
+        assert!(outbox(&message_facts, &stranger).is_empty());
+    }
+
+    /// A second recipient naming another anchor of the same settled person is
+    /// one more witness of one envelope. The query answers with a bag and the
+    /// listing collapses it; nothing is rejected as malformed.
+    #[test]
+    fn a_repeated_recipient_is_one_more_witness_not_one_more_message() {
+        let sender = test_id(0x39);
+        let addressed = test_id(0x3A);
+        let also_addressed = test_id(0x3B);
+        let mut relation_facts = TribleSet::new();
+        for person in [sender, addressed, also_addressed] {
+            relation_facts += person_anchor(person);
+        }
+        relation_facts +=
+            relations::identity_verdict_fragment(addressed, also_addressed, true, &[])
+                .unwrap()
+                .into_facts();
+
+        let envelope =
+            message::envelope_fragment(sender, addressed, test_body(), at(16.0), None, None);
+        let id = envelope.root().unwrap();
+        let mut message_facts = envelope.into_facts();
+        message_facts +=
+            entity! { ExclusiveId::force_ref(&id) @ local::to: also_addressed }.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, addressed);
+        let delivered = inbox(&message_facts, &relation_facts, &mine);
+        assert_eq!(delivered.len(), 2, "both recipients witness the envelope");
+        assert_eq!(
+            delivered
+                .iter()
+                .unique_by(|envelope| envelope_id(envelope))
+                .count(),
+            1,
+            "and they are one message"
+        );
     }
 }

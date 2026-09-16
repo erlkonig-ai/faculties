@@ -28,7 +28,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 use crate::headspace::{self, ConfigValue, ProfileValue, Resolution};
-use crate::message as message_model;
+use crate::message::operations::{envelope_id, inbox, read_by, settled_identity};
 use crate::relations::{self as relations_model, IdentityComponents, ProfileView};
 use crate::schemas::triage::{
     exec, model_chat, reason, KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID,
@@ -1148,17 +1148,14 @@ pub fn count_unread_messages<P: TriblePattern>(
     reader: Id,
 ) -> Result<usize> {
     let identities = IdentityComponents::from_facts(relations.facts)?;
-    let rows = message_model::load_message_rows(messages.facts)?;
-    let reads = message_model::load_read_rows(messages.facts)?;
-    let mut count = 0;
-    for row in rows {
-        if message_model::is_inbox_message(&row, reader, relations.facts, &identities)?
-            && !message_model::is_read_by(&reads, row.id, reader, &identities)?
-        {
-            count += 1;
-        }
-    }
-    Ok(count)
+    let mine = settled_identity(&identities, reader);
+    // One envelope per id, however many witnesses selected it.
+    let unread: BTreeSet<Id> = inbox(messages.facts, relations.facts, &mine)
+        .iter()
+        .map(envelope_id)
+        .filter(|message| !read_by(messages.facts, *message, &mine))
+        .collect();
+    Ok(unread.len())
 }
 
 fn extract_unknown_person_label(text: &str) -> Option<String> {

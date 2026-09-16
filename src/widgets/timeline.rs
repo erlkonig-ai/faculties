@@ -60,6 +60,7 @@ use GORBIE::prelude::CardCtx;
 
 use crate::schemas::blockdag as archive;
 use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use crate::schemas::message::{local as message_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
@@ -445,22 +446,37 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
 
 /// Emit a LocalMessages event per message.
 fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let Ok(rows) = crate::message::load_message_rows(dataset.facts) else {
-        return;
-    };
-    for row in rows {
-        let Some(ts_ns) = interval_start(row.created_at) else {
+    let rows: Vec<(Id, Id, Id, TextHandle, Inline<NsTAIInterval>)> = find!(
+        (
+            id: Id,
+            from: Id,
+            to: Id,
+            body: TextHandle,
+            created_at: Inline<NsTAIInterval>
+        ),
+        pattern!(dataset.facts, [{ ?id @
+            metadata::tag: &KIND_MESSAGE_ID,
+            message_attrs::from: ?from,
+            message_attrs::to: ?to,
+            message_attrs::body: ?body,
+            metadata::created_at: ?created_at,
+        }])
+    )
+    .collect();
+
+    for (id, from, to, body, created_at) in rows {
+        let Some(ts_ns) = interval_start(created_at) else {
             continue;
         };
-        let body = read_text(dataset, row.body);
+        let body = read_text(dataset, body);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::LocalMessages,
-            entity_id: row.id,
+            entity_id: id,
             ts_ns,
             summary: preview(&body, 80),
             status: None,
-            from_to: Some(format!("{} → {}", id_hex(row.from), id_hex(row.to))),
+            from_to: Some(format!("{} → {}", id_hex(from), id_hex(to))),
         });
     }
 }

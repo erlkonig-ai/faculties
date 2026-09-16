@@ -214,8 +214,8 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
     let original = messages.list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(original.reader, fixture.bob);
     assert_eq!(original.entries.len(), 1);
-    assert_eq!(original.entries[0].row.id, sent.id);
-    assert_eq!(original.entries[0].row.from, fixture.alice);
+    assert_eq!(original.entries[0].id, sent.id);
+    assert_eq!(original.entries[0].from, fixture.alice);
     assert_eq!(original.entries[0].status, MessageStatus::Unread);
     assert!(original.entries[0].incoming);
     assert!(!original.entries[0].outgoing);
@@ -364,7 +364,7 @@ fn bulk_ack_filters_sender_and_outbox_reports_direct_receipts() {
         remaining
             .entries
             .iter()
-            .map(|entry| entry.row.id)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>(),
         [cara.id]
     );
@@ -412,7 +412,7 @@ fn settled_identity_shares_receipts_without_rewriting_attribution() {
     let observed = messages.list(&ListOptions::new("Cara")).unwrap();
     assert_eq!(observed.entries.len(), 1);
     assert_eq!(
-        (observed.entries[0].row.from, observed.entries[0].row.to),
+        (observed.entries[0].from, observed.entries[0].to),
         (fixture.alice, fixture.bob)
     );
     assert_eq!(observed.entries[0].status, MessageStatus::Read);
@@ -441,7 +441,7 @@ fn mcp_text_is_literal_and_sender_and_host_configuration_are_never_implicit() {
     assert!(received
         .entries
         .iter()
-        .all(|entry| entry.row.from == fixture.alice));
+        .all(|entry| entry.from == fixture.alice));
 
     let missing = fixture.directory.path().join("never-open.pile");
     let adapter = mcp::Message::new(missing.clone(), None);
@@ -597,11 +597,11 @@ fn cli_keeps_persona_file_and_stdin_text_conventions() {
     assert!(received
         .entries
         .iter()
-        .any(|entry| entry.row.from == fixture.alice && entry.body == "from a CLI file\n"));
+        .any(|entry| entry.from == fixture.alice && entry.body == "from a CLI file\n"));
     assert!(received
         .entries
         .iter()
-        .any(|entry| entry.row.from == fixture.cara && entry.body == "from CLI stdin\n"));
+        .any(|entry| entry.from == fixture.cara && entry.body == "from CLI stdin\n"));
     let output = fixture
         .command()
         .args(["send", "Bob", "no sender"])

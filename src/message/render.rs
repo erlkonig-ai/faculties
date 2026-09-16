@@ -87,8 +87,8 @@ pub(super) fn list(list: &MessageList, out: &mut Out<'_>) -> Result<()> {
         };
         out.line(format!(
             "[{:x}] {} {} -> {} ({}) {}",
-            entry.row.id,
-            format_age(now, interval_key(entry.row.created_at)),
+            entry.id,
+            format_age(now, interval_key(entry.created_at)),
             entry.from_label,
             entry.to_label,
             status,

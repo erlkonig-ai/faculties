@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Message asks the collection instead of keeping a copy of it. The row types,
+  catalog loaders and closed-world validators are gone; every operation runs a
+  typed `find!` where it is used. Inbox membership is two joins, the second
+  across the Message and Relations views on the group snapshot frozen at send
+  time; a reader's settled identity is a membership constraint the engine joins
+  on; an acknowledgement is an `exists!`. Results are bags that the consumer
+  deduplicates, so a repeated field is another witness rather than a rejected
+  record, and an unsettled third-party identity can no longer fail a read.
+  `MessageObservation` carries its query's columns. Triage and the message and
+  timeline widgets ask the same shared query rather than loading their own
+  catalogs. No change to the read/write split, the maintenance contract or the
+  delivery semantics: frozen snapshots still decide audience, settled identity
+  still widens receipts without rewriting attribution, and a sender still
+  cannot acknowledge their own envelope.
+
 - Own a `Leech<Pile>` for foreground Faculty storage. Snapshots and exact
   payload acquisitions retain the existing interfaces without building a
   serving inventory. Local authored writes and close remain available; no
