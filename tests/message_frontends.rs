@@ -68,7 +68,7 @@ impl Fixture {
         let group_snapshot = members.root().unwrap();
         fragment += members;
         publish_fragment(&pile, Some(&key), RELATIONS_SCOPE, fragment).unwrap();
-        Self {
+        let fixture = Self {
             directory,
             pile,
             key,
@@ -77,7 +77,11 @@ impl Fixture {
             cara,
             group,
             group_snapshot,
-        }
+        };
+        // Labels and group membership become readable through their maintained
+        // Relations view; Message edits do not maintain another faculty's data.
+        fixture.carry();
+        fixture
     }
 
     fn messages(&self) -> Message {
@@ -89,7 +93,7 @@ impl Fixture {
     }
 
     /// Model the independent worker at an explicit observation boundary.
-    /// Construction and Message operations never carry these targets for us.
+    /// Message reads do not carry, and edits maintain only their Message chain.
     fn carry(&self) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
@@ -204,8 +208,8 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
             basis: faculties::schemas::message::GROUP_SNAPSHOT_BASIS_WITNESSED,
         }
     );
-    // The first send resolved the raw Relations facts through its edit
-    // residual. A reader observes the result only after the worker carries it.
+    // The send used the maintained Relations view. A read observes its new
+    // Message COMMIT only after the worker carries it.
     fixture.carry();
     let original = messages.list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(original.reader, fixture.bob);
@@ -279,8 +283,8 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
         .message_ids
         .is_empty());
     assert_eq!(fixture.message_commits(), committed);
-    // Repeat acknowledgements above saw the uncarried receipt via the edit
-    // residual. Carry it only now for the following ordinary read.
+    // Repeat edits maintained the earlier receipt before checking it. This
+    // explicit worker boundary also makes it available to ordinary reads.
     fixture.carry();
     assert!(messages
         .list(&ListOptions {
@@ -397,12 +401,13 @@ fn settled_identity_shares_receipts_without_rewriting_attribution() {
     let identity =
         relations::identity_verdict_fragment(fixture.bob, fixture.cara, true, &[]).unwrap();
     publish_fragment(&fixture.pile, Some(&fixture.key), RELATIONS_SCOPE, identity).unwrap();
+    fixture.carry();
     let receipt = messages.ack(&id, "Cara").unwrap();
     assert_eq!(receipt.reader, fixture.cara);
     assert!(receipt.already_read);
     assert_eq!(fixture.message_commits(), committed);
-    // Both acknowledgements intentionally preceded maintenance, including
-    // resolution through the newly published identity verdict.
+    // The maintained identity shares receipt visibility without rewriting the
+    // original message's attribution or publishing a second receipt.
     fixture.carry();
     let observed = messages.list(&ListOptions::new("Cara")).unwrap();
     assert_eq!(observed.entries.len(), 1);
