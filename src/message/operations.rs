@@ -23,7 +23,7 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::prelude::*;
 
 /// A configured Message capability. Every call observes one frozen
-/// Message/Relations view through its storage handle. Operations maintain targets
+/// Message/Relations view through its storage handle. Editing operations maintain targets
 /// they may write and otherwise attach the replicated views as they stand.
 /// No transport, sender environment, or text-file convention is consulted.
 #[derive(Clone, Debug)]
@@ -132,28 +132,41 @@ impl Message {
 
     pub fn send(&self, options: &SendOptions<'_>) -> Result<SentMessage> {
         options.validate()?;
-        with_storage(self, |storage, runtime| {
+        with_storage(self, ViewIntent::Edit, |storage, runtime| {
             runtime.block_on(send(storage, options))
         })
     }
 
     pub fn list(&self, options: &ListOptions<'_>) -> Result<MessageList> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, ViewIntent::Read, |storage, runtime| {
             runtime.block_on(list(storage, options))
         })
     }
 
     pub fn ack(&self, id: &str, by: &str) -> Result<Acknowledgement> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, ViewIntent::Edit, |storage, runtime| {
             runtime.block_on(ack(storage, id, by))
         })
     }
 
     pub fn ack_all(&self, options: &AckAllOptions<'_>) -> Result<AcknowledgedMessages> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, ViewIntent::Edit, |storage, runtime| {
             runtime.block_on(ack_all(storage, options))
         })
     }
+}
+
+/// Whether an operation only reads the maintained views or will edit the
+/// Message source. Readers attach the resident Succinct/Rank9 rollups as they
+/// stand and never run maintenance: carrying those lattices belongs to the
+/// selected maintenance worker, and a reader that maintained them duplicated
+/// its work on every `message list` (measured 2026-09-16 on sky: 67 to 175 s
+/// wall, 456 to 1,667 CPU-seconds per call at about 4 GB). An editor still
+/// maintains first so the fact it is about to change is in the view it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewIntent {
+    Read,
+    Edit,
 }
 
 struct MessageStorage<'a> {
@@ -448,6 +461,7 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
 
 fn with_storage<T>(
     capability: &Message,
+    intent: ViewIntent,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
@@ -468,7 +482,7 @@ fn with_storage<T>(
                 open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
             let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let (reader, relation_facts, message_facts) =
-                message_views(pile, signer, relations_source, message_source).await?;
+                message_views(pile, signer, relations_source, message_source, intent).await?;
             Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
         })?;
         let mut storage = MessageStorage {
@@ -488,9 +502,11 @@ async fn message_views(
     signer: &SigningKey,
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
+    intent: ViewIntent,
 ) -> Result<(FacultySnapshot, FactArchive, FactArchive)> {
     // Preparing a read, send, or acknowledgement may reuse a chain maintained
     // by another principal. Publication checks source WRITE independently.
+    // A read never maintains: it attaches the rollups as they stand.
     let descriptors = pile.snapshot().context("freeze Message source policies")?;
     let relations_policy = relations_source
         .policy(&descriptors)
@@ -511,7 +527,9 @@ async fn message_views(
     let message_rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
         .context("register Message Rank9 collection")?;
-    let (maintain_relations, maintain_messages) = {
+    let (maintain_relations, maintain_messages) = if intent == ViewIntent::Read {
+        (false, false)
+    } else {
         let snapshot = pile.snapshot().context("freeze Message WRITE admission")?;
         let subject = signer.verifying_key();
         let relations = relations_succinct
@@ -730,6 +748,7 @@ mod tests {
                     &owner,
                     relations_source,
                     message_source,
+                    ViewIntent::Edit,
                 ))
                 .unwrap(),
         );
@@ -763,6 +782,7 @@ mod tests {
                     &observer,
                     relations_source,
                     message_source,
+                    ViewIntent::Edit,
                 ))
                 .unwrap();
             assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
@@ -793,6 +813,7 @@ mod tests {
                 &observer,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -830,6 +851,7 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -850,6 +872,7 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -928,6 +951,7 @@ mod tests {
                     &owner,
                     relations_source,
                     message_source,
+                    ViewIntent::Edit,
                 ))
                 .unwrap(),
         );
@@ -967,6 +991,7 @@ mod tests {
                 &sender,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         assert!(message_source
@@ -1017,6 +1042,7 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1088,6 +1114,7 @@ mod tests {
                     &owner,
                     relations_source,
                     message_source,
+                    ViewIntent::Edit,
                 ))
                 .unwrap(),
         );
@@ -1129,6 +1156,7 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1212,6 +1240,7 @@ mod tests {
                         signer,
                         relations_source,
                         message_source,
+                        ViewIntent::Edit,
                     ))
                     .unwrap(),
             );
@@ -1244,6 +1273,7 @@ mod tests {
                 &message_owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         assert_eq!(
@@ -1262,6 +1292,7 @@ mod tests {
                 &relations_owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         assert_eq!(
@@ -1637,6 +1668,7 @@ mod tests {
                 &owner,
                 relations_source,
                 message_source,
+                ViewIntent::Edit,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1801,5 +1833,119 @@ mod tests {
         let after = store.snapshot().unwrap();
         assert_eq!(source.admitted(&after).unwrap().len(), 2);
         assert_eq!(after.wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn reads_attach_the_resident_views_without_maintaining() {
+        // A pure read never publishes maintenance records, even when a raw
+        // COMMIT the maintenance worker has not carried yet is resident.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = storage::open_store(file.path()).unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[93; 32]);
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let mut selectors = BTreeSet::new();
+        for source in [relations_source, message_source] {
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            for handle in [source.handle(), succinct.handle(), rank9.handle()] {
+                selectors.insert(CollectionRecordSelector::Collection(handle));
+            }
+        }
+        let sender = test_id(63);
+        let recipient = test_id(64);
+        let mut people = relations::person_fragment(
+            sender,
+            relations::ProfileInput {
+                label: "sender".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        people += relations::person_fragment(
+            recipient,
+            relations::ProfileInput {
+                label: "reader".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        pile.commit(relations_source, &owner, people).unwrap();
+        let (first, first_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(recipient),
+            "maintained message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &owner, first).unwrap();
+        // An edit maintains: the rollups now carry the first message.
+        drop(
+            runtime
+                .block_on(message_views(
+                    &mut pile,
+                    &owner,
+                    relations_source,
+                    message_source,
+                    ViewIntent::Edit,
+                ))
+                .unwrap(),
+        );
+        // A raw COMMIT nobody has carried yet.
+        let (second, second_id) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(recipient),
+            "fresh raw message",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(message_source, &owner, second).unwrap();
+        let before = pile
+            .snapshot()
+            .unwrap()
+            .select_records(&selectors)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let (_, _relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                ViewIntent::Read,
+            ))
+            .unwrap();
+        let after = pile
+            .snapshot()
+            .unwrap()
+            .select_records(&selectors)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            before, after,
+            "a read must publish no DERIVE or MERGE record"
+        );
+        assert!(
+            message::row_by_id(&message_facts, first_id).is_ok(),
+            "the maintained message stays readable"
+        );
+        // The pure read sees the rollup as it stands; the fresh raw COMMIT
+        // waits for the maintenance worker or an edit's residual fallback.
+        assert!(message::row_by_id(&message_facts, second_id).is_err());
     }
 }

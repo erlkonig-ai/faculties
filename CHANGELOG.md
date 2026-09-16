@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Message reads (`message list`) attach the resident Succinct/Rank9 views and never run maintenance; only edits (send, ack, ack-all) maintain first. On sky, 2026-09-16, a read cost 42 s wall and 171 CPU-seconds through maintenance and 6 s wall and 5 CPU-seconds without it; an already-read ack cost 156 s wall and 1,633 CPU-seconds doing nothing but maintenance. Carrying the lattices belongs to the selected maintenance worker.
 - Use Bash for the OOM-expendable Rust compiler wrapper so Cargo's hyphenated
   executable-path variables reach integration tests unchanged; retain the
   existing Linux OOM guard and child exit status.
