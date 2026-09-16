@@ -1176,17 +1176,9 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &owner, first).unwrap();
-        drop(
-            runtime
-                .block_on(message_views(
-                    &mut pile,
-                    &owner,
-                    relations_source,
-                    message_source,
-                    ViewIntent::Edit,
-                ))
-                .unwrap(),
-        );
+        // The worker carries both chains once, so the targets are warm.
+        carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
         assert!(pile.health().started_at.is_none());
 
         let mut missing = Vec::new();
