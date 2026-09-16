@@ -5425,6 +5425,7 @@ mod tests {
                 Ok(Some(
                     snapshot
                         .get::<Bytes, blobencodings::UnknownBlob>(handle)
+                        .await
                         .unwrap(),
                 ))
             }
