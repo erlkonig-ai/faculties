@@ -14,17 +14,22 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    UnionArchive,
 };
+use triblespace::core::blob::TryFromBlob;
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::patternunion::PatternUnion;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+use triblespace::core::trible::TribleSet;
 use triblespace::prelude::*;
 
 /// A configured Message capability. Every call observes one frozen
-/// Message/Relations view through its storage handle. Editing operations maintain targets
-/// they may write and otherwise attach the replicated views as they stand.
+/// Message/Relations view through its storage handle. Operations attach the
+/// replicated views as they stand and never maintain them; an edit also reads
+/// the residual payloads those views do not carry yet.
 /// No transport, sender environment, or text-file convention is consulted.
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -156,18 +161,25 @@ impl Message {
     }
 }
 
-/// Whether an operation only reads the maintained views or will edit the
-/// Message source. Readers attach the resident Succinct/Rank9 rollups as they
-/// stand and run no semantic upkeep (registration may still put immutable
-/// descriptor blobs): carrying those lattices belongs to the selected
-/// maintenance worker, and a reader that maintained them duplicated its work.
-/// Measured 2026-09-16 on sky, Fac 92308e55 / Core 256898f2, one process,
-/// RAYON_NUM_THREADS unset: `message list --unread` cost 42.39 s wall and
-/// 171.24 s combined CPU with maintenance, 6.10 s wall and 6.40 s combined
-/// CPU without, listing the same messages. Acknowledgements, which still
-/// maintain, cost 67 to 175 s wall and 456 to 1,667 s combined CPU each in
-/// the same session; those are edit timings, not list timings. An editor
-/// still maintains first so the fact it changes is in the view it checks.
+/// The facts one operation queries: the resident Rank9 view and, for an
+/// edit, two residual arms that view does not carry yet (Succinct members not
+/// yet accelerated, and raw source payloads not yet indexed at all), queried
+/// as one source. A read leaves both residual arms empty.
+type MessageFacts = PatternUnion<FactArchive, PatternUnion<Option<FactArchive>, Vec<TribleSet>>>;
+
+/// Whether an operation only reads the resident views or will edit the
+/// Message source. Nobody here runs maintenance: carrying the Succinct and
+/// Rank9 lattices belongs to the selected maintenance worker, and an operation
+/// that maintained them duplicated its work. Measured 2026-09-16 on sky,
+/// Fac 92308e55 / Core 256898f2, one process, RAYON_NUM_THREADS unset:
+/// `message list --unread` cost 42.39 s wall and 171.24 s combined CPU with
+/// maintenance, 6.10 s wall and 6.40 s combined CPU without, listing the same
+/// messages; acknowledgements, which then still maintained, cost 67 to 175 s
+/// wall and 456 to 1,667 s combined CPU each (edit timings, not list timings).
+/// A read attaches the views as they stand. An edit also selects, through
+/// the collection algebra, the resident payloads those views lack and queries
+/// them beside the views, so the fact it changes is in what it checks;
+/// publication then requires only source WRITE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewIntent {
     Read,
@@ -179,8 +191,8 @@ struct MessageStorage<'a> {
     signer: &'a SigningKey,
     collection: Collection<SimpleArchive>,
     reader: &'a FacultySnapshot,
-    messages: &'a FactArchive,
-    relations: &'a FactArchive,
+    messages: &'a MessageFacts,
+    relations: &'a MessageFacts,
 }
 
 impl MessageStorage<'_> {
@@ -188,7 +200,7 @@ impl MessageStorage<'_> {
     fn update<T>(
         &mut self,
         description: &'static str,
-        operation: impl FnOnce(&FactArchive, &FactArchive) -> Result<(Option<Fragment>, T)>,
+        operation: impl FnOnce(&MessageFacts, &MessageFacts) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         let (fragment, value) = operation(self.messages, self.relations)?;
         if let Some(mut fragment) = fragment {
@@ -508,10 +520,10 @@ async fn message_views(
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
     intent: ViewIntent,
-) -> Result<(FacultySnapshot, FactArchive, FactArchive)> {
-    // Preparing a read, send, or acknowledgement may reuse a chain maintained
-    // by another principal. Publication checks source WRITE independently.
-    // A read never maintains: it attaches the rollups as they stand.
+) -> Result<(FacultySnapshot, MessageFacts, MessageFacts)> {
+    // Preparing a read, send, or acknowledgement reuses the chains as the
+    // maintenance worker left them. Publication checks source WRITE
+    // independently; nothing here maintains.
     let descriptors = pile.snapshot().context("freeze Message source policies")?;
     let relations_policy = relations_source
         .policy(&descriptors)
@@ -532,57 +544,6 @@ async fn message_views(
     let message_rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(message_succinct, (), message_policy)
         .context("register Message Rank9 collection")?;
-    let (maintain_relations, maintain_messages) = if intent == ViewIntent::Read {
-        (false, false)
-    } else {
-        let snapshot = pile.snapshot().context("freeze Message WRITE admission")?;
-        let subject = signer.verifying_key();
-        let relations = relations_succinct
-            .writer_is_admitted(&snapshot, subject)
-            .map_err(|error| {
-                anyhow::anyhow!("check Relations Succinct WRITE admission: {error}")
-            })?
-            && relations_rank9
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| {
-                    anyhow::anyhow!("check Relations Rank9 WRITE admission: {error}")
-                })?;
-        let messages = message_succinct
-            .writer_is_admitted(&snapshot, subject)
-            .map_err(|error| anyhow::anyhow!("check Message Succinct WRITE admission: {error}"))?
-            && message_rank9
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| anyhow::anyhow!("check Message Rank9 WRITE admission: {error}"))?;
-        (relations, messages)
-    };
-    // One-edge maintenance selects resident immediate-source inputs. Never
-    // acquire an entire root just to read the target: a new COMMIT can arrive
-    // before its payload without hiding the target's already readable facts.
-    if maintain_relations {
-        drop(
-            pile.maintain(relations_succinct, signer)
-                .await
-                .context("maintain Relations Succinct collection")?,
-        );
-        drop(
-            pile.maintain(relations_rank9, signer)
-                .await
-                .context("maintain Relations Rank9 collection")?,
-        );
-    }
-    if maintain_messages {
-        drop(
-            pile.maintain(message_succinct, signer)
-                .await
-                .context("maintain Message Succinct collection")?,
-        );
-        drop(
-            pile.maintain(message_rank9, signer)
-                .await
-                .context("maintain Message Rank9 collection")?,
-        );
-    }
-
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
     let reader = pile.snapshot().context("freeze Message observation")?;
@@ -598,7 +559,66 @@ async fn message_views(
     let message_facts = message_collection
         .view::<FactArchive>()
         .context("read Message Rank9 projection")?;
+    let (relation_facts, message_facts) = match intent {
+        ViewIntent::Read => (
+            PatternUnion::new(relation_facts, PatternUnion::new(None, Vec::new())),
+            PatternUnion::new(message_facts, PatternUnion::new(None, Vec::new())),
+        ),
+        ViewIntent::Edit => (
+            PatternUnion::new(
+                relation_facts,
+                residual_arms(&reader, relations_succinct, relations_rank9, "Relations")?,
+            ),
+            PatternUnion::new(
+                message_facts,
+                residual_arms(&reader, message_succinct, message_rank9, "Message")?,
+            ),
+        ),
+    };
     Ok((reader, relation_facts, message_facts))
+}
+
+/// The facts an edit must see that the resident Rank9 view does not carry
+/// yet, selected by the collection algebra as exactly the residual `ensure`
+/// would map next: Succinct members the Rank9 target lacks, read as archive
+/// segments without decoding, and raw source payloads the Succinct target
+/// lacks, read as fact sets. Nothing is mapped or published. An incomplete
+/// cover is an error naming the missing support; an edit never proceeds on a
+/// delta that only looks complete.
+fn residual_arms(
+    reader: &FacultySnapshot,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    label: &str,
+) -> Result<PatternUnion<Option<FactArchive>, Vec<TribleSet>>> {
+    let mut segments = Vec::new();
+    for (member, blob, _) in reader
+        .uncovered_source_members(rank9)
+        .with_context(|| format!("select {label} Succinct members the Rank9 view lacks"))?
+    {
+        segments.push(
+            SuccinctArchive::<OrderedUniverse>::try_from_blob(blob).with_context(|| {
+                format!(
+                    "read residual {label} Succinct member {}",
+                    hex::encode_upper(member.raw)
+                )
+            })?,
+        );
+    }
+    let accelerated_gap = (!segments.is_empty()).then(|| UnionArchive::new(segments));
+    let mut raw = Vec::new();
+    for (member, blob, _) in reader
+        .uncovered_source_members(succinct)
+        .with_context(|| format!("select {label} source members the Succinct view lacks"))?
+    {
+        raw.push(TribleSet::try_from_blob(blob).with_context(|| {
+            format!(
+                "read residual {label} source member {}",
+                hex::encode_upper(member.raw)
+            )
+        })?);
+    }
+    Ok(PatternUnion::new(accelerated_gap, raw))
 }
 
 #[cfg(test)]
@@ -689,6 +709,25 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    /// Stand-in for the maintenance worker: carry one source's Succinct and
+    /// Rank9 targets, exactly what no operation does any more by itself.
+    fn carry(
+        pile: &mut FacultyStore,
+        runtime: &tokio::runtime::Runtime,
+        source: Collection<SimpleArchive>,
+        signer: &SigningKey,
+    ) {
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        drop(runtime.block_on(pile.maintain(succinct, signer)).unwrap());
+        drop(runtime.block_on(pile.maintain(rank9, signer)).unwrap());
+    }
+
     #[test]
     fn non_writer_lists_resident_messages_but_cannot_publish() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -746,17 +785,9 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &owner, first).unwrap();
-        drop(
-            runtime
-                .block_on(message_views(
-                    &mut pile,
-                    &owner,
-                    relations_source,
-                    message_source,
-                    ViewIntent::Edit,
-                ))
-                .unwrap(),
-        );
+        // The maintenance worker carries both chains; operations never do.
+        carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
 
         let (second, second_id) = message::message_fragment(
             sender,
@@ -781,13 +812,15 @@ mod tests {
                 pile.commit(message_source, &owner, message).unwrap();
             }
             let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+            // A listing is a read: it sees the carried views as they stand,
+            // not the raw records the worker has not carried yet.
             let (snapshot, relation_facts, message_facts) = runtime
                 .block_on(message_views(
                     &mut pile,
                     &observer,
                     relations_source,
                     message_source,
-                    ViewIntent::Edit,
+                    ViewIntent::Read,
                 ))
                 .unwrap();
             assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
@@ -871,6 +904,37 @@ mod tests {
             .block_on(ack(&mut input, &fmt_id(first_id), "reader"))
             .unwrap();
         assert!(!acknowledgement.already_read);
+        // The read receipt is a raw COMMIT the worker has not carried; an
+        // edit still sees it through the residual arm, so acknowledging
+        // again is a no-op that publishes nothing.
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                ViewIntent::Edit,
+            ))
+            .unwrap();
+        let before_noop = pile.snapshot().unwrap().select_records(&selectors).unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        assert!(
+            runtime
+                .block_on(ack(&mut input, &fmt_id(first_id), "reader"))
+                .unwrap()
+                .already_read
+        );
+        assert_eq!(
+            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+            before_noop
+        );
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1196,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn message_reads_maintain_each_authorized_chain_independently() {
+    fn edits_publish_nothing_and_see_fresh_facts_in_both_chains() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -1237,19 +1301,10 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &message_owner, first).unwrap();
-        for signer in [&relations_owner, &message_owner] {
-            drop(
-                runtime
-                    .block_on(message_views(
-                        &mut pile,
-                        signer,
-                        relations_source,
-                        message_source,
-                        ViewIntent::Edit,
-                    ))
-                    .unwrap(),
-            );
-        }
+        // Each chain's own maintainer carries it, as the worker would.
+        carry(&mut pile, &runtime, relations_source, &relations_owner);
+        carry(&mut pile, &runtime, message_source, &message_owner);
+        // Fresh raw records in both chains that nobody has carried yet.
         pile.commit(
             relations_source,
             &relations_owner,
@@ -1271,40 +1326,67 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &message_owner, second).unwrap();
+        let records = |pile: &mut FacultyStore| {
+            pile.snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(|record| record.unwrap())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = records(&mut pile);
 
+        // A read sees only what was carried, in both chains.
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
                 &message_owner,
                 relations_source,
                 message_source,
-                ViewIntent::Edit,
+                ViewIntent::Read,
             ))
             .unwrap();
         assert_eq!(
             relations::person_anchors(&relation_facts),
             BTreeSet::from([first_person])
         );
-        let messages = message::load_message_rows(&message_facts).unwrap();
         assert_eq!(
-            messages.iter().map(|row| row.id).collect::<BTreeSet<_>>(),
-            BTreeSet::from([first_message, second_message])
+            message::load_message_rows(&message_facts)
+                .unwrap()
+                .iter()
+                .map(|row| row.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_message])
         );
+        assert_eq!(records(&mut pile), before, "a read publishes nothing");
 
-        let (_, relation_facts, message_facts) = runtime
-            .block_on(message_views(
-                &mut pile,
-                &relations_owner,
-                relations_source,
-                message_source,
-                ViewIntent::Edit,
-            ))
-            .unwrap();
-        assert_eq!(
-            relations::person_anchors(&relation_facts),
-            BTreeSet::from([first_person, second_person])
-        );
-        assert_eq!(message::load_message_rows(&message_facts).unwrap().len(), 2);
+        // An edit sees the fresh raw records of both chains through the
+        // residual arms, whichever chain its signer may write, and still
+        // publishes nothing by itself.
+        for signer in [&message_owner, &relations_owner] {
+            let (_, relation_facts, message_facts) = runtime
+                .block_on(message_views(
+                    &mut pile,
+                    signer,
+                    relations_source,
+                    message_source,
+                    ViewIntent::Edit,
+                ))
+                .unwrap();
+            assert_eq!(
+                relations::person_anchors(&relation_facts),
+                BTreeSet::from([first_person, second_person])
+            );
+            assert_eq!(
+                message::load_message_rows(&message_facts)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([first_message, second_message])
+            );
+            assert_eq!(records(&mut pile), before, "an edit view publishes nothing");
+        }
         pile.close().unwrap();
     }
 
@@ -1898,18 +1980,9 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &owner, first).unwrap();
-        // An edit maintains: the rollups now carry the first message.
-        drop(
-            runtime
-                .block_on(message_views(
-                    &mut pile,
-                    &owner,
-                    relations_source,
-                    message_source,
-                    ViewIntent::Edit,
-                ))
-                .unwrap(),
-        );
+        // The worker carries both chains once.
+        carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
         // A raw COMMIT nobody has carried yet.
         let (second, second_id) = message::message_fragment(
             sender,
@@ -1958,7 +2031,34 @@ mod tests {
             "the maintained message stays readable"
         );
         // The pure read sees the rollup as it stands; the fresh raw COMMIT
-        // waits for the maintenance worker or an edit's residual fallback.
+        // waits for the maintenance worker. An edit reads it now, through
+        // the residual arm, and publishes nothing either.
         assert!(message::row_by_id(&message_facts, second_id).is_err());
+        let (_, _relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                ViewIntent::Edit,
+            ))
+            .unwrap();
+        assert!(message::row_by_id(&message_facts, first_id).is_ok());
+        assert!(message::row_by_id(&message_facts, second_id).is_ok());
+        assert_eq!(
+            pile.snapshot()
+                .unwrap()
+                .select_records(&selectors)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            after,
+            "an edit view must publish no DERIVE or MERGE record"
+        );
+        assert_eq!(
+            std::fs::metadata(file.path()).unwrap().len(),
+            bytes_before,
+            "an edit view must not append to the pile"
+        );
     }
 }
