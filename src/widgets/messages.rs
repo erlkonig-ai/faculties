@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::macros::{find, pattern};
+use triblespace::prelude::TryFromInline;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
@@ -43,6 +44,14 @@ use crate::widgets::storage::{DatasetRevision, DatasetView};
 /// is resolvable from the relations branch.
 fn id_hex(id: Id) -> String {
     format!("{id:x}")
+}
+
+/// The lower bound of a stored interval, for ordering only.
+fn interval_start(interval: message_model::IntervalValue) -> Option<i128> {
+    interval
+        .try_from_inline::<(i128, i128)>()
+        .ok()
+        .map(|(start, _)| start)
 }
 
 fn now_tai_ns() -> Option<i128> {
@@ -300,7 +309,7 @@ fn collect_messages(
     // Every envelope this view answers with, and only the columns the panel
     // draws. An entity carrying fields the panel does not model still shows;
     // one missing a field it draws simply does not.
-    let envelopes: Vec<(
+    let mut envelopes: Vec<(
         Id,
         Id,
         Id,
@@ -323,6 +332,15 @@ fn collect_messages(
         }])
     )
     .collect();
+
+    // One row per envelope, newest witness first, so a repeated field cannot
+    // make the panel show one message twice or mix two witnesses' fields.
+    envelopes.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| interval_start(right.4).cmp(&interval_start(left.4)))
+    });
+    envelopes.dedup_by_key(|envelope| envelope.0);
 
     let mut messages: HashMap<Id, MessageRow> = HashMap::new();
     for (id, from, to, body, created_at) in &envelopes {

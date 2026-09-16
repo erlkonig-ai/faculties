@@ -446,7 +446,7 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
 
 /// Emit a LocalMessages event per message.
 fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let rows: Vec<(Id, Id, Id, TextHandle, Inline<NsTAIInterval>)> = find!(
+    let mut rows: Vec<(Id, Id, Id, TextHandle, Inline<NsTAIInterval>)> = find!(
         (
             id: Id,
             from: Id,
@@ -463,6 +463,16 @@ fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Even
         }])
     )
     .collect();
+
+    // One chip per envelope. The view answers with a bag, so a repeated field
+    // is another witness of the same message; keep the newest, as the message
+    // listing and the triage count do.
+    rows.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| interval_start(right.4).cmp(&interval_start(left.4)))
+    });
+    rows.dedup_by_key(|row| row.0);
 
     for (id, from, to, body, created_at) in rows {
         let Some(ts_ns) = interval_start(created_at) else {
