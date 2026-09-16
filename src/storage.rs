@@ -49,7 +49,9 @@ pub type FactArchive = UnionArchive<OrderedUniverse>;
 /// A live faculty store. Its snapshots freeze collection records, proofs, and
 /// residency observations while permitting shared async exact-blob reads.
 /// The network host starts only when an explicitly requested blob is missing.
-pub type FacultyStore = triblespace_net::peer::Peer<Pile>;
+/// Local writes remain available; foreground operations never serve the pile's
+/// resident inventory or activate collection replication.
+pub type FacultyStore = triblespace_net::peer::Leech<Pile>;
 
 /// The live store's frozen observation with an async exact-blob reader.
 pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
@@ -59,7 +61,7 @@ pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 /// A one-shot caller uses [`Self::new`]: each operation opens and closes its
 /// pile, reporting close errors before returning. A long-lived application
 /// uses [`Self::shared`] and passes clones to its faculties. Those clones
-/// share one lazy peer, pile indexes and I/O runtime, not collection views or
+/// share one lazy leech, pile indexes and I/O runtime, not collection views or
 /// snapshots. Construction and tool discovery perform no I/O in either case.
 ///
 /// A shared owner must call [`Self::close`] (or [`Self::finish`]) at shutdown

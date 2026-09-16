@@ -160,9 +160,9 @@ output. This is not backend-state repair or recovery from aborts, GPU failures,
 or out-of-memory termination.
 
 The aggregate catalogue owns one lazily opened store for its configured pile.
-All pile-backed adapters share its indexes, I/O runtime and lazy-fetch peer;
+All pile-backed adapters share its indexes, I/O runtime and lazy-fetch leech;
 tool calls and HTTP protocol sessions do not reopen the pile or restart that
-peer. Each operation still takes fresh snapshots, including newly appended
+leech. Each operation still takes fresh snapshots, including newly appended
 records from other processes. Collection views are never cached in this owner.
 Discovery remains I/O-free, and resident reads do not start the network host.
 
@@ -414,10 +414,13 @@ serially. A compatible running provider must hold and advertise the requested
 bytes. With no bootstrap route, a fresh foreground process cannot discover
 that application-level DHT merely from an Iroh relay address.
 
-Local reads, writes, and snapshots start no network host. The first cold read
-starts an ephemeral transport identity, separate from the pile signer and any
+The owning `Leech<Pile>` uses the ordinary store traits; callers do not need a
+separate reader API. Local reads, writes, and snapshots start no network host.
+The first cold read starts an ephemeral transport identity, separate from the pile signer and any
 running replication daemon. The foreground client subscribes to no collection
-gossip and advertises no providers. Exact blob handles remain the read
+gossip, builds no serving inventory, and advertises no providers, even after
+acquisition has started its host. That host still participates in discovery and
+DHT routing. Exact blob handles remain the read
 capability; acquisition neither authors a `WANT` nor follows every reference
 inside a blob. `WANT` remains explicit durable delegation to another process.
 

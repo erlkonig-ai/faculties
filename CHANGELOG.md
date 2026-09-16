@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Own a `Leech<Pile>` for foreground Faculty storage. Snapshots and exact
+  payload acquisitions retain the existing interfaces without building a
+  serving inventory. Local authored writes and close remain available; no
+  Message selection, maintenance policy or bearer-protocol change is included.
+
 - Orient wait reports already-due habits addressed to its persona from the
   first readable frame after each arm, until completion is visible in the
   maintained Habit view. Untargeted habits retain their quiet initial baseline;

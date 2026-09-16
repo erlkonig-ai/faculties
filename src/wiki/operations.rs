@@ -2437,7 +2437,8 @@ mod tests {
                     let before = pile.snapshot()?;
                     assert!(!before.contains_blob(cold)?);
                     let records = before.records()?.collect::<Result<Vec<_>, _>>()?;
-                    assert!(pile.wake_plane().is_none());
+                    assert!(pile.health().started_at.is_none());
+                    assert!(!pile.health().store.serving_snapshot);
 
                     runtime.block_on(views_in(
                         pile,
@@ -2467,7 +2468,13 @@ mod tests {
                     assert!(!after.contains_blob(cold)?);
                     assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, records);
                     assert_eq!(after.wants()?.count(), 0);
-                    assert!(pile.wake_plane().is_none(), "an unrelated source miss must not start the mesh");
+                    // Health is corroborating evidence: started_at is written
+                    // at host-loop entry, not at the startup handshake. The
+                    // Core Leech fixture checks its dormant state directly.
+                    assert!(pile.health().started_at.is_none(), "no host activity should be observed for an unrelated source miss");
+                    let health = pile.health();
+                    assert!(!health.store.serving_snapshot);
+                    assert!(health.store.last_snapshot_published_at.is_none());
                     Ok(())
                 })
                 .unwrap();
