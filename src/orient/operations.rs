@@ -3277,15 +3277,28 @@ fn observe_habits_in_observation(
     )
 }
 
-/// Evaluate the established wait's Habit context at an explicit timer
-/// boundary. Pure payload retries do not call this function.
+/// A timer sweep refreshes the same selected Habit context whose cached
+/// evaluation it replaces. A newer pending frame may already have readable
+/// habits even while its news body is missing; never copy an evaluation of
+/// `current` into that frame. Pure payload retries do not call this function.
 fn sweep_wait_habits(
     current: &OrientObservation,
     persona: Id,
-    _pending: &mut Option<PendingWaitFrame>,
+    pending: &mut Option<PendingWaitFrame>,
     pile_path: &Path,
     now_secs: i64,
 ) -> Result<HabitObservation> {
+    if let Some(pending) = pending.as_mut() {
+        if let (Some(persona), Some(_), Some(observation)) = (
+            pending.persona,
+            pending.habits.as_ref(),
+            pending.observation.as_ref(),
+        ) {
+            let habits = observe_habits_in_observation(observation, pile_path, now_secs, persona)?;
+            pending.habits = Some(habits.clone());
+            return Ok(habits);
+        }
+    }
     observe_habits_in_observation(current, pile_path, now_secs, persona)
 }
 
@@ -3739,9 +3752,9 @@ async fn cmd_wait(
                 continue;
             }
 
-            // A newer observation awaiting required view input never replaces
-            // `current`. Time-driven Habit transitions therefore remain
-            // observable from the last fully readable frame.
+            // Habit readiness is independent of a selected news body's
+            // availability. Sweep the ready pending Habit context when there
+            // is one, otherwise retain the last fully readable context.
             let current_habits = sweep_wait_habits(
                 &current,
                 persona_id,
