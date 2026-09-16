@@ -158,11 +158,16 @@ impl Message {
 
 /// Whether an operation only reads the maintained views or will edit the
 /// Message source. Readers attach the resident Succinct/Rank9 rollups as they
-/// stand and never run maintenance: carrying those lattices belongs to the
-/// selected maintenance worker, and a reader that maintained them duplicated
-/// its work on every `message list` (measured 2026-09-16 on sky: 67 to 175 s
-/// wall, 456 to 1,667 CPU-seconds per call at about 4 GB). An editor still
-/// maintains first so the fact it is about to change is in the view it checks.
+/// stand and run no semantic upkeep (registration may still put immutable
+/// descriptor blobs): carrying those lattices belongs to the selected
+/// maintenance worker, and a reader that maintained them duplicated its work.
+/// Measured 2026-09-16 on sky, Fac 92308e55 / Core 256898f2, one process,
+/// RAYON_NUM_THREADS unset: `message list --unread` cost 42.39 s wall and
+/// 171.24 s combined CPU with maintenance, 6.10 s wall and 6.40 s combined
+/// CPU without, listing the same messages. Acknowledgements, which still
+/// maintain, cost 67 to 175 s wall and 456 to 1,667 s combined CPU each in
+/// the same session; those are edit timings, not list timings. An editor
+/// still maintains first so the fact it changes is in the view it checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewIntent {
     Read,
@@ -1920,6 +1925,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let bytes_before = std::fs::metadata(file.path()).unwrap().len();
         let (_, _relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1939,6 +1945,13 @@ mod tests {
         assert_eq!(
             before, after,
             "a read must publish no DERIVE or MERGE record"
+        );
+        // Descriptor registration is idempotent: with the descriptors already
+        // resident, a read appends nothing to the pile at all.
+        assert_eq!(
+            std::fs::metadata(file.path()).unwrap().len(),
+            bytes_before,
+            "a read after registration must not append to the pile"
         );
         assert!(
             message::row_by_id(&message_facts, first_id).is_ok(),
