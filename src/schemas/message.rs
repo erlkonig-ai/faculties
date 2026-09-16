@@ -66,8 +66,9 @@ pub mod local {
 }
 
 /// Legacy branch-reader predicate retained for consumers not migrated in this
-/// lane. Native Message readers use the frozen-snapshot semantics in
-/// [`crate::message::is_inbox_message`].
+/// lane. Native Message readers ask for delivery instead: a typed query over
+/// `local::to`, or over the group snapshot frozen into the envelope at send
+/// time, joined to `group::member` in Relations.
 pub fn is_inbox_message(from: Id, to: Id, reader: Id, reader_groups: &HashSet<Id>) -> bool {
     from != reader && (to == reader || reader_groups.contains(&to))
 }

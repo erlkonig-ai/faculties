@@ -1,6 +1,7 @@
 //! Typed finite Message operations over one frozen Message/Relations observation.
 //! Text is literal; sender selection and output routing belong to the caller.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
@@ -247,7 +248,13 @@ fn fmt_id(id: Id) -> String {
 /// The columns of one envelope these operations read. Nothing else is
 /// selected, so a record carrying fields this reader does not model still
 /// answers, and one that is missing a field it does model simply does not.
-pub(crate) type Envelope = (Id, Id, Id, message::TextHandle, IntervalValue);
+/// The columns of one envelope these operations read, including the exact
+/// group snapshot that delivered it to this reader — `None` for a direct
+/// send. The delivering snapshot is a column of the join that selected the
+/// envelope, not a second lookup: an envelope naming two snapshots is
+/// delivered by the one that names the reader, and only that one may name
+/// the audience a listing shows.
+pub(crate) type Envelope = (Id, Id, Id, message::TextHandle, IntervalValue, Option<Id>);
 
 pub(crate) fn envelope_id(envelope: &Envelope) -> Id {
     envelope.0
@@ -285,11 +292,19 @@ where
                 metadata::created_at: ?created_at,
             }])
         )
-    );
+    )
+    .map(|(id, from, to, body, created_at)| (id, from, to, body, created_at, None));
     let delivered = find!(
-        (id: Id, from: Id, to: Id, body: message::TextHandle, created_at: IntervalValue),
+        (
+            id: Id,
+            from: Id,
+            to: Id,
+            body: message::TextHandle,
+            created_at: IntervalValue,
+            snapshot: Id
+        ),
         temp!(
-            (snapshot, member),
+            (member),
             and!(
                 SortedSlice::new_unchecked(mine).has(member),
                 pattern!(message_facts, [{ ?id @
@@ -303,10 +318,20 @@ where
                 pattern!(relation_facts, [{ ?snapshot @ relation_group::member: ?member }])
             )
         )
-    );
+    )
+    .map(|(id, from, to, body, created_at, snapshot)| {
+        (id, from, to, body, created_at, Some(snapshot))
+    });
+    // Sending is a property of the envelope, not of one witness of it: if any
+    // witness names this identity as the sender the envelope is outgoing, so
+    // inbox and outbox stay disjoint by id however many senders are asserted.
+    let sent: BTreeSet<Id> = outbox(message_facts, mine)
+        .iter()
+        .map(envelope_id)
+        .collect();
     direct
         .chain(delivered)
-        .filter(|(_, from, ..)| mine.binary_search(from).is_err())
+        .filter(|envelope| !sent.contains(&envelope_id(envelope)))
         .collect()
 }
 
@@ -328,6 +353,12 @@ where
             }])
         )
     )
+    .map(|(id, from, to, body, created_at)| {
+        // A sender's own envelope was not delivered *to* them, so its audience
+        // is whatever snapshot it names.
+        let snapshot = delivery_snapshot(message_facts, id);
+        (id, from, to, body, created_at, snapshot)
+    })
     .collect()
 }
 
@@ -341,6 +372,21 @@ where
         pattern!(message_facts, [{ message @ local::group_snapshot: ?snapshot }])
     )
     .next()
+}
+
+/// The envelopes among these witnesses that a sender selector accepts, reduced
+/// to one id each. Witnesses are filtered *before* the reduction: an envelope
+/// asserting two senders is selected when any of its witnesses matches, and
+/// reducing first would let an unmatched witness hide it.
+pub(crate) fn envelopes_from(envelopes: Vec<Envelope>, senders: Option<&[Id]>) -> Vec<Id> {
+    envelopes
+        .into_iter()
+        .filter(|(_, sender, ..)| {
+            senders.map_or(true, |senders| senders.binary_search(sender).is_ok())
+        })
+        .map(|envelope| envelope_id(&envelope))
+        .unique()
+        .collect()
 }
 
 /// Whether any canonical read marker about this envelope belongs to one of
@@ -521,15 +567,10 @@ async fn ack_all(
             let observed_at = clock::point_now()?;
             let mut fragment = Fragment::empty();
             let mut message_ids = Vec::new();
-            for (id, sender, ..) in inbox(message_facts, relation_facts, &mine)
-                .into_iter()
-                .unique_by(envelope_id)
-            {
-                if let Some(senders) = &senders {
-                    if senders.binary_search(&sender).is_err() {
-                        continue;
-                    }
-                }
+            for id in envelopes_from(
+                inbox(message_facts, relation_facts, &mine),
+                senders.as_deref(),
+            ) {
                 if read_by(message_facts, id, &mine) {
                     continue;
                 }
@@ -580,7 +621,7 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
 
     let observed_at = clock::point_now()?;
     let mut entries = Vec::new();
-    for (incoming, (id, from, to, body, created_at)) in candidates {
+    for (incoming, (id, from, to, body, created_at, delivered_through)) in candidates {
         if entries.len() >= options.limit {
             break;
         }
@@ -588,7 +629,6 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
         if options.unread && !(incoming && !read) {
             continue;
         }
-        let delivered_through = delivery_snapshot(message_facts, id);
         let from_label = person_label(storage.pile, relation_facts, from).await?;
         let to_label =
             recipient_label(storage.pile, relation_facts, id, to, delivered_through).await?;
@@ -1712,7 +1752,8 @@ mod tests {
             vec![id]
         );
         assert!(outbox(envelope.facts(), &mine).is_empty());
-        let (_, from, to, body, _) = delivered[0];
+        let (_, from, to, body, _, snapshot) = delivered[0];
+        assert_eq!(snapshot, None, "a direct send is delivered by no snapshot");
         let mut store = AcquiringPile::new(envelope.blobs().clone());
 
         assert_eq!(
@@ -2442,6 +2483,122 @@ mod tests {
         let stranger = settled_identity(&identities, unrelated);
         assert!(delivered_ids(&message_facts, &relation_facts, &stranger).is_empty());
         assert!(outbox(&message_facts, &stranger).is_empty());
+    }
+
+    /// Sending is a property of the envelope, not of one witness: an envelope
+    /// that names this reader as a sender anywhere is outgoing, even when
+    /// another witness names someone else, so inbox and outbox stay disjoint.
+    #[test]
+    fn a_second_sender_witness_does_not_put_my_own_envelope_in_my_inbox() {
+        let me = test_id(0x50);
+        let other_sender = test_id(0x51);
+        let relation_facts = person_anchor(me) + person_anchor(other_sender);
+
+        let envelope = message::envelope_fragment(me, me, test_body(), at(17.0), None, None);
+        let id = envelope.root().unwrap();
+        let mut message_facts = envelope.into_facts();
+        message_facts +=
+            entity! { ExclusiveId::force_ref(&id) @ local::from: other_sender }.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, me);
+        assert!(
+            delivered_ids(&message_facts, &relation_facts, &mine).is_empty(),
+            "an envelope I am a sender of is never in my inbox"
+        );
+        assert_eq!(
+            outbox(&message_facts, &mine)
+                .iter()
+                .map(envelope_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([id])
+        );
+    }
+
+    /// An envelope naming two snapshots is delivered by the one that names the
+    /// reader, and the row carries that snapshot so the audience a listing
+    /// shows cannot come from the other one.
+    #[test]
+    fn the_delivering_snapshot_is_the_one_that_names_the_reader() {
+        let sender = test_id(0x52);
+        let member = test_id(0x53);
+        let stranger = test_id(0x54);
+        let group = test_id(0x55);
+        let mut relation_facts =
+            person_anchor(sender) + person_anchor(member) + person_anchor(stranger);
+        relation_facts += entity! { ExclusiveId::force_ref(&group) @
+            metadata::tag: &crate::schemas::relations::KIND_GROUP
+        }
+        .into_facts();
+        let without =
+            relations::group_snapshot_fragment(group, "without", &[stranger], &[]).unwrap();
+        let without_id = without.root().unwrap();
+        relation_facts += without.into_facts();
+        let with =
+            relations::group_snapshot_fragment(group, "with", &[member], &[without_id]).unwrap();
+        let with_id = with.root().unwrap();
+        relation_facts += with.into_facts();
+
+        let envelope = message::envelope_fragment(
+            sender,
+            group,
+            test_body(),
+            at(18.0),
+            Some(without_id),
+            Some(crate::schemas::message::GROUP_SNAPSHOT_BASIS_WITNESSED),
+        );
+        let id = envelope.root().unwrap();
+        let mut message_facts = envelope.into_facts();
+        message_facts += entity! { ExclusiveId::force_ref(&id) @
+            local::group_snapshot: with_id,
+        }
+        .into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, member);
+        let delivered = inbox(&message_facts, &relation_facts, &mine);
+        assert_eq!(
+            delivered.iter().map(envelope_id).collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(
+            delivered[0].5,
+            Some(with_id),
+            "the snapshot that delivered it, not the one it also names"
+        );
+    }
+
+    /// `--from` selects an envelope when any witness names that sender, so a
+    /// second sender witness cannot hide it behind the reduction.
+    #[test]
+    fn a_sender_selector_matches_any_witness_of_the_envelope() {
+        let first = test_id(0x56);
+        let second = test_id(0x57);
+        let reader = test_id(0x58);
+        let relation_facts = person_anchor(first) + person_anchor(second) + person_anchor(reader);
+
+        let envelope = message::envelope_fragment(first, reader, test_body(), at(19.0), None, None);
+        let id = envelope.root().unwrap();
+        let mut message_facts = envelope.into_facts();
+        message_facts += entity! { ExclusiveId::force_ref(&id) @ local::from: second }.into_facts();
+
+        let identities = IdentityComponents::from_facts(&relation_facts).unwrap();
+        let mine = settled_identity(&identities, reader);
+        let delivered = inbox(&message_facts, &relation_facts, &mine);
+        assert_eq!(delivered.len(), 2, "both senders witness the envelope");
+        assert_eq!(envelopes_from(delivered.clone(), None), vec![id]);
+        for sender in [first, second] {
+            assert_eq!(
+                envelopes_from(
+                    delivered.clone(),
+                    Some(&settled_identity(&identities, sender))
+                ),
+                vec![id],
+                "selecting {sender:x} must find the envelope"
+            );
+        }
+        let absent = settled_identity(&identities, test_id(0x59));
+        assert!(envelopes_from(delivered, Some(&absent)).is_empty());
     }
 
     /// A second recipient naming another anchor of the same settled person is
