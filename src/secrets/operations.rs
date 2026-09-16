@@ -89,7 +89,13 @@ impl Secrets {
                 pile, collection, signer,
             ))?;
             secret_storage::maintain_selected_recipient_envelopes(
-                pile, signer, &snapshot, collection, signer, selected,
+                pile,
+                signer,
+                &snapshot,
+                collection,
+                signer,
+                selected,
+                clock::now()?,
             )
         })
     }

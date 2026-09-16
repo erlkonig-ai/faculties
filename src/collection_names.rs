@@ -207,8 +207,8 @@ where
 ///
 /// Unlike [`open_configured`], an exact override requires READ rather than
 /// WRITE admission. This is the appropriate boundary for consumers of a
-/// shared collection which never publish to it. Admission uses the frozen
-/// instant of the snapshot which supplies the descriptor and proof evidence.
+/// shared collection which never publish to it. Admission uses the descriptor
+/// and proof evidence in the supplied frozen snapshot.
 pub fn open_configured_read<S>(
     storage: &mut S,
     scope: Id,
@@ -244,8 +244,8 @@ where
     open_exact_descriptor_in(snapshot, scope, handle)
 }
 
-/// Open and validate one exact faculty descriptor for a READ-only consumer at
-/// the snapshot's frozen authorization instant.
+/// Open and validate one exact faculty descriptor for a READ-only consumer
+/// using the snapshot's frozen descriptor and proof evidence.
 pub fn open_exact_read_in<S>(
     snapshot: &S,
     scope: Id,
@@ -331,7 +331,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ed25519_dalek::SigningKey;
-    use hifitime::Epoch;
     use triblespace::core::capability::{CapabilityProof, CapabilityResource};
     use triblespace::core::collection::grant_collection_read;
     use triblespace::core::metadata;
@@ -472,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_read_open_is_independent_of_the_snapshot_clock() {
+    fn exact_read_open_reuses_unchanged_snapshot_evidence() {
         let operator = SigningKey::from_bytes(&[0x63; 32]);
         let reader = SigningKey::from_bytes(&[0x64; 32]);
         let mut store = MemoryRepo::default();
@@ -487,9 +486,10 @@ mod tests {
                 reader.verifying_key(),
             ))
             .unwrap();
-        let valid = store.snapshot_at(Epoch::from_unix_seconds(15.0)).unwrap();
-        let later = store.snapshot_at(Epoch::from_unix_seconds(21.0)).unwrap();
+        let valid = store.snapshot().unwrap();
+        let later = store.snapshot().unwrap();
         assert!(later.changes_since(&valid).is_empty());
+        assert!(valid.changes_since(&later).is_empty());
         assert!(open_exact_read_in(
             &later,
             wiki::DEFAULT_SCOPE_ID,

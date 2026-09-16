@@ -2168,7 +2168,7 @@ mod tests {
     use anybytes::Bytes;
     use std::fs::File;
     use triblespace::core::blob::MemoryBlobStoreSnapshot;
-    use triblespace::core::repo::{BlobStoreList, MissingBlob, StoreSnapshot, WantRead};
+    use triblespace::core::repo::{BlobStoreList, MissingBlob, WantRead};
 
     #[test]
     fn typst_validation_world_refuses_external_sources_and_files() {
@@ -2552,8 +2552,7 @@ mod tests {
         let mut original = None::<FacultySnapshot>;
         let (report, entry, title, content) = storage
             .view(|view| {
-                let original = original.get_or_insert_with(|| view.reader.clone());
-                assert_eq!(view.reader.instant(), original.instant());
+                original.get_or_insert_with(|| view.reader.clone());
                 let entry = mutation_entry(view, &format!("{root:x}"))?;
                 assert_eq!(
                     entry

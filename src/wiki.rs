@@ -2054,11 +2054,10 @@ mod tests {
         let collection =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let instant = store_snapshot.instant();
         let cover_before = collection.admitted(&store_snapshot).unwrap();
         let snapshot =
             pollster::block_on(materialize_indexed_collection(&mut pile, &signer)).unwrap();
-        let store_snapshot = pile.snapshot_at(instant).unwrap();
+        let store_snapshot = pile.snapshot().unwrap();
         let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
         assert!(exists!(

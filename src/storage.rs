@@ -38,7 +38,7 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StorageClose,
-    StoreRead, StoreSnapshot,
+    StoreRead,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
@@ -280,8 +280,8 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
 ///
 /// Capture the command's already-frozen facts/support in `read`. The argument
 /// is its blob reader: acquisition may replace this reader with a later
-/// resident snapshot, at the original authorization instant. It must not be
-/// used to choose a newer collection frontier. Report output and publish facts
+/// resident snapshot. It must not be used to choose a newer collection frontier
+/// or application evaluation time. Report output and publish facts
 /// only after this function succeeds, since the read may run more than once.
 pub async fn read<S, T>(
     store: &mut S,
@@ -313,7 +313,7 @@ where
         if store.acquire(missing.handle).await?.is_none() {
             return Err(error);
         }
-        reader = store.snapshot_at(snapshot.instant())?;
+        reader = store.snapshot()?;
     }
 }
 
@@ -890,11 +890,8 @@ mod tests {
             type Snapshot = triblespace::core::repo::pile::PileSnapshot;
             type SnapshotError = <Pile as SnapshotSource>::SnapshotError;
 
-            fn snapshot_at(
-                &mut self,
-                instant: hifitime::Epoch,
-            ) -> Result<Self::Snapshot, Self::SnapshotError> {
-                self.pile.snapshot_at(instant)
+            fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+                self.pile.snapshot()
             }
         }
         impl AsyncBlobStoreAcquire for Supply {
@@ -923,11 +920,8 @@ mod tests {
             payload,
             requested: Vec::new(),
         };
-        let before = store
-            .snapshot_at(hifitime::Epoch::from_tai_seconds(42.0))
-            .unwrap();
+        let before = store.snapshot().unwrap();
         let value = pollster::block_on(read(&mut store, &before, |reader| {
-            assert_eq!(reader.instant(), before.instant());
             let bytes = reader.get::<Bytes, UnknownBlob>(handle)?;
             Ok(bytes)
         }))

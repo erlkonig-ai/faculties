@@ -179,9 +179,10 @@ pub(crate) fn recipients<R>(
     reader: &R,
     collection: CollectionHandle,
     binding: &envelope::BoundKey,
+    now: Epoch,
 ) -> Result<Vec<VerifyingKey>>
 where
-    R: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + CapabilityProofRead,
 {
     let Ok(facts) = reader.get::<TribleSet, _>(binding.resource) else {
         return Ok(Vec::new());
@@ -212,7 +213,7 @@ where
                     ACTION_KEY_DELIVERY,
                 ),
                 NonZeroUsize::new(quorum.invoke_threshold() as usize).expect("validated quorum"),
-                |prefix| delivery_prefix_is_current(reader, prefix, reader.instant()),
+                |prefix| delivery_prefix_is_current(reader, prefix, now),
             )
             .into_iter()
             .map(|key| key.to_bytes()),
@@ -470,7 +471,12 @@ mod tests {
         let current = storage::snapshot(after_grant, collection).unwrap();
         assert_eq!(
             storage::maintain_recipient_envelopes(
-                &mut store, &alice, &current, collection, &alice,
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(100.0),
             )
             .unwrap(),
             1
@@ -506,6 +512,7 @@ mod tests {
                 collection,
                 &alice,
                 &[SecretTarget::Resource(second_resource)],
+                Epoch::from_unix_seconds(100.0),
             )
             .unwrap(),
             1
@@ -595,17 +602,34 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let current = store.snapshot_at(Epoch::from_unix_seconds(100.0)).unwrap();
+        let current = store.snapshot().unwrap();
         assert_eq!(
-            recipients(&current, collection, &binding).unwrap(),
+            recipients(
+                &current,
+                collection,
+                &binding,
+                Epoch::from_unix_seconds(100.0)
+            )
+            .unwrap(),
             vec![bob.verifying_key()]
         );
-        let expired = store.snapshot_at(Epoch::from_unix_seconds(150.0)).unwrap();
-        assert!(recipients(&expired, collection, &binding)
-            .unwrap()
-            .is_empty());
-        let early = store.snapshot_at(Epoch::from_unix_seconds(40.0)).unwrap();
-        let audience = recipients(&early, collection, &binding).unwrap();
+        // One immutable evidence view supports different delivery instants;
+        // changing evaluation time does not need a new storage observation.
+        assert!(recipients(
+            &current,
+            collection,
+            &binding,
+            Epoch::from_unix_seconds(150.0)
+        )
+        .unwrap()
+        .is_empty());
+        let audience = recipients(
+            &current,
+            collection,
+            &binding,
+            Epoch::from_unix_seconds(40.0),
+        )
+        .unwrap();
         assert!(audience.contains(&bob.verifying_key()));
         assert!(audience.contains(&carol.verifying_key()));
     }

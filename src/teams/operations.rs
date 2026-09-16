@@ -3708,7 +3708,6 @@ mod tests {
         let secrets_reader = session.secrets.store_snapshot();
         assert!(session.reader.changes_since(secrets_reader).is_empty());
         assert!(secrets_reader.changes_since(&session.reader).is_empty());
-        assert_eq!(session.reader.instant(), secrets_reader.instant());
     }
 
     fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id) {

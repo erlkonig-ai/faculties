@@ -808,8 +808,8 @@ mod tests {
         type Snapshot = PileSnapshot;
         type SnapshotError = ReadError;
 
-        fn snapshot_at(&mut self, instant: Epoch) -> Result<PileSnapshot, ReadError> {
-            self.pile.snapshot_at(instant)
+        fn snapshot(&mut self) -> Result<PileSnapshot, ReadError> {
+            self.pile.snapshot()
         }
     }
 
@@ -2087,7 +2087,6 @@ mod tests {
         store.arriving = Some((source, signer, successor));
 
         let outcome = pollster::block_on(storage::read(&mut store, &before, |reader| {
-            assert_eq!(reader.instant(), before.instant());
             message::resolve_person(reader, &facts, "original label")
         }))
         .unwrap();

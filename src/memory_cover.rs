@@ -1357,9 +1357,7 @@ mod recollection_tests {
             ctx::start_at: point(100.0),
             ctx::end_at: point(200.0),
         };
-        let reader = blobs
-            .snapshot_at(Epoch::from_tai_seconds(300.0))
-            .expect("in-memory snapshot is infallible");
+        let reader = blobs.snapshot().expect("in-memory snapshot is infallible");
         let report = render_cover_report(
             facts.facts(),
             &TribleSet::new(),
