@@ -3471,6 +3471,7 @@ async fn cmd_wait(
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
+            let mut swept: Option<(HabitObservation, String)> = None;
             if let Some(pending) = pending_frame.as_ref() {
                 if let (Some(persona), Some(habits), Some(observation)) = (
                     pending.persona,
@@ -3510,24 +3511,29 @@ async fn cmd_wait(
                                 )?;
                                 let habit_report = render_habit_transitions(seen, &current_habits)
                                     .unwrap_or_default();
-                                pending_habits_seen = Some(current_habits);
-                                last_pending_sweep = Instant::now();
-                                if !habit_report.is_empty() {
-                                    // A habit-only report acknowledges no news.
-                                    write_complete_report(
-                                        output,
-                                        &habit_report,
-                                        "Orient habit report",
-                                    )?;
-                                    return Ok(WaitOutcome {
-                                        news_printed: true,
-                                        view_pending: true,
-                                        had_ready_frame: false,
-                                    });
-                                }
+                                swept = Some((current_habits, habit_report));
                             }
                         }
                     }
+                }
+            }
+            if let Some((current_habits, habit_report)) = swept {
+                // The sweep's observation is what the retained frame carries
+                // into Ready, so Ready compares against what was last seen and
+                // never against the observation its first preparation cached.
+                if let Some(pending) = pending_frame.as_mut() {
+                    pending.habits = Some(current_habits.clone());
+                }
+                pending_habits_seen = Some(current_habits);
+                last_pending_sweep = Instant::now();
+                if !habit_report.is_empty() {
+                    // A habit-only report acknowledges no news.
+                    write_complete_report(output, &habit_report, "Orient habit report")?;
+                    return Ok(WaitOutcome {
+                        news_printed: true,
+                        view_pending: true,
+                        had_ready_frame: false,
+                    });
                 }
             }
             view_pending = true;
@@ -5327,6 +5333,89 @@ mod tests {
         assert!(stored_presentations(&mut pile, &fixture.signer, cc).is_empty());
         pile.close().unwrap();
         drop(wiring);
+    }
+
+    #[test]
+    fn a_sweep_refreshes_the_observation_the_retained_frame_carries_into_ready() {
+        let fixture = TestPile::new();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let sources =
+            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let cc = id(22);
+        let sender = id(23);
+        let (person, _, _) = relations::person_fragment(
+            cc,
+            crate::relations::ProfileInput {
+                label: "cc".to_owned(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pile.commit(sources.relations.source, &fixture.signer, person)
+            .unwrap();
+        // A message whose body arrives only after the first timer sweep.
+        let mut remote = MemoryRepo::default();
+        let body = remote
+            .put::<blobencodings::UTF8String, _>("arrives after the sweep".to_owned())
+            .unwrap();
+        pile.commit(
+            sources.messages.source,
+            &fixture.signer,
+            message::envelope_fragment(
+                sender,
+                cc,
+                body,
+                clock::point(Epoch::from_tai_seconds(42.0)).unwrap(),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        // A shared script intention that is due at arm (the quiet baseline)
+        // and no longer due at the first sweep.
+        let marker = fixture.dir.join("due-marker");
+        fs::write(&marker, b"").unwrap();
+        let (probe, _) =
+            habits::habit_fragment("probe", "when test -e due-marker", "probe", None, &[], &[])
+                .unwrap();
+        pile.commit(
+            sources.habits.as_ref().unwrap().source,
+            &fixture.signer,
+            probe,
+        )
+        .unwrap();
+        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+
+        let path = fixture.path.clone();
+        let deliverer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            fs::remove_file(&marker).unwrap();
+            std::thread::sleep(Duration::from_secs(64));
+            let mut second = open_store(&path).unwrap();
+            second
+                .put::<blobencodings::UTF8String, _>("arrives after the sweep".to_owned())
+                .unwrap();
+            second.close().unwrap();
+        });
+        let text = run_wait_for(
+            &mut pile,
+            &fixture,
+            "cc",
+            Duration::from_secs(80),
+            Duration::from_millis(200),
+        );
+        deliverer.join().unwrap();
+        assert!(
+            text.contains("News: new message"),
+            "the body must land within the wait: {text}"
+        );
+        // Ready compares the last sweep's observation, where the probe is no
+        // longer due, never the first preparation's, where it was.
+        assert!(
+            !text.contains("became due"),
+            "a stale cached observation was carried into Ready: {text}"
+        );
+        pile.close().unwrap();
     }
 
     fn stored_presentations(
