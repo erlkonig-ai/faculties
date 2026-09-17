@@ -61,17 +61,10 @@ cargo install --path ../triblespace-rs/trible --locked
 ```
 
 That recipe targets the local CPU; use target-appropriate flags for portable
-or cross-compiled artifacts. In particular, the AArch64 half-precision math
-dependency (`gemm-f16`, reached through the default `local-embed` feature)
-wraps raw FP16 inline assembly in ordinary `#[inline]` functions, so it needs
-an FP16-capable target during code generation rather than only at runtime.
-`aarch64-apple-darwin` enables `fp16` in its default baseline and
-`aarch64-unknown-linux-gnu` does not, which is why this build fails only on
-Linux; `.cargo/config.toml` supplies `-Ctarget-feature=+fp16` for that triple.
-Cargo picks exactly one rustflags source, so a `RUSTFLAGS` environment
-variable replaces that setting instead of merging with it:
-`-Ctarget-cpu=native` is a superset and stays fine, but an unrelated
-`RUSTFLAGS` value silently drops `+fp16` and the build fails in `gemm-f16`.
+or cross-compiled artifacts. Note that Cargo picks exactly ONE rustflags
+source: a `RUSTFLAGS` environment variable REPLACES whatever
+`.cargo/config.toml` sets rather than merging with it, so a flag added to the
+environment for an unrelated reason silently drops the config's flags.
 
 The cohort installer publishes one content-verified, versioned generation
 through `~/.local/bin`. Each generation path is write-once by the installer,
