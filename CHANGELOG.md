@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient suppresses Compass/status-window activity attributed to the observing
+  persona through any settled same-person anchor, including repeated author
+  fields. Unknown authors remain visible: callers must provide `--persona` or
+  `PERSONA` to author attributable Compass actions; a shared signing key is not
+  a persona. Due Habit reminders and health alerts remain attention events,
+  not echoes of their creator's actions.
+
 - Add `orient daemon`: one persistent store and observation loop, delivering
   complete reports to an explicit executable callback over stdin. Callback
   exit zero precedes the existing Presented receipt; failure stops the daemon

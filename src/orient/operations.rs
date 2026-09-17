@@ -545,7 +545,7 @@ fn entity_tags<P: TriblePattern>(space: &P, entity_id: Id) -> Vec<String> {
 
 fn visible_notes<P: TriblePattern>(
     space: &P,
-    persona_id: Id,
+    own_identities: &HashSet<Id>,
     attention_keys: &HashSet<String>,
     relevant_goals: &HashSet<Id>,
 ) -> BTreeMap<Id, Id> {
@@ -562,7 +562,10 @@ fn visible_notes<P: TriblePattern>(
             { ?goal_id @ metadata::tag: &KIND_GOAL_ID },
         ])
     ) {
-        let own_note = exists!(pattern!(space, [{ note_id @ board::by: &persona_id }]));
+        let own_note = exists!((by: Id), and!(
+            own_identities.has(by),
+            pattern!(space, [{ note_id @ board::by: ?by }])
+        ));
         if own_note {
             continue;
         }
@@ -2681,6 +2684,12 @@ impl AttentionView {
 /// durable state consists only of receipt facts in the zooid's collection.
 fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<AttentionView> {
     let mut view = AttentionView::default();
+    // Attribution is relational: settled same-person anchors are also self.
+    // An absent actor remains unknown, never inferred from a shared signing key.
+    let own_identities: HashSet<Id> = IdentityIndex::from_relations(query.relations)
+        .component(persona_id)?
+        .into_iter()
+        .collect();
     for row in unread_messages(query, persona_id)? {
         view.insert(AttentionEvent::Message(row.id));
     }
@@ -2695,19 +2704,19 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
 
     let mut relevant_goals = HashSet::new();
     for id in find!(id: Id, pattern!(query.compass, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
-        let authored_status = exists!(pattern!(query.compass, [{
+        let authored_status = exists!((by: Id), and!(own_identities.has(by), pattern!(query.compass, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
             board::status_of: &id,
-            board::by: &persona_id,
-        }]));
-        let authored_note = exists!(pattern!(query.compass, [{
+            board::by: ?by,
+        }])));
+        let authored_note = exists!((by: Id), and!(own_identities.has(by), pattern!(query.compass, [{
             _?evt @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &id,
             board::note: _?body,
-            board::by: &persona_id,
-        }]));
+            board::by: ?by,
+        }])));
         let involved = authored_status || authored_note;
         let tags = entity_tags(query.compass, id);
         let addressed = tags
@@ -2717,12 +2726,11 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
             relevant_goals.insert(id);
             match latest_goal_status(query, id) {
                 Some((event, status, _)) => {
-                    let by = find!(
-                        by: Id,
+                    let authored = exists!((by: Id), and!(
+                        own_identities.has(by),
                         pattern!(query.compass, [{ event @ board::by: ?by }])
-                    )
-                    .next();
-                    if by != Some(persona_id) {
+                    ));
+                    if !authored {
                         view.insert(AttentionEvent::Goal {
                             event,
                             goal: id,
@@ -2740,12 +2748,17 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
         }
     }
 
-    for (note, goal) in visible_notes(query.compass, persona_id, &attention_keys, &relevant_goals) {
+    for (note, goal) in visible_notes(
+        query.compass,
+        &own_identities,
+        &attention_keys,
+        &relevant_goals,
+    ) {
         view.insert(AttentionEvent::Note { note, goal });
     }
 
     for window in status_roster(query)? {
-        if window != persona_id {
+        if !own_identities.contains(&window) {
             view.insert(AttentionEvent::StatusWindow(window));
         }
     }
@@ -4484,6 +4497,108 @@ mod tests {
 
     fn archive(facts: &TribleSet) -> FactArchive {
         UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(facts)])
+    }
+
+    #[test]
+    fn attention_excludes_every_self_attribution_but_keeps_unknown_and_other_actors() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let persona = id(200);
+            let alias = id(201);
+            let other = id(1);
+            let mut people = Fragment::empty();
+            for (person, label) in [
+                (persona, "observer"),
+                (alias, "old-observer"),
+                (other, "peer"),
+            ] {
+                people += relations::person_fragment(
+                    person,
+                    relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .0;
+            }
+            people += entity! {
+                metadata::tag: &KIND_IDENTITY_VERDICT,
+                relation_identity::low: &persona,
+                relation_identity::high: &alias,
+                relation_identity::same: true,
+            };
+            pile.commit(sources.relations.source, &fixture.signer, people)
+                .unwrap();
+
+            let now = clock::point_now().unwrap();
+            let mut facts = Fragment::empty();
+            let mut expected = BTreeSet::from([other]);
+            // The mixed event puts the external actor first in key order:
+            // choosing just one attribution cannot establish "not mine".
+            for (label, actor, extra_self, visible) in [
+                ("exact", Some(persona), false, false),
+                ("alias", Some(alias), false, false),
+                ("mixed", Some(other), true, false),
+                ("external", Some(other), false, true),
+                ("unknown", None, false, true),
+            ] {
+                let (goal, goal_id) =
+                    compass::goal_fragment(label, vec!["observer".to_owned()], None, now).unwrap();
+                facts += goal;
+                let mut status = compass::status_fragment(goal_id, "doing", actor, now).unwrap();
+                let status_id = status.root().unwrap();
+                let (mut note, note_id) =
+                    compass::note_fragment(goal_id, label, vec![], vec![], vec![], actor, now)
+                        .unwrap();
+                if extra_self {
+                    status += entity! { ExclusiveId::force_ref(&status_id) @ board::by: &alias };
+                    note += entity! { ExclusiveId::force_ref(&note_id) @ board::by: &alias };
+                }
+                facts += status;
+                facts += note;
+                if visible {
+                    expected.extend([status_id, note_id]);
+                }
+            }
+            // Involvement follows the same settled identity relation: another
+            // person's later update on an untagged goal still deserves attention.
+            let (goal, goal_id) = compass::goal_fragment("involved", vec![], None, now).unwrap();
+            facts += goal;
+            facts +=
+                compass::note_fragment(goal_id, "mine", vec![], vec![], vec![], Some(alias), now)
+                    .unwrap()
+                    .0;
+            let status = compass::status_fragment(goal_id, "done", Some(other), now).unwrap();
+            expected.insert(status.root().unwrap());
+            facts += status;
+            // A goal without a status/actor is likewise unknown, not self.
+            let (goal, goal_id) =
+                compass::goal_fragment("bare", vec!["observer".to_owned()], None, now).unwrap();
+            facts += goal;
+            expected.insert(goal_id);
+            pile.commit(sources.compass.source, &fixture.signer, facts)
+                .unwrap();
+            let mut windows = Fragment::empty();
+            for window in [persona, alias, other] {
+                windows +=
+                    entity! { metadata::tag: &KIND_STATUS_UPDATE, window_status::window: &window };
+            }
+            pile.commit(sources.status.source, &fixture.signer, windows)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let view =
+                load_attention_view(&observation.query(&observation.snapshot), persona).unwrap();
+            assert_eq!(view.ids().collect::<BTreeSet<_>>(), expected);
+            pile.close().unwrap();
+        });
     }
 
     #[test]
