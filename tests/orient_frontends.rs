@@ -306,6 +306,199 @@ fn text(parts: &[Part]) -> String {
 }
 
 #[test]
+fn daemon_keeps_observing_after_delivery_and_records_only_accepted_reports() {
+    let f = Fixture::new();
+    let first = f.message("daemon first delivery", f.persona);
+    let mut second = None;
+    let mut parts = Vec::new();
+    f.orient()
+        .daemon(
+            &f.who(),
+            &WaitOptions {
+                timeout: Some(Duration::from_secs(2)),
+                poll_interval: Duration::from_millis(10),
+            },
+            &mut Out::new(&mut |part| {
+                let Part::Text { text } = &part else {
+                    panic!("text expected")
+                };
+                assert!(text.starts_with("News: "), "not a delivery: {text}");
+                if second.is_none() {
+                    assert!(text.contains("daemon first delivery"));
+                    assert!(
+                        !f.presented().contains(&first),
+                        "receipt precedes acceptance"
+                    );
+                    // A real second Pile owner appends while the daemon remains
+                    // inside the same operation. No external maintenance call.
+                    second = Some(f.message("daemon subsequent arrival", f.persona));
+                }
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        parts.len(),
+        2,
+        "neither receipt writes nor timeout are news: {parts:?}"
+    );
+    assert!(text(&parts[1..]).contains("daemon subsequent arrival"));
+    let receipts = f.presented();
+    assert!(receipts.contains(&first));
+    assert!(receipts.contains(&second.unwrap()));
+    let restarted = f.call("orient_poll", json!({"persona": f.who()}));
+    assert!(
+        restarted.is_empty(),
+        "accepted reports must remain seen after close"
+    );
+}
+
+#[test]
+fn daemon_failed_delivery_is_not_seen_and_is_not_retried_in_process() {
+    let f = Fixture::new();
+    let event = f.message("daemon rejected report", f.persona);
+    let mut calls = 0;
+    let result = f.orient().daemon(
+        &f.who(),
+        &WaitOptions::default(),
+        &mut Out::new(&mut |_| {
+            calls += 1;
+            anyhow::bail!("injected delivery failure")
+        }),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("injected delivery failure"));
+    assert_eq!(calls, 1);
+    assert!(!f.presented().contains(&event));
+    assert!(text(&f.call("orient_poll", json!({"persona": f.who()})))
+        .contains("daemon rejected report"));
+}
+
+#[test]
+fn daemon_retains_due_habit_baseline_across_other_news_and_own_receipts() {
+    let f = Fixture::new();
+    let (habit, _) = faculties::habits::habit_fragment(
+        "daemon clock",
+        "every 1h",
+        "do the thing",
+        None,
+        &[],
+        &[f.persona],
+    )
+    .unwrap();
+    f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
+    let mut parts = Vec::new();
+    f.orient()
+        .daemon(
+            &f.who(),
+            &WaitOptions {
+                timeout: Some(Duration::from_secs(2)),
+                poll_interval: Duration::from_millis(10),
+            },
+            &mut Out::new(&mut |part| {
+                if parts.is_empty() {
+                    assert!(text(std::slice::from_ref(&part)).contains("daemon clock"));
+                    f.message("unrelated to unchanged due clock", f.persona);
+                }
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let report = text(&parts);
+    assert_eq!(report.matches("News: habit [").count(), 1, "{report}");
+    assert!(report.contains("unrelated to unchanged due clock"));
+    assert_eq!(
+        parts.len(),
+        2,
+        "timeout must be silent and due state must not spin"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_cli_has_one_callback_channel_and_failure_does_not_acknowledge() {
+    for success in [true, false] {
+        let f = Fixture::new();
+        let event = f.message("one callback, no stdout copy", f.persona);
+        let report = f.directory.path().join("delivered");
+        let code = if success { "0" } else { "7" };
+        let result = f
+            .process(None)
+            .args([
+                "daemon",
+                "--poll-ms",
+                "10",
+                "--run-for",
+                "1s",
+                "--callback",
+                "/bin/sh",
+                "--callback-arg=-c",
+                "--callback-arg",
+                "cat >> \"$1\"; printf 'not another report'; exit \"$2\"",
+                "--callback-arg",
+                "delivery",
+                "--callback-arg",
+            ])
+            .arg(&report)
+            .args(["--callback-arg", code])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.success(), success, "{:?}", result);
+        assert!(
+            result.stdout.is_empty(),
+            "callback output must not duplicate news"
+        );
+        let delivered = fs::read_to_string(report).unwrap();
+        assert_eq!(delivered.matches("News: new message [").count(), 1);
+        assert_eq!(f.presented().contains(&event), success);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_sigterm_closes_normally_after_delivery() {
+    let f = Fixture::new();
+    let event = f.message("stop the persistent observer", f.persona);
+    let report = f.directory.path().join("delivered");
+    let mut child = f
+        .process(None)
+        .args([
+            "daemon",
+            "--poll-ms",
+            "10",
+            "--run-for",
+            "10s",
+            "--callback",
+            "/bin/sh",
+            "--callback-arg=-c",
+            "--callback-arg",
+            "cat > \"$1\"",
+            "--callback-arg",
+            "delivery",
+            "--callback-arg",
+        ])
+        .arg(&report)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !report.exists() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The callback and receipt publication complete synchronously before the
+    // observer yields to its signal boundary.
+    let signalled = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let result = child.wait_with_output().unwrap();
+    assert!(report.exists(), "daemon never delivered: {:?}", result);
+    assert_eq!(signalled, 0);
+    assert!(result.status.success(), "normal close: {:?}", result);
+    assert!(result.stdout.is_empty());
+    assert!(f.presented().contains(&event));
+}
+
+#[test]
 fn refresh_probe_is_opt_in_stderr_only_and_preserves_peek() {
     let f = Fixture::new();
     f.message("diagnostic must not change the report", f.persona);

@@ -1,4 +1,4 @@
-//! Reusable Orient observations and one-shot waiting, independent of argv and stdout.
+//! Reusable Orient observations and persistent or one-shot waiting.
 //!
 //! Facts, proof evidence and selected event IDs remain frozen while
 //! exact payloads are acquired. Application evaluation time is explicit.
@@ -166,6 +166,39 @@ impl Orient {
                 self.health_max_age,
                 out,
             ))
+        })
+    }
+
+    /// Keep one store, input selection and Habit transition baseline alive
+    /// across accepted reports. The output sink is the sole delivery boundary:
+    /// an error ends the daemon before that report's receipts are committed.
+    /// SIGINT/SIGTERM or the optional monotonic timeout ends observation and
+    /// returns through the ordinary checked storage-close path. A synchronous
+    /// output sink must bound its own execution time.
+    pub fn daemon(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(async {
+                #[cfg(unix)]
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                let stop = async {
+                    #[cfg(unix)]
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => result?,
+                        _ = terminate.recv() => {},
+                    }
+                    #[cfg(not(unix))]
+                    tokio::signal::ctrl_c().await?;
+                    Ok::<(), anyhow::Error>(())
+                };
+                tokio::select! {
+                    result = stop => result,
+                    result = cmd_observe(
+                        pile, signer, self.storage.path(), Some(persona), options,
+                        self.health_max_age, true, out,
+                    ) => result,
+                }
+            })
         })
     }
 }
@@ -3567,6 +3600,32 @@ async fn cmd_wait(
     health_max_age: Duration,
     output: &mut Out<'_>,
 ) -> Result<()> {
+    cmd_observe(
+        pile,
+        signer,
+        pile_path,
+        persona,
+        options,
+        health_max_age,
+        false,
+        output,
+    )
+    .await
+}
+
+/// Both frontends use the same state machine. Continuous observation does not
+/// re-open the pile, re-arm already-due habits, or discard pending reads after
+/// a delivery. Successful output still precedes the existing receipt COMMIT.
+async fn cmd_observe(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    pile_path: &Path,
+    persona: Option<&str>,
+    options: &WaitOptions,
+    health_max_age: Duration,
+    continuous: bool,
+    output: &mut Out<'_>,
+) -> Result<()> {
     let Some(persona_input) = persona else {
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
@@ -3590,7 +3649,7 @@ async fn cmd_wait(
         let sources = loop {
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
-            if fired {
+            if fired && !continuous {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     view_pending: false,
@@ -3612,7 +3671,7 @@ async fn cmd_wait(
         let initial = loop {
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
-            if fired {
+            if fired && !continuous {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     view_pending: false,
@@ -3717,11 +3776,13 @@ async fn cmd_wait(
                             last_pending_sweep = Instant::now();
                             if !owned_due.is_empty() {
                                 write_complete_report(output, &owned_due, "Orient habit report")?;
-                                return Ok(WaitOutcome {
-                                    news_printed: true,
-                                    view_pending: true,
-                                    had_ready_frame: false,
-                                });
+                                if !continuous {
+                                    return Ok(WaitOutcome {
+                                        news_printed: true,
+                                        view_pending: true,
+                                        had_ready_frame: false,
+                                    });
+                                }
                             }
                         }
                         Some(seen) => {
@@ -3758,11 +3819,13 @@ async fn cmd_wait(
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
                     write_complete_report(output, &habit_report, "Orient habit report")?;
-                    return Ok(WaitOutcome {
-                        news_printed: true,
-                        view_pending: true,
-                        had_ready_frame: false,
-                    });
+                    if !continuous {
+                        return Ok(WaitOutcome {
+                            news_printed: true,
+                            view_pending: true,
+                            had_ready_frame: false,
+                        });
+                    }
                 }
             }
             view_pending = true;
@@ -3815,7 +3878,7 @@ async fn cmd_wait(
         .unwrap_or_default();
         let arm_fired = !arm_report.is_empty();
         apply_prepared_news(pile, signer, false, &news, &arm_report, output)?;
-        if initial_report || arm_fired {
+        if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
                 news_printed: true,
                 view_pending: false,
@@ -3841,7 +3904,7 @@ async fn cmd_wait(
             tokio::time::sleep(sleep).await;
             let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
             next_health_change = deadline;
-            if fired {
+            if fired && !continuous {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     view_pending: false,
@@ -3937,7 +4000,7 @@ async fn cmd_wait(
                             &habit_report,
                             output,
                         )?;
-                        if habit_fired || ordinary_fired {
+                        if (habit_fired || ordinary_fired) && !continuous {
                             return Ok(WaitOutcome {
                                 news_printed: true,
                                 view_pending: false,
@@ -4009,7 +4072,7 @@ async fn cmd_wait(
             }
             habit_seen = current_habits;
             last_habit_sweep = Instant::now();
-            if habit_fired {
+            if habit_fired && !continuous {
                 return Ok(WaitOutcome {
                     news_printed: true,
                     view_pending,
@@ -4020,6 +4083,10 @@ async fn cmd_wait(
     }
     .await;
     let outcome = result?;
+    if continuous {
+        // Timeout/shutdown is not news and must never invoke the delivery sink.
+        return Ok(());
+    }
     if outcome.news_printed {
         // Terse path: the News: reasons and the novel detail were already
         // printed inside the wait loop — don't re-dump the full snapshot.
