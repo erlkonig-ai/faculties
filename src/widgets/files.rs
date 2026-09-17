@@ -44,7 +44,7 @@ use triblespace::prelude::*;
 
 use crate::files::{ContentHandle, NameHandle};
 use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT};
-use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::widgets::storage::DatasetView;
 
 /// Cap on the number of import cards rendered. Older imports remain
 /// in the pile; the `files imports` CLI is the right tool for long
@@ -99,109 +99,99 @@ struct ImportRow {
     is_reimport: bool,
 }
 
-struct FilesLive {
-    cached_revision: DatasetRevision,
-    imports: Vec<ImportRow>,
-    total: usize,
-}
+// ── Point-of-use query ───────────────────────────────────────────────
 
-// ── Live snapshot ────────────────────────────────────────────────────
-
-impl FilesLive {
-    fn refresh(dataset: DatasetView<'_>) -> Self {
-        let mut imports = Vec::new();
-        for (id, imported_at, source_path, root) in find!(
-            (
-                id: Id,
-                imported_at: Inline<NsTAIInterval>,
-                source_path: Inline<Handle<UTF8String>>,
-                root: Id
-            ),
-            pattern!(dataset.facts, [{
-                ?id @ metadata::tag: &KIND_IMPORT,
-                file::imported_at: ?imported_at,
-                file::source_path: ?source_path,
-                file::root: ?root,
-            }])
-        ) {
-            let Ok((imported_at, _)): Result<(Epoch, Epoch), _> = imported_at.try_from_inline()
-            else {
-                continue;
-            };
-            let Some(imported_at) = epoch_to_chrono(imported_at).ok() else {
-                continue;
-            };
-            let Ok(source_path): Result<anybytes::View<str>, _> = dataset.reader.get(source_path)
-            else {
-                continue;
-            };
-            let tags = find!(
-                value: Inline<ShortString>,
-                pattern!(dataset.facts, [{ id @ file::tag: ?value }])
-            )
-            .filter_map(|value| String::try_from_inline(&value).ok())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-            imports.push(ImportRow {
-                id,
-                imported_at,
-                source_path: source_path.to_string(),
-                root,
-                tags,
-                is_reimport: false,
-            });
-        }
-        imports.sort_by(|left, right| {
-            (
-                left.id,
-                left.imported_at,
-                &left.source_path,
-                left.root,
-                &left.tags,
-            )
-                .cmp(&(
-                    right.id,
-                    right.imported_at,
-                    &right.source_path,
-                    right.root,
-                    &right.tags,
-                ))
+/// Query only the imports needed for this render. The returned rows are
+/// operation-local presentation values: they are dropped after the frame and
+/// never retained as a second Files model.
+fn query_imports(dataset: DatasetView<'_>) -> (Vec<ImportRow>, usize) {
+    let mut imports = Vec::new();
+    for (id, imported_at, source_path, root) in find!(
+        (
+            id: Id,
+            imported_at: Inline<NsTAIInterval>,
+            source_path: Inline<Handle<UTF8String>>,
+            root: Id
+        ),
+        pattern!(dataset.facts, [{
+            ?id @ metadata::tag: &KIND_IMPORT,
+            file::imported_at: ?imported_at,
+            file::source_path: ?source_path,
+            file::root: ?root,
+        }])
+    ) {
+        let Ok((imported_at, _)): Result<(Epoch, Epoch), _> = imported_at.try_from_inline() else {
+            continue;
+        };
+        let Some(imported_at) = epoch_to_chrono(imported_at).ok() else {
+            continue;
+        };
+        let Ok(source_path): Result<anybytes::View<str>, _> = dataset.reader.get(source_path)
+        else {
+            continue;
+        };
+        let tags = find!(
+            value: Inline<ShortString>,
+            pattern!(dataset.facts, [{ id @ file::tag: ?value }])
+        )
+        .filter_map(|value| String::try_from_inline(&value).ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+        imports.push(ImportRow {
+            id,
+            imported_at,
+            source_path: source_path.to_string(),
+            root,
+            tags,
+            is_reimport: false,
         });
-        imports.dedup_by(|left, right| {
-            left.id == right.id
-                && left.imported_at == right.imported_at
-                && left.source_path == right.source_path
-                && left.root == right.root
-                && left.tags == right.tags
-        });
-        let total = imports.len();
-
-        // Re-import is a set property. No traversal order establishes which
-        // import was "first" or which one supersedes another.
-        let mut path_counts = BTreeMap::<&str, usize>::new();
-        for row in &imports {
-            *path_counts.entry(&row.source_path).or_insert(0) += 1;
-        }
-        let duplicate_paths = path_counts
-            .into_iter()
-            .filter_map(|(path, count)| (count > 1).then_some(path.to_owned()))
-            .collect::<BTreeSet<_>>();
-        for row in &mut imports {
-            row.is_reimport = duplicate_paths.contains(&row.source_path);
-        }
-
-        // Time orders independent import projections for presentation only;
-        // repeated values remain separate rows above.
-        imports.sort_by(|a, b| b.imported_at.cmp(&a.imported_at).then(b.id.cmp(&a.id)));
-        imports.truncate(MAX_IMPORTS);
-
-        FilesLive {
-            cached_revision: dataset.revision,
-            imports,
-            total,
-        }
     }
+    imports.sort_by(|left, right| {
+        (
+            left.id,
+            left.imported_at,
+            &left.source_path,
+            left.root,
+            &left.tags,
+        )
+            .cmp(&(
+                right.id,
+                right.imported_at,
+                &right.source_path,
+                right.root,
+                &right.tags,
+            ))
+    });
+    imports.dedup_by(|left, right| {
+        left.id == right.id
+            && left.imported_at == right.imported_at
+            && left.source_path == right.source_path
+            && left.root == right.root
+            && left.tags == right.tags
+    });
+    let total = imports.len();
+
+    // Re-import is a set property. No traversal order establishes which
+    // import was "first" or which one supersedes another.
+    let mut path_counts = BTreeMap::<&str, usize>::new();
+    for row in &imports {
+        *path_counts.entry(&row.source_path).or_insert(0) += 1;
+    }
+    let duplicate_paths = path_counts
+        .into_iter()
+        .filter_map(|(path, count)| (count > 1).then_some(path.to_owned()))
+        .collect::<BTreeSet<_>>();
+    for row in &mut imports {
+        row.is_reimport = duplicate_paths.contains(&row.source_path);
+    }
+
+    // Time orders independent import projections for presentation only;
+    // repeated values remain separate rows above.
+    imports.sort_by(|a, b| b.imported_at.cmp(&a.imported_at).then(b.id.cmp(&a.id)));
+    imports.truncate(MAX_IMPORTS);
+
+    (imports, total)
 }
 
 fn epoch_to_chrono(e: Epoch) -> anyhow::Result<DateTime<Utc>> {
@@ -281,13 +271,11 @@ fn age_label(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-pub struct FilesViewer {
-    live: Option<FilesLive>,
-}
+pub struct FilesViewer {}
 
 impl Default for FilesViewer {
     fn default() -> Self {
-        Self { live: None }
+        Self {}
     }
 }
 
@@ -297,40 +285,29 @@ impl FilesViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => l.cached_revision != dataset.revision,
-        };
-        if need_refresh {
-            self.live = Some(FilesLive::refresh(dataset));
-        }
+        let (imports, total) = query_imports(dataset);
 
         // Click-time action: open the import's root file/directory.
         // The card's OPEN button only sets this request; the actual
         // blob extraction happens after the section closure ends, when
-        // the immutable `live` borrow has been released and we can use
+        // the immutable row borrows have been released and we can use
         // the dataset reader for blob reads again.
         let mut open_root: Option<Id> = None;
 
         ctx.section("Files", |ctx| {
-            let Some(live) = self.live.as_ref() else {
-                return;
-            };
-
             ctx.grid(|g| {
-                let shown = live.imports.len();
+                let shown = imports.len();
                 let now = current_utc();
-                let newest_age = live
-                    .imports
+                let newest_age = imports
                     .first()
                     .map(|r| r.imported_at)
                     .and_then(|at| now.map(|now| age_label(now, at)));
 
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let summary = match (shown < live.total, newest_age.as_deref()) {
+                    let summary = match (shown < total, newest_age.as_deref()) {
                         (true, Some(age)) => {
-                            format!("SHOWING {shown} OF {} IMPORTS · NEWEST {age}", live.total)
+                            format!("SHOWING {shown} OF {total} IMPORTS · NEWEST {age}")
                         }
                         (false, Some(age)) => format!(
                             "{shown} IMPORT{} · NEWEST {age}",
@@ -347,7 +324,7 @@ impl FilesViewer {
                     );
                 });
 
-                if live.imports.is_empty() {
+                if imports.is_empty() {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
@@ -371,7 +348,7 @@ impl FilesViewer {
                     return;
                 }
 
-                for import in &live.imports {
+                for import in &imports {
                     g.full(|ctx| {
                         render_import_card(ctx.ui_mut(), import, now, &mut open_root);
                     });
