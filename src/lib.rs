@@ -53,6 +53,7 @@ pub mod body;
 pub mod bootstrap;
 pub mod cli;
 pub mod clock;
+pub mod code;
 pub mod cognition;
 pub mod collection_names;
 pub mod comb;

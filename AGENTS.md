@@ -123,7 +123,7 @@ reconciliation.
   CLI/MCP grammar. Another Rust caller must be able to use operations without
   constructing argv, a synthetic invocation, or a transport. Paths/pipes belong
   to CLI UX; MCP adapters own tool schemas, typed arguments, and file/media
-  delivery. All 32 ordinary faculties and Viewer are MCP-registered. The
+  delivery. All 33 ordinary faculties and Viewer are MCP-registered. The
   aggregate `mcp::catalog` is shared by stdio and authenticated HTTP; public
   OAuth and per-user worker selection belong to the hosting edge. A tailored
   Clap frontend can use `cli::with_output` without the optional `Spec` helper. Never expose a CLI

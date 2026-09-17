@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add `code`: a source catalogue that answers questions grep structurally
+  cannot. An ITEM is one declaration identified by its normalized token stream
+  and NOTHING else, so byte-identical code in two files is one item with two
+  PLACEMENTs and duplication is exhaust rather than a feature — the pile's
+  content addressing is the clone detector, with no hash attribute and no
+  comparison pass. A UNIT is one `(repo, path, content)` triple, so
+  re-ingesting an unchanged tree parses nothing and grows the pile by zero
+  bytes, and two machines cataloguing one commit converge under `cat`. A SCAN
+  is one repository at one commit, and every answer ends by naming the
+  revisions it was true at, because an absence without its denominator is how
+  a wrong absence claim gets made from a stale checkout.
+
+  Judgements annotate those cores instead of entering them — kind, name, doc,
+  signature, visibility, mentions — so a better extractor re-annotates the same
+  entities rather than re-minting the world. `mentions` is one repeated
+  identifier relation carrying every path segment and every `::`-joined prefix,
+  recovered from macro token streams as well as the AST, which is how a path
+  that only ever appears inside `pattern!` is queryable at all. It is
+  deliberately UNRESOLVED and positionless, so a common identifier prints a
+  spread line and that caveat instead of a confident list.
+
+  Verbs: `ingest` (git is the walker — `ls-files`/`ls-tree`/`cat-file
+  --batch`), `find` (definition, or an affirmative ABSENT verdict with its
+  denominator and exactly-queried name-similar near misses), `uses`, `show`,
+  `dup`, `stats`, `index`, `search`, and `blame` (a `git log -S` seam, because
+  git shows the diff and so cannot misread a rename-with-edit as a removal).
+  `find`, `uses` and `show` never touch BM25: a lexical index cannot represent
+  absence, and an empty `find!` IS the answer.
+
+  The lexical tier is two stock `TextAttributeToBm25` derivations over
+  `code::doc` and `code::source_tokens` with the `Code` tokenizer — no new
+  mapping, no new algorithm id, and therefore queryable from `trible pile
+  collection search` with no code. `code ingest` never maintains an index and
+  neither does a read; `code index` does, once, explicitly. Search ranks FILES
+  rather than declarations and attaches derived evidence: the three rarest
+  non-ubiquitous `use` roots of each file by corpus frequency, counted one
+  query per candidate, plus the overlap with the top hit. There is no
+  vocabulary of "GPU things" anywhere in the code.
+
+  Schema `faculties/src/schemas/code.rs`, all ids minted with `trible genid`
+  on 2026-09-17 on this machine and pasted verbatim:
+
+    DEFAULT_SCOPE_ID       EB416080F8F2C34CA05598C4FCBA3535
+    KIND_UNIT              A52225D11B70645750139A3776DD3230
+    KIND_ITEM              47F7160C12A15702D5A3DFB5227FE79C
+    KIND_PLACEMENT         34E05E4F4155C853CD97C2D58B647CBF
+    KIND_SCAN              3213AAE6414EEEAAA712C17ED5CBD308
+    EXTRACTOR_RUST_SYN_V1  603D7068C8F1B92D5D20AA9206ABF467
+    repo                   8FBE9F0E3A11E45DBAC45692DDB44514
+    path                   32CDF6DB5C03778BE5EFD193B7421957
+    language               35F62EB70939951867305D9D986AE68C
+    doc                    4D5F0C0A0778939732A813D4100149CC
+    parse_error            CE2FACA8CFB8FABE1D3C54498D6374E3
+    import_root            22CAE18A57BDA43133B65547A6689663
+    kind                   A0ED33675DF3B92867FD68177794BEDD
+    visibility             41DAF4F9B5A081674E272996B89D818F
+    signature              6937C17DB1414657A0578447A8F6EAE3
+    mentions               9ECEFFBFC44F689A941C1214E0BF4C46
+    unit                   7E04326235C8A7A7EB1C3F8CB07C8A7F
+    item                   AEE10E1CADC91638D3906B40C3790723
+    within                 11A6CB6787AB1BFA17B25579239670F2
+    commit                 D2C9BF2E62C5EAFFA2299BB2B58747DA
+    holds                  110B07579AB1B8E3E95B7239B82AF1C0
+    extractor              F7DF8119B5470CF8BF692C5C5B5680B3
+
+  Re-declared in the literal-pinning form rather than minted, because
+  `triblespace-macros` already publishes these byte identities and its
+  compile-time instrumentation records macro invocation sites against exactly
+  them, so a pile holding both can join the compiler's record of a macro site
+  with the catalogue's record of the same file:
+  `source_range` (8ED33DA54C226ADEA0FFF7863563DF5F, LineLocation) and
+  `source_tokens` (B981AEA9437561F8DB96E7EECBB94BFD, Handle<UTF8String>).
+  Reused rather than near-duplicated: `metadata::tag`, `metadata::name`,
+  `metadata::created_at`, `metadata::description`, and `files::file::content`,
+  so a file added by `files add` and catalogued by `code ingest` addresses one
+  blob.
+
+  Every open-vocabulary string is `Handle<UTF8String>`; only the closed
+  vocabularies (`kind`, `language`, `visibility`) are `ShortString`, because
+  `ShortString` holds 32 bytes and overflow panics the encoder — 19% of the
+  distinct declared identifiers in this corpus are longer than that, and
+  `pub(in crate::a::b::c)` is a real spelling here.
+
+  Semantic search is NOT included and is not stubbed. It needs a measured
+  embedding throughput figure (nothing in the search crate records one) and a
+  decision about where the `mary-model-graph` collection lives relative to the
+  code collection; both belong before the code, not after it.
+
 - Orient suppresses Compass/status-window activity attributed to the observing
   persona through any settled same-person anchor, including repeated author
   fields. Unknown authors remain visible: callers must provide `--persona` or

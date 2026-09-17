@@ -33,7 +33,7 @@ use triblespace::core::repo::{
 use triblespace::core::trible::TribleSet;
 
 use crate::schemas::{
-    atlas, blockdag, body, cognition, compass, decide, discord, embeddings, files, habit,
+    atlas, blockdag, body, code, cognition, compass, decide, discord, embeddings, files, habit,
     headspace, mail, memory, message, orient, planner, posture, relations, status, swarm_health,
     teams, voice, web, wiki,
 };
@@ -63,6 +63,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (atlas::DEFAULT_SCOPE_ID, "atlas"),
         (blockdag::DEFAULT_SCOPE_ID, "blockdag"),
         (body::DEFAULT_SCOPE_ID, "body"),
+        (code::DEFAULT_SCOPE_ID, "code"),
         (cognition::DEFAULT_SCOPE_ID, "cognition"),
         (compass::DEFAULT_SCOPE_ID, "compass"),
         (decide::DEFAULT_SCOPE_ID, "decide"),

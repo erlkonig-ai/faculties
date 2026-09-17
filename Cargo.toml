@@ -200,6 +200,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8" # mail POP transport (platform trust roots)
 quick-xml = "0.37"          # posture (OOXML part parsing)
 rayon = "1.10"              # archive
+syn = { version = "2", features = ["full"] }  # code (Rust declaration extraction; `full` is what makes Item/File exist)
+proc-macro2 = { version = "1", features = ["span-locations"] }         # code (declaration spans; span-locations is load-bearing)
+quote = "1"                 # code (ToTokens for the item token-normalization law)
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)

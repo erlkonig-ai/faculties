@@ -91,7 +91,7 @@ viewer               # picks up PILE from the environment
 
 ### Library-first faculties, explicit frontends
 
-All 32 ordinary faculties have callable Rust operations, separate CLI and MCP
+All 33 ordinary faculties have callable Rust operations, separate CLI and MCP
 adapters, and thin individual binaries. Viewer and the 11 capture binaries share
 one notebook-composition/capture API. The single `faculties` binary registers
 all adapters together: 218 tools, including `viewer_capture`. See the
@@ -114,8 +114,8 @@ faculties mcp --pile ./self.pile
 #### MCP server and launcher configuration
 
 `faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
-Streamable HTTP with `--http-listen`. Both transports use the same 33 adapters,
-218 tools, argument decoding, and native image/audio/resource output. The
+Streamable HTTP with `--http-listen`. Both transports use the same 34 adapters,
+229 tools, argument decoding, and native image/audio/resource output. The
 library's `mcp::catalog::{Config, Catalog}` constructs the aggregate independently
 of either transport, without opening storage, keys, devices, or models.
 This server is trusted software, not a filesystem, network, or model-runtime
@@ -531,6 +531,7 @@ schemas describe exact arguments and effects.
 | `atlas` | Cross-collection catalog inspection |
 | `body` | Deliberate sensory captures and intent; separate host robot/device API |
 | `bootstrap` | Idempotent recipient-authored onboarding import |
+| `code` | Source catalogue: definitions, unresolved usage, duplication and capability search |
 | `cognition` | Validate shared execution/context evidence |
 | `compass` | Goals, status, priority edges and referenceable ledger notes |
 | `decide` | Proposals, factors and fork-visible decision resolutions |

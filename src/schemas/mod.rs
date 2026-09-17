@@ -4,6 +4,7 @@ pub mod archive;
 pub mod atlas;
 pub mod blockdag;
 pub mod body;
+pub mod code;
 pub mod cognition;
 pub mod compass;
 pub mod decide;
