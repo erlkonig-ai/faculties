@@ -3167,7 +3167,13 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             .next()
             .and_then(|from| read_native_person_label(query, from).ok())
             {
-                Some(from) => format!("new message from {from}"),
+                // The short id stays, unlike the goal lines where a title
+                // carries the identity: a message is the one thing here you act
+                // on BY id (`message ack <id> <persona>`), and without it the
+                // only way back to that id is `message list`, which costs 43 s
+                // on the live pile. A news line you cannot act on sends you to
+                // a slow lookup to recover what it just threw away.
+                Some(from) => format!("new message [{}] from {from}", fmt_short_id(id)),
                 None => event.reason(),
             }
         }
@@ -5890,7 +5896,7 @@ mod tests {
 
         let peek = run_poll_for(&mut pile, &fixture, true);
         assert!(
-            peek.contains(&format!("News: new message [{}]", fmt_id(event))),
+            peek.contains(&format!("News: new message [{}]", fmt_short_id(event))),
             "{peek}"
         );
         assert!(peek.contains("visible on the very next poll"), "{peek}");
@@ -5907,7 +5913,10 @@ mod tests {
             .is_empty());
 
         let delivered = run_poll_for(&mut pile, &fixture, false);
-        assert!(delivered.contains(&fmt_id(event)), "{delivered}");
+        // Short, because that is what news now prints. It stays a usable
+        // argument: resolve_id_prefix accepts a prefix, so the line can be
+        // pasted straight into `message ack`.
+        assert!(delivered.contains(&fmt_short_id(event)), "{delivered}");
         // No fixture carry between the consuming call and its fresh successor.
         let rearmed = run_poll_for(&mut pile, &fixture, true);
         assert!(rearmed.is_empty(), "a presented event repeated: {rearmed}");
@@ -7426,7 +7435,8 @@ mod tests {
             let News::Report { text, .. } = news else {
                 panic!("a goal tagged for the reader with a foreign note is news");
             };
-            assert!(text.contains("News: new message from astra"), "{text}");
+            assert!(text.contains("News: new message ["), "{text}");
+            assert!(text.contains("] from astra"), "{text}");
             let goal_hex = fmt_id(goal_id);
             let short = &goal_hex[..8];
             assert!(
