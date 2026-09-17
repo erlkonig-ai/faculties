@@ -3206,8 +3206,8 @@ fn render_tags(tags: &[String]) -> String {
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
-/// goals. Semantically read-only: it publishes no authoritative collection
-/// commits, though derived indexes may be maintained as cache exhaust.
+/// goals. A supplied persona records shown attention events after output
+/// acceptance; previous presentation history does not filter this overview.
 async fn cmd_wake(
     storage: &mut FacultyStore,
     signer: &SigningKey,
@@ -3246,9 +3246,11 @@ async fn cmd_wake(
                     .context("maintain Wiki supersession index")?,
             );
         }
+        // Wake renders the requested overview, not unseen news. Its output
+        // does not depend on prior Presented facts; recording what this wake
+        // shows afterward must not impose a historical receipt-read barrier.
         let observation =
-            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, persona.is_some())
-                .await?;
+            maintain_and_observe_snapshot(storage, signer, &watermark, &sources, false).await?;
         drop(watermark);
         let memory_facts = observation
             .snapshot
@@ -3707,6 +3709,120 @@ mod tests {
             assert!(require_receipts(&newer, &still_ready.facts.presentations)
                 .unwrap_err()
                 .is::<PresentationReceiptsPending>());
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
+    fn persona_wake_ignores_unrelated_historical_receipt_projection_lag() {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let persona = id(86);
+            let prior_event = id(87);
+            let (person, _, _) = relations::person_fragment(
+                persona,
+                relations::ProfileInput {
+                    label: "wake-reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, person)
+                .unwrap();
+            let (goal, goal_id) = compass::goal_fragment(
+                "a resident goal for this wake",
+                vec!["wake-reader".to_owned()],
+                None,
+                clock::point_now().unwrap(),
+            )
+            .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, goal)
+                .unwrap();
+            pile.commit(
+                sources.presentations.source,
+                &fixture.signer,
+                orient_model::presented_fragment(persona, [prior_event]),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+
+            // Another persona's historical receipt record arrives without its
+            // archive. The existing projection remains readable but cannot
+            // certify the newly frozen whole-source receipt boundary.
+            let cold = orient_model::presented_fragment(id(88), [id(89)]);
+            let cold = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
+            let arriving = CollectionCommit::sign(
+                &fixture.signer,
+                sources.presentations.source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+                empty_metadata_handle(),
+            );
+            pile.insert(CollectionRecord::Commit(arriving)).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let before = sources
+                .presentations
+                .observe(&pile.snapshot().unwrap())
+                .unwrap();
+            assert_eq!(
+                presented_events(before.view(), persona),
+                BTreeSet::from([prior_event]),
+            );
+            let missing = sources
+                .receipt_boundary
+                .difference(before.support())
+                .unwrap();
+            assert_eq!(missing.len(), 1);
+            assert!(missing.contains(cold.get_handle()));
+
+            let mut report = String::new();
+            cmd_wake(
+                &mut pile,
+                &fixture.signer,
+                Some("wake-reader"),
+                0,
+                5,
+                5,
+                &mut Out::new(&mut |part| {
+                    let crate::out::Part::Text { text } = part else {
+                        bail!("expected wake text")
+                    };
+                    report.push_str(&text);
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(report.contains("Beliefs (cover):"));
+            assert!(report.contains("a resident goal for this wake"));
+
+            // The accepted overview still publishes its shown goal receipt.
+            // Making that new receipt visible does not fill the historical gap
+            // or relax the guard used by consuming poll/wait observations.
+            sources
+                .presentations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let after = sources.presentations.observe(&snapshot).unwrap();
+            assert_eq!(
+                presented_events(after.view(), persona),
+                BTreeSet::from([prior_event, goal_id]),
+            );
+            assert!(require_receipts(&sources.receipt_boundary, &after)
+                .unwrap_err()
+                .is::<PresentationReceiptsPending>());
+            assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
+            assert!(snapshot.wants().unwrap().next().is_none());
+            assert!(pile.health().started_at.is_none());
             pile.close().unwrap();
         });
     }

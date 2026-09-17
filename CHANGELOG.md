@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Persona-bound Orient wake no longer waits for historical Presented rollups:
+  its requested overview does not filter already-shown events. Shown-event
+  receipts still publish after output acceptance; poll/wait dedup is unchanged.
+
 - Memory prepares ordinary journal, context, cursor, and provenance operations
   from resident maintained targets, without requiring complete historical root
   payloads. Each authorized mapping hop can still catch up from resident input;
