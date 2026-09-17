@@ -4368,6 +4368,73 @@ mod tests {
         });
     }
 
+    /// The lag the previous test accepts is exactly what a re-armed run
+    /// repeats. A run that is about to report closes that window itself, so
+    /// the next arm does not print the same event again.
+    ///
+    /// This drives the production helper rather than a fixture's explicit
+    /// upkeep. The distinction is the whole point: the fixture proves the
+    /// projection CAN catch up, and only the helper proves a reporting run
+    /// makes it. Nothing else in this suite exercises that helper, which is
+    /// why sixty green tests said nothing about it.
+    #[test]
+    fn a_reporting_run_refreshes_the_receipt_set_so_it_does_not_repeat_itself() {
+        pollster::block_on(async {
+            let fixture = TestPile::new();
+            let reader = SigningKey::from_bytes(&[73; 32]);
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &reader, false)
+                .await
+                .unwrap();
+            let persona = id(77);
+            let event = id(78);
+            let news = News::Report {
+                text: "News: one delivery\n".to_owned(),
+                events: vec![event],
+            };
+            let mut output = Vec::new();
+            apply_news_to_writer(&mut pile, &reader, persona, false, &news, "", &mut output)
+                .unwrap();
+
+            let mut attention = AttentionView::default();
+            attention.insert(AttentionEvent::Message(event));
+            let lagging = observe_current_sources(&mut pile, &sources).unwrap();
+            assert!(
+                !attention
+                    .pending(lagging.facts.presentations.view())
+                    .is_empty(),
+                "the window this closes must be open, or the control is vacuous",
+            );
+
+            let mut text = String::new();
+            let mut emit = |part| {
+                let crate::out::Part::Text { text: part } = part else {
+                    bail!("expected text")
+                };
+                text.push_str(&part);
+                Ok(())
+            };
+            refresh_receipts_before_observation(
+                &mut pile,
+                &reader,
+                &sources,
+                &mut Out::new(&mut emit),
+            )
+            .await
+            .unwrap();
+            assert!(text.is_empty(), "a successful refresh says nothing: {text}");
+
+            let refreshed = observe_current_sources(&mut pile, &sources).unwrap();
+            assert!(
+                attention
+                    .pending(refreshed.facts.presentations.view())
+                    .is_empty(),
+                "after the refresh the event is presented and must not repeat",
+            );
+            pile.close().unwrap();
+        });
+    }
+
     #[test]
     fn persona_wake_ignores_unrelated_historical_receipt_projection_lag() {
         runtime().unwrap().block_on(async {
