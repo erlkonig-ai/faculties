@@ -33,6 +33,7 @@ pub type AudioHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 
 pub const AUDIO_WAV_MIME: &str = "audio/wav";
 
+// TODO: Shadowmodel
 /// One decodable route row selected by a point-of-use query.
 ///
 /// Several rows may describe the same entity in an open-world collection.
