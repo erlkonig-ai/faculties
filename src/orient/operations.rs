@@ -2311,14 +2311,10 @@ fn newly_needing_attention(
 
 fn push_due_news(out: &mut String, due: &[(Id, DueHabit)]) {
     use std::fmt::Write as _;
-    for (id, habit) in due {
-        writeln!(
-            out,
-            "News: habit [{}] became due ({})",
-            fmt_id(*id),
-            habit.label
-        )
-        .unwrap();
+    // The label is the habit's name and `push_due_detail` spells out the nudge
+    // directly below, so the hex id only cost the reader tokens.
+    for (_, habit) in due {
+        writeln!(out, "News: habit became due: {}", habit.label).unwrap();
     }
 }
 
@@ -2345,16 +2341,12 @@ fn render_habit_transitions(
     }
     let mut out = String::new();
     push_due_news(&mut out, &due);
-    for (id, _) in &attention {
-        writeln!(out, "News: habit [{}] needs attention", fmt_id(*id)).unwrap();
+    // The warning already names the habit and its id, so it *is* the reason;
+    // the separate attention block below it only repeated the same string.
+    for (_, warning) in &attention {
+        writeln!(out, "News: habit needs attention: {warning}").unwrap();
     }
     push_due_detail(&mut out, &due);
-    if !attention.is_empty() {
-        writeln!(out, "\nHabit attention:").unwrap();
-        for (_, warning) in attention {
-            writeln!(out, "- {warning}").unwrap();
-        }
-    }
     Some(out)
 }
 
@@ -3049,6 +3041,182 @@ fn render_news_detail(
     Ok(out)
 }
 
+/// Longest preview one `News:` line may carry from a stored body.
+///
+/// News is an attention channel an agent reads a line at a time, so a bounded
+/// first line is the whole point: the body stays in Compass instead of being
+/// re-delivered on every wake.
+const NEWS_PREVIEW_CHARS: usize = 96;
+
+/// Longest goal title one `News:` line may carry.
+const NEWS_TITLE_CHARS: usize = 72;
+
+/// Short, still-actionable form of an id for a News line.
+///
+/// Compass resolves hex prefixes (`resolve_id_prefix`), so eight characters
+/// remain a usable argument to `compass show`/`move`/`note` at a quarter of the
+/// tokens a full id costs. The full id is printed wherever no human-readable
+/// name accompanies it, because there an exact id is the only thing the reader
+/// can act on.
+fn fmt_short_id(id: Id) -> String {
+    fmt_id(id).chars().take(8).collect()
+}
+
+/// The first non-empty line of `text`, clipped to `limit` characters.
+///
+/// `None` for a body with nothing to show, so callers drop the clause entirely
+/// rather than printing an empty preview.
+fn clip_line(text: &str, limit: usize) -> Option<String> {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let more_lines = lines.next().is_some();
+    let clipped: String = first.chars().take(limit).collect();
+    let clipped_chars = clipped.chars().count();
+    if clipped_chars < first.chars().count() || more_lines {
+        Some(format!("{}…", clipped.trim_end()))
+    } else {
+        Some(clipped)
+    }
+}
+
+/// Best-effort text behind a handle for a News line.
+///
+/// An absent or not-yet-acquired blob degrades to no preview. Propagating the
+/// error instead would turn a decorative body into a `MissingBlob`, and
+/// `prepare_news_once` treats that as a pending payload — withholding the whole
+/// report over text the reader never had before.
+fn news_text(query: &OrientQuery<'_>, handle: compass::TextHandle, label: &str) -> Option<String> {
+    read_utf8(query.snapshot, handle, label).ok()
+}
+
+/// How a goal is named in a News line: `[short] "Title"` when a title reads,
+/// the full id otherwise.
+///
+/// Open world: a goal with no `board::title`, or one whose title blob has not
+/// arrived, is named by the id the reader can still act on. A placeholder word
+/// would be strictly less useful than the identifier it replaced.
+fn news_goal_name(query: &OrientQuery<'_>, goal: Id) -> String {
+    let title = find!(
+        handle: compass::TextHandle,
+        pattern!(query.compass, [{ goal @ board::title: ?handle }])
+    )
+    .next()
+    .and_then(|handle| news_text(query, handle, "Compass title"))
+    .and_then(|title| clip_line(&title, NEWS_TITLE_CHARS));
+    match title {
+        Some(title) => format!("[{}] \"{title}\"", fmt_short_id(goal)),
+        None => format!("[{}]", fmt_id(goal)),
+    }
+}
+
+/// ` by <label>` when an event records an acting persona.
+///
+/// `board::by` is optional attribution with no workflow semantics, so an absent
+/// author simply drops the clause.
+fn news_actor(query: &OrientQuery<'_>, event: Id) -> String {
+    find!(by: Id, pattern!(query.compass, [{ event @ board::by: ?by }]))
+        .next()
+        .and_then(|by| read_native_person_label(query, by).ok())
+        .map(|label| format!(" by {label}"))
+        .unwrap_or_default()
+}
+
+/// The lane a goal left, when the ledger records one before `current`.
+///
+/// One point-of-use query over the status events of a single goal — a handful
+/// of rows — ordered the way the LWW register orders them, so the predecessor
+/// named here is the state the winning event replaced. `None` for a goal whose
+/// first status this is.
+fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Option<String> {
+    let mut events: Vec<(i128, Id, String)> = find!(
+        (event: Id, status: String, at: IntervalValue),
+        pattern!(query.compass, [{ ?event @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &goal,
+            board::status: ?status,
+            metadata::created_at: ?at,
+        }])
+    )
+    .map(|(event, status, at)| (interval_key(at), event, status))
+    .collect();
+    events.sort();
+    let position = events.iter().position(|(_, event, _)| *event == current)?;
+    events[..position]
+        .last()
+        .map(|(_, _, status)| status.clone())
+}
+
+/// The `News:` line for one attention event, carrying the content the reader
+/// would otherwise have to run another command to see.
+///
+/// Every lookup is a point-of-use query keyed on one entity, and this runs only
+/// over *pending* events — the handful that are new since the last receipt, not
+/// the candidate set. It therefore adds nothing to the per-goal scan
+/// `load_attention_view` already performs on every call.
+///
+/// Mail and Teams keep their reason lines: `render_news_detail` already prints
+/// sender, subject and body for those beneath the reasons.
+fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
+    match event {
+        AttentionEvent::Message(id) => {
+            let id = *id;
+            match find!(
+                from: Id,
+                pattern!(query.messages, [{ id @ local_message::from: ?from }])
+            )
+            .next()
+            .and_then(|from| read_native_person_label(query, from).ok())
+            {
+                Some(from) => format!("new message from {from}"),
+                None => event.reason(),
+            }
+        }
+        AttentionEvent::Goal {
+            event: status_event,
+            goal,
+            status,
+        } if status_event == goal => {
+            format!("new goal {} ({status})", news_goal_name(query, *goal))
+        }
+        AttentionEvent::Goal {
+            event: status_event,
+            goal,
+            status,
+        } => {
+            let name = news_goal_name(query, *goal);
+            let actor = news_actor(query, *status_event);
+            match previous_goal_status(query, *goal, *status_event) {
+                Some(previous) if !previous.eq_ignore_ascii_case(status) => {
+                    format!("goal {name}: {previous} -> {status}{actor}")
+                }
+                _ => format!("goal {name} is now {status}{actor}"),
+            }
+        }
+        AttentionEvent::Note { note, goal } => {
+            let name = news_goal_name(query, *goal);
+            let actor = news_actor(query, *note);
+            let note = *note;
+            let preview = find!(
+                handle: compass::TextHandle,
+                pattern!(query.compass, [{ note @ board::note: ?handle }])
+            )
+            .next()
+            .and_then(|handle| news_text(query, handle, "Compass note"))
+            .and_then(|body| clip_line(&body, NEWS_PREVIEW_CHARS))
+            .map(|body| format!(": {body}"))
+            .unwrap_or_default();
+            format!("note on {name}{actor}{preview}")
+        }
+        AttentionEvent::StatusWindow(window) => match read_native_person_label(query, *window) {
+            Ok(label) => format!("new status window {label}"),
+            Err(_) => event.reason(),
+        },
+        AttentionEvent::Mail(_) | AttentionEvent::Teams(_) | AttentionEvent::Health { .. } => {
+            event.reason()
+        }
+    }
+}
+
 enum News {
     Quiet,
     Report { text: String, events: Vec<Id> },
@@ -3073,7 +3241,7 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
 
     let mut text = String::new();
     for event in pending.events.values() {
-        writeln!(text, "News: {}", event.reason()).unwrap();
+        writeln!(text, "News: {}", news_line(query, event)).unwrap();
     }
     text.push_str(&render_news_detail(query, &pending, persona_id)?);
     Ok(News::Report {
@@ -4406,10 +4574,7 @@ mod tests {
         );
         armed.due.insert(owned, due_habit("cc-tick", 1300, true));
         let report = render_habits_due_at_arm(&armed).expect("an owned clock is reported at arm");
-        assert!(report.contains(&format!(
-            "News: habit [{}] became due (cc-tick)",
-            fmt_id(owned)
-        )));
+        assert!(report.contains("News: habit became due: cc-tick"));
         assert!(!report.contains("stranded-work"));
     }
 
@@ -5890,10 +6055,7 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(
-            text.contains(&format!(
-                "News: habit [{}] became due (cc-clock)",
-                fmt_id(owned_id)
-            )),
+            text.contains("News: habit became due: cc-clock"),
             "the clock must be reported while the body is still missing: {text}"
         );
         assert!(
@@ -5987,10 +6149,7 @@ mod tests {
             Duration::from_secs(1),
         );
         assert!(
-            armed.contains(&format!(
-                "News: habit [{}] became due (cc-clock)",
-                fmt_id(owned_id)
-            )),
+            armed.contains("News: habit became due: cc-clock"),
             "{armed}"
         );
         assert!(!armed.contains("shared-clock"), "{armed}");
@@ -6070,10 +6229,7 @@ mod tests {
             Duration::from_millis(100),
         );
         assert!(
-            armed.contains(&format!(
-                "News: habit [{}] became due (cc-clock)",
-                fmt_id(owned_id)
-            )),
+            armed.contains("News: habit became due: cc-clock"),
             "{armed}"
         );
         assert!(!armed.contains("News: new message"), "{armed}");
@@ -6165,10 +6321,7 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(
-            text.contains(&format!(
-                "News: habit [{}] became due (cc-clock)",
-                fmt_id(owned_id)
-            )),
+            text.contains("News: habit became due: cc-clock"),
             "the clock must get its turn while the fetch stalls: {text}"
         );
         assert!(
@@ -7193,5 +7346,106 @@ mod tests {
             later.pending(&presented).ids().collect::<Vec<_>>(),
             vec![event]
         );
+    }
+
+    /// A News line carries what the reader has to act on, not the identifier
+    /// they would otherwise have to look up: a note names its goal, its author
+    /// and one bounded line of its body, and a status move names both lanes.
+    #[test]
+    fn news_names_goals_authors_and_both_lanes_instead_of_bare_ids() {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(90);
+            let author_id = id(91);
+            for (person, label) in [(reader_id, "cc"), (author_id, "astra")] {
+                let (profile, _, _) = relations::person_fragment(
+                    person,
+                    relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                pile.commit(sources.relations.source, &fixture.signer, profile)
+                    .unwrap();
+            }
+            let moment =
+                |seconds: f64| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
+            let (goal, goal_id) = compass::goal_fragment(
+                "Give the maintenance daemons their cores",
+                vec!["cc".to_owned()],
+                None,
+                moment(1.0),
+            )
+            .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, goal)
+                .unwrap();
+            for (status, when) in [("doing", moment(2.0)), ("done", moment(3.0))] {
+                pile.commit(
+                    sources.compass.source,
+                    &fixture.signer,
+                    compass::status_fragment(goal_id, status, Some(author_id), when).unwrap(),
+                )
+                .unwrap();
+            }
+            let (note, _) = compass::note_fragment(
+                goal_id,
+                "Slice B frozen, Core lock unchanged\nthe rest of the body stays in Compass",
+                vec![],
+                vec![],
+                vec![],
+                Some(author_id),
+                moment(4.0),
+            )
+            .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, note)
+                .unwrap();
+            let (envelope, _) = message::message_fragment(
+                author_id,
+                &message::Recipient::Person(reader_id),
+                "the body itself still follows under New messages",
+                moment(5.0),
+            );
+            pile.commit(sources.messages.source, &fixture.signer, envelope)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, .. } = news else {
+                panic!("a goal tagged for the reader with a foreign note is news");
+            };
+            assert!(text.contains("News: new message from astra"), "{text}");
+            let goal_hex = fmt_id(goal_id);
+            let short = &goal_hex[..8];
+            assert!(
+                text.contains(&format!(
+                    "News: goal [{short}] \"Give the maintenance daemons their cores\": doing -> done by astra"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "News: note on [{short}] \"Give the maintenance daemons their cores\" by astra: Slice B frozen, Core lock unchanged…"
+                )),
+                "{text}"
+            );
+            // Bounded preview: the first line only, and the full id never has
+            // to be printed once the title names the goal.
+            assert!(!text.contains("the rest of the body stays in Compass"), "{text}");
+            assert!(!text.contains(&goal_hex), "{text}");
+            pile.close().unwrap();
+        });
     }
 }

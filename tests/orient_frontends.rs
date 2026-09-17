@@ -450,7 +450,7 @@ fn daemon_cli_has_one_callback_channel_and_failure_does_not_acknowledge() {
             "callback output must not duplicate news"
         );
         let delivered = fs::read_to_string(report).unwrap();
-        assert_eq!(delivered.matches("News: new message [").count(), 1);
+        assert_eq!(delivered.matches("News: new message from ").count(), 1);
         assert_eq!(f.presented().contains(&event), success);
     }
 }

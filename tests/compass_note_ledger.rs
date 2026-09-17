@@ -12,6 +12,13 @@ use triblespace::prelude::*;
 
 static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
+/// The eight-character prefix Orient prints for a goal in a News line. Compass
+/// resolves hex prefixes, so the short form stays an argument the reader can
+/// paste back.
+fn short(id: &str) -> &str {
+    &id[..8]
+}
+
 struct TestPile {
     dir: PathBuf,
     path: PathBuf,
@@ -251,7 +258,10 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
-        news.contains(&format!("goal [{addressed_goal}] is now todo")),
+        news.contains(&format!(
+            "goal [{}] \"Group-addressed goal\" is now todo",
+            short(&addressed_goal)
+        )),
         "unexpected news: {news}"
     );
     // Accepted output appends a receipt; suppression begins once its
@@ -267,7 +277,14 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let foreign_id = id_after("Added note ", &foreign);
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!("new note [{foreign_id}] on goal [{goal_id}]")));
+    assert!(
+        news.contains(&format!(
+            "note on [{}] \"Shared goal\" by peer: foreign observation",
+            short(&goal_id)
+        )),
+        "unexpected news: {news}"
+    );
+    let _ = &foreign_id;
     pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
@@ -287,7 +304,15 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let unattributed_id = id_after("Added note ", &unattributed);
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!("new note [{unattributed_id}] on goal [{goal_id}]")));
+    // Open world: a note with no acting persona simply drops the clause.
+    assert!(
+        news.contains(&format!(
+            "note on [{}] \"Shared goal\": unattributed observation",
+            short(&goal_id)
+        )),
+        "unexpected news: {news}"
+    );
+    let _ = &unattributed_id;
 
     let unrelated = stdout(run(
         compass,
@@ -313,9 +338,14 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let direct_id = id_after("Added note ", &direct);
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!(
-        "new note [{direct_id}] on goal [{unrelated_goal}]"
-    )));
+    assert!(
+        news.contains(&format!(
+            "note on [{}] \"Unrelated goal\" by peer: direct ping",
+            short(&unrelated_goal)
+        )),
+        "unexpected news: {news}"
+    );
+    let _ = &direct_id;
 
     let participated = stdout(run(
         compass,
@@ -340,13 +370,18 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
-        news.contains(&format!("goal [{participated_goal}] is now todo")),
+        news.contains(&format!(
+            "goal [{}] \"Participated goal\" is now todo",
+            short(&participated_goal)
+        )),
         "unexpected news: {news}"
     );
+    // A preview would leak an own note into the report; nothing of it appears.
     assert!(
-        !news.contains(&format!("new note [{joining_id}]")),
+        !news.contains("joining the discussion"),
         "own note was presented: {news}"
     );
+    let _ = &joining_id;
     pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let response = stdout(run(
@@ -363,9 +398,14 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let response_id = id_after("Added note ", &response);
     pile.maintain_attention();
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(news.contains(&format!(
-        "new note [{response_id}] on goal [{participated_goal}]"
-    )));
+    assert!(
+        news.contains(&format!(
+            "note on [{}] \"Participated goal\" by peer: peer response",
+            short(&participated_goal)
+        )),
+        "unexpected news: {news}"
+    );
+    let _ = &response_id;
     pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 }
