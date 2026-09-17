@@ -74,9 +74,21 @@ try:
         if (".git" in directories or ".git" in files) and not os.path.islink(marker):
             sys.stdout.buffer.write(os.fsencode(marker) + b"\0")
             sys.stdout.buffer.flush()
+        # A directory holding `.stranded-ignore` is pruned with everything
+        # under it. This exists for deliberate ARCHIVES: a preserved snapshot of
+        # an old workspace is full of things that look exactly like stranded
+        # work -- orphaned worktrees whose gitdir points at a machine that no
+        # longer has it, vendored clones with commits on no remote -- and every
+        # one of them is retained on purpose, permanently. Reporting them each
+        # run does not prompt a decision, it buries the findings that do. The
+        # marker lives WITH the archive rather than as a path in this script, so
+        # an archive declares itself and no per-machine list has to be kept in
+        # sync with the disk.
         directories[:] = [name for name in directories
                           if name != ".git" and not name.startswith("target")
-                          and name not in ("node_modules", ".venv")]
+                          and name not in ("node_modules", ".venv")
+                          and not os.path.exists(
+                              os.path.join(path, name, ".stranded-ignore"))]
 except BrokenPipeError:
     os._exit(0)  # --due has already found something and closed its input.
 except OSError as error:
