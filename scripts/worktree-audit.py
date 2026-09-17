@@ -4,6 +4,10 @@
 The JSON Lines interface is versioned by ``FORMAT_VERSION``.  This program is
 deliberately incapable of cleanup: its only commands are ``report`` and
 ``due``, and every Git operation is checked against a read-only allow-list.
+It never fetches or contacts other machines. Default discovery inventories
+direct child main checkouts and their registered worktrees; pass nested
+independent clone paths explicitly. This is local evidence, not a definitive
+cross-machine or remote-publication audit.
 """
 
 from __future__ import annotations
@@ -651,7 +655,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--root",
             default=os.environ.get("WORKTREE_AUDIT_ROOT", "."),
-            help="workspace root used when no repositories are named (default: current directory)",
+            help="local workspace root for direct-child main checkouts; name nested independent clones explicitly (default: current directory)",
         )
         command.add_argument("repositories", nargs="*")
     return parser

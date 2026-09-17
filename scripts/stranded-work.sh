@@ -20,12 +20,13 @@
 #
 # So this is deliberately the CHEAP half. `orient` re-evaluates habit conditions
 # every 60 seconds (orient.rs:1740), so `--due` must cost almost nothing: it does
-# NOT fetch, does NOT ssh, and does NOT walk history. It answers "is there
-# something to look at" in milliseconds. The expensive, definitive answer is
-# `worktree-audit.py`, which the nudge sends you to once this says yes.
+# NOT fetch or ssh. It uses cached refs and local ancestry, not remote proof.
+# `worktree-audit.py` supplies richer local evidence, but likewise does not
+# fetch or inspect other machines. Audit each machine explicitly when needed.
+# Exit 126 means the inspection itself failed, never "nothing stranded".
 #
-# It reports on TRANSITION, not continuously -- `newly_due` handles that -- so a
-# thing you have decided to leave alone will not nag once you mark the habit done.
+# Habit owns reminders/completion, not this detector. A completion does not
+# store a per-branch disposition here or make a still-true predicate false.
 
 set -uo pipefail
 # Prefer the evaluator's workspace cwd when this script has been materialized
@@ -42,14 +43,51 @@ elif [ -e "$PWD/faculties/.git" ]; then
   # cache. In that case its source path says nothing about the workspace, while
   # the evaluator deliberately runs it from the directory containing the pile.
   ROOT=$PWD
-else
+elif [ -e "$_here/../.git" ] && [ -f "$_here/../src/habits.rs" ]; then
   ROOT=$(cd "$_here/../.." && pwd)
+else
+  echo 'stranded-work: set STRANDED_ROOT to the workspace when the pile is elsewhere' >&2
+  exit 126
 fi
+ROOT=$(cd "$ROOT" 2>/dev/null && pwd -P) || { echo 'stranded-work: unusable STRANDED_ROOT' >&2; exit 126; }
 DUE_ONLY=0
 [ "${1:-}" = "--due" ] && DUE_ONLY=1
 
 found=0
 report=""
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/stranded-work.XXXXXX") || exit 126
+trap 'rm -rf "$scratch"' EXIT
+# Stream discovery so --due can exit at its first real finding without first
+# walking every cohort. scandir-backed os.walk avoids stat-ing every file.
+# Empty NUL records mean inspection failed, not that no work was found.
+discover_repositories() {
+  python3 - "$ROOT" <<'PY' || printf '\0'
+import os
+import sys
+
+def failed(error):
+    raise error
+
+try:
+    for path, directories, files in os.walk(sys.argv[1], followlinks=False, onerror=failed):
+        marker = os.path.join(path, ".git")
+        if (".git" in directories or ".git" in files) and not os.path.islink(marker):
+            sys.stdout.buffer.write(os.fsencode(marker) + b"\0")
+            sys.stdout.buffer.flush()
+        directories[:] = [name for name in directories
+                          if name != ".git" and not name.startswith("target")
+                          and name not in ("node_modules", ".venv")]
+except BrokenPipeError:
+    os._exit(0)  # --due has already found something and closed its input.
+except OSError as error:
+    print(f"stranded-work: repository discovery failed: {error}", file=sys.stderr)
+    sys.stdout.buffer.write(b"\0")
+    sys.stdout.buffer.flush()
+PY
+}
+repositories=0
+# Bash 3.2 treats expansion of an empty array as unset under nounset.
+seen_common=("")
 
 # In --due mode the ANSWER is a boolean, so stop at the first finding. The full
 # report costs ~6s across 75 trees; the question "is there anything" usually
@@ -71,19 +109,17 @@ mtime() {
   printf '%s\n' "$value"
 }
 
-# A WORKTREE's `.git` is a FILE, not a directory. Testing `-d` skipped all 33 of
-# them here against 42 real repositories -- a 44% blind spot in exactly the
-# artifact class this file exists for. Worktrees are also the only place a
-# DETACHED HEAD can hide, and a detached worktree is invisible to every
-# branch-based check by construction: there is no branch to be unmerged.
-for repo in "$ROOT"/*/; do
-  [ -e "$repo/.git" ] || continue
-  name=$(basename "$repo")
+# A linked worktree's `.git` is a file, not a directory. Both independent
+# clones and linked worktrees can have detached HEADs with no named branch.
+while IFS= read -r -d '' marker; do
+  [ -n "$marker" ] || exit 126
+  repositories=$((repositories + 1))
+  repo=${marker%/.git}
+  name=${repo#"$ROOT"/}
   cd "$repo" 2>/dev/null || continue
 
-  # Worktrees SHARE the parent repository's refs, so running the branch checks in
-  # each one would report the same branch once per worktree. Give them only the
-  # checks that are theirs: what HEAD is doing, and what is uncommitted in them.
+  # Custody checks belong to each worktree. Shared refs are checked only once
+  # per canonical git-common-dir below, even when only linked trees are found.
   is_worktree=0
   [ -f "$repo/.git" ] && is_worktree=1
 
@@ -105,7 +141,11 @@ for repo in "$ROOT"/*/; do
     elif [ -z "$(git branch --show-current 2>/dev/null)" ]; then
       note "  $name (worktree): DETACHED at $(git log --oneline -1 2>/dev/null | cut -c1-40)"
     fi
-    continue
+  fi
+
+  # A detached independent clone can contain the only ref to its work too.
+  if [ "$is_worktree" = "0" ] && [ -z "$(git branch --show-current 2>/dev/null)" ]; then
+    note "  $name: DETACHED at $(git log --oneline -1 2>/dev/null | cut -c1-40)"
   fi
 
   # 1. Uncommitted work. Ignores untracked build noise; tracked edits only,
@@ -117,7 +157,8 @@ for repo in "$ROOT"/*/; do
   # failure -- a detector you learn to ignore is a detector that is off.
   # STRANDED_MINUTES sets the line; the default assumes a session boundary.
   mins=${STRANDED_MINUTES:-90}
-  dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+  dirty=0
+  [ "$is_worktree" = "0" ] && dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
   if [ "${dirty:-0}" -gt 0 ]; then
     oldest=$(git status --porcelain --untracked-files=no 2>/dev/null | awk '{print $NF}' \
              | while read -r f; do [ -e "$f" ] && mtime "$f"; done \
@@ -141,6 +182,19 @@ for repo in "$ROOT"/*/; do
   # whether it went there.
   if [ "$(git remote 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]; then continue; fi
 
+  if [ -z "$(git branch --show-current 2>/dev/null)" ]; then
+    n=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+    [ "${n:-0}" -gt 0 ] && note "  $name: detached HEAD has $n commit(s) on no cached remote"
+  fi
+  common=$(git rev-parse --git-common-dir 2>/dev/null) || continue
+  common=$(cd "$common" 2>/dev/null && pwd -P) || continue
+  already=0
+  for previous in "${seen_common[@]}"; do
+    [ "$previous" = "$common" ] && already=1
+  done
+  [ "$already" = "1" ] && continue
+  seen_common+=("$common")
+
   for br in $(git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null); do
     # `archive-*`/`archive/*` is a CLAIM, and it carries an obligation: naming a
     # branch this way asserts that its bytes are preserved somewhere durable that
@@ -161,7 +215,7 @@ for repo in "$ROOT"/*/; do
   #       merged into main and deleted  -- the work landed
   #       named `negative-*`            -- a measured dead end, kept deliberately
   #       named `archive-*`/`archive/*` -- preserved deliberately; see below
-  #       under a live worktree         -- someone is working in it
+  #       under a registered worktree   -- treated as claimed (not process proof)
   #     Anything else is the ambiguous middle, and the ambiguous middle is where
   #     everything stranded on 2026-08-26 was living. The point is not to delete
   #     it; it is that "I have not decided" stops being a silent option.
@@ -172,12 +226,11 @@ for repo in "$ROOT"/*/; do
   now=$(date +%s)
   git for-each-ref --format='%(refname:short) %(committerdate:unix)' refs/heads 2>/dev/null | while read -r br when; do
     case "$br" in main|master|negative-*|negative/*|archive-*|archive/*) continue ;; esac
-    case "|$wt_branches" in *"|$br|"*) continue ;; esac   # a live worktree is a claim
+    case "|$wt_branches" in *"|$br|"*) continue ;; esac   # registration is a claim, not liveness evidence
     age=$(( (now - ${when:-$now}) / 86400 ))
     [ "$age" -ge 2 ] && echo "  $name: branch '$br' owes a disposition (${age}d idle) -- merge+delete, rename negative-*/archive-*, or claim it"
-  done > /tmp/.sw_disp.$$ 2>/dev/null
-  if [ -s /tmp/.sw_disp.$$ ]; then found=1; report="${report}$(cat /tmp/.sw_disp.$$)"$'\n'; fi
-  rm -f /tmp/.sw_disp.$$
+  done > "$scratch/dispositions" 2>/dev/null
+  if [ -s "$scratch/dispositions" ]; then found=1; report="${report}$(cat "$scratch/dispositions")"$'\n'; fi
 
   # 3. Merged and not deleted. Cheap, and it is the husk that made finished work
   #    look unfinished all day.
@@ -188,10 +241,16 @@ for repo in "$ROOT"/*/; do
   # expected". This project hit that on 2026-08-26 in tp-probe.sh -- where it made
   # a clean-RoCE result read as "transport UNKNOWN" -- and the author of THIS file
   # reproduced it the same evening. Capture, then default.
-  stale=$(git branch -r --merged "$base" 2>/dev/null | grep -c '^  origin/')
+  stale=$(git for-each-ref --merged "$base" --format='%(refname:short)' refs/remotes/origin 2>/dev/null \
+    | grep -Ev '^(origin/HEAD|origin/main|origin/master)$' | grep -c '^origin/')
   stale=${stale:-0}
-  [ "$stale" -gt 3 ] && note "  $name: $stale merged branch(es) not deleted"
-done
+  [ "$stale" -gt 0 ] && note "  $name: $stale merged cached remote branch ref(s) retained (remote freshness unchecked)"
+done < <(discover_repositories)
+
+if [ "$repositories" = "0" ]; then
+  echo 'stranded-work: no repositories found under STRANDED_ROOT; inspection unavailable' >&2
+  exit 126
+fi
 
 if [ "$DUE_ONLY" = "1" ]; then exit $((1 - found)); fi
 if [ "$found" = "1" ]; then printf 'stranded work:\n%s' "$report"; else echo "nothing stranded"; fi
