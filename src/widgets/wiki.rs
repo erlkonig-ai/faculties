@@ -13,8 +13,8 @@
 //! Features:
 //! - Search bar at the top
 //! - A force-directed graph of current entry-frontier revisions + links
-//!   derived from immutable content (GPU,
-//!   with optional FDEB edge bundling)
+//!   derived from immutable content, laid out by the shared solver in
+//!   `GORBIE::graph`
 //! - Floating wiki-page cards that open when the user clicks a node, a
 //!   `wiki:<hex>` link in typst content, or a file entry
 //! - Fork-visible revision cards without inventing a scalar latest state
@@ -25,8 +25,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use cubecl::prelude::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -37,6 +35,7 @@ use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::*;
+use GORBIE::graph::{self, GraphViewport, KeyedLayout, LayoutParams};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
@@ -374,255 +373,19 @@ impl WikiLive {
     }
 }
 
-// ── GPU force-directed layout kernel ──────────────────────────────────
-
-#[cube(launch)]
-fn force_step_kernel(
-    pos: &Array<f32>,
-    vel: &mut Array<f32>,
-    edges: &Array<u32>,
-    // Per-node degree (1.0 + incident edge count), used for the
-    // SYMMETRIC attraction weight below. Precomputed on the CPU so
-    // the kernel can look up the *other* endpoint's degree, not just
-    // its own.
-    degrees: &Array<f32>,
-    node_count: u32,
-    edge_count: u32,
-    pos_out: &mut Array<f32>,
-) {
-    let i = ABSOLUTE_POS as u32;
-    if i < node_count {
-        // Calmer layout. `damping` is a velocity *retention* factor
-        // applied every step — at 0.75 a node kept 75% of its
-        // momentum, so attract/repel pairs orbited each other forever
-        // (the energy sink was too weak to ever let them settle).
-        // 0.45 bleeds momentum off fast, so orbital motion decays into
-        // a resting layout. This is the only lever that drains the
-        // *pairwise* orbital energy — the global anti-rotation pass
-        // only removes the whole cloud's average spin, not relative
-        // orbits between node pairs.
-        // `attraction` is the spring constant: 0.3 → 0.15 makes edges
-        // softer (less stiff), so connected nodes ease together rather
-        // than snapping taut and overshooting. `max_force` caps the
-        // per-step impulse — halved so a big push moves gently.
-        // Repulsion eased so the initial expansion is less explosive.
-        let repulsion = 140000.0f32;
-        let attraction = 0.15f32;
-        let damping = 0.45f32;
-        let max_force = 15.0f32;
-        let gravity = 0.001f32;
-
-        let ix = (i * 2) as usize;
-        let iy = ix + 1;
-        let px = pos[ix];
-        let py = pos[iy];
-
-        let mut fx = f32::new(0.0);
-        let mut fy = f32::new(0.0);
-
-        for j in 0..node_count {
-            if j != i {
-                let jx = (j * 2) as usize;
-                let dx = px - pos[jx];
-                let dy = py - pos[jx + 1];
-                let dist_sq = (dx * dx + dy * dy).max(1.0f32);
-                let dist = dist_sq.sqrt().max(0.001f32);
-                let f = repulsion / dist_sq;
-                fx += (dx / dist) * f;
-                fy += (dy / dist) * f;
-            }
-        }
-
-        // Attraction with a SYMMETRIC degree weight. The old code
-        // scaled each endpoint's pull by 1/degree(self), so a hub
-        // linked to a leaf pulled the leaf hard (small leaf degree)
-        // but the leaf barely pulled the hub (large hub degree) —
-        // unequal magnitudes on the same edge, which violates
-        // Newton's 3rd law and continuously injects net linear AND
-        // angular momentum (the source of the never-ending spin/drift
-        // that damping could never overcome). The weight
-        // `attraction / sqrt(deg_i * deg_o)` is symmetric in the two
-        // endpoints, so both feel the same magnitude → equal and
-        // opposite → momentum is conserved and the layout can settle.
-        // It still relieves hubs (the anti-collapse benefit).
-        let deg_i = degrees[i as usize];
-        for e in 0..edge_count {
-            let ea = edges[(e * 2) as usize];
-            let eb = edges[(e * 2 + 1) as usize];
-            if ea == i {
-                let deg_o = degrees[eb as usize];
-                let w = attraction / (deg_i * deg_o).sqrt();
-                let bx = (eb * 2) as usize;
-                fx += (pos[bx] - px) * w;
-                fy += (pos[bx + 1] - py) * w;
-            }
-            if eb == i {
-                let deg_o = degrees[ea as usize];
-                let w = attraction / (deg_i * deg_o).sqrt();
-                let ax = (ea * 2) as usize;
-                fx += (pos[ax] - px) * w;
-                fy += (pos[ax + 1] - py) * w;
-            }
-        }
-
-        fx -= px * gravity;
-        fy -= py * gravity;
-
-        let fmag = (fx * fx + fy * fy).sqrt();
-        if fmag > max_force {
-            let scale = max_force / fmag;
-            fx *= scale;
-            fy *= scale;
-        }
-
-        let vx = (vel[ix] + fx) * damping;
-        let vy = (vel[iy] + fy) * damping;
-        vel[ix] = vx;
-        vel[iy] = vy;
-        pos_out[ix] = px + vx;
-        pos_out[iy] = py + vy;
-    }
-}
-
-// ── FDEB (force-directed edge bundling) kernel ────────────────────────
-
-#[cube(launch)]
-fn fdeb_step_kernel(
-    points: &Array<f32>,
-    points_out: &mut Array<f32>,
-    edge_count: u32,
-    k: u32,
-    step_size: f32,
-    spring_k: f32,
-) {
-    let tid = ABSOLUTE_POS as u32;
-    let total = edge_count * k;
-    if tid < total {
-        let e = tid / k;
-        let p = tid % k;
-        let ix = (tid * 2) as usize;
-        let px = points[ix];
-        let py = points[ix + 1];
-
-        if p == 0u32 || p == k - 1u32 {
-            points_out[ix] = px;
-            points_out[ix + 1] = py;
-        } else {
-            let my0 = (e * k * 2) as usize;
-            let my1 = ((e * k + k - 1u32) * 2) as usize;
-            let my_p0x = points[my0];
-            let my_p0y = points[my0 + 1];
-            let my_p1x = points[my1];
-            let my_p1y = points[my1 + 1];
-            let my_dx = my_p1x - my_p0x;
-            let my_dy = my_p1y - my_p0y;
-            let my_len = (my_dx * my_dx + my_dy * my_dy).sqrt().max(1.0f32);
-            let my_mx = (my_p0x + my_p1x) * 0.5f32;
-            let my_my = (my_p0y + my_p1y) * 0.5f32;
-
-            // Smoothing spring: penalizes curvature (local).
-            let prev_ix = ((e * k + p - 1u32) * 2) as usize;
-            let next_ix = ((e * k + p + 1u32) * 2) as usize;
-            let fx_smooth = ((points[prev_ix] - px) + (points[next_ix] - px)) * spring_k;
-            let fy_smooth = ((points[prev_ix + 1] - py) + (points[next_ix + 1] - py)) * spring_k;
-
-            // Straight-line restoring: pulls back toward the unbent
-            // position on the original edge (global shape anchor).
-            let t = p as f32 / (k - 1u32) as f32;
-            let sx = my_p0x + (my_p1x - my_p0x) * t;
-            let sy = my_p0y + (my_p1y - my_p0y) * t;
-            let straighten = 0.03f32;
-            let fx_straight = (sx - px) * straighten;
-            let fy_straight = (sy - py) * straighten;
-
-            // Electrostatic: unit-vector pull toward corresponding
-            // point on each compatible edge, averaged over compatible
-            // count so total magnitude is bounded ≤ 1.
-            let mut fx_elec = f32::new(0.0);
-            let mut fy_elec = f32::new(0.0);
-
-            for other in 0u32..edge_count {
-                if other != e {
-                    let o0 = (other * k * 2) as usize;
-                    let o1 = ((other * k + k - 1u32) * 2) as usize;
-                    let o_p0x = points[o0];
-                    let o_p0y = points[o0 + 1];
-                    let o_p1x = points[o1];
-                    let o_p1y = points[o1 + 1];
-                    let o_dx = o_p1x - o_p0x;
-                    let o_dy = o_p1y - o_p0y;
-                    let o_len = (o_dx * o_dx + o_dy * o_dy).sqrt().max(1.0f32);
-                    let o_mx = (o_p0x + o_p1x) * 0.5f32;
-                    let o_my = (o_p0y + o_p1y) * 0.5f32;
-
-                    let dot = my_dx * o_dx + my_dy * o_dy;
-                    let cos_a = dot / (my_len * o_len);
-                    let c_angle = cos_a * cos_a;
-
-                    let lavg = (my_len + o_len) * 0.5f32;
-                    let lmin = my_len.min(o_len);
-                    let lmax = my_len.max(o_len);
-                    let c_scale = 2.0f32 / (lavg / lmin + lmax / lavg);
-
-                    let mdx = my_mx - o_mx;
-                    let mdy = my_my - o_my;
-                    let mdist = (mdx * mdx + mdy * mdy).sqrt();
-                    let c_pos = lavg / (lavg + mdist);
-
-                    let compat = c_angle * c_scale * c_pos;
-
-                    if compat > 0.2f32 {
-                        let corr_p = if dot >= 0.0f32 { p } else { k - 1u32 - p };
-                        let other_ix = ((other * k + corr_p) * 2) as usize;
-                        let ox = points[other_ix];
-                        let oy = points[other_ix + 1];
-                        let ddx = ox - px;
-                        let ddy = oy - py;
-                        let d = (ddx * ddx + ddy * ddy).sqrt().max(0.1f32);
-                        fx_elec += (ddx / d) * compat;
-                        fy_elec += (ddy / d) * compat;
-                    }
-                }
-            }
-
-            // Cap electrostatic magnitude so it can't overwhelm
-            // the straight-line restoring force.
-            let elec_mag = (fx_elec * fx_elec + fy_elec * fy_elec).sqrt();
-            let max_elec = 3.0f32;
-            if elec_mag > max_elec {
-                let s = max_elec / elec_mag;
-                fx_elec *= s;
-                fy_elec *= s;
-            }
-
-            let fx = fx_smooth + fx_straight + fx_elec;
-            let fy = fy_smooth + fy_straight + fy_elec;
-            points_out[ix] = px + fx * step_size;
-            points_out[ix + 1] = py + fy * step_size;
-        }
-    }
-}
-
 // ── force-directed graph ──────────────────────────────────────────────
 
 struct WikiGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<(usize, usize)>,
-    gpu: Option<GpuForceState>,
-    /// Bundled polylines per edge (world coords). `None` = draw straight.
-    polylines: Option<Vec<Vec<egui::Vec2>>>,
-}
-
-struct GpuForceState {
-    client: ComputeClient<WgpuRuntime>,
-    pos_handle: cubecl::server::Handle,
-    vel_handle: cubecl::server::Handle,
-    edges_handle: cubecl::server::Handle,
-    /// Per-node degree (1.0 + incident edges), immutable across steps.
-    degrees_handle: cubecl::server::Handle,
-    pos_out_handle: cubecl::server::Handle,
-    node_count: u32,
-    edge_count: u32,
+    /// Positions, under the force law this file used to carry itself.
+    ///
+    /// The seam is narrow on purpose: the layout owns positions by index, and
+    /// this widget owns everything else at the same index. There is no node
+    /// payload on the other side of it, which is what lets the peer mesh and
+    /// the collection lattice share the same solver without sharing a node
+    /// type with the wiki.
+    layout: KeyedLayout,
 }
 
 struct GraphNode {
@@ -630,22 +393,58 @@ struct GraphNode {
     entry_key: Id,
     archived: bool,
     label: String,
-    pos: egui::Vec2,
-    /// Total incident edges (in + out). Used to scale the node
-    /// radius so hub revisions visually dominate.
-    degree: u32,
 }
 
 impl WikiGraph {
     fn from_wiki(wiki: DatasetView<'_>) -> Self {
+        let (nodes, edges) = Self::read(wiki);
+        let keys = Self::keys(&nodes);
+        let pairs = Self::pairs(&edges);
+        let layout = KeyedLayout::new(keys, &pairs, LayoutParams::default());
+        WikiGraph {
+            nodes,
+            edges,
+            layout,
+        }
+    }
+
+    /// Bring the graph up to date with a new dataset revision, carrying every
+    /// node that survived.
+    ///
+    /// This replaces dropping the whole graph, which is what this viewer used
+    /// to do: on any revision change it rebuilt from scratch, so every node was
+    /// re-seeded on a fresh ring with zero velocity and the whole settle was
+    /// paid again. One `wiki create` by anyone else working the same pile
+    /// teleported the layout back to a circle. Now survivors keep position
+    /// *and* velocity,
+    /// and the new nodes arrive where their neighbours already are, heated —
+    /// so a write nudges the picture where it landed instead of resetting it.
+    fn refresh(&mut self, wiki: DatasetView<'_>) {
+        let (nodes, edges) = Self::read(wiki);
+        let keys = Self::keys(&nodes);
+        let pairs = Self::pairs(&edges);
+        self.layout.sync(&keys, &pairs);
+        self.nodes = nodes;
+        self.edges = edges;
+    }
+
+    fn keys(nodes: &[GraphNode]) -> Vec<u64> {
+        nodes
+            .iter()
+            .map(|node| graph::key_of(node.revision_id.as_ref()))
+            .collect()
+    }
+
+    fn pairs(edges: &[(usize, usize)]) -> Vec<(u32, u32)> {
+        edges.iter().map(|&(a, b)| (a as u32, b as u32)).collect()
+    }
+
+    fn read(wiki: DatasetView<'_>) -> (Vec<GraphNode>, Vec<(usize, usize)>) {
         let heads = WikiLive::visible_heads(wiki);
         let mut revision_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
 
-        let n = heads.len().max(1) as f32;
         for (i, head) in heads.iter().enumerate() {
-            let angle = (i as f32 / n) * std::f32::consts::TAU;
-            let radius = 200.0 + n * 5.0;
             let title = WikiLive::title(wiki.facts, wiki.reader, head.revision_id);
             revision_to_idx.insert(head.revision_id, i);
             let mut label = if title.is_empty() {
@@ -664,8 +463,6 @@ impl WikiGraph {
                 entry_key: head.entry_key,
                 archived: head.archived,
                 label,
-                pos: egui::vec2(angle.cos() * radius, angle.sin() * radius),
-                degree: 0,
             });
         }
 
@@ -688,296 +485,25 @@ impl WikiGraph {
             eprintln!("[wiki] graph: {unresolved} link targets are outside the visible frontier");
         }
 
-        // Compute per-node degree for size scaling in the render pass.
-        for &(from, to) in &edges {
-            nodes[from].degree = nodes[from].degree.saturating_add(1);
-            nodes[to].degree = nodes[to].degree.saturating_add(1);
-        }
-
-        let gpu = Self::init_gpu(&nodes, &edges);
-        WikiGraph {
-            nodes,
-            edges,
-            gpu,
-            polylines: None,
-        }
+        (nodes, edges)
     }
 
-    fn init_gpu(nodes: &[GraphNode], edges: &[(usize, usize)]) -> Option<GpuForceState> {
-        let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
-        let n = nodes.len();
-
-        let mut pos_flat: Vec<f32> = Vec::with_capacity(n * 2);
-        let vel_flat: Vec<f32> = vec![0.0; n * 2];
-        for node in nodes {
-            pos_flat.push(node.pos.x);
-            pos_flat.push(node.pos.y);
-        }
-
-        let edges_flat: Vec<u32> = edges
-            .iter()
-            .flat_map(|&(a, b)| [a as u32, b as u32])
-            .collect();
-
-        // Per-node degree for the symmetric attraction weight. Base of
-        // 1.0 (matches the old `degree` starting value) keeps isolated
-        // nodes at deg=1 and avoids a divide-by-zero in sqrt(deg*deg).
-        let degrees_flat: Vec<f32> = nodes.iter().map(|nd| 1.0 + nd.degree as f32).collect();
-
-        let pos_handle = client.create_from_slice(f32::as_bytes(&pos_flat));
-        let vel_handle = client.create_from_slice(f32::as_bytes(&vel_flat));
-        let edges_handle = if edges_flat.is_empty() {
-            client.create_from_slice(u32::as_bytes(&[0u32; 2]))
-        } else {
-            client.create_from_slice(u32::as_bytes(&edges_flat))
-        };
-        let degrees_handle = if degrees_flat.is_empty() {
-            client.create_from_slice(f32::as_bytes(&[1.0f32]))
-        } else {
-            client.create_from_slice(f32::as_bytes(&degrees_flat))
-        };
-        let pos_out_handle = client.empty(n * 2 * std::mem::size_of::<f32>());
-
-        Some(GpuForceState {
-            client,
-            pos_handle,
-            vel_handle,
-            edges_handle,
-            degrees_handle,
-            pos_out_handle,
-            node_count: n as u32,
-            edge_count: edges.len() as u32,
-        })
-    }
-
-    fn step(&mut self) {
-        let Some(gpu) = &mut self.gpu else { return };
-        let n = gpu.node_count as usize;
-        if n == 0 {
-            return;
-        }
-
-        unsafe {
-            force_step_kernel::launch::<WgpuRuntime>(
-                &gpu.client,
-                CubeCount::new_1d(((n as u32) + 255) / 256),
-                CubeDim::new_1d(256),
-                ArrayArg::from_raw_parts(gpu.pos_handle.clone(), n * 2),
-                ArrayArg::from_raw_parts(gpu.vel_handle.clone(), n * 2),
-                ArrayArg::from_raw_parts(
-                    gpu.edges_handle.clone(),
-                    gpu.edge_count.max(1) as usize * 2,
-                ),
-                ArrayArg::from_raw_parts(gpu.degrees_handle.clone(), n),
-                gpu.node_count,
-                gpu.edge_count,
-                ArrayArg::from_raw_parts(gpu.pos_out_handle.clone(), n * 2),
-            );
-        }
-
-        std::mem::swap(&mut gpu.pos_handle, &mut gpu.pos_out_handle);
-
-        let bytes = gpu
-            .client
-            .read_one(gpu.pos_handle.clone())
-            .expect("gpu readback");
-        let positions: &[f32] = f32::from_bytes(&bytes);
-
-        // Compute center of mass and average angular velocity,
-        // then subtract to kill collective rotation.
-        let mut cx = 0.0f32;
-        let mut cy = 0.0f32;
-        for i in 0..n {
-            cx += positions[i * 2];
-            cy += positions[i * 2 + 1];
-        }
-        cx /= n as f32;
-        cy /= n as f32;
-
-        // Compute average angular momentum around center of mass.
-        let mut angular = 0.0f32;
-        let mut inertia = 0.0f32;
-        for (i, node) in self.nodes.iter().enumerate() {
-            let px = positions[i * 2];
-            let py = positions[i * 2 + 1];
-            let dx = px - cx;
-            let dy = py - cy;
-            let vx = px - node.pos.x;
-            let vy = py - node.pos.y;
-            let r_sq = dx * dx + dy * dy;
-            angular += dx * vy - dy * vx; // cross product = angular contribution
-            inertia += r_sq;
-        }
-        let omega = if inertia > 1.0 {
-            angular / inertia
-        } else {
-            0.0
-        };
-
-        // Read back velocities up-front so we can compute the mean
-        // (= the system's linear momentum / mass) alongside the
-        // angular correction.
-        let vel_bytes = gpu
-            .client
-            .read_one(gpu.vel_handle.clone())
-            .expect("gpu readback");
-        let velocities: &[f32] = f32::from_bytes(&vel_bytes);
-        let mut mean_vx = 0.0f32;
-        let mut mean_vy = 0.0f32;
-        for i in 0..n {
-            mean_vx += velocities[i * 2];
-            mean_vy += velocities[i * 2 + 1];
-        }
-        mean_vx /= n as f32;
-        mean_vy /= n as f32;
-
-        // Corrections fed back to the GPU each frame:
-        //
-        // - Position: pin the centroid at the world origin (positions
-        //   ← positions − centroid). Pure translation of the frame —
-        //   norm-preserving, never distorts the layout.
-        // - Velocity: remove the net linear (mean) and net angular
-        //   (omega × r) components. Both are momentum-removal that is
-        //   a no-op at rest (omega, mean → 0) and only bleeds off any
-        //   residual global drift/spin from initial conditions or
-        //   numerical noise during settling.
-        //
-        // We deliberately do NOT shear positions by `omega × r` any
-        // more. That was a small-angle approximation of a rotation —
-        // not norm-preserving — and it wrote into `node.pos`, which is
-        // also the baseline for next frame's velocity estimate, so it
-        // closed a feedback loop that could *sustain* rotation. With
-        // the attraction now momentum-conserving (symmetric weight)
-        // there is no torque source, so global angular momentum stays
-        // ~0 on its own and the velocity-only removal is all the
-        // insurance we need.
-        let mut corrected_pos: Vec<f32> = Vec::with_capacity(n * 2);
-        let mut corrected_vel: Vec<f32> = Vec::with_capacity(n * 2);
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            let dx = positions[i * 2] - cx;
-            let dy = positions[i * 2 + 1] - cy;
-            node.pos = egui::vec2(dx, dy);
-            corrected_pos.push(dx);
-            corrected_pos.push(dy);
-            corrected_vel.push(velocities[i * 2] - mean_vx + omega * dy);
-            corrected_vel.push(velocities[i * 2 + 1] - mean_vy - omega * dx);
-        }
-
-        // Replace GPU buffers — `create_from_slice` is the only public
-        // update path in cubecl 0.9; the old handles drop and the
-        // runtime's allocator reclaims their slots.
-        gpu.pos_handle = gpu.client.create_from_slice(f32::as_bytes(&corrected_pos));
-        gpu.vel_handle = gpu.client.create_from_slice(f32::as_bytes(&corrected_vel));
-    }
-
-    #[allow(dead_code)]
-    fn is_bundled(&self) -> bool {
-        self.polylines.is_some()
+    /// Advance the layout one step.
+    ///
+    /// The force law this calls is the one this file used to carry: it moved
+    /// down into `GORBIE::graph` so the peer mesh and the collection lattice
+    /// could use the same physics, and `LayoutParams::default()` is that law
+    /// constant for constant.
+    fn step(&mut self) -> GORBIE::graph::LayoutStats {
+        self.layout.layout_mut().step()
     }
 
     fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    #[allow(dead_code)]
-    fn edge_count(&self) -> usize {
-        self.edges.len()
-    }
-
-    #[allow(dead_code)]
-    fn clear_bundling(&mut self) {
-        self.polylines = None;
-    }
-
-    /// Force-Directed Edge Bundling (Holten & Van Wijk 2009) on GPU.
-    /// Edges subdivide into K control points; each non-endpoint point
-    /// is pulled by spring forces from its polyline neighbors and by
-    /// electrostatic attraction from *compatible* edges (matching
-    /// angle, scale, and midpoint proximity). Compatibility prevents
-    /// edges from detouring through unrelated bundles.
-    #[allow(dead_code)]
-    fn bundle_edges(&mut self) {
-        const K: u32 = 17;
-        const CYCLES: usize = 5;
-        const ITERATIONS_START: usize = 50;
-        const SPRING_K: f32 = 0.1;
-
-        if self.edges.is_empty() {
-            self.polylines = Some(Vec::new());
-            return;
-        }
-
-        let e = self.edges.len() as u32;
-        let total = e * K;
-        let total_floats = (total * 2) as usize;
-
-        let mut flat: Vec<f32> = Vec::with_capacity(total_floats);
-        for &(a, b) in &self.edges {
-            let p0 = self.nodes[a].pos;
-            let p1 = self.nodes[b].pos;
-            for i in 0..K {
-                let t = i as f32 / (K - 1) as f32;
-                let p = p0 + (p1 - p0) * t;
-                flat.push(p.x);
-                flat.push(p.y);
-            }
-        }
-
-        // Average edge length — sets step scale so forces move control
-        // points a sensible fraction of a typical edge per iteration.
-        let mut len_sum = 0.0f32;
-        for &(a, b) in &self.edges {
-            len_sum += (self.nodes[a].pos - self.nodes[b].pos).length();
-        }
-        let avg_len = (len_sum / e as f32).max(1.0);
-        // Step in world units. Electrostatic force is a unit vector
-        // (bounded ≤ 1 after averaging), so step_size controls the
-        // max displacement per iteration. Segment length ≈ avg_len/16;
-        // move at most ~1/3 of a segment per step for stability.
-        let segment_len = avg_len / (K - 1) as f32;
-        let mut step_size = segment_len * 0.15;
-
-        let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
-        let mut pts_handle = client.create_from_slice(f32::as_bytes(&flat));
-        let mut pts_out_handle = client.empty(total_floats * std::mem::size_of::<f32>());
-
-        let mut iterations = ITERATIONS_START;
-        for _cycle in 0..CYCLES {
-            for _ in 0..iterations {
-                unsafe {
-                    fdeb_step_kernel::launch::<WgpuRuntime>(
-                        &client,
-                        CubeCount::new_1d((total + 255) / 256),
-                        CubeDim::new_1d(256),
-                        ArrayArg::from_raw_parts(pts_handle.clone(), total_floats),
-                        ArrayArg::from_raw_parts(pts_out_handle.clone(), total_floats),
-                        e,
-                        K,
-                        step_size,
-                        SPRING_K,
-                    );
-                }
-                std::mem::swap(&mut pts_handle, &mut pts_out_handle);
-            }
-            step_size *= 0.5;
-            iterations = (iterations * 2 / 3).max(10);
-        }
-
-        let bytes = client.read_one(pts_handle).expect("gpu readback");
-        let result: &[f32] = f32::from_bytes(&bytes);
-
-        let mut polylines = Vec::with_capacity(self.edges.len());
-        for ei in 0..self.edges.len() {
-            let mut poly = Vec::with_capacity(K as usize);
-            for pi in 0..K as usize {
-                let ix = (ei * K as usize + pi) * 2;
-                poly.push(egui::vec2(result[ix], result[ix + 1]));
-            }
-            polylines.push(poly);
-        }
-        self.polylines = Some(polylines);
+    fn positions(&self) -> &[[f32; 2]] {
+        self.layout.layout().positions()
     }
 
     /// Paint the force-directed graph. Returns both the clicked node
@@ -1007,82 +533,30 @@ impl WikiGraph {
         let (response, painter) =
             ui.allocate_painter(egui::vec2(available.x, h), egui::Sense::click_and_drag());
         let rect = response.rect;
-        let center = rect.center();
 
+        // Pan, zoom and the two hard-won details that make them work inside a
+        // notebook's ScrollArea now live in `GORBIE::graph::viewport`, where
+        // the mesh and the lattice get them too.
         let view_id = ui.id().with("wiki_graph_view");
-        let pan_id = view_id.with("pan");
-        let zoom_id = view_id.with("zoom");
+        let mut view = GraphViewport::load(ui, view_id);
+        view.interact(ui, &response, rect);
+        // Frame the graph until the reader takes the framing over. This viewer
+        // has never done it, and at its live size it opened entirely
+        // off-screen: the old ring seed was 200 + 5n world units, which is
+        // 17 110 at three thousand nodes against a visible half-width of 7 680
+        // at the old zoom floor. The reader had to find the graph by dragging.
+        const LABEL_MARGIN: f32 = 40.0;
+        view.fit_unless_touched(rect, self.layout.layout().stats().bounds, LABEL_MARGIN);
+        view.store(ui, view_id);
+        let zoom = view.zoom();
+        let positions = self.positions();
+        let to_screen = |world: [f32; 2]| view.to_screen(rect, world);
 
-        let mut pan: egui::Vec2 = ui.ctx().memory_mut(|m| {
-            *m.data
-                .get_temp_mut_or_insert_with(pan_id, || egui::Vec2::ZERO)
-        });
-        let mut zoom: f32 = ui
-            .ctx()
-            .memory_mut(|m| *m.data.get_temp_mut_or_insert_with(zoom_id, || 1.0f32));
-
-        // Direct rect-contains-pointer hover check — the outer
-        // notebook ScrollArea otherwise claims hover priority and
-        // `response.hovered()` returns false, so wheel events fall
-        // through to the notebook instead of the graph.
-        let pointer_in_graph = ui
-            .input(|i| i.pointer.hover_pos())
-            .map(|p| rect.contains(p))
-            .unwrap_or(false);
-        if pointer_in_graph {
-            // Pinch-to-zoom (trackpad native) or cmd/ctrl + scroll
-            // (mouse wheel). Plain vertical/horizontal scroll is NOT
-            // consumed — it falls through to the outer notebook
-            // ScrollArea. Previously we zoomed on `smooth_scroll_delta.x`
-            // alone, which caught trackpad sideways drift on every
-            // scroll and made the graph zoom when the user just wanted
-            // to scroll the page.
-            let (pinch, scroll_y, ctrl) = ui.input(|i| {
-                (
-                    i.zoom_delta(),
-                    i.smooth_scroll_delta.y,
-                    i.modifiers.command || i.modifiers.ctrl,
-                )
-            });
-            let zoom_factor = if pinch != 1.0 {
-                pinch
-            } else if ctrl && scroll_y != 0.0 {
-                (1.0 + scroll_y * 0.004).clamp(0.85, 1.15)
-            } else {
-                1.0
-            };
-            if zoom_factor != 1.0 {
-                let old_zoom = zoom;
-                zoom = (zoom * zoom_factor).clamp(0.05, 10.0);
-                if let Some(hp) = response.hover_pos() {
-                    let cursor_offset = hp - center - pan;
-                    pan -= cursor_offset * (zoom / old_zoom - 1.0);
-                }
-                ui.ctx().memory_mut(|m| {
-                    m.data.insert_temp(zoom_id, zoom);
-                    m.data.insert_temp(pan_id, pan);
-                });
-                // Only consume the scroll delta we actually used.
-                if ctrl && scroll_y != 0.0 {
-                    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-                }
-            }
-        }
-
-        // Drag-to-pan via egui's z-aware drag sense — `drag_delta()`
-        // only fires when the press started on this widget AND no
-        // higher-z widget is on top, so floats dragged across the
-        // viewport don't steal pans (or pan-and-drag in lockstep).
-        let drag_delta = response.drag_delta();
-        if drag_delta != egui::Vec2::ZERO {
-            pan += drag_delta;
-            ui.ctx().memory_mut(|m| m.data.insert_temp(pan_id, pan));
-        }
-
-        let to_screen =
-            |world: egui::Vec2| center + pan + egui::vec2(world.x * zoom, world.y * zoom);
-
-        let node_radius = 6.0 * zoom.max(0.3);
+        // The shared mark size, not a second copy of the constant. A mark is a
+        // symbol rather than a measured object, so it holds its size instead of
+        // shrinking to a speck when a large graph is framed or growing into a
+        // plate when one node is.
+        let node_radius = graph::MARK * view.mark_scale();
         let edge_color = ui.visuals().weak_text_color();
         let node_match_fill = GORBIE::themes::ral(1003);
         let needle_lower = search.query().to_lowercase();
@@ -1091,21 +565,13 @@ impl WikiGraph {
         let font_id = egui::TextStyle::Small.resolve(ui.style());
 
         let edge_stroke = egui::Stroke::new(0.5, edge_color);
-        for (e_idx, &(a, b)) in self.edges.iter().enumerate() {
-            let p1 = to_screen(self.nodes[a].pos);
-            let p2 = to_screen(self.nodes[b].pos);
+        for &(a, b) in &self.edges {
+            let p1 = to_screen(positions[a]);
+            let p2 = to_screen(positions[b]);
             if !(rect.expand(50.0).contains(p1) || rect.expand(50.0).contains(p2)) {
                 continue;
             }
-            match &self.polylines {
-                Some(polys) => {
-                    let pts: Vec<egui::Pos2> = polys[e_idx].iter().map(|&p| to_screen(p)).collect();
-                    painter.add(egui::Shape::line(pts, edge_stroke));
-                }
-                None => {
-                    painter.line_segment([p1, p2], edge_stroke);
-                }
-            }
+            painter.line_segment([p1, p2], edge_stroke);
         }
 
         let mut clicked = None;
@@ -1119,7 +585,7 @@ impl WikiGraph {
             let (r, g, b) = (panel_fill.r(), panel_fill.g(), panel_fill.b());
             egui::Color32::from_rgba_unmultiplied(r, g, b, 220)
         };
-        for node in &self.nodes {
+        for (index, node) in self.nodes.iter().enumerate() {
             // Search-active and the node's title matches? Report to
             // the search session BEFORE the visibility check, so
             // off-screen matches still bump the global `n / total`
@@ -1136,14 +602,17 @@ impl WikiGraph {
                 None
             };
 
-            let pos = to_screen(node.pos);
+            let pos = to_screen(positions[index]);
             if !rect.expand(20.0).contains(pos) {
                 continue;
             }
 
             // Scale node radius by degree: isolated nodes at the base
             // size, hub revisions grow logarithmically. Caps at 3×.
-            let deg_scale = (1.0 + (node.degree as f32 + 1.0).ln() * 0.4).min(3.0);
+            // The degree comes from the layout's own adjacency rather than
+            // from a second count kept here: the solver already builds it, and
+            // two counts of the same edges are two chances to disagree.
+            let deg_scale = (1.0 + self.layout.layout().degree(index).ln() * 0.4).min(3.0);
             let r = node_radius * deg_scale;
             // Matching nodes paint in RAL 1003 (signal yellow) — same
             // color GORBIE uses for word-level search underlines, so
@@ -1155,7 +624,20 @@ impl WikiGraph {
             } else {
                 frag_color(node.entry_key)
             };
-            painter.circle(pos, r, fill, node_stroke);
+            // Drawn through the shared mark kit, so a wiki node, a peer and a
+            // collection are the same vocabulary rather than three sketches of
+            // it. The outline is a second call because the kit takes one
+            // colour per mark; the result is the shape `painter.circle` drew.
+            graph::draw_node(
+                &painter,
+                pos,
+                r / graph::MARK,
+                graph::Glyph::Circle,
+                graph::Stroke2::Filled,
+                fill,
+                1,
+            );
+            painter.circle_stroke(pos, r, node_stroke);
             if show_labels {
                 // Measure the label first so we know whether it fits
                 // on the right. If painting to the right of the node
@@ -1392,7 +874,11 @@ impl WikiViewer {
                     self.error = Some(((wiki_revision, files_revision), error));
                 }
             }
-            self.graph = None;
+            // A failed refresh has no dataset to read, so the graph goes; a
+            // successful one keeps it and retargets below.
+            if self.error.is_some() {
+                self.graph = None;
+            }
         }
 
         if let Some((_, error)) = self.error.as_ref() {
@@ -1409,8 +895,10 @@ impl WikiViewer {
         let mut submit_query: Option<String> = None;
 
         // ── force-directed graph ─────────────────────────────────────
-        if self.graph.is_none() {
-            self.graph = Some(WikiGraph::from_wiki(wiki_view));
+        match self.graph.as_mut() {
+            None => self.graph = Some(WikiGraph::from_wiki(wiki_view)),
+            Some(graph) if need_refresh => graph.refresh(wiki_view),
+            Some(_) => {}
         }
         // Empty state when the Wiki collection has no live entries —
         // otherwise the graph is a blank canvas.
@@ -1448,12 +936,9 @@ impl WikiViewer {
             if graph.node_count() == 0 {
                 return;
             }
-            // Advance the force layout every frame. Bundle toggle is
-            // gone (graph.bundle_edges / clear_bundling are still
-            // available for a future reintroduction); the meta info
-            // is overlaid inside the viewport itself — see
-            // WikiGraph::show.
-            graph.step();
+            // Advance the force layout every frame. The meta info is
+            // overlaid inside the viewport itself — see WikiGraph::show.
+            let stats = graph.step();
             // Graph is rendered OUTSIDE the grid so it uses the full
             // section width without the grid cell's edge padding —
             // visually the force-directed view becomes edge-to-edge
@@ -1470,7 +955,13 @@ impl WikiViewer {
                     self.open_pages.push(OpenPage { revision_id });
                 }
             }
-            ctx.ctx().request_repaint();
+            // Repaint only while something is moving. This ran unconditionally
+            // every frame, so a settled graph burned a core at display rate
+            // forever; `quiet` is a repaint gate and deliberately not a claim
+            // that the layout converged.
+            if !stats.quiet {
+                ctx.ctx().request_repaint();
+            }
 
             // ── Search-bar overlay in the top-left of the graph.
             // No FIND label — the empty field's hint_text and the

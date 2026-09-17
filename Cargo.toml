@@ -19,7 +19,7 @@ categories = ["command-line-utilities", "data-structures"]
 
 # docs.rs should render all public API, including the optional
 # `widgets` module (WikiViewer / CompassBoard / etc.) that depends
-# on egui/GORBIE/cubecl.
+# on egui/GORBIE.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -34,9 +34,12 @@ path = "src/bin/viewer.rs"
 required-features = ["widgets"]
 
 # Minimal headless capture target for iterating on planner-widget
-# visuals in isolation — avoids spinning up the wiki widget (cubecl
-# GPU context) which collides with the headless wgpu renderer on
-# some platforms.
+# visuals in isolation. It was needed because the wiki widget opened its
+# own cubecl `WgpuDevice`, which collided with the headless wgpu renderer
+# on some platforms; that device is gone — the graph layout runs on the
+# CPU in `GORBIE::graph` — so the collision it works around no longer
+# exists. Kept because iterating on one widget is still faster than
+# rendering the whole notebook.
 [[bin]]
 name = "planner-capture"
 path = "src/bin/planner-capture.rs"
@@ -114,7 +117,6 @@ default = ["local-embed", "widgets", "audio", "hear"]
 widgets = [
     "dep:GORBIE",
     "dep:egui",
-    "dep:cubecl",
 ]
 # Consumed by GORBIE's `#[notebook]` expansion to gate its export branch.
 web-export = []
@@ -220,7 +222,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }  # pos
 # Widgets-only (optional): GORBIE viewer stack.
 GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
-cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
 
 # Optional, heavy: mary's Burn/Metal model ports. Activated as a bare optional
 # dep (no default features); the *consuming* faculties feature turns on exactly

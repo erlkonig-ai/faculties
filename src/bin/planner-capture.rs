@@ -1,8 +1,14 @@
 //! Minimal capture target for iterating on the planner widget in
-//! isolation. The full `viewer` pulls in the wiki widget
-//! which initialises its own cubecl/wgpu GPU context — that collides
-//! with the headless wgpu renderer on some platforms and produces
-//! 2-pixel-tall stub PNGs for every card after wiki.
+//! isolation.
+//!
+//! It exists because the full `viewer` pulled in the wiki widget, which
+//! initialised its own cubecl/wgpu GPU context — that collided with the
+//! headless wgpu renderer on some platforms and produced 2-pixel-tall stub
+//! PNGs for every card after wiki. **That context is gone**: the graph layout
+//! moved to the CPU in `GORBIE::graph`, so the wiki widget no longer opens a
+//! device of its own and the collision has no cause left. Whether the full
+//! viewer now captures cleanly has not been re-run; if it does, this target is
+//! redundant except as a faster loop on one widget.
 //!
 //! Usage:
 //! ```sh
