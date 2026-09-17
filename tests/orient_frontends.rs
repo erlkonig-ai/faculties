@@ -501,7 +501,7 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
         let before = f.records();
         let report = match frontend {
             "poll" => text(&f.call("orient_poll", json!({"persona": f.who()}))),
-            "show" => text(&f.call("orient_show", json!({}))),
+            "show" => text(&f.call("orient_show", json!({"persona": f.who()}))),
             "wake" => text(&f.call("orient_wake", json!({"chars": 0}))),
             "wait" => {
                 let mut parts = Vec::new();
@@ -542,7 +542,7 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
             "{frontend} must carry the raw input before reporting"
         );
         assert!(before.iter().all(|record| after.contains(record)));
-        if frontend == "wait" {
+        if matches!(frontend, "show" | "wait") {
             assert!(f.presented().contains(&event));
             // A fresh reporting call catches up its own receipt projection;
             // no external upkeep call is inserted to hide a duplicate.
