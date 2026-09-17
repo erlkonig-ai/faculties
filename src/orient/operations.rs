@@ -411,6 +411,7 @@ impl RefreshProbe {
             },
         ));
         let outcome = match result {
+            Ok(Some(WaitFrameLoad::Retained(_))) => "retained",
             Ok(Some(WaitFrameLoad::Ready(frame))) => {
                 self.ordinary(previous, &frame.observation);
                 "ready"
@@ -3177,6 +3178,9 @@ fn pending_blob(error: &anyhow::Error) -> Option<MissingBlob> {
 enum WaitFrameLoad {
     Pending(PendingWaitFrame),
     Ready(WaitFrame),
+    /// Eager upkeep succeeded without changing any selected dependency.
+    /// Keep the ready observation and its application-time Habit context.
+    Retained(FacultySnapshot),
 }
 
 impl WaitFrameLoad {
@@ -3184,6 +3188,7 @@ impl WaitFrameLoad {
         match self {
             Self::Pending(pending) => &pending.watermark,
             Self::Ready(frame) => &frame.watermark,
+            Self::Retained(snapshot) => snapshot,
         }
     }
 }
@@ -3458,6 +3463,7 @@ async fn prepare_wait_frame_before_health_deadline(
     maintained_from: &mut Option<FacultySnapshot>,
     upkeep_interrupted: &mut bool,
     pending: &mut Option<PendingWaitFrame>,
+    current: Option<&OrientObservation>,
     pile_path: &Path,
     persona_input: &str,
     next_health_change: Option<Epoch>,
@@ -3496,6 +3502,13 @@ async fn prepare_wait_frame_before_health_deadline(
         *maintained_from = Some(before);
         snapshot = pile.snapshot()?;
         evaluated_at = clock::now()?;
+    }
+    // A broad source change can require upkeep without changing the selected
+    // projections. Reuse only a fully ready view, never a pending payload or
+    // an interrupted upkeep attempt. Keep the pre-upkeep maintenance baseline
+    // above so a concurrent append to an earlier input is still noticed.
+    if pending.is_none() && current.is_some_and(|current| current.is_current(&snapshot)) {
+        return Ok(Some(WaitFrameLoad::Retained(snapshot)));
     }
     tokio::select! {
         _ = wait_timeout_deadline(timeout_at) => Ok(None),
@@ -3641,6 +3654,7 @@ async fn cmd_wait(
                 &mut maintained_from,
                 &mut upkeep_interrupted,
                 &mut pending_frame,
+                None,
                 pile_path,
                 persona_input,
                 boundary,
@@ -3669,6 +3683,9 @@ async fn cmd_wait(
                             pending_habits_seen = None;
                         }
                         pending_frame = Some(pending);
+                    }
+                    WaitFrameLoad::Retained(_) => {
+                        unreachable!("initial preparation has no ready observation to retain")
                     }
                 }
             }
@@ -3881,6 +3898,7 @@ async fn cmd_wait(
                     &mut maintained_from,
                     &mut upkeep_interrupted,
                     &mut pending_frame,
+                    Some(&current),
                     pile_path,
                     persona_input,
                     boundary,
@@ -3897,6 +3915,12 @@ async fn cmd_wait(
                     observed_snapshot = attempt.watermark_snapshot().clone();
                 }
                 match attempt {
+                    Some(WaitFrameLoad::Retained(_)) => {
+                        // Do not reset the Habit evaluation or its sweep
+                        // clock. Any deadline crossed during upkeep is still
+                        // handled below against this same selected view.
+                        view_pending = false;
+                    }
                     Some(WaitFrameLoad::Ready(candidate)) => {
                         pending_frame = None;
                         view_pending = false;

@@ -459,7 +459,7 @@ fn wait_refreshes_an_arriving_message_target_without_rebuilding_health() {
         panic!("wait did not become ready: {}", reader.join().unwrap());
     }
     let event = f.message("this target arrived after the wait observation", f.persona);
-    f.maintain();
+    // Only the raw source arrives: the active waiter owns its eager catch-up.
     let result = child.wait_with_output().unwrap();
     let stderr = reader.join().unwrap();
     assert!(result.status.success(), "{stderr}");
@@ -481,128 +481,85 @@ fn wait_refreshes_an_arriving_message_target_without_rebuilding_health() {
 }
 
 #[test]
-fn authorized_readers_leave_lagging_targets_to_external_maintenance() {
-    let f = Fixture::new();
-    // Register and maintain the private projections under this same signer:
-    // these reads have WRITE, but that is not a request to produce equations.
-    f.maintain();
-    let event = f.message("visible only after external upkeep", f.persona);
-    let (goal, _) = faculties::compass::goal_fragment(
-        "a goal still outside the resident projection",
-        Vec::new(),
-        None,
-        faculties::clock::point_now().unwrap(),
-    )
-    .unwrap();
-    f.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, goal);
-    let before = f.records();
-    assert!(f
-        .call("orient_poll", json!({"persona": f.who()}))
-        .is_empty());
-    assert!(f
-        .call("orient_poll", json!({"persona": f.who(), "peek": false}))
-        .is_empty());
-    let show = text(&f.call("orient_show", json!({})));
-    let wake = text(&f.call("orient_wake", json!({"chars": 0})));
-    for report in [&show, &wake] {
-        assert!(!report.contains("visible only after external upkeep"));
-        assert!(!report.contains("a goal still outside the resident projection"));
+fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
+    for frontend in ["poll", "show", "wake", "wait"] {
+        let f = Fixture::new();
+        // Start with registered, exact targets, then append only raw source
+        // commits. Each fresh fixture makes this frontend own the catch-up.
+        f.maintain();
+        let body = "visible through eager reader upkeep";
+        let title = "a goal carried by the reporting frontend";
+        let event = f.message(body, f.persona);
+        let (goal, _) = faculties::compass::goal_fragment(
+            title,
+            Vec::new(),
+            None,
+            faculties::clock::point_now().unwrap(),
+        )
+        .unwrap();
+        f.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, goal);
+        let before = f.records();
+        let report = match frontend {
+            "poll" => text(&f.call("orient_poll", json!({"persona": f.who()}))),
+            "show" => text(&f.call("orient_show", json!({}))),
+            "wake" => text(&f.call("orient_wake", json!({"chars": 0}))),
+            "wait" => {
+                let mut parts = Vec::new();
+                f.orient()
+                    .wait(
+                        &f.who(),
+                        &WaitOptions {
+                            timeout: Some(Duration::from_secs(5)),
+                            poll_interval: Duration::from_millis(2),
+                        },
+                        &mut Out::new(&mut |part| {
+                            parts.push(part);
+                            Ok(())
+                        }),
+                    )
+                    .unwrap();
+                text(&parts)
+            }
+            _ => unreachable!(),
+        };
+        if frontend == "wake" {
+            assert!(report.contains(title), "{frontend}: {report}");
+        } else {
+            assert!(report.contains(body), "{frontend}: {report}");
+        }
+        if frontend == "show" {
+            assert!(report.contains(title), "{report}");
+        }
+        let after = f.records();
+        let appended: Vec<_> = after
+            .iter()
+            .filter(|record| !before.contains(record))
+            .collect();
+        assert!(
+            appended
+                .iter()
+                .any(|record| matches!(record, CollectionRecord::Derive(_))),
+            "{frontend} must carry the raw input before reporting"
+        );
+        assert!(before.iter().all(|record| after.contains(record)));
+        if frontend == "wait" {
+            assert!(f.presented().contains(&event));
+            // A fresh reporting call catches up its own receipt projection;
+            // no external upkeep call is inserted to hide a duplicate.
+            assert!(f
+                .call("orient_poll", json!({"persona": f.who()}))
+                .is_empty());
+        } else {
+            assert!(
+                f.presented().is_empty(),
+                "{frontend} must remain non-consuming"
+            );
+            assert!(appended.iter().all(|record| matches!(
+                record,
+                CollectionRecord::Merge(_) | CollectionRecord::Derive(_)
+            )));
+        }
     }
-    let options = WaitOptions {
-        timeout: Some(Duration::from_millis(10)),
-        poll_interval: Duration::from_millis(2),
-    };
-    let mut parts = Vec::new();
-    f.orient()
-        .wait(
-            &f.who(),
-            &options,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-    assert!(text(&parts).contains("No change detected"));
-    assert_eq!(
-        f.records(),
-        before,
-        "ordinary reads must append no COMMIT, MERGE or DERIVE"
-    );
-
-    // A separate producer catches up the targets. The next one-shot wait can
-    // deliver the message; its only signed output is the explicit receipt.
-    f.maintain();
-    let before_delivery = f.records();
-    let peek = f.call("orient_poll", json!({"persona": f.who()}));
-    assert!(text(&peek).contains("visible only after external upkeep"));
-    assert_eq!(f.records(), before_delivery);
-    parts.clear();
-    f.orient()
-        .wait(
-            &f.who(),
-            &options,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-    assert!(text(&parts).contains("visible only after external upkeep"));
-    assert!(f.presented().contains(&event));
-    let after_delivery = f.records();
-    let appended: Vec<_> = after_delivery
-        .iter()
-        .filter(|record| !before_delivery.contains(record))
-        .collect();
-    assert_eq!(appended.len(), 1);
-    assert!(matches!(appended[0], CollectionRecord::Commit(_)));
-
-    // Receipt projection is asynchronous. Another accepted delivery may
-    // repeat the event until the external producer updates its ID set.
-    assert!(
-        text(&f.call("orient_poll", json!({"persona": f.who(), "peek": false})))
-            .contains("visible only after external upkeep")
-    );
-    parts.clear();
-    f.orient()
-        .wait(
-            &f.who(),
-            &options,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-    assert!(text(&parts).contains("visible only after external upkeep"));
-    let after_repeats = f.records();
-    assert!(after_delivery
-        .iter()
-        .all(|record| after_repeats.contains(record)));
-    assert!(after_repeats
-        .iter()
-        .filter(|record| !after_delivery.contains(record))
-        .all(|record| matches!(record, CollectionRecord::Commit(_))));
-
-    f.maintain();
-    let after_upkeep = f.records();
-    assert!(f
-        .call("orient_poll", json!({"persona": f.who()}))
-        .is_empty());
-    parts.clear();
-    f.orient()
-        .wait(
-            &f.who(),
-            &options,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-    assert!(text(&parts).contains("No change detected"));
-    assert_eq!(f.records(), after_upkeep);
 }
 
 #[test]
@@ -710,12 +667,13 @@ fn routing_aliases_under_one_signer_share_projected_health_receipts() {
         assert!(text(&f.call("orient_poll", json!({"persona": persona})))
             .contains("DHT publication: stalled"));
     }
-    f.call("orient_poll", json!({"persona": f.who(), "peek": false}));
-    // The same zooid can see a duplicate through another routing alias while
-    // its asynchronous projection still predates the accepted output.
-    assert!(text(&f.call("orient_poll", json!({"persona": alias})))
-        .contains("DHT publication: stalled"));
-    f.maintain_receipts(&f.key);
+    assert!(
+        text(&f.call("orient_poll", json!({"persona": f.who(), "peek": false})))
+            .contains("DHT publication: stalled")
+    );
+    // The other routing alias is the first reader after acceptance. Its eager
+    // upkeep must observe the same signer-owned receipt without a daemon.
+    assert!(f.call("orient_poll", json!({"persona": alias})).is_empty());
     assert!(f
         .call("orient_poll", json!({"persona": f.who()}))
         .is_empty());

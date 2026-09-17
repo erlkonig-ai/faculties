@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   patch and separately carries Habit completions; peek never presents.
   Resident-only health upkeep and unchanged-prefix checks preserve the local
   health boundary without treating the daemon as the freshness authority.
+  After upkeep, an unchanged selected wait view is retained without repeating
+  attachment or resetting its Habit clocks; pending payloads still retry.
   This supersedes the daemon-only reader policy recorded below; it adds no
   collection, grant, replication selection or GPU work.
 
