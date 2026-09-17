@@ -26,7 +26,7 @@ use triblespace::core::repo::pile::PileSnapshot;
 use crate::mail::{self, ProjectionDirection};
 use crate::relations::{self, ProfileInput, ProfileView};
 use crate::storage::FactArchive;
-use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::widgets::storage::DatasetView;
 
 // ── Color palette ────────────────────────────────────────────────────
 
@@ -126,51 +126,21 @@ impl Person {
     }
 }
 
-// ── Live snapshot ────────────────────────────────────────────────────
+// ── Point-of-use queries ────────────────────────────────────────────
 
-struct MailLive {
-    cached_revision: DatasetRevision,
-    relations_cached_revision: Option<DatasetRevision>,
-    people: HashMap<String, Person>,
-    mails: Vec<MailRow>,
-    diagnostics: Vec<String>,
+/// Resolve one address for this render without retaining a second Mail model.
+fn display_person(people: &HashMap<String, Person>, address: &str) -> String {
+    people
+        .get(&mailbox_key(address))
+        .map(|person| person.display.clone())
+        .unwrap_or_else(|| address.to_owned())
 }
 
-impl MailLive {
-    fn refresh(view: DatasetView<'_>, relations: Option<DatasetView<'_>>) -> Self {
-        let (relations_cached_revision, people, mut diagnostics) = match relations {
-            Some(relations) => {
-                let (people, diagnostics) = build_people(relations.facts, relations.reader);
-                (Some(relations.revision), people, diagnostics)
-            }
-            None => (None, HashMap::new(), Vec::new()),
-        };
-
-        let (mails, mail_diagnostics) = collect_mails(view.reader, view.facts);
-        diagnostics.extend(mail_diagnostics);
-
-        MailLive {
-            cached_revision: view.revision,
-            relations_cached_revision,
-            people,
-            mails,
-            diagnostics,
-        }
-    }
-
-    fn display(&self, address: &str) -> String {
-        self.people
-            .get(&mailbox_key(address))
-            .map(|person| person.display.clone())
-            .unwrap_or_else(|| address.to_owned())
-    }
-
-    fn color(&self, address: &str) -> egui::Color32 {
-        self.people
-            .get(&mailbox_key(address))
-            .map(|person| person_color(person.id))
-            .unwrap_or_else(|| colorhash::ral_categorical(mailbox_key(address).as_bytes()))
-    }
+fn color_person(people: &HashMap<String, Person>, address: &str) -> egui::Color32 {
+    people
+        .get(&mailbox_key(address))
+        .map(|person| person_color(person.id))
+        .unwrap_or_else(|| colorhash::ral_categorical(mailbox_key(address).as_bytes()))
 }
 
 fn collect_mails(reader: &PileSnapshot, space: &FactArchive) -> (Vec<MailRow>, Vec<String>) {
@@ -400,16 +370,12 @@ fn mailbox_key(value: &str) -> String {
 /// Read-only mail viewer. Set `show_spam(true)` to surface spam-tagged
 /// messages alongside the normal list (default is hide).
 pub struct MailViewer {
-    live: Option<MailLive>,
     show_spam: bool,
 }
 
 impl Default for MailViewer {
     fn default() -> Self {
-        Self {
-            live: None,
-            show_spam: false,
-        }
+        Self { show_spam: false }
     }
 }
 
@@ -429,28 +395,18 @@ impl MailViewer {
         view: DatasetView<'_>,
         relations: Option<DatasetView<'_>>,
     ) {
-        let revision = view.revision;
-        let relations_revision = relations.map(|view| view.revision);
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => {
-                l.cached_revision != revision || l.relations_cached_revision != relations_revision
-            }
+        let (people, mut diagnostics) = match relations {
+            Some(relations) => build_people(relations.facts, relations.reader),
+            None => (HashMap::new(), Vec::new()),
         };
-        if need_refresh {
-            self.live = Some(MailLive::refresh(view, relations));
-        }
+        let (mails, mail_diagnostics) = collect_mails(view.reader, view.facts);
+        diagnostics.extend(mail_diagnostics);
 
         ctx.section("Mail", |ctx| {
-            let Some(live) = self.live.as_ref() else {
-                return;
-            };
-
-            let total = live.mails.len();
-            let drafts = live.mails.iter().filter(|m| m.is_draft).count();
-            let spam = live.mails.iter().filter(|m| m.is_spam).count();
-            let visible_count = live
-                .mails
+            let total = mails.len();
+            let drafts = mails.iter().filter(|m| m.is_draft).count();
+            let spam = mails.iter().filter(|m| m.is_spam).count();
+            let visible_count = mails
                 .iter()
                 .filter(|m| self.show_spam || !m.is_spam)
                 .count();
@@ -461,7 +417,7 @@ impl MailViewer {
             let search_active = !needle.is_empty();
 
             ctx.grid(|g| {
-                for diagnostic in &live.diagnostics {
+                for diagnostic in &diagnostics {
                     g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
                 }
                 g.full(|ctx| {
@@ -497,7 +453,7 @@ impl MailViewer {
                     });
                 });
 
-                if live.mails.is_empty() {
+                if mails.is_empty() {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
@@ -525,12 +481,12 @@ impl MailViewer {
                 // a depth-driven left indent (in grid columns), so
                 // replies visually nest under their parents and
                 // sibling threads stay at column 0.
-                let threaded = flatten_threaded(&live.mails);
+                let threaded = flatten_threaded(&mails);
                 for (depth, mail) in threaded {
                     if mail.is_spam && !show_spam {
                         continue;
                     }
-                    if search_active && !mail_matches_search(mail, live, &needle) {
+                    if search_active && !mail_matches_search(mail, &people, &needle) {
                         continue;
                     }
                     let match_info = if search_active {
@@ -547,7 +503,7 @@ impl MailViewer {
                     g.place(width_cols, |ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
-                        render_mail(ui, mail, live, &needle, is_focused);
+                        render_mail(ui, mail, &people, &needle, is_focused);
                         if let Some(info) = match_info {
                             if info.should_scroll_to {
                                 let post_y = ui.cursor().min.y;
@@ -565,7 +521,7 @@ impl MailViewer {
     }
 }
 
-fn mail_matches_search(mail: &MailRow, live: &MailLive, needle: &str) -> bool {
+fn mail_matches_search(mail: &MailRow, people: &HashMap<String, Person>, needle: &str) -> bool {
     if mail.subject.to_lowercase().contains(needle) {
         return true;
     }
@@ -573,12 +529,15 @@ fn mail_matches_search(mail: &MailRow, live: &MailLive, needle: &str) -> bool {
         return true;
     }
     if let Some(from) = &mail.from {
-        if live.display(from).to_lowercase().contains(needle) {
+        if display_person(people, from).to_lowercase().contains(needle) {
             return true;
         }
     }
     for address in mail.to.iter().chain(mail.cc.iter()) {
-        if live.display(address).to_lowercase().contains(needle) {
+        if display_person(people, address)
+            .to_lowercase()
+            .contains(needle)
+        {
             return true;
         }
     }
@@ -594,7 +553,7 @@ const STROKE_INSET: f32 = 1.0;
 fn render_mail(
     ui: &mut egui::Ui,
     mail: &MailRow,
-    live: &MailLive,
+    people: &HashMap<String, Person>,
     search_needle: &str,
     focused: bool,
 ) {
@@ -602,11 +561,11 @@ fn render_mail(
     let from_color = mail
         .from
         .as_deref()
-        .map(|address| live.color(address))
+        .map(|address| color_person(people, address))
         .unwrap_or_else(|| color_muted(ui));
     let primary_recipient = mail.to.first().or_else(|| mail.cc.first());
     let to_color = primary_recipient
-        .map(|address| live.color(address))
+        .map(|address| color_person(people, address))
         .unwrap_or_else(|| color_muted(ui));
 
     let inner_margin = egui::Margin {
@@ -724,7 +683,7 @@ fn render_mail(
         let from_label = mail
             .from
             .as_deref()
-            .map(|address| live.display(address))
+            .map(|address| display_person(people, address))
             .unwrap_or_else(|| "(no sender)".into());
         paint_party_stripe(
             ui.painter(),
@@ -734,7 +693,7 @@ fn render_mail(
             &from_label.to_uppercase(),
         );
         let to_label = primary_recipient
-            .map(|address| live.display(address))
+            .map(|address| display_person(people, address))
             .unwrap_or_else(|| "(no recipient)".into());
         paint_party_stripe(
             ui.painter(),
