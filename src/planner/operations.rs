@@ -356,12 +356,6 @@ impl PlannerStorage<'_> {
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
-                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile, collection, signer,
-                ))
-                .context(
-                    "Planner facts were committed, but maintaining their query views failed",
-                )?;
             }
             Ok(value)
         })
@@ -1049,7 +1043,7 @@ fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Resul
 
 #[cfg(test)]
 #[test]
-fn event_and_initial_note_are_projected_as_one_completed_action() {
+fn event_and_initial_note_are_one_commit_a_preparing_reader_observes() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("planner.pile");
     let key = directory.path().join("planner.key");
@@ -1072,7 +1066,10 @@ fn event_and_initial_note_are_projected_as_one_completed_action() {
             let policy = source.policy(&pile.snapshot()?)?;
             let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
             let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-            let snapshot = pile.snapshot()?;
+            let snapshot = pollster::block_on(async {
+                drop(pile.maintain(succinct, signer).await?);
+                pile.maintain(rank9, signer).await
+            })?;
             let selected = snapshot.collection(rank9)?;
             let facts = selected.view::<FactArchive>()?;
             assert!(planner_model::event(&facts, added.event).is_some());

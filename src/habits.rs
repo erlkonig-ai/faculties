@@ -1881,9 +1881,8 @@ mod tests {
             read_catalog_strict(&self.pile, Some(&self.key)).unwrap()
         }
 
-        // Name the targets before exercising a writer. Observation below does
-        // not register, ensure, or maintain anything, so it cannot hide a
-        // writer which returns before carrying its own source publication.
+        // Name the targets before exercising a writer, so the reader below
+        // prepares exactly these and never silently registers new ones.
         fn targets(
             &self,
         ) -> (
@@ -1905,14 +1904,20 @@ mod tests {
             (succinct, rank9)
         }
 
-        fn resident_targets(
+        /// Prepare both derived targets the way an ordinary reader does, then
+        /// attach them through the one resulting store boundary.
+        fn prepared_targets(
             &self,
             succinct: Collection<SuccinctArchiveBlob>,
             rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         ) -> (PileSnapshot, FactArchive, FactArchive) {
-            let before = std::fs::metadata(&self.pile).unwrap().len();
+            let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            let snapshot = pile.snapshot().unwrap();
+            let snapshot = pollster::block_on(async {
+                drop(pile.maintain(succinct, &signer).await?);
+                pile.maintain(rank9, &signer).await
+            })
+            .unwrap();
             let succinct_facts = snapshot
                 .collection(succinct)
                 .unwrap()
@@ -1924,11 +1929,6 @@ mod tests {
                 .view::<FactArchive>()
                 .unwrap();
             pile.close().unwrap();
-            assert_eq!(
-                std::fs::metadata(&self.pile).unwrap().len(),
-                before,
-                "the regression observer must not repair either derived target"
-            );
             (snapshot, succinct_facts, rank9_facts)
         }
     }
@@ -2005,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_mutations_reach_resident_targets_without_a_daemon() {
+    fn successive_mutations_advance_the_targets_a_reader_prepares() {
         let fixture = Fixture::new();
         let (succinct, rank9) = fixture.targets();
         let api = Habits::new(fixture.pile.clone(), Some(fixture.key.clone()));
@@ -2013,14 +2013,14 @@ mod tests {
             .add("eager habit", "every 1h", "observe it", None, &[], &[])
             .unwrap();
         let selector = format!("{:x}", added.id);
-        let (before_done, old_succinct, old_rank9) = fixture.resident_targets(succinct, rank9);
+        let (before_done, old_succinct, old_rank9) = fixture.prepared_targets(succinct, rank9);
         for facts in [&old_succinct, &old_rank9] {
             assert_eq!(definition_ids(facts), BTreeSet::from([added.id]));
             assert!(completions(facts, added.id).is_empty());
         }
 
         let done = api.done(&selector).unwrap();
-        let (reader, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        let (reader, succinct_facts, rank9_facts) = fixture.prepared_targets(succinct, rank9);
         for facts in [&succinct_facts, &rank9_facts] {
             let completed = completions(facts, added.id);
             assert_eq!(completed.len(), 1);
@@ -2048,7 +2048,7 @@ mod tests {
             let event = changed
                 .event
                 .expect("each transition authors a state event");
-            let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+            let (_, succinct_facts, rank9_facts) = fixture.prepared_targets(succinct, rank9);
             for facts in [&succinct_facts, &rank9_facts] {
                 let current = activation(facts, added.id).unwrap();
                 assert_eq!(current.declared(), Some(state));
@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_publication_reaches_resident_targets_without_a_repairing_read() {
+    fn direct_publication_advances_the_targets_a_reader_prepares() {
         let fixture = Fixture::new();
         let (succinct, rank9) = fixture.targets();
         let (definition, habit) = habit_fragment(
@@ -2076,13 +2076,13 @@ mod tests {
         )
         .unwrap();
         fixture.publish(definition);
-        let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        let (_, succinct_facts, rank9_facts) = fixture.prepared_targets(succinct, rank9);
         for facts in [&succinct_facts, &rank9_facts] {
             assert_eq!(definition_ids(facts), BTreeSet::from([habit]));
         }
         let (completion, event) = completion_fragment(habit, at(10.0)).unwrap();
         fixture.publish(completion);
-        let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        let (_, succinct_facts, rank9_facts) = fixture.prepared_targets(succinct, rank9);
         for facts in [&succinct_facts, &rank9_facts] {
             assert_eq!(
                 completions(facts, habit)

@@ -281,26 +281,21 @@ impl HabitSession<'_> {
     }
 }
 
-/// Publish first, then carry the admitted targets before reporting success.
+/// Publish the fragment; derived query views advance when a reader prepares
+/// them.
 ///
 /// Source publication remains unconditional: an unadmitted COMMIT is still a
-/// raw ledger entry, not an admitted Habit fact. Maintenance never grants the
-/// signer authority it did not already have. The command's selected read view
-/// is left immutable; subsequent observers attach the newly maintained view.
+/// raw ledger entry, not an admitted Habit fact. The command's selected read
+/// view is left immutable; subsequent observers maintain and attach the views
+/// themselves.
 pub(super) fn commit_habit_fragment(
     pile: &mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let commit = pile
-        .commit(collection, signer, fragment)
-        .context("commit Habit fragment")?;
-    pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-        pile, collection, signer,
-    ))
-    .context("Habit fragment was committed, but eager maintenance of its derived views failed")?;
-    Ok(commit)
+    pile.commit(collection, signer, fragment)
+        .context("commit Habit fragment")
 }
 
 fn with_habits<T>(
@@ -444,7 +439,6 @@ mod tests {
     use crate::storage::initialize_signer;
     use clap::CommandFactory;
     use triblespace::core::collection::{CollectionRead, CollectionRecord};
-    use triblespace::core::repo::memoryrepo::MemoryRepo;
 
     #[test]
     fn permanent_cli_has_no_branch_scope_head_or_migration_surface() {
@@ -576,12 +570,21 @@ mod tests {
             source.admitted(&before).unwrap(),
             source.admitted(&after).unwrap()
         );
-        let succinct_facts = after
+        drop(after);
+        drop(before);
+        // Preparing the targets as the owner is what a reader now does, and it
+        // must still leave the outsider's unadmitted COMMIT out of the view.
+        let prepared = pollster::block_on(async {
+            drop(pile.maintain(succinct, &owner).await?);
+            pile.maintain(rank9, &owner).await
+        })
+        .unwrap();
+        let succinct_facts = prepared
             .collection(succinct)
             .unwrap()
             .view::<FactArchive>()
             .unwrap();
-        let rank9_facts = after
+        let rank9_facts = prepared
             .collection(rank9)
             .unwrap()
             .view::<FactArchive>()
@@ -589,43 +592,7 @@ mod tests {
         for facts in [&succinct_facts, &rank9_facts] {
             assert_eq!(habits::definition_ids(facts), BTreeSet::from([owner_habit]));
         }
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn upkeep_failure_reports_that_the_fragment_was_already_committed() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("habit.pile");
-        std::fs::File::create(&path).unwrap();
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        let signer = SigningKey::from_bytes(&[63; 32]);
-        // A typed descriptor exists elsewhere, but is deliberately absent
-        // from this pile. Core publication can still append its raw COMMIT;
-        // looking up the maintenance policy is the subsequent failure.
-        let mut elsewhere = MemoryRepo::default();
-        let source =
-            crate::collection_names::open(&mut elsewhere, DEFAULT_SCOPE_ID, signer.verifying_key())
-                .unwrap();
-        let (fragment, _) =
-            habits::habit_fragment("already committed", "every 1h", "observe", None, &[], &[])
-                .unwrap();
-        let error = commit_habit_fragment(&mut pile, source, &signer, fragment).unwrap_err();
-        assert!(error.to_string().contains("Habit fragment was committed"));
-        assert!(
-            error.chain().count() > 1,
-            "the storage cause must remain attached"
-        );
-        let records = pile
-            .snapshot()
-            .unwrap()
-            .records()
-            .unwrap()
-            .map(|record| record.unwrap())
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            records.as_slice(),
-            [CollectionRecord::Commit(commit)] if commit.collection() == source.handle()
-        ));
+        drop(prepared);
         pile.close().unwrap();
     }
 }

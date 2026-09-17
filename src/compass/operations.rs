@@ -464,20 +464,6 @@ impl CompassStorage<'_> {
                 );
                 drop(snapshot);
                 compass::commit_collection(pile, signer, fragment)?;
-                runtime
-                    .block_on(async {
-                        storage::maintain_admitted_fact_targets(pile, compass_source, signer)
-                            .await?;
-                        let status =
-                            compass::status_register_collection(pile, signer.verifying_key())?;
-                        if status.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
-                            drop(pile.maintain(status, signer).await?);
-                        }
-                        Ok::<_, anyhow::Error>(())
-                    })
-                    .context(
-                        "Compass fragment was committed, but eager maintenance of its projections failed",
-                    )?;
             }
             Ok(value)
         })
@@ -1721,14 +1707,14 @@ mod tests {
     }
 
     #[test]
-    fn successful_actions_leave_fact_and_status_targets_current_without_a_daemon() {
+    fn successive_actions_advance_the_views_a_reader_prepares() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("eager-compass.pile");
         let key = directory.path().join("eager-compass.key");
         std::fs::File::create(&pile_path).unwrap();
         initialize_signer(&pile_path, Some(&key)).unwrap();
         let storage = Storage::new(pile_path.clone(), Some(key));
-        let (rank9, status) = storage
+        let (succinct, rank9, status) = storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
                 let policy = source.policy(&pile.snapshot()?)?;
@@ -1736,15 +1722,18 @@ mod tests {
                 let rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
-                Ok((rank9, status))
+                Ok((succinct, rank9, status))
             })
             .unwrap();
-        // Observation only attaches pre-named targets; it cannot repair them.
+        // The reader prepares the pre-named targets; publication only commits.
         let observe = || {
-            let before = std::fs::metadata(&pile_path).unwrap().len();
-            let views = storage
-                .with_pile(|pile, _| {
-                    let snapshot = pile.snapshot()?;
+            storage
+                .with_pile(|pile, signer| {
+                    let snapshot = pollster::block_on(async {
+                        drop(pile.maintain(succinct, signer).await?);
+                        drop(pile.maintain(rank9, signer).await?);
+                        pile.maintain(status, signer).await
+                    })?;
                     Ok((
                         snapshot.collection(rank9)?.view::<FactArchive>()?,
                         snapshot
@@ -1753,9 +1742,7 @@ mod tests {
                             .query()?,
                     ))
                 })
-                .unwrap();
-            assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
-            views
+                .unwrap()
         };
         let faculty = Compass::with_storage(storage.clone());
         let added = faculty.add("eager goal", AddOptions::default()).unwrap();

@@ -2252,16 +2252,8 @@ impl PostureStorage<'_> {
             "policy",
             |pile, collection, signer| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                let commit = pile
-                    .commit(collection, signer, fragment)
-                    .context("commit authored Posture policy fragment")?;
-                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile, collection, signer,
-                ))
-                .context(
-                    "Posture policy facts were committed, but maintaining their query views failed",
-                )?;
-                Ok(commit)
+                pile.commit(collection, signer, fragment)
+                    .context("commit authored Posture policy fragment")
             },
         )
     }
@@ -2269,16 +2261,8 @@ impl PostureStorage<'_> {
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
         self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            let commit = pile
-                .commit(collection, signer, fragment)
-                .context("commit authored Posture scan fragment")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context(
-                "Posture scan facts were committed, but maintaining their query views failed",
-            )?;
-            Ok(commit)
+            pile.commit(collection, signer, fragment)
+                .context("commit authored Posture scan fragment")
         })
     }
 
@@ -5762,7 +5746,7 @@ fn cmd_sweep(
 
 #[cfg(test)]
 #[test]
-fn policy_and_scan_actions_complete_their_resident_projections() {
+fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("posture.pile");
     let key = directory.path().join("posture.key");
@@ -5778,7 +5762,10 @@ fn policy_and_scan_actions_complete_their_resident_projections() {
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                 let rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-                let snapshot = pile.snapshot()?;
+                let snapshot = pollster::block_on(async {
+                    drop(pile.maintain(succinct, signer).await?);
+                    pile.maintain(rank9, signer).await
+                })?;
                 let selected = snapshot.collection(rank9)?;
                 let facts = selected.view::<FactArchive>()?;
                 assert!(find!(

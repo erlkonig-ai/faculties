@@ -189,7 +189,7 @@ fn transcript_lines_round_trip() {
 }
 
 #[test]
-fn recorded_utterance_is_visible_without_a_repairing_voice_read() {
+fn recorded_utterance_is_observed_by_a_preparing_voice_read() {
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
@@ -214,16 +214,18 @@ fn recorded_utterance_is_visible_without_a_repairing_voice_read() {
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
         .unwrap();
-    let view = pile
-        .snapshot()
-        .unwrap()
-        .collection(rank9)
-        .unwrap()
-        .view::<crate::storage::FactArchive>()
-        .unwrap();
+    let view = pollster::block_on(async {
+        drop(pile.maintain(succinct, &signer).await.unwrap());
+        pile.maintain(rank9, &signer).await
+    })
+    .unwrap()
+    .collection(rank9)
+    .unwrap()
+    .view::<crate::storage::FactArchive>()
+    .unwrap();
     assert!(
         view.iter().next().is_some(),
-        "the recorder must publish its query projection"
+        "the recorder must publish the facts a prepared projection reads"
     );
     pile.close().unwrap();
 }

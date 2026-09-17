@@ -2,7 +2,7 @@
 use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
 use crate::storage::{open_secrets_collection, open_secrets_collection_read};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use std::path::PathBuf;
@@ -45,12 +45,6 @@ impl Secrets {
                 plaintext,
                 clock::point_now()?,
             )?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile,
-                collection.source(),
-                signer,
-            ))
-            .context("Encrypted secret was committed, but maintaining its query views failed")?;
             Ok(secret)
         })
     }
@@ -104,16 +98,6 @@ impl Secrets {
                 selected,
                 clock::now()?,
             )?;
-            if count != 0 {
-                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile,
-                    collection.source(),
-                    signer,
-                ))
-                .context(
-                    "Recipient envelopes were committed, but maintaining their query views failed",
-                )?;
-            }
             Ok(count)
         })
     }
@@ -160,7 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adding_a_secret_returns_with_its_metadata_already_queryable() {
+    fn an_added_secret_is_queryable_and_openable_through_an_ordinary_read() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("secrets.pile");
         std::fs::File::create(&path).unwrap();
@@ -171,9 +155,11 @@ mod tests {
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
-        // Deliberately passive: get/list would themselves repair a lagging
-        // target and would therefore not establish the write-side guarantee.
-        let snapshot = secret_storage::snapshot(pile.snapshot().unwrap(), collection).unwrap();
+        // The ordinary read path prepares the target, exactly as get/list do.
+        let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
+            &mut pile, collection, &signer,
+        ))
+        .unwrap();
         assert!(secrets::secret_rows(snapshot.facts().unwrap())
             .iter()
             .any(|row| row.id == id));

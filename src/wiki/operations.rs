@@ -266,15 +266,8 @@ impl WikiStorage<'_> {
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
             let collection = runtime.block_on(open_source(pile, scope, signer.verifying_key()))?;
-            let commit = pile
-                .commit(collection, signer, fragment)
-                .context("publish native collection fragment")?;
-            runtime
-                .block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile, collection, signer,
-                ))
-                .context("Wiki auxiliary fragment was committed, but eager projection maintenance failed")?;
-            Ok(commit)
+            pile.commit(collection, signer, fragment)
+                .context("publish native collection fragment")
         })
     }
 
@@ -295,23 +288,8 @@ impl WikiStorage<'_> {
                 "publishing a Wiki fragment requires source collection WRITE"
             );
             drop(snapshot);
-            let commit = pile
-                .commit(collection, signer, fragment)
-                .context("publish Wiki fragment")?;
-            runtime
-                .block_on(async {
-                    crate::storage::maintain_admitted_fact_targets(pile, collection, signer)
-                        .await?;
-                    let latest = wiki_model::latest_for_source(pile, collection)?;
-                    if latest.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
-                        drop(pile.maintain(latest, signer).await?);
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })
-                .context(
-                    "Wiki fragment was committed, but eager maintenance of its projections failed",
-                )?;
-            Ok(commit)
+            pile.commit(collection, signer, fragment)
+                .context("publish Wiki fragment")
         })
     }
 
@@ -2236,10 +2214,10 @@ mod tests {
     }
 
     #[test]
-    fn publication_leaves_facts_and_latest_current_without_a_repairing_read() {
+    fn successive_publications_advance_the_views_a_reader_prepares() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let (rank9, latest) = fixture
+        let (succinct, rank9, latest) = fixture
             .storage
             .with_pile(|pile, signer| {
                 let source =
@@ -2248,23 +2226,28 @@ mod tests {
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                 let rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-                Ok((rank9, wiki_model::latest_for_source(pile, source)?))
+                Ok((
+                    succinct,
+                    rank9,
+                    wiki_model::latest_for_source(pile, source)?,
+                ))
             })
             .unwrap();
         let observe = || {
-            let before = fs::metadata(&fixture.pile).unwrap().len();
-            let views = fixture
+            fixture
                 .storage
-                .with_pile(|pile, _| {
-                    let snapshot = pile.snapshot()?;
+                .with_pile(|pile, signer| {
+                    let snapshot = pollster::block_on(async {
+                        drop(pile.maintain(succinct, signer).await?);
+                        drop(pile.maintain(rank9, signer).await?);
+                        pile.maintain(latest, signer).await
+                    })?;
                     Ok((
                         snapshot.collection(rank9)?.view::<FactArchive>()?,
                         snapshot.collection(latest)?.view::<LatestIndex>()?,
                     ))
                 })
-                .unwrap();
-            assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
-            views
+                .unwrap()
         };
         let mut first = Fragment::empty();
         let root = stage_revision(

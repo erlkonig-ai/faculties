@@ -388,10 +388,6 @@ impl DecideStorage<'_> {
             fragment.describe_with(entity! { metadata::description: description });
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context("Decide facts were committed, but maintaining their query views failed")?;
             Ok(value)
         })
     }
@@ -520,7 +516,7 @@ pub(super) fn common_snapshot(resolution: &Resolution) -> Option<&ResolutionSnap
 
 #[cfg(test)]
 #[test]
-fn proposed_decision_is_projected_before_the_action_returns() {
+fn proposed_decision_is_one_commit_a_preparing_reader_observes() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("decide.pile");
     let key = directory.path().join("decide.key");
@@ -535,8 +531,12 @@ fn proposed_decision_is_projected_before_the_action_returns() {
             let policy = source.policy(&pile.snapshot()?)?;
             let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
             let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-            // No Decide read or maintenance call can repair publication here.
-            let snapshot = pile.snapshot()?;
+            // Maintenance is the reader's job now: prepare the projection here,
+            // then observe exactly what the action published.
+            let snapshot = pollster::block_on(async {
+                drop(pile.maintain(succinct, signer).await?);
+                pile.maintain(rank9, signer).await
+            })?;
             let selected = snapshot.collection(rank9)?;
             let facts = selected.view::<FactArchive>()?;
             assert!(decide::decision_anchors(&facts).contains(&proposed.decision));

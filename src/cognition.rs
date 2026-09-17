@@ -160,12 +160,6 @@ pub fn publish_events_with_storage(
                 })?;
             commits.push(commit);
         }
-        if !commits.is_empty() {
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context("Cognition facts were committed; eager maintenance failed")?;
-        }
         Ok(commits)
     })
 }
@@ -558,9 +552,12 @@ mod tests {
         let rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
-        // The ordinary publication boundary, not this observer, must have
-        // carried the event into the derived query target.
-        let snapshot = pile.snapshot().unwrap();
+        // The reader prepares its own query target; publication only commits.
+        let snapshot = pollster::block_on(async {
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            pile.maintain(rank9, &signer).await
+        })
+        .unwrap();
         let facts = snapshot
             .collection(rank9)
             .unwrap()
@@ -574,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_event_batch_is_visible_to_a_passive_rank9_reader() {
+    fn successful_event_batch_is_observed_by_a_preparing_rank9_reader() {
         let directory = tempfile::tempdir().unwrap();
         let pile_path = directory.path().join("cognition.pile");
         let key_path = directory.path().join("cognition.key");
@@ -601,13 +598,15 @@ mod tests {
         let rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
-        let facts = pile
-            .snapshot()
-            .unwrap()
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = pollster::block_on(async {
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            pile.maintain(rank9, &signer).await
+        })
+        .unwrap()
+        .collection(rank9)
+        .unwrap()
+        .view::<FactArchive>()
+        .unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), expected);
         pile.close().unwrap();
     }

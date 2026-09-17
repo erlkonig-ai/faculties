@@ -359,10 +359,7 @@ impl WebStorage<'_> {
             let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit Web observation")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context("Web facts were committed; eager maintenance failed")
+            Ok(())
         })
     }
 }
@@ -906,9 +903,13 @@ mod tests {
         let collection_rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)
             .unwrap();
-        // This is a passive attachment: publication itself must have carried
-        // the source, without a read helper or daemon doing it for the test.
-        let store_snapshot = pile.snapshot().unwrap();
+        // Maintenance moved to the reader, so prepare the projection here and
+        // then observe exactly what publication wrote.
+        let store_snapshot = pollster::block_on(async {
+            drop(pile.maintain(collection_succinct, &signer).await.unwrap());
+            pile.maintain(collection_rank9, &signer).await
+        })
+        .unwrap();
         let facts = store_snapshot
             .collection(collection_rank9)
             .unwrap()

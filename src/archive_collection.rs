@@ -187,12 +187,6 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
-        pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-            self.pile.borrow_mut(),
-            self.collection,
-            &self.signer,
-        ))
-        .context("Archive projection unit was committed, but maintaining its query views failed")?;
         Ok(Some(commit))
     }
 }
@@ -1008,8 +1002,7 @@ mod tests {
         let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
         assert!(writer.commit_unit().unwrap().is_some());
-        // The writer's successful action already carries the facts; do not
-        // call ensure_local here and accidentally repair the observation.
+        // The reader prepares the projection; the writer only commits.
         let policy = writer
             .collection
             .policy(&writer.pile.snapshot().unwrap())
@@ -1022,8 +1015,16 @@ mod tests {
             .pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
-        let passive = writer.pile.snapshot().unwrap();
-        let passive_facts = passive
+        let prepared = {
+            let signer = writer.signer.clone();
+            let pile = &mut writer.pile;
+            pollster::block_on(async {
+                drop(pile.maintain(succinct, &signer).await.unwrap());
+                pile.maintain(rank9, &signer).await
+            })
+            .unwrap()
+        };
+        let prepared_facts = prepared
             .collection(rank9)
             .unwrap()
             .view::<FactArchive>()
@@ -1031,7 +1032,7 @@ mod tests {
         assert!(fragment
             .facts()
             .iter()
-            .all(|fact| fact_archive_contains(&passive_facts, fact)));
+            .all(|fact| fact_archive_contains(&prepared_facts, fact)));
         writer.stage_fragment(fragment.clone()).unwrap();
         assert_eq!(writer.delta_len(), 0);
         assert!(writer.commit_unit().unwrap().is_none());

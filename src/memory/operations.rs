@@ -747,11 +747,8 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
-                .context("commit authored Memory fragment")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context("Memory fragment was committed, but eager projection maintenance failed")
+                .context("commit authored Memory fragment")
+                .map(drop)
         })
     }
 
@@ -760,13 +757,8 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
-                .context("commit authored embedding observations")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context(
-                "Embedding observations were committed, but eager projection maintenance failed",
-            )
+                .context("commit authored embedding observations")
+                .map(drop)
         })
     }
 
@@ -774,11 +766,8 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
-                .context("commit authored Comb cursor")?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile, collection, signer,
-            ))
-            .context("Comb cursor was committed, but eager projection maintenance failed")
+                .context("commit authored Comb cursor")
+                .map(drop)
         })
     }
 }
@@ -2900,27 +2889,31 @@ mod tests {
     }
 
     #[test]
-    fn authored_memory_reaches_fact_targets_without_a_repairing_load() {
+    fn authored_memory_advances_the_view_a_reader_prepares() {
         let fixture = TestPile::new();
-        let rank9 = fixture
+        let (succinct, rank9) = fixture
             .storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let policy = source.policy(&pile.snapshot()?)?;
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                Ok(pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?)
+                Ok((
+                    succinct,
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?,
+                ))
             })
             .unwrap();
         let observe = || {
-            let before = std::fs::metadata(&fixture.pile).unwrap().len();
-            let facts = fixture
+            fixture
                 .storage
-                .with_pile(|pile, _| {
-                    Ok(pile.snapshot()?.collection(rank9)?.view::<FactArchive>()?)
+                .with_pile(|pile, signer| {
+                    let snapshot = pollster::block_on(async {
+                        drop(pile.maintain(succinct, signer).await?);
+                        pile.maintain(rank9, signer).await
+                    })?;
+                    Ok(snapshot.collection(rank9)?.view::<FactArchive>()?)
                 })
-                .unwrap();
-            assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), before);
-            facts
+                .unwrap()
         };
         let first = publish_chunk(
             fixture.storage(),

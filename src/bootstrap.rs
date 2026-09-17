@@ -16,7 +16,6 @@ use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::SnapshotSource;
 use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
@@ -533,29 +532,6 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             let compass_commit = compass::commit_collection(pile, signer, seed.compass)
                 .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
 
-            async {
-                for scope in [
-                    crate::schemas::wiki::DEFAULT_SCOPE_ID,
-                    crate::schemas::compass::DEFAULT_SCOPE_ID,
-                ] {
-                    let source = crate::collection_names::open_configured(
-                        pile,
-                        scope,
-                        signer.verifying_key(),
-                    )?;
-                    crate::storage::maintain_admitted_fact_targets(pile, source, signer).await?;
-                }
-                let status = compass::status_register_collection(pile, signer.verifying_key())?;
-                if status.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
-                    drop(pile.maintain(status, signer).await?);
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await
-            .context(
-                "Bootstrap facts were committed, but maintaining fact/status projections failed",
-            )?;
-
             let wiki_after = wiki_model::materialize_indexed_collection(pile, signer)
                 .await
                 .context(
@@ -642,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_seed_is_visible_in_passive_fact_and_status_projections() {
+    fn imported_seed_reaches_the_fact_and_status_projections_a_reader_prepares() {
         use triblespace::core::blob::encodings::succinctarchive::{
             Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
         };
@@ -669,20 +645,21 @@ mod tests {
             let rank9 = pile
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                 .unwrap();
-            let view = pile
-                .snapshot()
-                .unwrap()
-                .collection(rank9)
-                .unwrap()
-                .view::<crate::storage::FactArchive>()
-                .unwrap();
+            let view = pollster::block_on(async {
+                drop(pile.maintain(succinct, &signer).await.unwrap());
+                pile.maintain(rank9, &signer).await
+            })
+            .unwrap()
+            .collection(rank9)
+            .unwrap()
+            .view::<crate::storage::FactArchive>()
+            .unwrap();
             let actual: TribleSet = view.iter().collect();
             assert!(expected.difference(&actual).is_empty());
         }
         let status =
             compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        assert!(!pile
-            .snapshot()
+        assert!(!pollster::block_on(pile.maintain(status, &signer))
             .unwrap()
             .collection(status)
             .unwrap()

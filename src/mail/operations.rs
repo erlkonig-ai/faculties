@@ -157,18 +157,12 @@ impl Mail {
         self.storage.scope(|storage| {
             let context = Storage::from_storage(storage.clone(), Scopes::FIXED)?;
             let result = execute(&context);
-            let published = !context.published_scopes.borrow().is_empty();
-            let maintenance = context.maintain_published();
-            let result = match (result, maintenance) {
-                (Ok(value), Ok(())) => Ok(value),
-                (Ok(_), Err(error)) => Err(error),
-                (Err(error), Ok(())) if published => Err(error.context(
+            let result = match result {
+                Ok(value) => Ok(value),
+                Err(error) if context.published.get() => Err(error.context(
                     "Mail action failed after facts were committed; publication was not rolled back",
                 )),
-                (Err(error), Ok(())) => Err(error),
-                (Err(error), Err(maintenance)) => Err(error.context(format!(
-                    "Mail action failed after facts were committed; eager maintenance also failed: {maintenance:#}"
-                ))),
+                Err(error) => Err(error),
             };
             let notices = context.notices.take();
             match result {
@@ -281,10 +275,9 @@ struct Storage {
     signer: SigningKey,
     scopes: Scopes,
     notices: RefCell<Vec<String>>,
-    // Operation-local batching only: no facts or query results are copied.
-    published_scopes: RefCell<BTreeSet<Id>>,
-    #[cfg(test)]
-    maintenance_calls: std::cell::Cell<usize>,
+    // Whether this action already committed, so a later failure reports that
+    // its publication was not rolled back.
+    published: std::cell::Cell<bool>,
 }
 
 impl Storage {
@@ -295,9 +288,7 @@ impl Storage {
             signer,
             scopes,
             notices: RefCell::new(Vec::new()),
-            published_scopes: RefCell::new(BTreeSet::new()),
-            #[cfg(test)]
-            maintenance_calls: std::cell::Cell::new(0),
+            published: std::cell::Cell::new(false),
         })
     }
 
@@ -493,34 +484,7 @@ impl Storage {
             let collection = open_configured(pile, scope, self.signer.verifying_key())?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
-            self.published_scopes.borrow_mut().insert(scope);
-            Ok(())
-        })
-    }
-
-    fn maintain_published(&self) -> Result<()> {
-        let scopes: Vec<_> = self.published_scopes.borrow().iter().copied().collect();
-        if scopes.is_empty() {
-            return Ok(());
-        }
-        self.storage.with_pile(|pile, _| {
-            for scope in scopes {
-                let collection = open_configured(pile, scope, self.signer.verifying_key())
-                    .with_context(|| format!(
-                        "Mail facts were committed; reopen collection {scope:x} for eager maintenance"
-                    ))?;
-                #[cfg(test)]
-                self.maintenance_calls.set(self.maintenance_calls.get() + 1);
-                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile,
-                    collection,
-                    &self.signer,
-                ))
-                .with_context(|| format!(
-                    "Mail facts were committed; eager maintenance failed for collection {scope:x}"
-                ))?;
-                self.published_scopes.borrow_mut().remove(&scope);
-            }
+            self.published.set(true);
             Ok(())
         })
     }
@@ -1404,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_mail_action_carries_written_scopes_before_returning() {
+    fn a_mail_action_commits_every_written_scope_for_a_preparing_reader() {
         let fixture = Fixture::new();
         let marker = *fucid();
         let facade = Mail::new(fixture.pile.clone(), Some(fixture.key.clone()));
@@ -1434,42 +1398,20 @@ mod tests {
             let rank9 = pile
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                 .unwrap();
-            let facts = pile
-                .snapshot()
-                .unwrap()
-                .collection(rank9)
-                .unwrap()
-                .view::<FactArchive>()
-                .unwrap();
+            let facts = pollster::block_on(async {
+                drop(pile.maintain(succinct, &signer).await.unwrap());
+                pile.maintain(rank9, &signer).await
+            })
+            .unwrap()
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
             assert!(exists!(
                 pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
             ));
         }
         pile.close().unwrap();
-    }
-
-    #[test]
-    fn mail_action_batches_repeated_publications_into_one_upkeep_per_scope() {
-        let fixture = Fixture::new();
-        let storage = fixture.storage();
-        for _ in 0..3 {
-            let marker = *fucid();
-            storage
-                .publish(
-                    storage.scopes.mail,
-                    entity! { metadata::tag: &marker },
-                    "batch item",
-                )
-                .unwrap();
-        }
-        assert_eq!(storage.maintenance_calls.get(), 0);
-        assert_eq!(storage.published_scopes.borrow().len(), 1);
-        storage.maintain_published().unwrap();
-        assert_eq!(storage.maintenance_calls.get(), 1);
-        assert!(storage.published_scopes.borrow().is_empty());
-        storage.maintain_published().unwrap();
-        assert_eq!(storage.maintenance_calls.get(), 1);
-        storage.close().unwrap();
     }
 
     #[test]
@@ -1500,13 +1442,15 @@ mod tests {
         let rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
-        let facts = pile
-            .snapshot()
-            .unwrap()
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = pollster::block_on(async {
+            drop(pile.maintain(succinct, &signer).await.unwrap());
+            pile.maintain(rank9, &signer).await
+        })
+        .unwrap()
+        .collection(rank9)
+        .unwrap()
+        .view::<FactArchive>()
+        .unwrap();
         assert!(exists!(
             pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
         ));

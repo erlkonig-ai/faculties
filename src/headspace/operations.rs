@@ -263,12 +263,6 @@ impl Storage {
             let collection = open_configured(pile, scope, self.signer.verifying_key())?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
-            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                pile,
-                collection,
-                &self.signer,
-            ))
-            .context(HeadspaceCommitted)?;
             Ok(())
         })
     }
@@ -966,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn headspace_publication_is_visible_without_a_maintaining_reader() {
+    fn headspace_publication_is_observed_by_a_maintaining_reader() {
         let (_directory, path, key) = fixture();
         let storage = Storage::open(&path, Some(&key)).unwrap();
         let profile = headspace::default_profile(*fucid(), "eager");
@@ -982,7 +976,10 @@ mod tests {
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                 let rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-                let snapshot = pile.snapshot()?;
+                let snapshot = pollster::block_on(async {
+                    drop(pile.maintain(succinct, signer).await?);
+                    pile.maintain(rank9, signer).await
+                })?;
                 let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
                 assert!(exists!(
                     pattern!(&facts, [{ profile_id @ metadata::tag: &headspace::KIND_LIVE_RECORD }])

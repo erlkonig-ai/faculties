@@ -323,15 +323,6 @@ impl BodyStorage<'_> {
             let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish native Body collection fragment")?;
-            pollster::block_on(async {
-                crate::storage::maintain_admitted_fact_targets(pile, collection, signer).await?;
-                let intents = super::intent_register_collection(pile, signer.verifying_key())?;
-                if intents.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
-                    drop(pile.maintain(intents, signer).await?);
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .context("Body facts were committed; eager maintenance failed")?;
             Ok(())
         })
     }
@@ -384,13 +375,13 @@ impl BodyStorage<'_> {
 mod tests;
 
 #[cfg(test)]
-mod eager_tests {
+mod projection_tests {
     use super::*;
     use crate::storage::{initialize_signer, load_signer, open_pile_strict};
     use triblespace::core::collection::lww_register::LwwIndex;
 
     #[test]
-    fn body_publication_carries_facts_and_intent_before_a_passive_read() {
+    fn body_publication_reaches_facts_and_intent_for_a_preparing_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("body.pile");
         let key = directory.path().join("body.key");
@@ -407,7 +398,6 @@ mod eager_tests {
             .unwrap();
         let intent_id = intent.id;
         let capture_id = capture.id;
-        let length = std::fs::metadata(&path).unwrap().len();
         let signer = load_signer(&path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&path).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
@@ -420,7 +410,14 @@ mod eager_tests {
             .unwrap();
         let intents =
             crate::body::intent_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        let snapshot = pile.snapshot().unwrap();
+        // Maintenance is the reader's job: prepare facts and the intent
+        // register, then observe what publication committed.
+        let snapshot = pollster::block_on(async {
+            drop(pile.maintain(succinct, &signer).await?);
+            drop(pile.maintain(rank9, &signer).await?);
+            pile.maintain(intents, &signer).await
+        })
+        .unwrap();
         let facts = snapshot
             .collection(rank9)
             .unwrap()
@@ -440,7 +437,6 @@ mod eager_tests {
             .query()
             .unwrap();
         assert_eq!(winners.winner(KIND_INTENT), Some(intent.id));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
         pile.close().unwrap();
     }
 }

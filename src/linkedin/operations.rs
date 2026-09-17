@@ -363,12 +363,6 @@ impl RelationsStorage<'_> {
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
-                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-                    pile, collection, signer,
-                ))
-                .context(
-                    "Relations facts were committed, but maintaining their query views failed",
-                )?;
             }
             Ok(value)
         })
@@ -1352,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn an_import_batch_is_projected_before_returning() {
+    fn an_import_batch_is_one_commit_a_preparing_reader_observes() {
         let fixture = Fixture::new();
         let report = ingest(
             fixture.storage(),
@@ -1381,7 +1375,10 @@ mod tests {
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                 let rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-                let snapshot = pile.snapshot()?;
+                let snapshot = pollster::block_on(async {
+                    drop(pile.maintain(succinct, signer).await?);
+                    pile.maintain(rank9, signer).await
+                })?;
                 let selected = snapshot.collection(rank9)?;
                 let facts = selected.view::<FactArchive>()?;
                 let people = relations::person_anchors(&facts);

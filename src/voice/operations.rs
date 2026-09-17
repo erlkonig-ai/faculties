@@ -204,12 +204,6 @@ impl VoiceSession<'_> {
             .pile
             .commit(self.collection, self.signer, fragment)
             .context("commit Voice fragment")?;
-        pollster::block_on(crate::storage::maintain_admitted_fact_targets(
-            self.pile,
-            self.collection,
-            self.signer,
-        ))
-        .context("Voice facts were committed, but maintaining their query views failed")?;
         Ok(commit)
     }
 }
@@ -411,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_and_recording_are_projected_before_returning() {
+    fn routing_and_recording_are_observed_by_a_preparing_reader() {
         fn resident_facts(capability: &Voice) -> FactArchive {
             capability
                 .storage
@@ -423,7 +417,10 @@ mod tests {
                         pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                     let rank9 =
                         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-                    let snapshot = pile.snapshot()?;
+                    let snapshot = pollster::block_on(async {
+                        drop(pile.maintain(succinct, signer).await?);
+                        pile.maintain(rank9, signer).await
+                    })?;
                     let selected = snapshot.collection(rank9)?;
                     Ok(selected.view::<FactArchive>()?)
                 })
