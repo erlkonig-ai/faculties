@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Pin the build root to AnyBytes `066c32a7` so temporary archive sections
+  freeze without a per-section durability flush, including during resident
+  rollup reads. Explicit `ByteArea::persist` retains its synchronization
+  barrier. Stored facts, collection handles, and faculty behavior are unchanged.
+
 - Memory prepares ordinary journal, context, cursor, and provenance operations
   from resident maintained targets, without requiring complete historical root
   payloads. Each authorized mapping hop can still catch up from resident input;
