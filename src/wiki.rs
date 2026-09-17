@@ -43,6 +43,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
 
+// TODO: Shadowmodel 👻
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorshipRecord {
     pub id: Id,
@@ -50,6 +51,7 @@ pub struct AuthorshipRecord {
     pub authored_at: Option<IntervalValue>,
 }
 
+// TODO: Shadowmodel 👻
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionRecord {
     pub id: Id,
@@ -91,6 +93,7 @@ impl RevisionRecord {
     }
 }
 
+// TODO: Shadowmodel 👻
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryRecord {
     pub roots: Vec<Id>,
@@ -98,6 +101,7 @@ pub struct EntryRecord {
     pub frontier: Vec<RevisionRecord>,
 }
 
+// TODO: Shadowmodel 👻
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionReadModel {
     revisions: BTreeMap<Id, RevisionRecord>,
@@ -181,6 +185,7 @@ impl RevisionReadModel {
     }
 }
 
+// TODO: Shadowmodel 👻
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WikiCatalog {
     pub revisions: RevisionReadModel,
@@ -217,7 +222,7 @@ impl WikiQuerySnapshot {
         (self.facts, self.store_snapshot, self.latest)
     }
 }
-
+// TODO: If a migration needs this it should move there, import shouldn't need it.
 /// Strict detached Wiki projection retained for migrations and import
 /// preflight. Ordinary readers use [`WikiQuerySnapshot`] instead.
 pub struct WikiSnapshot {
@@ -280,6 +285,7 @@ where
     Ok(target)
 }
 
+// TODO: Shadowmodel, this should just be `entity!` calls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionDraft {
     pub title: String,
@@ -1253,7 +1259,7 @@ pub fn tag_display_name_from_facts<P: TriblePattern>(
         names.into_iter().collect::<Vec<_>>().join(" / ")
     })
 }
-
+// TODO: Shadowmodel
 /// One current state of an entry, with its content-derived link targets.
 #[derive(Clone, Debug)]
 pub struct FrontierState {
@@ -1263,6 +1269,7 @@ pub struct FrontierState {
     pub links: Vec<Id>,
 }
 
+// TODO: Shadowmodel
 /// One logical entry: a stable label, every current state, and whether any of
 /// those states is still un-archived.
 #[derive(Clone, Debug)]
@@ -1298,6 +1305,7 @@ pub enum LinkResolution {
     Ambiguous(Vec<usize>),
 }
 
+// TODO: Shadowmodel
 /// Every entry's current states, plus the indexes that make a link target
 /// resolvable: revision ids directly, legacy fragment anchors through the
 /// compatibility path, and the non-revision entities a target might name.
@@ -1468,6 +1476,7 @@ impl LinkClass {
     }
 }
 
+// TODO: Shadowmodel
 /// One citation, kept with the revision that made it.
 #[derive(Clone, Debug)]
 pub struct LinkReference {
@@ -1478,6 +1487,7 @@ pub struct LinkReference {
     pub class: LinkClass,
 }
 
+// TODO: Shadowmodel
 /// The whole frontier's outgoing citations, classified, plus the incoming
 /// count each entry earned from that same walk.
 #[derive(Clone, Debug, Default)]
