@@ -1353,10 +1353,16 @@ fn native_message_rows(query: &OrientQuery<'_>) -> Vec<NativeMessage> {
 fn message_is_inbox(
     query: &OrientQuery<'_>,
     identities: &IdentityIndex,
+    own_identities: &HashSet<Id>,
     row: &NativeMessage,
     persona: Id,
 ) -> Result<bool> {
-    if identities.equivalent(row.from, persona)? {
+    // A repeated sender field is another attribution witness, not another
+    // envelope. An external witness cannot make our own envelope into news.
+    if exists!((sender: Id), and!(
+        own_identities.has(sender),
+        pattern!(query.messages, [{ row.id @ local_message::from: ?sender }])
+    )) {
         return Ok(false);
     }
     let snapshots: Vec<Id> = find!(
@@ -1403,9 +1409,10 @@ fn unread_messages(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<NativeMes
         return Ok(Vec::new());
     }
     let identities = IdentityIndex::from_relations(query.relations);
+    let own_identities = identities.component(persona)?.into_iter().collect();
     let mut rows = Vec::new();
     for row in native_message_rows(query) {
-        if message_is_inbox(query, &identities, &row, persona)?
+        if message_is_inbox(query, &identities, &own_identities, &row, persona)?
             && !message_is_read(query, &identities, row.id, persona)?
         {
             rows.push(row);
@@ -4589,6 +4596,39 @@ mod tests {
                     entity! { metadata::tag: &KIND_STATUS_UPDATE, window_status::window: &window };
             }
             pile.commit(sources.status.source, &fixture.signer, windows)
+                .unwrap();
+            let mut messages = Fragment::empty();
+            for (label, sender, recipient, extra_self, visible) in [
+                ("self", persona, persona, false, false),
+                ("alias", alias, persona, false, false),
+                ("mixed", other, persona, true, false),
+                ("external", other, persona, false, true),
+                // An opaque sender without a Relations profile is not self.
+                ("unknown", id(199), persona, false, true),
+                ("elsewhere", other, id(198), false, false),
+            ] {
+                let body = messages.put(label.to_owned());
+                let mut envelope =
+                    message::envelope_fragment(sender, recipient, body, now, None, None);
+                let envelope_id = envelope.root().unwrap();
+                if extra_self {
+                    envelope += entity! { ExclusiveId::force_ref(&envelope_id) @ local_message::from: &alias };
+                }
+                messages += envelope;
+                if visible {
+                    expected.insert(envelope_id);
+                }
+            }
+            // A senderless fragment still does not satisfy Message's typed
+            // envelope query; do not change that pre-existing reader policy.
+            let body: message::TextHandle = messages.put("no sender".to_owned());
+            messages += entity! {
+                metadata::tag: &KIND_MESSAGE_ID,
+                local_message::to: &persona,
+                local_message::body: body,
+                metadata::created_at: now,
+            };
+            pile.commit(sources.messages.source, &fixture.signer, messages)
                 .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await

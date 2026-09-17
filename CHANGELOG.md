@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   `PERSONA` to author attributable Compass actions; a shared signing key is not
   a persona. Due Habit reminders and health alerts remain attention events,
   not echoes of their creator's actions.
+  Message applies the same envelope-level exclusion when repeated sender
+  fields include self; another sender witness cannot turn an own send into news.
 
 - Add `orient daemon`: one persistent store and observation loop, delivering
   complete reports to an explicit executable callback over stdin. Callback
