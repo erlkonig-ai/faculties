@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add `orient daemon`: one persistent store and observation loop, delivering
+  complete reports to an explicit executable callback over stdin. Callback
+  exit zero precedes the existing Presented receipt; failure stops the daemon
+  without acknowledging that report. No agent-handled acknowledgement or
+  delivery retry queue is added. Habit transitions retain their in-process
+  baseline instead of repeatedly rearming an already-due intention. SIGINT,
+  SIGTERM and optional run duration return through checked storage close.
+  Replace the Codex print-and-queue wrapper and per-prompt/rearm hooks with a
+  single stdin-to-queue callback; daemon reports never also appear on stdout.
+  Best effort remains explicit: a crash after callback acceptance but before
+  receipt publication can duplicate a report, and a restart may remind about
+  a still-due habit. Existing one-shot wait/poll behavior is unchanged.
+
 - Restore authorized eager maintenance at Faculty read and publication
   boundaries, including Orient, Message and Habit. Ordinary actions carry new
   COMMITs into their query projections before success; post-COMMIT upkeep errors

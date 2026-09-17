@@ -498,10 +498,12 @@ already installed `bootstrap` binary. Include a rebuilt importer in the next
 tested native cohort before importing that generation. There is no pre-signed
 `bootstrap.pile` artifact to patch or concatenate into a recipient.
 
-The harness guide includes the [Codex Orient wake bridge](hooks/codex/README.md):
-one owned wait queues its report to the exact Codex session. `PERSONA` selects
-attention; the session id selects delivery. Set up and test both when adding a
-new agent window.
+The harness guide includes [persistent Orient delivery](hooks/codex/README.md):
+one `orient daemon` keeps the pile open and delivers each report through a
+callback to the exact Codex session. `PERSONA` selects attention; the thread
+id selects delivery. Remove old rearm and prompt-time peek hooks before enabling
+the daemon; news must not also be delivered through tool output. Set up and
+test this single delivery path when adding a new agent window.
 
 ## Why
 

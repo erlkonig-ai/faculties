@@ -77,25 +77,23 @@ their own pace, and their report remains useful evidence without becoming a
 global lock. Release or publication boundaries may impose their own policy,
 but that policy is separate from Compass and from the diagnostic record.
 
-== Orient wait for idle agents
+== Persistent notifications for idle agents
 
-With a harness that delivers tracked task completion into a new turn:
-
-```sh
-orient wait
-```
-
-For Codex, use the one-shot queue bridge in the owning window instead:
+For Codex, use one daemon in the owning window's environment:
 
 ```sh
-sh faculties/hooks/codex/orient_wait.sh "$CODEX_THREAD_ID" \
-  --pile "$PILE" --persona "$PERSONA"
+orient --pile "$PILE" --persona "$PERSONA" daemon \
+  --callback /bin/sh \
+  --callback-arg "$PWD/faculties/hooks/codex/orient_queue.sh" \
+  --callback-arg "$CODEX_THREAD_ID"
 ```
 
-Retain that exec session and rearm after its successful delivery. The persona
-is the attention recipient; the Codex thread id is the destination session.
-Keep one watcher owner per persona/pile pair. Polling a report and later
-receiving its queued copy does not make it two separate work requests.
+Use the installed release, and retain or supervise that one daemon process.
+The persona is the attention recipient; the Codex thread id is the destination
+session. No rearming is needed after delivery. Remove the old watcher/rearm
+and prompt-time peek hooks first, and do not forward the daemon's output as
+another message. One callback invocation is the only delivery path.
+Manual `orient poll` and one-shot `orient wait` remain available when needed.
 
 With a persona set, the watcher wakes for directed news: unread inbox or group
 messages, relevant goal transitions, new goals tagged with the persona or one

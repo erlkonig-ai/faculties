@@ -30,10 +30,11 @@ pub(super) fn deliver(
     struct OwnedChild {
         child: Child,
         accepted: bool,
+        reaped: bool,
     }
     impl Drop for OwnedChild {
         fn drop(&mut self) {
-            if !self.accepted {
+            if !self.accepted && !self.reaped {
                 // SAFETY: process_group(0) below creates a group owned by this
                 // child; only that group's members are targeted, never ours.
                 unsafe {
@@ -62,6 +63,7 @@ pub(super) fn deliver(
     let mut owned = OwnedChild {
         child,
         accepted: false,
+        reaped: false,
     };
     let input = owned
         .child
@@ -89,6 +91,9 @@ pub(super) fn deliver(
             .try_wait()
             .context("could not observe callback exit")?
         {
+            // try_wait has reaped this PID. Do not signal its old process
+            // group afterward: the numeric identity is no longer reserved.
+            owned.reaped = true;
             if !status.success() {
                 bail!("Orient delivery callback failed ({status})");
             }

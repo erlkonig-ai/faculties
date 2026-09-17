@@ -494,6 +494,29 @@ fn habit_deadline(seen: &Option<HabitObservation>) -> Option<Epoch> {
         .map(|secs| Epoch::from_tai_seconds(secs as f64))
 }
 
+// Presentation history survives a temporarily unreadable initial frame in a
+// daemon. Its clock does not: only currently readable Habit inputs may impose
+// a deadline on a payload retry. One-shot waiting keeps its original policy.
+fn pending_habit_deadline(
+    continuous: bool,
+    readable: Option<&HabitObservation>,
+    seen: &Option<HabitObservation>,
+) -> Option<Epoch> {
+    if continuous {
+        readable
+            .and_then(|habits| habits.next_cooldown_at)
+            .map(|secs| Epoch::from_tai_seconds(secs as f64))
+    } else {
+        habit_deadline(seen)
+    }
+}
+
+fn invalidate_pending_habit_context(continuous: bool, seen: &mut Option<HabitObservation>) {
+    if !continuous {
+        *seen = None;
+    }
+}
+
 fn format_age(now_key: i128, past_key: i128) -> String {
     let delta_ns = now_key.saturating_sub(past_key);
     let delta_s = (delta_ns / 1_000_000_000).max(0) as i64;
@@ -3695,7 +3718,13 @@ async fn cmd_observe(
             // body or preparation payload that answers within its budget lands.
             // Upkeep cut before it could select a frame also gets that retry:
             // resetting the same short cap would starve a slower acquisition.
-            let boundary = match habit_deadline(&pending_habits_seen) {
+            let boundary = match pending_habit_deadline(
+                continuous,
+                pending_frame
+                    .as_ref()
+                    .and_then(|pending| pending.habits.as_ref()),
+                &pending_habits_seen,
+            ) {
                 Some(deadline) => earliest(next_health_change, Some(deadline)),
                 None if pending_frame.is_none() && !upkeep_interrupted => {
                     let first_read = Epoch::from_tai_seconds(
@@ -3737,9 +3766,9 @@ async fn cmd_observe(
                             pending.reason,
                             PendingWaitReason::PersonaSelection | PendingWaitReason::Preparation
                         ) {
-                            // A different persona or observation would select
-                            // different intentions: no habit context to keep.
-                            pending_habits_seen = None;
+                            // Stop this context's clock without forgetting a
+                            // daemon's already-announced due occurrences.
+                            invalidate_pending_habit_context(continuous, &mut pending_habits_seen);
                         }
                         pending_frame = Some(pending);
                     }
@@ -3755,7 +3784,7 @@ async fn cmd_observe(
                 .as_ref()
                 .is_some_and(|pending| pending.habits.is_none())
             {
-                pending_habits_seen = None;
+                invalidate_pending_habit_context(continuous, &mut pending_habits_seen);
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
@@ -3802,6 +3831,15 @@ async fn cmd_observe(
                                 let habit_report = render_habit_transitions(seen, &current_habits)
                                     .unwrap_or_default();
                                 swept = Some((current_habits, habit_report));
+                            } else if continuous {
+                                // A newly readable pending frame may contain
+                                // a completion or a new due occurrence even
+                                // while its directed-news body is unavailable.
+                                let report =
+                                    render_habit_transitions(seen, habits).unwrap_or_default();
+                                if seen != habits {
+                                    swept = Some((habits.clone(), report));
+                                }
                             }
                         }
                     }
@@ -3837,7 +3875,16 @@ async fn cmd_observe(
                     had_ready_frame: false,
                 });
             }
-            let boundary = earliest(next_health_change, habit_deadline(&pending_habits_seen));
+            let boundary = earliest(
+                next_health_change,
+                pending_habit_deadline(
+                    continuous,
+                    pending_frame
+                        .as_ref()
+                        .and_then(|pending| pending.habits.as_ref()),
+                    &pending_habits_seen,
+                ),
+            );
             let sleep =
                 health::until(boundary, clock::now()?).map_or(poll, |delay| delay.min(poll));
             let sleep = timeout.map_or(sleep, |timeout| {
@@ -4278,6 +4325,32 @@ mod tests {
             since,
             targeted,
         }
+    }
+
+    #[test]
+    fn daemon_pending_recovery_keeps_seen_occurrence_but_not_an_unreadable_clock() {
+        let habit = *fucid();
+        let mut due = HabitObservation::default();
+        due.due
+            .insert(habit, due_habit("owned reminder", 100, true));
+        due.next_cooldown_at = Some(200);
+        assert!(render_habits_due_at_arm(&due).is_some());
+        let mut seen = Some(due.clone());
+        // All initial-pending invalidation sites use this boundary. Losing
+        // inputs must stop their clock, not turn recovery into another arm.
+        invalidate_pending_habit_context(true, &mut seen);
+        assert_eq!(pending_habit_deadline(true, None, &seen), None);
+        assert!(render_habit_transitions(seen.as_ref().unwrap(), &due).is_none());
+        assert_eq!(
+            pending_habit_deadline(true, Some(&due), &seen),
+            Some(Epoch::from_tai_seconds(200.0))
+        );
+        let mut next = due.clone();
+        next.due
+            .insert(habit, due_habit("owned reminder", 300, true));
+        assert!(render_habit_transitions(seen.as_ref().unwrap(), &next).is_some());
+        invalidate_pending_habit_context(false, &mut seen);
+        assert!(seen.is_none(), "one-shot rearm semantics remain unchanged");
     }
 
     #[test]

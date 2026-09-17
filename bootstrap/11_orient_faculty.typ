@@ -1,12 +1,13 @@
 = Orient: The Situation-Snapshot Faculty
 
-`orient` has five deliberately different modes. Use `wake` at session start or
+`orient` has six deliberately different modes. Use `wake` at session start or
 after context compaction to recover the whole self: memory cover, cover-tagged
 beliefs, and goals. Use `show` mid-session for the much smaller answer to "what
 is going on right now?"; it deliberately contains neither memories nor Wiki
 entries. `wait` blocks and also sweeps timer-driven Habits; `poll` performs the
 same relational attention check once without blocking; `baseline` explicitly
-marks the current attention set as already presented.
+marks the current attention set as already presented. `daemon` keeps the pile
+open and delivers successive reports to one callback, without per-turn hooks.
 
 == What it shows
 
@@ -28,13 +29,14 @@ as presented, after the complete report has been flushed.
 
   - `orient wake` at session start and after compaction
   - `orient show` after a pause or before context-switching
-  - `orient poll` from non-blocking per-turn hooks
-  - `orient wait` with a harness delivery bridge for idle notifications
+  - `orient poll` for a deliberate immediate news check
+  - `orient wait` for a deliberate one-shot blocking check
+  - `orient daemon` for persistent automatic notifications
   - `orient baseline` for an explicit quiet starting point
 
 == `orient wait`
 
-`orient wait` blocks until the separately maintained target collections at one
+`orient wait` blocks until the maintained target collections at one
 immutable pile snapshot contain news for this persona, rather than reporting
 every raw pile append. Directed news includes unread
 inbox or group messages, relevant goal transitions, new goals tagged with the
@@ -59,12 +61,13 @@ arrived state into a local notification. `orient poll` performs that pile-backed
 news check without blocking; `--peek` reports without adding any `Presented`
 facts.
 
-Process wake and model-turn wake are separate. In Codex, launch the one-shot
-`faculties/hooks/codex/orient_wait.sh` wrapper from the owning window's
-long-running exec. It forwards the report with `codex queue` to the exact
-session, retries delivery failures without rereading Orient, then exits for
-the root to rearm. A bare background exec completing is not enough to promise
-an idle Codex turn will start. See
+Process wake and model-turn wake are separate. In Codex, use `orient daemon`
+with the `faculties/hooks/codex/orient_queue.sh` delivery callback. The daemon
+retains its open pile and sends one complete report on callback stdin; the
+callback queues it to the exact owning thread. It does not also print news to
+tool output. Callback success records presentation, not completion of the work.
+Failure exits the daemon without marking that report seen; there is no retry
+loop. Remove old rearm and prompt-time peek hooks before enabling it. See
 [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
 for the persona/session distinction and handover procedure.
 
