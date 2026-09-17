@@ -200,9 +200,17 @@ impl VoiceSession<'_> {
     ) -> Result<CollectionCommit> {
         voice_model::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: description });
-        self.pile
+        let commit = self
+            .pile
             .commit(self.collection, self.signer, fragment)
-            .context("commit Voice fragment")
+            .context("commit Voice fragment")?;
+        pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+            self.pile,
+            self.collection,
+            self.signer,
+        ))
+        .context("Voice facts were committed, but maintaining their query views failed")?;
+        Ok(commit)
     }
 }
 
@@ -400,6 +408,57 @@ mod tests {
             .iter()
             .all(|commit| commit.collection() == collection.handle()));
         pile_storage.close().unwrap();
+    }
+
+    #[test]
+    fn routing_and_recording_are_projected_before_returning() {
+        fn resident_facts(capability: &Voice) -> FactArchive {
+            capability
+                .storage
+                .with_pile(|pile, signer| {
+                    let source =
+                        open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
+                    let policy = source.policy(&pile.snapshot()?)?;
+                    let succinct =
+                        pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                    let rank9 =
+                        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                    let snapshot = pile.snapshot()?;
+                    let selected = snapshot.collection(rank9)?;
+                    Ok(selected.view::<FactArchive>()?)
+                })
+                .unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("voice.pile");
+        let key = directory.path().join("voice.key");
+        File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let capability = Voice::new(pile, Some(key));
+        let devices = vec!["Private test headphones".to_owned()];
+        capability.set_route(Channel::Say, &devices).unwrap();
+        let routing = resident_facts(&capability);
+        assert_eq!(load_route(&routing, CHANNEL_SAY).unwrap(), devices);
+
+        let recorded = capability
+            .record(Channel::Say, "A recorded attempt", None, "test attempt")
+            .unwrap();
+        let recorded_facts = resident_facts(&capability);
+        assert!(find!(
+            id: Id,
+            pattern!(&recorded_facts, [{ ?id @ metadata::tag: KIND_UTTERANCE }])
+        )
+        .any(|id| id == recorded));
+        assert!(
+            find!(
+                id: Id,
+                pattern!(&routing, [{ ?id @ metadata::tag: KIND_UTTERANCE }])
+            )
+            .next()
+            .is_none(),
+            "the prior route view remains frozen"
+        );
     }
 
     #[test]

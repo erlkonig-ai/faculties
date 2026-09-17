@@ -307,7 +307,7 @@ impl RelationsStorage<'_> {
         ) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
+            let (collection, view) = pollster::block_on(async {
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let descriptor_snapshot = pile.snapshot()?;
                 let policy = collection.policy(&descriptor_snapshot)?;
@@ -335,17 +335,15 @@ impl RelationsStorage<'_> {
                 let facts = observed
                     .view::<FactArchive>()
                     .context("read Relations Rank9 projection")?;
-                operation(
-                    pile,
+                Ok::<_, anyhow::Error>((
                     collection,
-                    signer,
-                    &RelationsView {
+                    RelationsView {
                         facts,
                         reader: store_snapshot,
                     },
-                )
-            });
-            result
+                ))
+            })?;
+            operation(pile, collection, signer, &view)
         })
     }
 
@@ -365,6 +363,12 @@ impl RelationsStorage<'_> {
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
+                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile, collection, signer,
+                ))
+                .context(
+                    "Relations facts were committed, but maintaining their query views failed",
+                )?;
             }
             Ok(value)
         })
@@ -1345,6 +1349,54 @@ mod tests {
             email: email.to_owned(),
             ..Connection::default()
         }
+    }
+
+    #[test]
+    fn an_import_batch_is_projected_before_returning() {
+        let fixture = Fixture::new();
+        let report = ingest(
+            fixture.storage(),
+            &[
+                connection(
+                    "Ada Example",
+                    "https://www.linkedin.com/in/ada-eager",
+                    "ada@example.invalid",
+                ),
+                connection(
+                    "Grace Example",
+                    "https://www.linkedin.com/in/grace-eager",
+                    "grace@example.invalid",
+                ),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(report.committed);
+        assert_eq!(report.profiles.len(), 2);
+        fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let snapshot = pile.snapshot()?;
+                let selected = snapshot.collection(rank9)?;
+                let facts = selected.view::<FactArchive>()?;
+                let people = relations::person_anchors(&facts);
+                assert!(report
+                    .profiles
+                    .iter()
+                    .all(|profile| people.contains(&profile.person)));
+                assert_eq!(
+                    source.admitted(&snapshot)?.len(),
+                    1,
+                    "the import remains one COMMIT"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn person(label: &str, url: &str, email: &str) -> (Id, Fragment) {

@@ -69,6 +69,19 @@ impl std::error::Error for CredentialUpdateError {
     }
 }
 
+/// Typed context keeps Secrets-first error reporting honest when the reference
+/// COMMIT succeeded but its derived query targets could not be maintained.
+#[derive(Debug)]
+struct HeadspaceCommitted;
+
+impl std::fmt::Display for HeadspaceCommitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Headspace facts were committed; eager maintenance failed")
+    }
+}
+
+impl std::error::Error for HeadspaceCommitted {}
+
 impl Headspace {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self::with_storage(crate::storage::Storage::new(pile, key))
@@ -250,6 +263,12 @@ impl Storage {
             let collection = open_configured(pile, scope, self.signer.verifying_key())?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile,
+                collection,
+                &self.signer,
+            ))
+            .context(HeadspaceCommitted)?;
             Ok(())
         })
     }
@@ -879,6 +898,7 @@ fn set_secret(
                 Ok(secret)
             })();
             finish.map_err(|source| {
+                let reference_published = reference_published || source.is::<HeadspaceCommitted>();
                 CredentialUpdateError {
                     version: secret,
                     role,
@@ -943,6 +963,34 @@ mod tests {
         let storage = Storage::open(pile, Some(key)).unwrap();
         let views = storage.views().unwrap();
         (storage, views)
+    }
+
+    #[test]
+    fn headspace_publication_is_visible_without_a_maintaining_reader() {
+        let (_directory, path, key) = fixture();
+        let storage = Storage::open(&path, Some(&key)).unwrap();
+        let profile = headspace::default_profile(*fucid(), "eager");
+        let (fragment, profile_id) = headspace::profile_snapshot_fragment(&profile, &[]).unwrap();
+        storage
+            .publish(DEFAULT_SCOPE_ID, fragment, "test eager profile")
+            .unwrap();
+        storage
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let snapshot = pile.snapshot()?;
+                let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
+                assert!(exists!(
+                    pattern!(&facts, [{ profile_id @ metadata::tag: &headspace::KIND_LIVE_RECORD }])
+                ));
+                Ok(())
+            })
+            .unwrap();
+        storage.close().unwrap();
     }
 
     #[test]

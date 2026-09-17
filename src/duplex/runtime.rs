@@ -1266,6 +1266,10 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
         fragment.describe_with(entity! { metadata::description: "duplex spoke" });
         pile.commit(collection, &signer, fragment)
             .context("commit the utterance")?;
+        pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+            &mut pile, collection, &signer,
+        ))
+        .context("Duplex utterance was committed, but maintaining its query views failed")?;
         Ok(())
     })();
     let close = pile.close().map_err(anyhow::Error::from);

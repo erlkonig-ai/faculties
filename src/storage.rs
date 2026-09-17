@@ -28,7 +28,9 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
     CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
@@ -38,7 +40,7 @@ use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StorageClose,
-    StoreRead,
+    Store, StoreRead,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
@@ -274,6 +276,37 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .context("create faculty I/O runtime")
+}
+
+/// Carry an ordinary fact source into its existing-policy query projections.
+///
+/// Foreground actions call this after committing, before reporting success.
+/// Each derived target keeps its own WRITE boundary: a reader or source-only
+/// writer may retain the already-published projection without gaining the
+/// authority to extend it. This does not change admission of the source COMMIT
+/// and does not maintain unrelated collections or discover a new source.
+pub(crate) async fn maintain_admitted_fact_targets<S>(
+    store: &mut S,
+    source: Collection<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<()>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    let policy = source.policy(&store.snapshot()?)?;
+    let succinct = store.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let rank9 = store.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+    let authority = store.snapshot()?;
+    let maintain_succinct = succinct.writer_is_admitted(&authority, signer.verifying_key())?;
+    let maintain_rank9 = rank9.writer_is_admitted(&authority, signer.verifying_key())?;
+    drop(authority);
+    if maintain_succinct {
+        drop(store.maintain(succinct, signer).await?);
+    }
+    if maintain_rank9 {
+        drop(store.maintain(rank9, signer).await?);
+    }
+    Ok(())
 }
 
 /// Run a pure read, acquiring only the exact blobs that it asks for.
@@ -1089,6 +1122,81 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(observed.support().unwrap().len(), 1);
         assert_eq!(view.segment_count(), 1);
+    }
+
+    #[test]
+    fn foreground_fact_upkeep_publishes_views_without_replacing_old_snapshots() {
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let mut store = MemoryRepo::default();
+        let source = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let policy = source.policy(&store.snapshot().unwrap()).unwrap();
+        let succinct = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let old = store.snapshot().unwrap();
+        let fragment = entity! { metadata::name: "visible before action success" };
+        let expected = fragment.facts().clone();
+        store.commit(source, &signer, fragment).unwrap();
+        pollster::block_on(maintain_admitted_fact_targets(&mut store, source, &signer)).unwrap();
+
+        let after = store.snapshot().unwrap();
+        let view = after
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        assert_eq!(view.iter().collect::<TribleSet>(), expected);
+        assert!(old.collection(rank9).unwrap().cover().is_empty());
+    }
+
+    #[test]
+    fn foreground_fact_upkeep_does_not_grant_target_authority() {
+        let owner = SigningKey::from_bytes(&[7; 32]);
+        let other = SigningKey::from_bytes(&[8; 32]);
+        let mut store = MemoryRepo::default();
+        let source = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let policy = source.policy(&store.snapshot().unwrap()).unwrap();
+        let succinct = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        // Raw publication stays unconditional; admission remains a query
+        // decision, not a new check introduced by eager upkeep.
+        store
+            .commit(source, &other, entity! { metadata::name: "unadmitted" })
+            .unwrap();
+        let before = store.snapshot().unwrap();
+        let records = before
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        pollster::block_on(maintain_admitted_fact_targets(&mut store, source, &other)).unwrap();
+        let after = store.snapshot().unwrap();
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            records
+        );
+        assert!(after.collection(rank9).unwrap().cover().is_empty());
     }
 
     #[test]

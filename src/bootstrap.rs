@@ -13,9 +13,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
@@ -529,9 +530,37 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             let expected_wiki = seed.wiki.facts().clone();
             let expected_compass = seed.compass.facts().clone();
             let wiki_commit = wiki_model::commit_collection(pile, signer, seed.wiki)?;
-            let compass_commit = compass::commit_collection(pile, signer, seed.compass)?;
+            let compass_commit = compass::commit_collection(pile, signer, seed.compass)
+                .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
 
-            let wiki_after = wiki_model::materialize_indexed_collection(pile, signer).await?;
+            async {
+                for scope in [
+                    crate::schemas::wiki::DEFAULT_SCOPE_ID,
+                    crate::schemas::compass::DEFAULT_SCOPE_ID,
+                ] {
+                    let source = crate::collection_names::open_configured(
+                        pile,
+                        scope,
+                        signer.verifying_key(),
+                    )?;
+                    crate::storage::maintain_admitted_fact_targets(pile, source, signer).await?;
+                }
+                let status = compass::status_register_collection(pile, signer.verifying_key())?;
+                if status.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
+                    drop(pile.maintain(status, signer).await?);
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
+            .context(
+                "Bootstrap facts were committed, but maintaining fact/status projections failed",
+            )?;
+
+            let wiki_after = wiki_model::materialize_indexed_collection(pile, signer)
+                .await
+                .context(
+                    "Bootstrap facts were committed, but maintaining Wiki projections failed",
+                )?;
             if !expected_wiki.difference(wiki_after.facts()).is_empty() {
                 bail!("Wiki collection omitted portable bootstrap facts after publication");
             }
@@ -610,6 +639,56 @@ mod tests {
             seed.compass,
             build(&signer.verifying_key()).unwrap().compass
         );
+    }
+
+    #[test]
+    fn imported_seed_is_visible_in_passive_fact_and_status_projections() {
+        use triblespace::core::blob::encodings::succinctarchive::{
+            Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+        };
+        use triblespace::core::collection::CollectionSnapshotExt;
+        use triblespace::core::trible::TribleSet;
+        let imported = imported("eager-projections");
+        let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
+        let seed = build(&signer.verifying_key()).unwrap();
+        let mut pile = open_pile_strict(&imported.pile).unwrap();
+        for (scope, expected) in [
+            (crate::schemas::wiki::DEFAULT_SCOPE_ID, seed.wiki.facts()),
+            (
+                crate::schemas::compass::DEFAULT_SCOPE_ID,
+                seed.compass.facts(),
+            ),
+        ] {
+            let source =
+                crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+                    .unwrap();
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            let view = pile
+                .snapshot()
+                .unwrap()
+                .collection(rank9)
+                .unwrap()
+                .view::<crate::storage::FactArchive>()
+                .unwrap();
+            let actual: TribleSet = view.iter().collect();
+            assert!(expected.difference(&actual).is_empty());
+        }
+        let status =
+            compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
+        assert!(!pile
+            .snapshot()
+            .unwrap()
+            .collection(status)
+            .unwrap()
+            .cover()
+            .is_empty());
+        pile.close().unwrap();
     }
 
     #[test]

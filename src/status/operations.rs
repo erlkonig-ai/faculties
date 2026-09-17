@@ -306,8 +306,14 @@ fn commit_status(
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    pile.commit(collection, signer, fragment)
-        .context("commit authored Status event")
+    let commit = pile
+        .commit(collection, signer, fragment)
+        .context("commit authored Status event")?;
+    pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+        pile, collection, signer,
+    ))
+    .context("Status facts were committed; eager maintenance failed")?;
+    Ok(commit)
 }
 
 fn fmt_id(id: Id) -> String {
@@ -447,6 +453,31 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn status_publication_is_visible_to_a_passive_rank9_reader() {
+        let fixture = fixture();
+        let window = *fucid();
+        let receipt = Status::with_storage(fixture.storage.clone())
+            .set_at(&fmt_id(window), "eager", at(11.0))
+            .unwrap();
+        let length = fs::metadata(&fixture.pile).unwrap().len();
+        storage(&fixture)
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let facts = pile.snapshot()?.collection(rank9)?.view::<FactArchive>()?;
+                let rows = status::load_status_rows(&facts)?;
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].event, receipt.event);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
     }
 
     #[test]

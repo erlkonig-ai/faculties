@@ -2252,8 +2252,16 @@ impl PostureStorage<'_> {
             "policy",
             |pile, collection, signer| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Posture policy fragment")
+                let commit = pile
+                    .commit(collection, signer, fragment)
+                    .context("commit authored Posture policy fragment")?;
+                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile, collection, signer,
+                ))
+                .context(
+                    "Posture policy facts were committed, but maintaining their query views failed",
+                )?;
+                Ok(commit)
             },
         )
     }
@@ -2261,8 +2269,16 @@ impl PostureStorage<'_> {
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
         self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            pile.commit(collection, signer, fragment)
-                .context("commit authored Posture scan fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("commit authored Posture scan fragment")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context(
+                "Posture scan facts were committed, but maintaining their query views failed",
+            )?;
+            Ok(commit)
         })
     }
 
@@ -2278,9 +2294,12 @@ impl PostureStorage<'_> {
     ) -> Result<T> {
         self.storage.with_pile(|pile, signer| {
             let result = (|| {
-                let collection = open_configured(pile, scope, signer.verifying_key())?;
+                let collection = open_configured(pile, scope, signer.verifying_key())
+                    .with_context(|| format!("open Posture {label} collection"))?;
+                // The action distinguishes a failed COMMIT from failed
+                // upkeep after COMMIT; do not hide that result behind a
+                // generic publication-failed context.
                 operation(pile, collection, signer)
-                    .with_context(|| format!("publish Posture {label} fragment"))
             })();
             result
         })
@@ -5739,6 +5758,59 @@ fn cmd_sweep(
         skipped_private,
         no_remote,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn policy_and_scan_actions_complete_their_resident_projections() {
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("posture.pile");
+    let key = directory.path().join("posture.key");
+    std::fs::File::create(&pile).unwrap();
+    crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    let capability = Posture::new(pile, Some(key));
+    let assert_projected = |scope: Id, expected: Id, kind: Id| {
+        capability
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, scope, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let snapshot = pile.snapshot()?;
+                let selected = snapshot.collection(rank9)?;
+                let facts = selected.view::<FactArchive>()?;
+                assert!(find!(
+                    id: Id,
+                    pattern!(&facts, [{ ?id @ metadata::tag: &kind }])
+                )
+                .any(|id| id == expected));
+                assert_eq!(
+                    source.admitted(&snapshot)?.len(),
+                    1,
+                    "the action remains one COMMIT"
+                );
+                Ok(())
+            })
+            .unwrap();
+    };
+    let policy = capability
+        .vocab_add("private-example", "public", None)
+        .unwrap();
+    assert!(policy.published);
+    assert_projected(DEFAULT_POLICY_SCOPE_ID, policy.member, KIND_TERM);
+    let scan = capability
+        .scan(
+            "generated input",
+            &[DocumentInput {
+                name: "empty.txt",
+                bytes: b"ordinary generated text",
+            }],
+            false,
+        )
+        .unwrap();
+    assert_projected(DEFAULT_SCAN_SCOPE_ID, scan.scan_id.unwrap(), KIND_SCAN);
 }
 
 #[cfg(test)]

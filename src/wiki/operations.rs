@@ -266,8 +266,15 @@ impl WikiStorage<'_> {
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
             let collection = runtime.block_on(open_source(pile, scope, signer.verifying_key()))?;
-            pile.commit(collection, signer, fragment)
-                .context("publish native collection fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("publish native collection fragment")?;
+            runtime
+                .block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile, collection, signer,
+                ))
+                .context("Wiki auxiliary fragment was committed, but eager projection maintenance failed")?;
+            Ok(commit)
         })
     }
 
@@ -288,8 +295,23 @@ impl WikiStorage<'_> {
                 "publishing a Wiki fragment requires source collection WRITE"
             );
             drop(snapshot);
-            pile.commit(collection, signer, fragment)
-                .context("publish Wiki fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("publish Wiki fragment")?;
+            runtime
+                .block_on(async {
+                    crate::storage::maintain_admitted_fact_targets(pile, collection, signer)
+                        .await?;
+                    let latest = wiki_model::latest_for_source(pile, collection)?;
+                    if latest.writer_is_admitted(&pile.snapshot()?, signer.verifying_key())? {
+                        drop(pile.maintain(latest, signer).await?);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .context(
+                    "Wiki fragment was committed, but eager maintenance of its projections failed",
+                )?;
+            Ok(commit)
         })
     }
 
@@ -2211,6 +2233,84 @@ mod tests {
                 storage: &self.storage,
             }
         }
+    }
+
+    #[test]
+    fn publication_leaves_facts_and_latest_current_without_a_repairing_read() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let (rank9, latest) = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source =
+                    open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let rank9 =
+                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                Ok((rank9, wiki_model::latest_for_source(pile, source)?))
+            })
+            .unwrap();
+        let observe = || {
+            let before = fs::metadata(&fixture.pile).unwrap().len();
+            let views = fixture
+                .storage
+                .with_pile(|pile, _| {
+                    let snapshot = pile.snapshot()?;
+                    Ok((
+                        snapshot.collection(rank9)?.view::<FactArchive>()?,
+                        snapshot.collection(latest)?.view::<LatestIndex>()?,
+                    ))
+                })
+                .unwrap();
+            assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
+            views
+        };
+        let mut first = Fragment::empty();
+        let root = stage_revision(
+            storage,
+            &mut first,
+            None,
+            "first".into(),
+            "body".into(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(first).unwrap();
+        let (first_facts, first_latest) = observe();
+        let entry = wiki_model::entry(&first_facts, &first_latest, root).unwrap();
+        let mut successor = Fragment::empty();
+        let next = stage_revision(
+            storage,
+            &mut successor,
+            Some(&entry),
+            "next".into(),
+            "new body".into(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(successor).unwrap();
+        let (facts, latest) = observe();
+        let current = wiki_model::entry(&facts, &latest, root).unwrap();
+        assert_eq!(
+            current
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            vec![next]
+        );
+        assert_eq!(
+            entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            vec![root]
+        );
+        assert!(first_latest.contains(root));
+        assert!(!latest.contains(root));
+        assert!(latest.contains(next));
     }
 
     #[test]

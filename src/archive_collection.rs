@@ -187,6 +187,12 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
+        pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+            self.pile.borrow_mut(),
+            self.collection,
+            &self.signer,
+        ))
+        .context("Archive projection unit was committed, but maintaining its query views failed")?;
         Ok(Some(commit))
     }
 }
@@ -207,15 +213,8 @@ impl ArchiveImportWriter {
 
     pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, Option<CollectionCommit>)> {
         let result = surrounding.and_then(|value| {
-            if self.delta.facts().is_empty() {
-                return Ok((value, None));
-            }
-            let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
-            let commit = self
-                .pile
-                .commit(self.collection, &self.signer, fragment)
-                .context("commit authored Archive projection unit")?;
-            Ok((value, Some(commit)))
+            let commit = self.commit_unit()?;
+            Ok((value, commit))
         });
         close_pile(
             self.pile,
@@ -1009,6 +1008,30 @@ mod tests {
         let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
         assert!(writer.commit_unit().unwrap().is_some());
+        // The writer's successful action already carries the facts; do not
+        // call ensure_local here and accidentally repair the observation.
+        let policy = writer
+            .collection
+            .policy(&writer.pile.snapshot().unwrap())
+            .unwrap();
+        let succinct = writer
+            .pile
+            .derive::<SuccinctArchiveBlob>(writer.collection, (), policy.clone())
+            .unwrap();
+        let rank9 = writer
+            .pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let passive = writer.pile.snapshot().unwrap();
+        let passive_facts = passive
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        assert!(fragment
+            .facts()
+            .iter()
+            .all(|fact| fact_archive_contains(&passive_facts, fact)));
         writer.stage_fragment(fragment.clone()).unwrap();
         assert_eq!(writer.delta_len(), 0);
         assert!(writer.commit_unit().unwrap().is_none());

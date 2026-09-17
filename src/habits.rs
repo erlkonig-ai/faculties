@@ -22,7 +22,7 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -1615,11 +1615,13 @@ pub fn publish(
 }
 
 /// Publish one Habit fragment through an explicitly owned storage lifetime.
+/// Targets this signer is admitted to maintain are carried before success is
+/// returned. If that upkeep fails, the error identifies the already-committed
+/// fragment; it does not imply that publication was rolled back.
 pub fn publish_with_storage(storage: &Storage, fragment: Fragment) -> Result<CollectionCommit> {
     storage.with_pile(|pile, signer| {
         let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        pile.commit(collection, signer, fragment)
-            .context("commit Habit fragment")
+        operations::commit_habit_fragment(pile, collection, signer, fragment)
     })
 }
 
@@ -1836,8 +1838,12 @@ mod tests {
     use std::path::PathBuf;
 
     use hifitime::Epoch;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 
-    use crate::storage::{load_signer, open_pile_strict};
+    use crate::storage::{load_signer, open_pile_strict, FactArchive};
     use crate::test_support::initialize_open_collection_fixture;
 
     use super::*;
@@ -1873,6 +1879,57 @@ mod tests {
 
         fn catalog(&self) -> Catalog {
             read_catalog_strict(&self.pile, Some(&self.key)).unwrap()
+        }
+
+        // Name the targets before exercising a writer. Observation below does
+        // not register, ensure, or maintain anything, so it cannot hide a
+        // writer which returns before carrying its own source publication.
+        fn targets(
+            &self,
+        ) -> (
+            Collection<SuccinctArchiveBlob>,
+            Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+        ) {
+            let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let source =
+                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            pile.close().unwrap();
+            (succinct, rank9)
+        }
+
+        fn resident_targets(
+            &self,
+            succinct: Collection<SuccinctArchiveBlob>,
+            rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+        ) -> (PileSnapshot, FactArchive, FactArchive) {
+            let before = std::fs::metadata(&self.pile).unwrap().len();
+            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let succinct_facts = snapshot
+                .collection(succinct)
+                .unwrap()
+                .view::<FactArchive>()
+                .unwrap();
+            let rank9_facts = snapshot
+                .collection(rank9)
+                .unwrap()
+                .view::<FactArchive>()
+                .unwrap();
+            pile.close().unwrap();
+            assert_eq!(
+                std::fs::metadata(&self.pile).unwrap().len(),
+                before,
+                "the regression observer must not repair either derived target"
+            );
+            (snapshot, succinct_facts, rank9_facts)
         }
     }
 
@@ -1945,6 +2002,96 @@ mod tests {
         }
         assert_eq!(evaluate(&row, 12_600, Path::new(".")), State::Due);
         assert_eq!(row.next_cooldown_at().unwrap(), Some(12_600));
+    }
+
+    #[test]
+    fn successful_mutations_reach_resident_targets_without_a_daemon() {
+        let fixture = Fixture::new();
+        let (succinct, rank9) = fixture.targets();
+        let api = Habits::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let added = api
+            .add("eager habit", "every 1h", "observe it", None, &[], &[])
+            .unwrap();
+        let selector = format!("{:x}", added.id);
+        let (before_done, old_succinct, old_rank9) = fixture.resident_targets(succinct, rank9);
+        for facts in [&old_succinct, &old_rank9] {
+            assert_eq!(definition_ids(facts), BTreeSet::from([added.id]));
+            assert!(completions(facts, added.id).is_empty());
+        }
+
+        let done = api.done(&selector).unwrap();
+        let (reader, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        for facts in [&succinct_facts, &rank9_facts] {
+            let completed = completions(facts, added.id);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].id, done.event);
+            let current = rows(&reader, facts).unwrap().remove(0);
+            assert_eq!(
+                evaluate(
+                    &current,
+                    current.last_done().unwrap(),
+                    fixture._directory.path()
+                ),
+                State::Cooling
+            );
+        }
+        // A later maintenance pass must not mutate a previously selected view.
+        for facts in [&old_succinct, &old_rank9] {
+            assert!(completions(facts, added.id).is_empty());
+            assert!(rows(&before_done, facts).unwrap()[0]
+                .completed_at
+                .is_empty());
+        }
+
+        for state in [DeclaredState::Paused, DeclaredState::Active] {
+            let changed = api.set_state(&selector, state).unwrap();
+            let event = changed
+                .event
+                .expect("each transition authors a state event");
+            let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+            for facts in [&succinct_facts, &rank9_facts] {
+                let current = activation(facts, added.id).unwrap();
+                assert_eq!(current.declared(), Some(state));
+                assert_eq!(current.head_ids(), [event]);
+            }
+        }
+        assert!(api
+            .set_state(&selector, DeclaredState::Active)
+            .unwrap()
+            .event
+            .is_none());
+    }
+
+    #[test]
+    fn direct_publication_reaches_resident_targets_without_a_repairing_read() {
+        let fixture = Fixture::new();
+        let (succinct, rank9) = fixture.targets();
+        let (definition, habit) = habit_fragment(
+            "direct eager habit",
+            "every 1h",
+            "observe it",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        fixture.publish(definition);
+        let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        for facts in [&succinct_facts, &rank9_facts] {
+            assert_eq!(definition_ids(facts), BTreeSet::from([habit]));
+        }
+        let (completion, event) = completion_fragment(habit, at(10.0)).unwrap();
+        fixture.publish(completion);
+        let (_, succinct_facts, rank9_facts) = fixture.resident_targets(succinct, rank9);
+        for facts in [&succinct_facts, &rank9_facts] {
+            assert_eq!(
+                completions(facts, habit)
+                    .iter()
+                    .map(|done| done.id)
+                    .collect::<Vec<_>>(),
+                [event]
+            );
+        }
     }
 
     #[test]

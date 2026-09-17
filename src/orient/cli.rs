@@ -58,10 +58,12 @@ pub struct Cli {
 /// answers "what is happening" — which is why the belief set lives in one and
 /// is out of place in the other however cheap it would be to add.
 ///
-/// These modes read resident maintained targets; none performs collection
-/// maintenance, even with WRITE authority. Run a separate
-/// `trible pile collection maintain-all ... --watch` for the selected targets.
-/// Accepted output may still publish Presented receipt COMMITs.
+/// These modes eagerly maintain their inputs when the existing signer has
+/// derived WRITE authority, then query one immutable observation. Other
+/// readers attach the resident targets without acquiring new authority.
+/// Background maintenance remains useful, but is not the freshness boundary
+/// for an authorized foreground read. Accepted output publishes Presented
+/// receipt COMMITs; `--peek` performs upkeep but never records presentation.
 #[derive(Subcommand)]
 enum Command {
     /// Mid-session overview, with resident local swarm health first (no memories, no wiki)

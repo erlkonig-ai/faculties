@@ -277,10 +277,30 @@ struct HabitSession<'a> {
 
 impl HabitSession<'_> {
     fn commit(&mut self, fragment: Fragment) -> Result<CollectionCommit> {
-        self.pile
-            .commit(self.collection, self.signer, fragment)
-            .context("commit Habit fragment")
+        commit_habit_fragment(self.pile, self.collection, self.signer, fragment)
     }
+}
+
+/// Publish first, then carry the admitted targets before reporting success.
+///
+/// Source publication remains unconditional: an unadmitted COMMIT is still a
+/// raw ledger entry, not an admitted Habit fact. Maintenance never grants the
+/// signer authority it did not already have. The command's selected read view
+/// is left immutable; subsequent observers attach the newly maintained view.
+pub(super) fn commit_habit_fragment(
+    pile: &mut Pile,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    fragment: Fragment,
+) -> Result<CollectionCommit> {
+    let commit = pile
+        .commit(collection, signer, fragment)
+        .context("commit Habit fragment")?;
+    pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+        pile, collection, signer,
+    ))
+    .context("Habit fragment was committed, but eager maintenance of its derived views failed")?;
+    Ok(commit)
 }
 
 fn with_habits<T>(
@@ -423,6 +443,8 @@ mod tests {
     use crate::habits::cli::Cli;
     use crate::storage::initialize_signer;
     use clap::CommandFactory;
+    use triblespace::core::collection::{CollectionRead, CollectionRecord};
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
 
     #[test]
     fn permanent_cli_has_no_branch_scope_head_or_migration_surface() {
@@ -490,5 +512,120 @@ mod tests {
             unseen
         );
         assert!(resolve_predecessor(&definitions, "a5a5").is_err());
+    }
+
+    #[test]
+    fn unadmitted_publication_stays_raw_and_does_not_gain_target_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("habit.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let owner = SigningKey::from_bytes(&[61; 32]);
+        let outsider = SigningKey::from_bytes(&[62; 32]);
+        let source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        let (definition, owner_habit) =
+            habits::habit_fragment("owner habit", "every 1h", "observe", None, &[], &[]).unwrap();
+        commit_habit_fragment(&mut pile, source, &owner, definition).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let before = pile.snapshot().unwrap();
+        let before_records = before
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<BTreeSet<_>>();
+        for admitted in [
+            source
+                .writer_is_admitted(&before, outsider.verifying_key())
+                .unwrap(),
+            succinct
+                .writer_is_admitted(&before, outsider.verifying_key())
+                .unwrap(),
+            rank9
+                .writer_is_admitted(&before, outsider.verifying_key())
+                .unwrap(),
+        ] {
+            assert!(!admitted);
+        }
+
+        let (fragment, _) =
+            habits::habit_fragment("raw outsider habit", "every 1h", "observe", None, &[], &[])
+                .unwrap();
+        let commit = commit_habit_fragment(&mut pile, source, &outsider, fragment).unwrap();
+        let after = pile.snapshot().unwrap();
+        let after_records = after
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            after_records
+                .difference(&before_records)
+                .copied()
+                .collect::<Vec<_>>(),
+            [CollectionRecord::Commit(commit)]
+        );
+        assert_eq!(
+            source.admitted(&before).unwrap(),
+            source.admitted(&after).unwrap()
+        );
+        let succinct_facts = after
+            .collection(succinct)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        let rank9_facts = after
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        for facts in [&succinct_facts, &rank9_facts] {
+            assert_eq!(habits::definition_ids(facts), BTreeSet::from([owner_habit]));
+        }
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn upkeep_failure_reports_that_the_fragment_was_already_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("habit.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[63; 32]);
+        // A typed descriptor exists elsewhere, but is deliberately absent
+        // from this pile. Core publication can still append its raw COMMIT;
+        // looking up the maintenance policy is the subsequent failure.
+        let mut elsewhere = MemoryRepo::default();
+        let source =
+            crate::collection_names::open(&mut elsewhere, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        let (fragment, _) =
+            habits::habit_fragment("already committed", "every 1h", "observe", None, &[], &[])
+                .unwrap();
+        let error = commit_habit_fragment(&mut pile, source, &signer, fragment).unwrap_err();
+        assert!(error.to_string().contains("Habit fragment was committed"));
+        assert!(
+            error.chain().count() > 1,
+            "the storage cause must remain attached"
+        );
+        let records = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            records.as_slice(),
+            [CollectionRecord::Commit(commit)] if commit.collection() == source.handle()
+        ));
+        pile.close().unwrap();
     }
 }

@@ -251,6 +251,19 @@ fn with_files_store<T>(
     })
 }
 
+fn maintain_files_after_commit(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<()> {
+    runtime
+        .block_on(crate::storage::maintain_admitted_fact_targets(
+            store, collection, signer,
+        ))
+        .context("Files fragment was committed, but eager projection maintenance failed")
+}
+
 /// Attach one immutable shard-preserving Files view for commands whose result
 /// or mutation depends on facts already present in the collection.
 ///
@@ -768,6 +781,7 @@ fn cmd_add(
 
     pile.commit(collection, signer, change)
         .context("commit Files import")?;
+    maintain_files_after_commit(pile, collection, signer, runtime)?;
 
     // A saved image is searchable the moment it is saved, where this machine
     // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
@@ -811,6 +825,7 @@ fn cmd_fetch(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     url: &str,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -881,6 +896,7 @@ fn cmd_fetch(
     let content = content_handle_of(change.facts(), file_id).context("staged file content")?;
     pile.commit(collection, signer, change)
         .context("commit fetched file")?;
+    maintain_files_after_commit(pile, collection, signer, runtime)?;
     out.line(format!(
         "{}  {}  ({})",
         handle_hex(content),
@@ -1085,6 +1101,7 @@ fn cmd_tag<P: TriblePattern>(
     let change = entity! { ExclusiveId::force_ref(&eid) @ file::tag: tag_name };
     pile.commit(collection, signer, change)
         .context("commit Files tag")?;
+    maintain_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!("Tagged {name} with '{tag_name}'"))?;
     Ok(())
@@ -1520,6 +1537,7 @@ fn cmd_embed7b<P: TriblePattern>(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
     force: bool,
@@ -1615,6 +1633,7 @@ fn cmd_embed7b<P: TriblePattern>(
 
     pile.commit(collection, signer, change)
         .context("commit Files 7b embeddings")?;
+    maintain_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!(
         "7b-embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
@@ -1726,6 +1745,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
     force: bool,
@@ -1863,6 +1883,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
 
     pile.commit(collection, signer, change)
         .context("commit Files PDF page embeddings")?;
+    maintain_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!(
         "7b-embedded {pages_embedded} pages across {pdfs_done} PDFs (of {pending_pdfs} pending){}",
@@ -2347,10 +2368,11 @@ impl Files {
         tags: &[String],
     ) -> Result<Id> {
         let (change, file_id, _) = stage_byte_import(bytes, name, mime, tags, "resident bytes")?;
-        with_files_store(&self.storage, |store, collection, signer, _| {
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
             store
                 .commit(collection, signer, change)
                 .context("commit Files byte import")?;
+            maintain_files_after_commit(store, collection, signer, runtime)?;
             Ok(file_id)
         })
     }
@@ -2382,11 +2404,12 @@ impl Files {
 
     pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
         anyhow::ensure!(options.max_bytes > 0, "max_bytes must be positive");
-        with_files_store(&self.storage, |store, collection, signer, _| {
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
             cmd_fetch(
                 store,
                 collection,
                 signer,
+                runtime,
                 options.url,
                 options.mime,
                 options.name,
@@ -2462,12 +2485,13 @@ impl Files {
         // boundaries; never retry the whole operation after partial publication.
         with_files_view(
             &self.storage,
-            |store, collection, signer, facts, snapshot, _| {
+            |store, collection, signer, facts, snapshot, runtime| {
                 if options.pdf {
                     cmd_embed7b_pdf(
                         store,
                         collection,
                         signer,
+                        runtime,
                         facts,
                         snapshot,
                         options.force,
@@ -2481,6 +2505,7 @@ impl Files {
                         store,
                         collection,
                         signer,
+                        runtime,
                         facts,
                         snapshot,
                         options.force,
@@ -2702,6 +2727,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn import_and_tag_reach_fact_targets_without_a_repairing_read() {
+        let fixture = TestPile::new();
+        let storage = Storage::new(fixture.path.clone(), None);
+        let rank9 = storage
+            .with_pile(|pile, signer| {
+                let source = open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                Ok(pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?)
+            })
+            .unwrap();
+        let observe = || {
+            let before = fs::metadata(&fixture.path).unwrap().len();
+            let facts = storage
+                .with_pile(|pile, _| {
+                    Ok(pile.snapshot()?.collection(rank9)?.view::<FactArchive>()?)
+                })
+                .unwrap();
+            assert_eq!(fs::metadata(&fixture.path).unwrap().len(), before);
+            facts
+        };
+        let faculty = Files::with_storage(storage.clone());
+        let id = faculty
+            .add_bytes(
+                anybytes::Bytes::from_static(b"eager file"),
+                "eager.txt",
+                "text/plain",
+                &[],
+            )
+            .unwrap();
+        let old_facts = observe();
+        assert!(content_handle_of(&old_facts, id).is_some());
+        let mut discard = |_| Ok(());
+        faculty
+            .tag(&format!("{id:x}"), "eager", &mut Out::new(&mut discard))
+            .unwrap();
+        let facts = observe();
+        assert!(tags_of(&facts, id).contains(&"eager".to_owned()));
+        assert!(!tags_of(&old_facts, id).contains(&"eager".to_owned()));
     }
 
     struct AcquiringPile {

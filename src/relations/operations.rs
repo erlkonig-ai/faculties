@@ -38,6 +38,7 @@ struct RelationsStorage<'a> {
     collection: Collection<SimpleArchive>,
     facts: &'a FactArchive,
     reader: &'a RelationsReader,
+    published: bool,
 }
 
 impl RelationsStorage<'_> {
@@ -59,6 +60,7 @@ impl RelationsStorage<'_> {
             self.pile
                 .commit(self.collection, self.signer, fragment)
                 .context("commit authored Relations fragment")?;
+            self.published = true;
         }
         Ok(result)
     }
@@ -1079,8 +1081,19 @@ fn with_relations_view<T>(
         collection,
         facts: &view,
         reader: &payload_reader,
+        published: false,
     };
-    execute(&mut storage)
+    let result = execute(&mut storage)?;
+    let published = storage.published;
+    drop(storage);
+    if published {
+        runtime
+            .block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context("Relations fragment was committed, but eager projection maintenance failed")?;
+    }
+    Ok(result)
 }
 #[cfg(test)]
 mod tests {
@@ -1102,6 +1115,64 @@ mod tests {
             first_name: Some("Ada".to_owned()),
             ..ProfileInput::default()
         }
+    }
+
+    #[test]
+    fn successful_profile_actions_reach_targets_without_a_repairing_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("eager-relations.pile");
+        let key = directory.path().join("eager-relations.key");
+        fs::File::create(&pile_path).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let storage = Storage::new(pile_path.clone(), Some(key));
+        let rank9 = storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                Ok(pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?)
+            })
+            .unwrap();
+        let observe = || {
+            let before = fs::metadata(&pile_path).unwrap().len();
+            let facts = storage
+                .with_pile(|pile, _| {
+                    Ok(pile.snapshot()?.collection(rank9)?.view::<FactArchive>()?)
+                })
+                .unwrap();
+            assert_eq!(fs::metadata(&pile_path).unwrap().len(), before);
+            facts
+        };
+        let faculty = Relations::with_storage(storage.clone());
+        let added = faculty.add(profile("Ada"), None, &[]).unwrap();
+        let old_facts = observe();
+        assert_eq!(
+            relations::current_profile(&old_facts, added.person)
+                .unwrap()
+                .id,
+            added.profile
+        );
+        let changed = faculty
+            .set(
+                &format!("{:x}", added.person),
+                ProfilePatch {
+                    company: Some("Analytical Engines".into()),
+                    ..ProfilePatch::default()
+                },
+                &[],
+            )
+            .unwrap();
+        let facts = observe();
+        assert_eq!(
+            Some(relations::current_profile(&facts, added.person).unwrap().id),
+            changed.current
+        );
+        assert_eq!(
+            relations::current_profile(&old_facts, added.person)
+                .unwrap()
+                .id,
+            added.profile
+        );
     }
 
     #[test]
@@ -1356,6 +1427,7 @@ mod tests {
             collection,
             facts: &view,
             reader: &reader,
+            published: false,
         };
         storage
             .with_view(|facts, reader| {

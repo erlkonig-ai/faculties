@@ -189,6 +189,46 @@ fn transcript_lines_round_trip() {
 }
 
 #[test]
+fn recorded_utterance_is_visible_without_a_repairing_voice_read() {
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+    use triblespace::core::repo::{SnapshotSource, StorageClose};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("voice.pile");
+    std::fs::File::create(&path).unwrap();
+    let signer = crate::storage::initialize_signer(&path, None).unwrap();
+    record_utterance(&path, None, "generated transcript").unwrap();
+    let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+    let source = crate::collection_names::open_configured(
+        &mut pile,
+        crate::schemas::voice::COLLECTION_SCOPE_ID,
+        signer.verifying_key(),
+    )
+    .unwrap();
+    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    let view = pile
+        .snapshot()
+        .unwrap()
+        .collection(rank9)
+        .unwrap()
+        .view::<crate::storage::FactArchive>()
+        .unwrap();
+    assert!(
+        view.iter().next().is_some(),
+        "the recorder must publish its query projection"
+    );
+    pile.close().unwrap();
+}
+
+#[test]
 fn wav_header_states_its_own_length() {
     let header = wav_header(1920 * 2);
     assert_eq!(&header[0..4], b"RIFF");

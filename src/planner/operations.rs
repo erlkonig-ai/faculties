@@ -356,6 +356,12 @@ impl PlannerStorage<'_> {
                 fragment.describe_with(entity! { metadata::description: description });
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
+                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile, collection, signer,
+                ))
+                .context(
+                    "Planner facts were committed, but maintaining their query views failed",
+                )?;
             }
             Ok(value)
         })
@@ -1039,6 +1045,46 @@ fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Resul
             },
         ))
     })
+}
+
+#[cfg(test)]
+#[test]
+fn event_and_initial_note_are_projected_as_one_completed_action() {
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("planner.pile");
+    let key = directory.path().join("planner.key");
+    std::fs::File::create(&pile).unwrap();
+    crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    let capability = Planner::new(pile, Some(key));
+    let mut options = AddOptions::new(
+        "Already visible",
+        (
+            Epoch::from_unix_seconds(10.0),
+            Epoch::from_unix_seconds(20.0),
+        ),
+    );
+    options.note = Some("Part of the same COMMIT".to_owned());
+    let added = capability.add(&options).unwrap();
+    capability
+        .storage
+        .with_pile(|pile, signer| {
+            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let policy = source.policy(&pile.snapshot()?)?;
+            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+            let snapshot = pile.snapshot()?;
+            let selected = snapshot.collection(rank9)?;
+            let facts = selected.view::<FactArchive>()?;
+            assert!(planner_model::event(&facts, added.event).is_some());
+            assert_eq!(planner_model::notes_for_event(&facts, added.event).len(), 1);
+            assert_eq!(
+                source.admitted(&snapshot)?.len(),
+                1,
+                "the action remains one COMMIT"
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[cfg(test)]

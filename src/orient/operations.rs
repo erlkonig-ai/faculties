@@ -522,7 +522,6 @@ fn visible_notes<P: TriblePattern>(
 /// One Orient input's authored collection and explicit query projections.
 struct OrientSource {
     source: Collection<SimpleArchive>,
-    #[cfg(test)]
     succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &'static str,
@@ -572,14 +571,12 @@ impl OrientSource {
             .with_context(|| format!("register {label} Rank9 collection"))?;
         Ok(Self {
             source,
-            #[cfg(test)]
             succinct,
             rank9,
             label,
         })
     }
 
-    #[cfg(test)]
     fn can_maintain<S>(&self, snapshot: &S, signer: &SigningKey) -> Result<bool>
     where
         S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
@@ -595,8 +592,8 @@ impl OrientSource {
                 .with_context(|| format!("check {} Rank9 WRITE admission", self.label))?)
     }
 
-    /// Test fixtures explicitly model an authorized background producer.
-    #[cfg(test)]
+    /// Refresh authorized inputs before selecting their immutable query views.
+    /// Readers without derived WRITE keep using the resident projection.
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         if !self.can_maintain(&pile.snapshot()?, signer)? {
             return Ok(());
@@ -604,7 +601,6 @@ impl OrientSource {
         self.maintain_local(pile, signer).await
     }
 
-    #[cfg(test)]
     async fn maintain_local(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         drop(
             pile.maintain(self.succinct, signer)
@@ -849,9 +845,10 @@ impl OrientObservation {
     }
 }
 
-/// Explicit fixture upkeep, separate from every production reader.
-#[cfg(test)]
-async fn maintain_sources(
+/// Bring authorized source projections forward before one coherent observation.
+/// Receipt upkeep has its own best-effort boundary so a failure to refresh
+/// presentation membership cannot suppress otherwise readable attention.
+async fn maintain_inputs(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     sources: &OrientSources,
@@ -870,7 +867,6 @@ async fn maintain_sources(
     {
         source.maintain(pile, signer).await?;
     }
-    sources.presentations.maintain(pile, signer).await?;
     if sources
         .compass_status
         .writer_is_admitted(&pile.snapshot()?, signer.verifying_key())
@@ -879,10 +875,20 @@ async fn maintain_sources(
         drop(
             pile.maintain(sources.compass_status, signer)
                 .await
-                .map_err(|error| anyhow!("maintain Compass status register: {error}"))?,
+                .context("maintain Compass status register")?,
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn maintain_sources(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    sources: &OrientSources,
+) -> Result<()> {
+    maintain_inputs(pile, signer, sources).await?;
+    sources.presentations.maintain(pile, signer).await
 }
 
 /// Read every target collection as it actually exists at one immutable store
@@ -986,7 +992,10 @@ fn is_preparation_pending(error: &anyhow::Error) -> bool {
         source.downcast_ref::<MissingBlob>().is_some()
             || matches!(
                 source.downcast_ref::<CollectionRealizationError>(),
-                Some(CollectionRealizationError::IncompleteCover { .. })
+                Some(
+                    CollectionRealizationError::IncompleteCover { .. }
+                        | CollectionRealizationError::MissingDependency { .. }
+                )
             )
     })
 }
@@ -2735,9 +2744,10 @@ async fn cmd_baseline(
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile)?;
+        let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
         let health_events = health.report().attention;
         let sources = OrientSources::open(pile, signer, false).await?;
+        maintain_inputs(pile, signer, &sources).await?;
         let observation = observe_current_sources(pile, &sources)?;
         let (persona, events) = read(pile, &observation.snapshot, |reader| {
             let query = observation.query(reader);
@@ -2778,7 +2788,7 @@ async fn cmd_show(
 
     async {
         let health_sources = HealthSources::open(pile, signer, health_max_age)?;
-        let health = health_sources.observe(pile)?;
+        let health = health_sources.observe(pile, signer)?;
         let health_report = health.report();
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
@@ -2789,6 +2799,7 @@ async fn cmd_show(
             }
         }
         let sources = OrientSources::open(pile, signer, true).await?;
+        maintain_inputs(pile, signer, &sources).await?;
         refresh_receipts_before_observation(pile, signer, &sources, output).await?;
         let instant = clock::now()?;
         let observation = observe_current_sources(pile, &sources)?;
@@ -3052,9 +3063,13 @@ async fn cmd_poll(
             return Ok(());
         }
         let sources = OrientSources::open(pile, signer, false).await?;
-        if !peek {
-            refresh_receipts_before_observation(pile, signer, &sources, output).await?;
+        if let Err(error) = maintain_inputs(pile, signer, &sources).await {
+            if is_preparation_pending(&error) {
+                return Ok(());
+            }
+            return Err(error);
         }
+        refresh_receipts_before_observation(pile, signer, &sources, output).await?;
         let observation = match observe_current_sources(pile, &sources) {
             Ok(observation) => observation,
             Err(error) if is_preparation_pending(&error) => return Ok(()),
@@ -3145,9 +3160,18 @@ fn wait_storage_changed(sampled: &FacultySnapshot, previous: &FacultySnapshot) -
 }
 
 fn pending_blob(error: &anyhow::Error) -> Option<MissingBlob> {
-    error
-        .chain()
-        .find_map(|source| source.downcast_ref::<MissingBlob>().copied())
+    error.chain().find_map(|source| {
+        source.downcast_ref::<MissingBlob>().copied().or_else(|| {
+            match source.downcast_ref::<CollectionRealizationError>() {
+                Some(CollectionRealizationError::MissingDependency { member }) => {
+                    Some(MissingBlob {
+                        handle: Inline::new(member.raw),
+                    })
+                }
+                _ => None,
+            }
+        })
+    })
 }
 
 enum WaitFrameLoad {
@@ -3422,6 +3446,76 @@ async fn load_wait_frame_before_health_deadline(
     }
 }
 
+/// Eager upkeep belongs before view selection, never inside a selected payload
+/// retry. Keep the pre-upkeep prefix as the attempted baseline: an append to an
+/// earlier input during upkeep must still be noticed on the next poll. Our own
+/// equations can consequently cause one extra, quiet upkeep pass.
+async fn prepare_wait_frame_before_health_deadline(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    sources: &OrientSources,
+    mut snapshot: FacultySnapshot,
+    maintained_from: &mut Option<FacultySnapshot>,
+    upkeep_interrupted: &mut bool,
+    pending: &mut Option<PendingWaitFrame>,
+    pile_path: &Path,
+    persona_input: &str,
+    next_health_change: Option<Epoch>,
+    timeout_at: Option<tokio::time::Instant>,
+    mut evaluated_at: Epoch,
+    output: &mut Out<'_>,
+) -> Result<Option<WaitFrameLoad>> {
+    if maintained_from
+        .as_ref()
+        .is_none_or(|previous| wait_storage_changed(&snapshot, previous))
+    {
+        let before = snapshot.clone();
+        let result = tokio::select! {
+            _ = wait_timeout_deadline(timeout_at) => {
+                *upkeep_interrupted = true;
+                return Ok(None);
+            }
+            boundary = health::deadline(next_health_change) => {
+                boundary?;
+                *upkeep_interrupted = true;
+                return Ok(None);
+            }
+            result = async {
+                maintain_inputs(pile, signer, sources).await?;
+                refresh_receipts_before_observation(pile, signer, sources, output).await
+            } => result,
+        };
+        if let Err(error) = result {
+            if !is_preparation_pending(&error) {
+                return Err(error);
+            }
+            let mut fresh = PendingWaitFrame::awaiting_view(before, PendingWaitReason::Preparation);
+            fresh.missing = pending_blob(&error);
+            return Ok(Some(WaitFrameLoad::Pending(fresh)));
+        }
+        *upkeep_interrupted = false;
+        *maintained_from = Some(before);
+        snapshot = pile.snapshot()?;
+        evaluated_at = clock::now()?;
+    }
+    tokio::select! {
+        _ = wait_timeout_deadline(timeout_at) => Ok(None),
+        frame = load_wait_frame_before_health_deadline(
+            pile, sources, snapshot, pending, pile_path, persona_input,
+            next_health_change, evaluated_at,
+        ) => frame,
+    }
+}
+
+/// The command budget is monotonic; wall-clock corrections only affect the
+/// health/Habit deadlines, never how long a bounded wait may run.
+async fn wait_timeout_deadline(timeout_at: Option<tokio::time::Instant>) {
+    match timeout_at {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn cmd_wait(
     pile: &mut FacultyStore,
     signer: &SigningKey,
@@ -3439,9 +3533,12 @@ async fn cmd_wait(
         let mut health = HealthSources::open(pile, signer, health_max_age)?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
+        let timeout_at = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let mut view_pending;
         let mut next_health_change;
         let mut pending_frame: Option<PendingWaitFrame> = None;
+        let mut maintained_from: Option<FacultySnapshot> = None;
+        let mut upkeep_interrupted = false;
         // While directed news is still pending, the persona's own clocks keep
         // running against the pending observation. Their baseline and sweep
         // cadence mirror the ready frame's.
@@ -3459,12 +3556,15 @@ async fn cmd_wait(
                 });
             }
             tokio::select! {
+                _ = wait_timeout_deadline(timeout_at) => return Ok(WaitOutcome {
+                    news_printed: false,
+                    view_pending: true,
+                    had_ready_frame: false,
+                }),
                 boundary = health::deadline(next_health_change) => { boundary?; }
                 sources = OrientSources::open(pile, signer, true) => break sources?,
             }
         };
-        refresh_receipts_before_observation(pile, signer, &sources, output).await?;
-
         // Keep the prefix which selected these target views as the polling
         // watermark, including while their lazy payload reads are pending.
         let initial = loop {
@@ -3492,9 +3592,11 @@ async fn cmd_wait(
             // retry keeps the health boundary when its baseline has no deadline
             // (empty or script-only intentions) or no baseline exists yet, so a
             // body or preparation payload that answers within its budget lands.
+            // Upkeep cut before it could select a frame also gets that retry:
+            // resetting the same short cap would starve a slower acquisition.
             let boundary = match habit_deadline(&pending_habits_seen) {
                 Some(deadline) => earliest(next_health_change, Some(deadline)),
-                None if pending_frame.is_none() => {
+                None if pending_frame.is_none() && !upkeep_interrupted => {
                     let first_read = Epoch::from_tai_seconds(
                         clock::now()?.to_tai_seconds() + poll.as_secs_f64(),
                     );
@@ -3502,15 +3604,20 @@ async fn cmd_wait(
                 }
                 None => next_health_change,
             };
-            let attempt = load_wait_frame_before_health_deadline(
+            let attempt = prepare_wait_frame_before_health_deadline(
                 pile,
+                signer,
                 &sources,
                 sampled,
+                &mut maintained_from,
+                &mut upkeep_interrupted,
                 &mut pending_frame,
                 pile_path,
                 persona_input,
                 boundary,
+                timeout_at,
                 evaluated_at,
+                output,
             )
             .await;
             if let Some(probe) = &probe {
@@ -3699,7 +3806,10 @@ async fn cmd_wait(
             let sampled = pile
                 .snapshot()
                 .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
-            let storage_changed = !current.is_current(&sampled);
+            let maintenance_changed = maintained_from
+                .as_ref()
+                .is_none_or(|previous| wait_storage_changed(&sampled, previous));
+            let storage_changed = maintenance_changed || !current.is_current(&sampled);
             let probe = RefreshProbe::begin(
                 "ordinary",
                 &sampled,
@@ -3719,27 +3829,46 @@ async fn cmd_wait(
             }
 
             if storage_changed || view_pending {
-                let attempt = load_wait_frame_before_health_deadline(
+                // Ready clocks continue to run while a changed source needs
+                // upkeep. An interruption must reach the retained sweep below.
+                let boundary = earliest(
+                    next_health_change,
+                    earliest(
+                        habit_seen
+                            .next_cooldown_at
+                            .map(|secs| Epoch::from_tai_seconds(secs as f64)),
+                        pending_frame
+                            .as_ref()
+                            .and_then(|pending| pending.habits.as_ref())
+                            .and_then(|habits| habits.next_cooldown_at)
+                            .map(|secs| Epoch::from_tai_seconds(secs as f64)),
+                    ),
+                );
+                let attempt = prepare_wait_frame_before_health_deadline(
                     pile,
+                    signer,
                     &sources,
                     sampled,
+                    &mut maintained_from,
+                    &mut upkeep_interrupted,
                     &mut pending_frame,
                     pile_path,
                     persona_input,
-                    next_health_change,
+                    boundary,
+                    timeout_at,
                     now,
+                    output,
                 )
                 .await;
                 if let Some(probe) = &probe {
                     probe.frame(Some(&current), &attempt);
                 }
-                let Some(attempt) = attempt? else {
-                    view_pending = true;
-                    continue;
-                };
-                observed_snapshot = attempt.watermark_snapshot().clone();
+                let attempt = attempt?;
+                if let Some(attempt) = &attempt {
+                    observed_snapshot = attempt.watermark_snapshot().clone();
+                }
                 match attempt {
-                    WaitFrameLoad::Ready(candidate) => {
+                    Some(WaitFrameLoad::Ready(candidate)) => {
                         pending_frame = None;
                         view_pending = false;
                         current_habit_context_valid = true;
@@ -3768,7 +3897,7 @@ async fn cmd_wait(
                         last_habit_sweep = Instant::now();
                         continue;
                     }
-                    WaitFrameLoad::Pending(pending) => {
+                    Some(WaitFrameLoad::Pending(pending)) => {
                         view_pending = true;
                         if matches!(
                             pending.reason,
@@ -3781,6 +3910,7 @@ async fn cmd_wait(
                         }
                         pending_frame = Some(pending);
                     }
+                    None => view_pending = true,
                 }
             } else if let Some(probe) = &probe {
                 probe.finish("clock_only");
@@ -3792,6 +3922,18 @@ async fn cmd_wait(
                 last_habit_sweep = Instant::now();
                 continue;
             }
+            // Upkeep/payload acquisition may have crossed a clock boundary
+            // after the pre-attempt check above.
+            let now_secs = epoch_seconds(clock::now()?);
+            let cooldown_elapsed = habit_seen
+                .next_cooldown_at
+                .is_some_and(|deadline| now_secs >= deadline)
+                || pending_frame
+                    .as_ref()
+                    .and_then(|pending| pending.habits.as_ref())
+                    .and_then(|habits| habits.next_cooldown_at)
+                    .is_some_and(|deadline| now_secs >= deadline);
+            let periodic_condition_check = last_habit_sweep.elapsed() >= Duration::from_secs(60);
             if !cooldown_elapsed && !periodic_condition_check {
                 continue;
             }
@@ -3886,14 +4028,28 @@ async fn cmd_wake(
     use std::fmt::Write as _;
 
     async {
-        // Register descriptors before freezing one resident query boundary.
-        // Background workers alone produce the projections selected here.
+        // Register and maintain authorized inputs before freezing one query
+        // boundary. Plain wake still never consults Embeddings.
         let sources = OrientSources::open(storage, signer, false).await?;
         let memory_collection =
             OrientSource::open(storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
         let wiki_collection = OrientSource::open(storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
         let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
             .context("register Wiki supersession index")?;
+        maintain_inputs(storage, signer, &sources).await?;
+        memory_collection.maintain(storage, signer).await?;
+        wiki_collection.maintain(storage, signer).await?;
+        if wiki_latest
+            .writer_is_admitted(&storage.snapshot()?, signer.verifying_key())
+            .context("check Wiki supersession WRITE admission")?
+        {
+            drop(
+                storage
+                    .maintain(wiki_latest, signer)
+                    .await
+                    .context("maintain Wiki supersession index")?,
+            );
+        }
         let snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
@@ -4948,7 +5104,7 @@ mod tests {
     }
 
     #[test]
-    fn only_incomplete_realization_is_preparation_pending() {
+    fn only_unavailable_realization_is_preparation_pending() {
         assert!(is_preparation_pending(
             &CollectionRealizationError::IncompleteCover {
                 missing: Vec::new(),
@@ -4956,6 +5112,11 @@ mod tests {
             }
             .into()
         ));
+        let member = triblespace::core::collection::CollectionData::new([73; 32]);
+        let missing = anyhow::Error::new(CollectionRealizationError::MissingDependency { member })
+            .context("maintain selected inputs");
+        assert!(is_preparation_pending(&missing));
+        assert_eq!(pending_blob(&missing).unwrap().handle.raw, member.raw);
         for error in [
             CollectionRealizationError::InvalidCover("bad support".to_owned()),
             CollectionRealizationError::Resolution("conflicting equations".to_owned()),
@@ -5156,6 +5317,242 @@ mod tests {
         text
     }
 
+    fn run_poll_for(pile: &mut FacultyStore, fixture: &TestPile, peek: bool) -> String {
+        let mut text = String::new();
+        let mut emit = |part| {
+            let crate::out::Part::Text { text: part } = part else {
+                bail!("expected text")
+            };
+            text.push_str(&part);
+            Ok(())
+        };
+        runtime()
+            .unwrap()
+            .block_on(cmd_poll(
+                pile,
+                &fixture.signer,
+                Some("eager-reader"),
+                peek,
+                Duration::from_secs(180),
+                &mut Out::new(&mut emit),
+            ))
+            .unwrap();
+        text
+    }
+
+    #[test]
+    fn poll_carries_raw_inputs_and_rearmed_receipts_without_a_daemon() {
+        let fixture = TestPile::new();
+        let mut pile = open_store(&fixture.path).unwrap();
+        let sources =
+            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, false)).unwrap();
+        let reader = id(91);
+        let sender = id(92);
+        for (person, label) in [(reader, "eager-reader"), (sender, "eager-sender")] {
+            let (fragment, _, _) = relations::person_fragment(
+                person,
+                crate::relations::ProfileInput {
+                    label: label.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, fragment)
+                .unwrap();
+        }
+        let (fragment, event) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(reader),
+            "visible on the very next poll",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(sources.messages.source, &fixture.signer, fragment)
+            .unwrap();
+        let before = pile.snapshot().unwrap();
+        assert!(before
+            .collection(sources.messages.rank9)
+            .unwrap()
+            .cover()
+            .is_empty());
+
+        let peek = run_poll_for(&mut pile, &fixture, true);
+        assert!(
+            peek.contains(&format!("News: new message [{}]", fmt_id(event))),
+            "{peek}"
+        );
+        assert!(peek.contains("visible on the very next poll"), "{peek}");
+        assert!(sources
+            .presentations
+            .observe(&pile.snapshot().unwrap())
+            .unwrap()
+            .view()
+            .is_empty());
+        assert!(before
+            .collection(sources.messages.rank9)
+            .unwrap()
+            .cover()
+            .is_empty());
+
+        let delivered = run_poll_for(&mut pile, &fixture, false);
+        assert!(delivered.contains(&fmt_id(event)), "{delivered}");
+        // No fixture carry between the consuming call and its fresh successor.
+        let rearmed = run_poll_for(&mut pile, &fixture, true);
+        assert!(rearmed.is_empty(), "a presented event repeated: {rearmed}");
+        assert!(sources
+            .presentations
+            .observe(&pile.snapshot().unwrap())
+            .unwrap()
+            .view()
+            .contains(event));
+        assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn wait_timeout_interrupts_eager_target_acquisition() {
+        use triblespace::core::collection::CollectionDerive;
+        use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+
+        let fixture = TestPile::new();
+        let mut pile: FacultyStore = FacultyStore::lazy(
+            crate::storage::open_pile_strict(&fixture.path).unwrap(),
+            fixture.signer.clone(),
+            PeerConfig {
+                peers: Vec::new(),
+                qos: ReconcileQos {
+                    direction: ReconcileDirection::ReadOnly,
+                },
+                provider_publication_budget: Some(0),
+            },
+        );
+        let sources =
+            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let retained = observe_current_sources(&mut pile, &sources).unwrap();
+        let retained_watermark = retained.snapshot.clone();
+        let fragment = entity! { metadata::name: "source whose endorsed image has not landed" };
+        let output = IntoBlob::<SuccinctArchiveBlob>::to_blob(
+            SuccinctArchive::<OrderedUniverse>::from(fragment.facts()),
+        );
+        let commit = pile
+            .commit(sources.messages.source, &fixture.signer, fragment)
+            .unwrap();
+        // A valid record-before-blob arrival: maintenance first asks for the
+        // already endorsed output before rebuilding it from the resident source.
+        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &fixture.signer,
+            sources.messages.succinct.handle(),
+            (commit.data(), commit.fingerprint()),
+            inlineencodings::Handle::<SuccinctArchiveBlob>::to_hash(output.get_handle()),
+        )))
+        .unwrap();
+        assert!(!pile
+            .snapshot()
+            .unwrap()
+            .contains_blob(output.get_handle())
+            .unwrap());
+        let options = WaitOptions {
+            timeout: Some(Duration::from_millis(400)),
+            // Before the budget was applied to upkeep, its first-read cap was
+            // ten seconds and the outer three-second tripwire would fail instead.
+            poll_interval: Duration::from_secs(10),
+        };
+        let mut text = String::new();
+        let mut emit = |part| {
+            let crate::out::Part::Text { text: part } = part else {
+                bail!("expected text")
+            };
+            text.push_str(&part);
+            Ok(())
+        };
+        let rt = runtime().unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                cmd_wait(
+                    &mut pile,
+                    &fixture.signer,
+                    &fixture.path,
+                    Some(&fmt_id(id(93))),
+                    &options,
+                    Duration::from_secs(180),
+                    &mut Out::new(&mut emit),
+                ),
+            )
+            .await
+            .expect("command timeout must interrupt eager upkeep, not only payload reads")
+            .unwrap();
+        });
+        assert!(text.contains("No fully readable attention view"), "{text}");
+        assert!(
+            pile.health().started_at.is_some(),
+            "the acquisition arm must execute"
+        );
+        assert!(!pile
+            .snapshot()
+            .unwrap()
+            .contains_blob(output.get_handle())
+            .unwrap());
+
+        // The same interruption must not replace an already-selected payload
+        // frame or certify that the changed prefix has been maintained.
+        let mut maintained_from = Some(retained_watermark.clone());
+        let mut upkeep_interrupted = false;
+        let mut pending = Some(PendingWaitFrame {
+            watermark: retained_watermark.clone(),
+            reason: PendingWaitReason::Payload,
+            missing: None,
+            observation: Some(retained),
+            persona: Some(id(93)),
+            habits: None,
+        });
+        let sampled = pile.snapshot().unwrap();
+        let mut discard = |_| Ok(());
+        rt.block_on(async {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                prepare_wait_frame_before_health_deadline(
+                    &mut pile,
+                    &fixture.signer,
+                    &sources,
+                    sampled,
+                    &mut maintained_from,
+                    &mut upkeep_interrupted,
+                    &mut pending,
+                    &fixture.path,
+                    &fmt_id(id(93)),
+                    None,
+                    Some(tokio::time::Instant::now() + Duration::from_millis(50)),
+                    clock::now().unwrap(),
+                    &mut Out::new(&mut discard),
+                ),
+            )
+            .await
+            .expect("the retained-frame retry has the same command budget")
+            .unwrap();
+            assert!(result.is_none());
+        });
+        assert!(upkeep_interrupted);
+        assert!(maintained_from
+            .unwrap()
+            .changes_since(&retained_watermark)
+            .is_empty());
+        let pending = pending.unwrap();
+        assert_eq!(pending.reason, PendingWaitReason::Payload);
+        assert_eq!(pending.persona, Some(id(93)));
+        assert!(pending
+            .watermark
+            .changes_since(&retained_watermark)
+            .is_empty());
+        assert!(pending
+            .observation
+            .unwrap()
+            .facts
+            .messages
+            .view()
+            .is_empty());
+        pile.close().unwrap();
+    }
+
     #[test]
     fn an_owned_clock_falls_due_while_a_message_body_is_still_missing() {
         let fixture = TestPile::new();
@@ -5297,7 +5694,8 @@ mod tests {
             owned + owned_done + shared + shared_done,
         )
         .unwrap();
-        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+        // No fixture upkeep or daemon: the command must carry these raw
+        // Relations and Habit writes before it can decide what is due.
 
         // Both fell due before the watcher armed. The clock addressed to this
         // persona is reported at once; the shared intention is a quiet baseline.
@@ -5320,7 +5718,6 @@ mod tests {
         // Completed now: the rearmed watcher is quiet until the next due.
         let (fresh, _) = habits::completion_fragment(owned_id, clock::point(now).unwrap()).unwrap();
         pile.commit(habit_source, &fixture.signer, fresh).unwrap();
-        pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
         let rearmed = run_wait_for(
             &mut pile,
             &fixture,

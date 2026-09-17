@@ -2,7 +2,7 @@
 use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
 use crate::storage::{open_secrets_collection, open_secrets_collection_read};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use std::path::PathBuf;
@@ -37,14 +37,21 @@ impl Secrets {
     pub fn add(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage().with_pile(|pile, signer| {
             let collection = open_secrets_collection(pile, signer.verifying_key())?;
-            secret_storage::add_secret(
+            let secret = secret_storage::add_secret(
                 pile,
                 signer,
                 collection,
                 name,
                 plaintext,
                 clock::point_now()?,
-            )
+            )?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile,
+                collection.source(),
+                signer,
+            ))
+            .context("Encrypted secret was committed, but maintaining its query views failed")?;
+            Ok(secret)
         })
     }
     /// Explicitly open one exact version. Callers decide how plaintext is used.
@@ -88,7 +95,7 @@ impl Secrets {
             let snapshot = pollster::block_on(secret_storage::maintain_and_snapshot(
                 pile, collection, signer,
             ))?;
-            secret_storage::maintain_selected_recipient_envelopes(
+            let count = secret_storage::maintain_selected_recipient_envelopes(
                 pile,
                 signer,
                 &snapshot,
@@ -96,7 +103,18 @@ impl Secrets {
                 signer,
                 selected,
                 clock::now()?,
-            )
+            )?;
+            if count != 0 {
+                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile,
+                    collection.source(),
+                    signer,
+                ))
+                .context(
+                    "Recipient envelopes were committed, but maintaining their query views failed",
+                )?;
+            }
+            Ok(count)
         })
     }
     /// Sign resource-specific delivery authority, without granting collection
@@ -134,5 +152,37 @@ impl SecretsStorage<'_> {
         operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_pile(operation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace::core::repo::StorageClose;
+
+    #[test]
+    fn adding_a_secret_returns_with_its_metadata_already_queryable() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("secrets.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, None).unwrap();
+        let id = Secrets::new(path.clone(), None)
+            .add("eager fixture", b"generated disposable secret")
+            .unwrap();
+
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        // Deliberately passive: get/list would themselves repair a lagging
+        // target and would therefore not establish the write-side guarantee.
+        let snapshot = secret_storage::snapshot(pile.snapshot().unwrap(), collection).unwrap();
+        assert!(secrets::secret_rows(snapshot.facts().unwrap())
+            .iter()
+            .any(|row| row.id == id));
+        assert_eq!(
+            snapshot.open(id, &signer).unwrap(),
+            b"generated disposable secret"
+        );
+        drop(snapshot);
+        pile.close().unwrap();
     }
 }

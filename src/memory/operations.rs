@@ -746,11 +746,12 @@ impl MemoryStorage<'_> {
     fn publish_memory(&self, fragment: Fragment) -> Result<()> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-            let result = pile
-                .commit(collection, signer, fragment)
-                .context("commit authored Memory fragment")
-                .map(|_| ());
-            result
+            pile.commit(collection, signer, fragment)
+                .context("commit authored Memory fragment")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context("Memory fragment was committed, but eager projection maintenance failed")
         })
     }
 
@@ -758,22 +759,26 @@ impl MemoryStorage<'_> {
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-            let result = pile
-                .commit(collection, signer, fragment)
-                .context("commit authored embedding observations")
-                .map(|_| ());
-            result
+            pile.commit(collection, signer, fragment)
+                .context("commit authored embedding observations")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context(
+                "Embedding observations were committed, but eager projection maintenance failed",
+            )
         })
     }
 
     fn publish_comb(&self, fragment: Fragment) -> Result<()> {
         self.storage.with_pile(|pile, signer| {
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            let result = pile
-                .commit(collection, signer, fragment)
-                .context("commit authored Comb cursor")
-                .map(|_| ());
-            result
+            pile.commit(collection, signer, fragment)
+                .context("commit authored Comb cursor")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context("Comb cursor was committed, but eager projection maintenance failed")
         })
     }
 }
@@ -2892,6 +2897,55 @@ mod tests {
             observed_at: BTreeSet::from([point(end)]),
             aliases: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn authored_memory_reaches_fact_targets_without_a_repairing_load() {
+        let fixture = TestPile::new();
+        let rank9 = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let policy = source.policy(&pile.snapshot()?)?;
+                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                Ok(pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?)
+            })
+            .unwrap();
+        let observe = || {
+            let before = std::fs::metadata(&fixture.pile).unwrap().len();
+            let facts = fixture
+                .storage
+                .with_pile(|pile, _| {
+                    Ok(pile.snapshot()?.collection(rank9)?.view::<FactArchive>()?)
+                })
+                .unwrap();
+            assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), before);
+            facts
+        };
+        let first = publish_chunk(
+            fixture.storage(),
+            text_draft(
+                "first eager memory",
+                "2026-09-01T00:00:00",
+                "2026-09-01T01:00:00",
+            ),
+        );
+        let old_facts = observe();
+        assert!(all_chunk_ids(&old_facts).contains(&first));
+        let second = publish_chunk(
+            fixture.storage(),
+            text_draft(
+                "second eager memory",
+                "2026-09-01T01:00:00",
+                "2026-09-01T02:00:00",
+            ),
+        );
+        let facts = observe();
+        assert_eq!(
+            all_chunk_ids(&facts).into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
+        );
+        assert_eq!(all_chunk_ids(&old_facts), vec![first]);
     }
 
     #[test]

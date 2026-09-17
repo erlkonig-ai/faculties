@@ -681,26 +681,30 @@ replication. This preserves local read-your-writes without making WRITE a
 prerequisite for reading shared data. Transport READ must independently cover
 the exact derived collections being replicated, not just their foundation.
 
-Orient is entirely passive about collection maintenance, even when its key has
-WRITE. `wake`, `show`, `poll`, and `wait` attach the maintained targets already
-readable in one frozen snapshot; newer source data becomes visible after an
-independent producer advances those targets. Selected attachment bodies may
-still be fetched lazily. Accepted output may publish receipt COMMITs, but never
-MERGE or DERIVE records. A retained observation tracks the exact collection and
-blob dependencies it consulted; unrelated hydration does not reattach it.
-Historical support is an explicit `support()` request, not part of these reads.
+Orient performs eager upkeep of its configured inputs when its signer has the
+required target WRITE authority. `wake`, `show`, `poll`, and `wait` carry those
+inputs before selecting their immutable query views; a daemon is not the
+foreground freshness boundary. The local health path remains resident-only.
+Selected attachment bodies may still be fetched lazily, without replacing the
+facts or application time already selected for that read. A retained observation
+tracks the collection and blob dependencies it consulted; an unchanged store
+prefix needs no new upkeep. Historical support is an explicit `support()`
+request, not an extra read-side certification pass.
 
 Receipt history belongs to the signing zooid, not its routing alias or host.
 Ordinary `orient-receipts` facts retain event IDs and `created_at` annotations;
 a derived EntityIdSet on `presentation::event` supplies fast membership tests.
 Both descriptors have READ and WRITE rooted only at that key, independently of
 the old `TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
-key share receipt history; separate zooids need separate keys. A lagging ID-set
-projection can repeat an event, but never holds the waiter behind a whole-ledger
-completeness barrier. The source facts keep the richer historical query.
+key share receipt history; separate zooids need separate keys. Reporting runs
+refresh that membership projection before observing it. Failed receipt upkeep
+is reported and may permit a repeat; it does not hold the waiter behind a
+whole-ledger completeness barrier. This receipt path does not complete Habits:
+their definitions and completion facts are carried through the Habit chain.
+The source facts keep the richer historical query.
 
-Run `trible pile collection maintain-all PILE TARGET... --watch` separately for
-the selected Orient targets and their dependencies. Include each node's local
+Background `trible pile collection maintain-all PILE TARGET... --watch` can keep
+the selected Orient targets and their dependencies current. Include each node's local
 health/latest targets and its private receipt ID-set target as well as shared inputs;
 keeping only message and goal indexes current is insufficient. Explicit target
 selection avoids reviving obsolete index descriptors. Each author's public key
@@ -708,7 +712,11 @@ biases independent target priority, while every selected chain remains
 dependency-first and signed results are reusable through ordinary replication.
 
 State-dependent edits and Message acknowledgements retain their pre-action
-maintenance. `poll --peek` never records presentation. To carry one existing
+maintenance. Ordinary Faculty publication also carries its affected projections
+after COMMIT, where authorized, before reporting success. If this upkeep fails,
+the error says that the facts were already committed; it does not imply rollback.
+Raw collection/migration primitives retain their explicit publication contracts.
+`poll --peek` may perform upkeep but never records presentation. To carry one existing
 observer's history into the private source, explicitly run
 `orient import-receipts --persona LEGACY_SELECTOR`, then maintain its ID-set
 target. This imports only matching resident legacy receipts, preserving their

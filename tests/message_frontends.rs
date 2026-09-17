@@ -16,12 +16,16 @@ use faculties::message::{
 };
 use faculties::out::{Out, Part};
 use faculties::relations::{self, ProfileInput};
-use faculties::schemas::message::DEFAULT_SCOPE_ID;
+use faculties::schemas::message::{local, DEFAULT_SCOPE_ID, KIND_MESSAGE_ID, KIND_READ_ID};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE;
-use faculties::storage::{initialize_signer, load_signer, open_pile_strict, publish_fragment};
+use faculties::storage::{
+    initialize_signer, load_signer, open_pile_strict, publish_fragment, FactArchive,
+};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
+use triblespace::core::metadata;
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 struct Fixture {
@@ -68,7 +72,7 @@ impl Fixture {
         let group_snapshot = members.root().unwrap();
         fragment += members;
         publish_fragment(&pile, Some(&key), RELATIONS_SCOPE, fragment).unwrap();
-        let fixture = Self {
+        Self {
             directory,
             pile,
             key,
@@ -77,11 +81,7 @@ impl Fixture {
             cara,
             group,
             group_snapshot,
-        };
-        // Labels and group membership become readable through their maintained
-        // Relations view; Message edits do not maintain another faculty's data.
-        fixture.carry();
-        fixture
+        }
     }
 
     fn messages(&self) -> Message {
@@ -92,26 +92,48 @@ impl Fixture {
         mcp::Message::new(self.pile.clone(), Some(self.key.clone()))
     }
 
-    /// Model the independent worker at an explicit observation boundary.
-    /// Message reads do not carry, and edits maintain only their Message chain.
-    fn carry(&self) {
+    /// Inspect the resident projection without maintenance, so an incomplete
+    /// action cannot be repaired by the assertion that is meant to catch it.
+    fn message_facts(&self) -> FactArchive {
+        let before = fs::metadata(&self.pile).unwrap().len();
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        pollster::block_on(async {
-            for scope in [RELATIONS_SCOPE, DEFAULT_SCOPE_ID] {
-                let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
-                let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-                let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                    .unwrap();
-                let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-                    .unwrap();
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                drop(pile.maintain(rank9, &signer).await.unwrap());
-            }
-        });
+        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let selected = snapshot.collection(rank9).unwrap();
+        let facts = selected.view::<FactArchive>().unwrap();
         pile.close().unwrap();
+        assert_eq!(fs::metadata(&self.pile).unwrap().len(), before);
+        facts
+    }
+
+    fn assert_projected_message(&self, id: Id) {
+        let facts = self.message_facts();
+        assert!(find!(
+            message: Id,
+            pattern!(&facts, [{ ?message @ metadata::tag: &KIND_MESSAGE_ID }])
+        )
+        .any(|message| message == id));
+    }
+
+    fn assert_projected_receipt(&self, id: Id, by: Id) {
+        let facts = self.message_facts();
+        assert!(find!(
+            (message: Id, reader: Id),
+            pattern!(&facts, [{
+                metadata::tag: &KIND_READ_ID,
+                local::about_message: ?message,
+                local::reader: ?reader,
+            }])
+        )
+        .any(|receipt| receipt == (id, by)));
     }
 
     fn command(&self) -> Command {
@@ -208,9 +230,8 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
             basis: faculties::schemas::message::GROUP_SNAPSHOT_BASIS_WITNESSED,
         }
     );
-    // The send used the maintained Relations view. A read observes its new
-    // Message COMMIT only after the worker carries it.
-    fixture.carry();
+    // The send itself carries the raw Relations setup and its new Message.
+    fixture.assert_projected_message(sent.id);
     let original = messages.list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(original.reader, fixture.bob);
     assert_eq!(original.entries.len(), 1);
@@ -235,7 +256,6 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
         successor,
     )
     .unwrap();
-    fixture.carry();
     assert!(messages
         .list(&ListOptions::new("Cara"))
         .unwrap()
@@ -258,6 +278,7 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
     assert!(messages.ack(&format!("{:x}", sent.id), "Alice").is_err());
 
     let ack = messages.ack(&format!("{:x}", sent.id), "Bob").unwrap();
+    fixture.assert_projected_receipt(sent.id, fixture.bob);
     assert_eq!(
         (ack.message, ack.reader, ack.already_read),
         (sent.id, fixture.bob, false)
@@ -285,7 +306,6 @@ fn direct_operations_keep_frozen_group_delivery_and_idempotent_receipts() {
     assert_eq!(fixture.message_commits(), committed);
     // Repeat edits maintained the earlier receipt before checking it. This
     // explicit worker boundary also makes it available to ordinary reads.
-    fixture.carry();
     assert!(messages
         .list(&ListOptions {
             reader: "Bob",
@@ -320,7 +340,6 @@ fn bulk_ack_filters_sender_and_outbox_reports_direct_receipts() {
             text: "C",
         })
         .unwrap();
-    fixture.carry();
     assert_eq!(
         messages
             .list(&ListOptions {
@@ -352,7 +371,7 @@ fn bulk_ack_filters_sender_and_outbox_reports_direct_receipts() {
     assert_eq!(acknowledged.reader, fixture.bob);
     assert_eq!(acknowledged.message_ids, [alice.id]);
     assert_eq!(fixture.message_commits(), before + 1);
-    fixture.carry();
+    fixture.assert_projected_receipt(alice.id, fixture.bob);
     let remaining = messages
         .list(&ListOptions {
             reader: "Bob",
@@ -401,14 +420,12 @@ fn settled_identity_shares_receipts_without_rewriting_attribution() {
     let identity =
         relations::identity_verdict_fragment(fixture.bob, fixture.cara, true, &[]).unwrap();
     publish_fragment(&fixture.pile, Some(&fixture.key), RELATIONS_SCOPE, identity).unwrap();
-    fixture.carry();
     let receipt = messages.ack(&id, "Cara").unwrap();
     assert_eq!(receipt.reader, fixture.cara);
     assert!(receipt.already_read);
     assert_eq!(fixture.message_commits(), committed);
     // The maintained identity shares receipt visibility without rewriting the
     // original message's attribution or publishing a second receipt.
-    fixture.carry();
     let observed = messages.list(&ListOptions::new("Cara")).unwrap();
     assert_eq!(observed.entries.len(), 1);
     assert_eq!(
@@ -432,7 +449,6 @@ fn mcp_text_is_literal_and_sender_and_host_configuration_are_never_implicit() {
             serde_json::json!({"from":"Alice","to":"Bob","text":literal}),
         );
     }
-    fixture.carry();
     let received = fixture.messages().list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(received.entries.len(), 2);
     for literal in ["@-", literal_path.as_str()] {
@@ -524,7 +540,6 @@ fn explicit_cli_and_mcp_share_list_and_receipt_rendering() {
             text: "first\nsecond\r\nGrüße",
         })
         .unwrap();
-    fixture.carry();
     let cli_list = text(|out| cli::execute(fixture.cli(&["list", "Bob"]), out)).unwrap();
     let mcp_list = call(
         &fixture,
@@ -592,7 +607,6 @@ fn cli_keeps_persona_file_and_stdin_text_conventions() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fixture.carry();
     let received = fixture.messages().list(&ListOptions::new("Bob")).unwrap();
     assert!(received
         .entries
@@ -630,7 +644,6 @@ fn emission_failure_does_not_retry_a_completed_send() {
     assert_eq!(emissions, 1);
     assert!(error.to_string().contains("closed output"));
     assert_eq!(fixture.message_commits(), before + 1);
-    fixture.carry();
     let received = fixture.messages().list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(received.entries.len(), 1);
     assert_eq!(received.entries[0].body, "one publication");

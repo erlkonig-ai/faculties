@@ -1,4 +1,5 @@
-//! Resident-only health input. No maintenance, host activation, or blob fetch.
+//! Resident-only health input with admitted foreground maintenance.
+//! No host activation or blob acquisition is part of this path.
 //!
 //! The maintained targets remain the query sources. The values built below
 //! are just one report's output and attention IDs, never a second health store.
@@ -13,11 +14,20 @@ pub(super) struct HealthSources {
     relations: OrientSource,
     presentations: ReceiptSource,
     max_age: Duration,
+    // The prefix before successful health upkeep and an optional receipt
+    // attempt, not its final query snapshot: an append racing upkeep must
+    // remain changed on the next poll.
+    maintained_view: Option<(ed25519_dalek::VerifyingKey, FacultySnapshot)>,
+    // A failed receipt attempt is not a freshness claim. Retain its note with
+    // that input/signer so unchanged polls report it without repeating upkeep.
+    receipt_maintenance_note: Option<String>,
     // One process-local observation, not another persisted health model. The
     // cached views and watermark belong to exactly the same sampled prefix.
     poll_view: Option<(FacultySnapshot, HealthObservation)>,
     #[cfg(test)]
     poll_observations: usize,
+    #[cfg(test)]
+    maintenance_passes: std::cell::Cell<usize>,
 }
 
 impl HealthSources {
@@ -47,14 +57,20 @@ impl HealthSources {
             relations,
             presentations,
             max_age,
+            maintained_view: None,
+            receipt_maintenance_note: None,
             poll_view: None,
             #[cfg(test)]
             poll_observations: 0,
+            #[cfg(test)]
+            maintenance_passes: std::cell::Cell::new(0),
         })
     }
 
-    #[cfg(test)]
-    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<()> {
+    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<Option<String>> {
+        #[cfg(test)]
+        self.maintenance_passes
+            .set(self.maintenance_passes.get() + 1);
         let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
@@ -69,25 +85,75 @@ impl HealthSources {
                 drop(local.maintain(source.rank9, signer).await?);
             }
             if self
-                .presentations
-                .ids
-                .writer_is_admitted(&snapshot, signer.verifying_key())?
-            {
-                drop(local.maintain(self.presentations.ids, signer).await?);
-            }
-            if self
                 .latest
                 .writer_is_admitted(&snapshot, signer.verifying_key())?
             {
                 drop(local.maintain(self.latest, signer).await?);
             }
-            Ok(())
+            // As on the ordinary Orient path, receipt freshness avoids a
+            // repeat but is not a precondition of reporting resident health.
+            // Only this optional projection is best effort; health, Relations
+            // and latest-target failures above still propagate unchanged.
+            let receipt_result: Result<()> = async {
+                if self
+                    .presentations
+                    .ids
+                    .writer_is_admitted(&snapshot, signer.verifying_key())
+                    .context("check Orient receipt membership WRITE admission")?
+                {
+                    drop(
+                        local
+                            .maintain(self.presentations.ids, signer)
+                            .await
+                            .context("maintain Orient receipt membership set")?,
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            Ok(receipt_result.err().map(|error| {
+                format!(
+                    "note: Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
+                )
+            }))
         })
     }
 
-    pub(super) fn observe(&self, pile: &mut FacultyStore) -> Result<HealthObservation> {
+    pub(super) fn observe(
+        &self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+    ) -> Result<HealthObservation> {
+        // Baseline/show select health, not presentation freshness. Poll has an
+        // Out through which it reports an optional receipt-attempt failure.
+        let _receipt_note = self.maintain(pile, signer)?;
         let now = clock::now()?;
         self.at(pile.snapshot()?, now)
+    }
+
+    fn maintain_if_changed(
+        &mut self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+    ) -> Result<bool> {
+        let before = pile.snapshot()?;
+        let subject = signer.verifying_key();
+        if self
+            .maintained_view
+            .as_ref()
+            .is_some_and(|(prior_subject, prior)| {
+                *prior_subject == subject && before.changes_since(prior).is_empty()
+            })
+        {
+            return Ok(false);
+        }
+        let receipt_note = self.maintain(pile, signer)?;
+        // Our own publications can cause one extra quiet upkeep. Advancing to
+        // a post-upkeep snapshot instead could silently cover a concurrent
+        // append to a source whose mapping has already run.
+        self.maintained_view = Some((subject, before));
+        self.receipt_maintenance_note = receipt_note;
+        Ok(true)
     }
 
     /// Health is delivered before any ordinary source or payload acquisition.
@@ -100,6 +166,10 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
+        self.maintain_if_changed(pile, signer)?;
+        if let Some(note) = &self.receipt_maintenance_note {
+            output.line(note)?;
+        }
         let now = clock::now()?;
         let sampled = pile.snapshot()?;
         self.refresh_poll_view(sampled, now)?;
@@ -513,6 +583,10 @@ fn render_health(
 mod tests {
     use super::*;
     use schema::{Component, Condition, Recorder, State};
+    use triblespace::core::blob::Blob;
+    use triblespace::core::collection::{
+        records::empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
+    };
     use triblespace::core::repo::{BlobStorePut, WantRead};
 
     struct Fixture {
@@ -547,8 +621,34 @@ mod tests {
         }
 
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
-            self.sources.maintain(&self.store, &self.signer).unwrap();
+            assert!(self
+                .sources
+                .maintain(&self.store, &self.signer)
+                .unwrap()
+                .is_none());
             self.sources.at(self.store.snapshot().unwrap(), at).unwrap()
+        }
+
+        fn malformed_member(&mut self, source: Collection<SimpleArchive>) -> CollectionCommit {
+            // Resident and content-valid as a blob, but not a SimpleArchive.
+            // A missing member alone can be skipped by resident source support
+            // and would not establish the upkeep-failure boundary.
+            let blob = Blob::<SimpleArchive>::new(Bytes::from(vec![0xff]));
+            let handle = self.store.put::<SimpleArchive, _>(blob).unwrap();
+            let commit = CollectionCommit::sign(
+                &self.signer,
+                source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(handle),
+                empty_metadata_handle(),
+            );
+            self.store.insert(CollectionRecord::Commit(commit)).unwrap();
+            assert!(self
+                .store
+                .snapshot()
+                .unwrap()
+                .contains_blob(handle)
+                .unwrap());
+            commit
         }
     }
 
@@ -590,7 +690,8 @@ mod tests {
         };
         let before = f.store.snapshot().unwrap();
         let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-        let observed = f.sources.observe(&mut f.store).unwrap();
+        assert!(!f.sources.health.can_maintain(&before, &reader_key).unwrap());
+        let observed = f.sources.observe(&mut f.store, &reader_key).unwrap();
         let reports = find!(
             report: Id,
             pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
@@ -608,10 +709,12 @@ mod tests {
             records,
             "health-first reads must not require WRITE on remote inputs",
         );
+        assert!(observed.presentations.view().is_empty());
+        assert!(observed.snapshot.wants().unwrap().next().is_none());
     }
 
     #[test]
-    fn health_reads_with_write_authority_wait_for_external_maintenance() {
+    fn health_reads_with_write_authority_maintain_before_observing() {
         let mut f = Fixture::new();
         let mut recorder = Recorder::new(f.signer.verifying_key());
         let first = recorder
@@ -627,32 +730,14 @@ mod tests {
             .latest
             .writer_is_admitted(&before, f.signer.verifying_key())
             .unwrap());
-        f.sources
-            .refresh_poll_view(before.clone(), at(1.0))
-            .unwrap();
-        let pending = &f.sources.poll_view.as_ref().unwrap().1;
-        assert!(pending.facts.collection.cover().is_empty());
-        assert!(pending
-            .report()
-            .text
-            .contains("not observed / not configured"));
-        assert!(f
-            .store
-            .snapshot()
-            .unwrap()
-            .changes_since(&before)
-            .is_empty());
-
-        // The independent producer advances the targets. The next sampled
-        // prefix sees that work without mutating the earlier observation.
-        f.sources.maintain(&f.store, &f.signer).unwrap();
-        let ready = f.store.snapshot().unwrap();
-        f.sources.refresh_poll_view(ready.clone(), at(1.0)).unwrap();
-        assert_eq!(f.sources.poll_observations, 2);
-        assert!(f.store.snapshot().unwrap().changes_since(&ready).is_empty());
+        let ready = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        assert!(exists!(pattern!(ready.facts.view(), [
+            { first_id @ metadata::tag: &schema::KIND_REPORT }
+        ])));
+        assert!(ready.latest.contains(first_id));
         assert!(f
             .sources
-            .at(before, at(1.0))
+            .at(before.clone(), at(1.0))
             .unwrap()
             .facts
             .collection
@@ -664,45 +749,30 @@ mod tests {
             .unwrap();
         let second_id = second.root().unwrap();
         f.publish(second);
-        let lagging = f.store.snapshot().unwrap();
-        f.sources
-            .refresh_poll_view(lagging.clone(), at(3.0))
-            .unwrap();
-        let observed = &f.sources.poll_view.as_ref().unwrap().1;
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
         let reports: BTreeSet<_> = find!(
             report: Id,
             pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
         )
         .collect();
-        assert_eq!(reports, BTreeSet::from([first_id]));
-        assert!(observed.report().attention.is_empty());
-        assert!(f
-            .store
-            .snapshot()
-            .unwrap()
-            .changes_since(&lagging)
-            .is_empty());
-
-        f.sources.maintain(&f.store, &f.signer).unwrap();
-        let caught_up = f.store.snapshot().unwrap();
-        f.sources
-            .refresh_poll_view(caught_up.clone(), at(3.0))
-            .unwrap();
-        let observed = &f.sources.poll_view.as_ref().unwrap().1;
-        assert!(exists!(pattern!(observed.facts.view(), [
-            { second_id @ metadata::tag: &schema::KIND_REPORT }
-        ])));
-        assert!(!observed.report().attention.is_empty());
-        assert!(f
-            .store
-            .snapshot()
-            .unwrap()
-            .changes_since(&caught_up)
-            .is_empty());
+        assert_eq!(reports, BTreeSet::from([first_id, second_id]));
+        assert!(observed.latest.contains(second_id));
+        assert!(!observed.latest.contains(first_id));
+        assert!(
+            !exists!(pattern!(ready.facts.view(), [
+                { second_id @ metadata::tag: &schema::KIND_REPORT }
+            ])),
+            "foreground upkeep must not replace an earlier selected view"
+        );
+        assert!(
+            observed.presentations.view().is_empty(),
+            "observing is not presenting"
+        );
+        assert!(observed.snapshot.wants().unwrap().next().is_none());
     }
 
     #[test]
-    fn consuming_health_repeats_until_private_receipt_projection_catches_up() {
+    fn health_reads_and_polls_carry_existing_private_receipts_before_delivery() {
         let mut f = Fixture::new();
         let persona = *fucid();
         let mut recorder = Recorder::new(f.signer.verifying_key());
@@ -711,13 +781,12 @@ mod tests {
                 .record(clock::now().unwrap(), [condition(State::Stalled, true)])
                 .unwrap(),
         );
-        f.sources.maintain(&f.store, &f.signer).unwrap();
-        let health = f.sources.observe(&mut f.store).unwrap();
+        let health = f.sources.observe(&mut f.store, &f.signer).unwrap();
         let events: Vec<_> = health.report().attention.ids().collect();
         assert!(!events.is_empty());
 
         // Receipt ownership is the signing zooid, independent of the selected
-        // contact. The source COMMIT alone does not make set membership visible.
+        // contact. An earlier source COMMIT must be carried before reporting.
         let reader_key = SigningKey::from_bytes(&[73; 32]);
         f.sources.presentations = {
             let mut local = f.store.store();
@@ -734,7 +803,12 @@ mod tests {
             )
             .unwrap();
         let before = f.store.snapshot().unwrap();
-        let lagging = f.sources.observe(&mut f.store).unwrap();
+        let raw_receipts = before
+            .collection(f.sources.presentations.source)
+            .unwrap()
+            .cover()
+            .clone();
+        let lagging = f.sources.at(before, clock::now().unwrap()).unwrap();
         assert!(events
             .iter()
             .all(|event| !lagging.presentations.view().contains(*event)));
@@ -742,34 +816,12 @@ mod tests {
             lagging.news(persona, &lagging.report()),
             News::Report { .. }
         ));
-        assert!(f
-            .store
-            .snapshot()
-            .unwrap()
-            .changes_since(&before)
-            .is_empty());
+        let ready = f.sources.observe(&mut f.store, &reader_key).unwrap();
+        assert!(events
+            .iter()
+            .all(|event| ready.presentations.view().contains(*event)));
+        assert!(matches!(ready.news(persona, &ready.report()), News::Quiet));
         let mut parts = Vec::new();
-        let mut emit = |part| {
-            parts.push(part);
-            Ok(())
-        };
-        let (fired, _) = f
-            .sources
-            .poll(
-                &mut f.store,
-                &reader_key,
-                &fmt_id(persona),
-                false,
-                &mut Out::new(&mut emit),
-            )
-            .unwrap();
-        assert!(fired, "a lagging receipt view does not block delivery");
-        assert!(!parts.is_empty());
-
-        // Explicit fixture production catches up only this zooid's set. A
-        // receipt committed before a crash is allowed to have repeated above.
-        f.sources.maintain(&f.store, &reader_key).unwrap();
-        parts.clear();
         let mut emit = |part| {
             parts.push(part);
             Ok(())
@@ -786,9 +838,330 @@ mod tests {
             .unwrap();
         assert!(
             !fired,
-            "the maintained private receipt suppresses the old report"
+            "foreground receipt upkeep suppresses an already presented report"
         );
         assert!(parts.is_empty());
+        let after = f.store.snapshot().unwrap();
+        assert_eq!(
+            after
+                .collection(f.sources.presentations.source)
+                .unwrap()
+                .cover(),
+            &raw_receipts,
+            "catching up a receipt projection must not author another receipt",
+        );
+        assert!(after.wants().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn malformed_receipt_upkeep_is_reported_without_blocking_resident_health() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .unwrap(),
+        );
+        let receipts = f.sources.presentations.source;
+        f.malformed_member(receipts);
+        let before = f.store.snapshot().unwrap();
+        assert!(receipts
+            .writer_is_admitted(&before, f.signer.verifying_key())
+            .unwrap());
+        let raw_receipts = before.collection(receipts).unwrap().cover().clone();
+        let failure = {
+            let mut local = f.store.store();
+            pollster::block_on(local.maintain(f.sources.presentations.ids, &f.signer))
+                .err()
+                .expect("resident malformed admitted receipt must actually fail upkeep")
+        };
+        assert!(format!("{failure:#}").contains("malformed"));
+
+        // The baseline/show observation is still useful even though its
+        // optional private presentation projection could not catch up.
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        assert!(!observed.report().attention.is_empty());
+        assert!(observed.presentations.view().is_empty());
+        let mut text = String::new();
+        let mut emit = |part| {
+            let crate::out::Part::Text { text: part } = part else {
+                bail!("expected health text");
+            };
+            text.push_str(&part);
+            Ok(())
+        };
+        let (fired, _) = f
+            .sources
+            .poll(
+                &mut f.store,
+                &f.signer,
+                &fmt_id(persona),
+                true,
+                &mut Out::new(&mut emit),
+            )
+            .unwrap();
+        assert!(fired);
+        assert!(text.contains("note: Orient receipt membership not refreshed"));
+        assert!(text.contains("malformed"));
+        assert!(text.contains("News:"));
+        let after = f.store.snapshot().unwrap();
+        assert_eq!(after.collection(receipts).unwrap().cover(), &raw_receipts);
+        assert!(after.wants().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn failed_receipt_attempt_remains_visible_on_unchanged_quiet_polls() {
+        let mut f = Fixture::new();
+        let receipts = f.sources.presentations.source;
+        f.malformed_member(receipts);
+        let before = f.store.snapshot().unwrap();
+        let records = before
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            let mut text = String::new();
+            let mut emit = |part| {
+                let crate::out::Part::Text { text: part } = part else {
+                    bail!("expected health text");
+                };
+                text.push_str(&part);
+                Ok(())
+            };
+            let (fired, _) = f
+                .sources
+                .poll(
+                    &mut f.store,
+                    &f.signer,
+                    "unused-quiet-persona",
+                    true,
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap();
+            assert!(!fired);
+            assert!(text.contains("note: Orient receipt membership not refreshed"));
+            assert!(text.contains("malformed"));
+            assert_eq!(f.sources.maintenance_passes.get(), 1);
+        }
+        let after = f.store.snapshot().unwrap();
+        assert!(after.changes_since(&before).is_empty());
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            records
+        );
+        assert!(after.wants().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn malformed_health_input_is_not_downgraded_to_a_receipt_warning() {
+        let mut f = Fixture::new();
+        let source = f.sources.health.source;
+        f.malformed_member(source);
+        let error = f
+            .sources
+            .observe(&mut f.store, &f.signer)
+            .err()
+            .expect("malformed health data remains a real observation error");
+        assert!(format!("{error:#}").contains("malformed"));
+        let mut parts = Vec::new();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        assert!(f
+            .sources
+            .poll(
+                &mut f.store,
+                &f.signer,
+                "unused-error-persona",
+                true,
+                &mut Out::new(&mut emit),
+            )
+            .is_err());
+        assert!(parts.is_empty());
+        assert!(f.sources.maintained_view.is_none());
+        assert!(f
+            .store
+            .snapshot()
+            .unwrap()
+            .wants()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn health_poll_maintains_new_input_without_turning_peek_into_a_receipt() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .unwrap(),
+        );
+        let mut parts = Vec::new();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        assert!(
+            f.sources
+                .poll(
+                    &mut f.store,
+                    &f.signer,
+                    &fmt_id(persona),
+                    true,
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap()
+                .0
+        );
+        assert!(!parts.is_empty());
+        let peeked = f.store.snapshot().unwrap();
+        assert!(peeked
+            .collection(f.sources.presentations.source)
+            .unwrap()
+            .cover()
+            .is_empty());
+        assert!(peeked.wants().unwrap().next().is_none());
+
+        parts.clear();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        assert!(
+            f.sources
+                .poll(
+                    &mut f.store,
+                    &f.signer,
+                    &fmt_id(persona),
+                    false,
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap()
+                .0
+        );
+        assert!(!parts.is_empty());
+
+        // A new watcher has no process-local receipt state to lean on. Its
+        // first poll carries the committed receipt through the ordinary set.
+        let mut rearmed =
+            HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60)).unwrap();
+        parts.clear();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        assert!(
+            !rearmed
+                .poll(
+                    &mut f.store,
+                    &f.signer,
+                    &fmt_id(persona),
+                    false,
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap()
+                .0
+        );
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn unchanged_health_poll_prefix_skips_upkeep_after_own_writes_settle() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(at(0.0), [condition(State::Current, false)])
+                .unwrap(),
+        );
+        assert!(f
+            .sources
+            .maintain_if_changed(&mut f.store, &f.signer)
+            .unwrap());
+        assert_eq!(f.sources.maintenance_passes.get(), 1);
+        assert!(f
+            .sources
+            .maintain_if_changed(&mut f.store, &f.signer)
+            .unwrap());
+        assert_eq!(f.sources.maintenance_passes.get(), 2);
+        let before = f.store.snapshot().unwrap();
+        for instant in [1.0, 60.0, -1.0, 2.0] {
+            assert!(!f
+                .sources
+                .maintain_if_changed(&mut f.store, &f.signer)
+                .unwrap());
+            f.sources
+                .refresh_poll_view(f.store.snapshot().unwrap(), at(instant))
+                .unwrap();
+        }
+        assert_eq!(f.sources.maintenance_passes.get(), 2);
+        assert_eq!(f.sources.poll_observations, 1);
+        assert!(f
+            .store
+            .snapshot()
+            .unwrap()
+            .changes_since(&before)
+            .is_empty());
+    }
+
+    #[test]
+    fn health_upkeep_does_not_cover_a_second_writer_after_its_attempt() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(at(0.0), [condition(State::Current, false)])
+                .unwrap(),
+        );
+        f.sources
+            .maintain_if_changed(&mut f.store, &f.signer)
+            .unwrap();
+        let earlier = f.sources.at(f.store.snapshot().unwrap(), at(1.0)).unwrap();
+
+        // Deterministic interleaving: a separately opened writer appends after
+        // upkeep, but before this reader's final selected observation. No
+        // concurrent-thread timing is needed to place the append at the seam.
+        let second = recorder
+            .record(at(2.0), [condition(State::Stalled, true)])
+            .unwrap();
+        let second_id = second.root().unwrap();
+        let mut writer = open_store(&f._directory.path().join("health.pile")).unwrap();
+        writer
+            .commit(f.sources.health.source, &f.signer, second)
+            .unwrap();
+        let raced = f.store.snapshot().unwrap();
+        f.sources.refresh_poll_view(raced, at(3.0)).unwrap();
+        assert!(!exists!(
+            pattern!(f.sources.poll_view.as_ref().unwrap().1.facts.view(), [
+                { second_id @ metadata::tag: &schema::KIND_REPORT }
+            ])
+        ));
+
+        assert!(f
+            .sources
+            .maintain_if_changed(&mut f.store, &f.signer)
+            .unwrap());
+        f.sources
+            .refresh_poll_view(f.store.snapshot().unwrap(), at(3.0))
+            .unwrap();
+        assert!(exists!(
+            pattern!(f.sources.poll_view.as_ref().unwrap().1.facts.view(), [
+                { second_id @ metadata::tag: &schema::KIND_REPORT }
+            ])
+        ));
+        assert!(!exists!(pattern!(earlier.facts.view(), [
+            { second_id @ metadata::tag: &schema::KIND_REPORT }
+        ])));
     }
 
     #[test]
@@ -835,7 +1208,7 @@ mod tests {
         let report_id = report.root().unwrap();
         f.publish(report);
         // Complete local production before the counted polling observation.
-        f.sources.maintain(&f.store, &f.signer).unwrap();
+        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
         let watermark = f.store.snapshot().unwrap();
         for (instant, stale, next) in [
             (59.0, false, Some(60.0)),
@@ -864,7 +1237,7 @@ mod tests {
                 .record(at(0.0), [condition(State::Current, false)])
                 .unwrap(),
         );
-        f.sources.maintain(&f.store, &f.signer).unwrap();
+        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
         let before = f.store.snapshot().unwrap();
         f.sources
             .refresh_poll_view(before.clone(), at(1.0))
@@ -913,7 +1286,7 @@ mod tests {
                 .record(at(0.0), [condition(State::Stalled, true)])
                 .unwrap(),
         );
-        f.sources.maintain(&f.store, &f.signer).unwrap();
+        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();
@@ -979,7 +1352,7 @@ mod tests {
                 .record(at(0.0), [condition(State::Stalled, true)])
                 .unwrap(),
         );
-        f.sources.maintain(&f.store, &f.signer).unwrap();
+        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Restore authorized eager maintenance at Faculty read and publication
+  boundaries, including Orient, Message and Habit. Ordinary actions carry new
+  COMMITs into their query projections before success; post-COMMIT upkeep errors
+  explicitly retain that publication fact. Existing non-maintainer fallbacks,
+  source admission and immutable selected observations remain intact. Orient
+  refreshes its private Presented set using the existing receipt-maintenance
+  patch and separately carries Habit completions; peek never presents.
+  Resident-only health upkeep and unchanged-prefix checks preserve the local
+  health boundary without treating the daemon as the freshness authority.
+  This supersedes the daemon-only reader policy recorded below; it adds no
+  collection, grant, replication selection or GPU work.
+
 - Message asks the collection instead of keeping a copy of it. The row types,
   catalog loaders and closed-world validators are gone; every operation runs a
   typed `find!` where it is used. Inbox membership is two joins, the second

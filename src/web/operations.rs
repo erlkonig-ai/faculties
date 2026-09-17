@@ -356,13 +356,13 @@ impl WebStorage<'_> {
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
         self.storage.with_pile(|pile, signer| {
             fragment.describe_with(entity! { metadata::description: description });
-            let result = (|| {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                pile.commit(collection, signer, fragment)
-                    .context("commit Web observation")
-                    .map(|_| ())
-            })();
-            result
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            pile.commit(collection, signer, fragment)
+                .context("commit Web observation")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context("Web facts were committed; eager maintenance failed")
         })
     }
 }
@@ -906,12 +906,9 @@ mod tests {
         let collection_rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)
             .unwrap();
-        let store_snapshot = pollster::block_on(async {
-            drop(pile.ensure(source, &signer).await?);
-            drop(pile.maintain(collection_succinct, &signer).await?);
-            pile.maintain(collection_rank9, &signer).await
-        })
-        .unwrap();
+        // This is a passive attachment: publication itself must have carried
+        // the source, without a read helper or daemon doing it for the test.
+        let store_snapshot = pile.snapshot().unwrap();
         let facts = store_snapshot
             .collection(collection_rank9)
             .unwrap()

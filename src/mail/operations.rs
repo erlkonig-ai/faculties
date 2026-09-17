@@ -157,6 +157,19 @@ impl Mail {
         self.storage.scope(|storage| {
             let context = Storage::from_storage(storage.clone(), Scopes::FIXED)?;
             let result = execute(&context);
+            let published = !context.published_scopes.borrow().is_empty();
+            let maintenance = context.maintain_published();
+            let result = match (result, maintenance) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(error), Ok(())) if published => Err(error.context(
+                    "Mail action failed after facts were committed; publication was not rolled back",
+                )),
+                (Err(error), Ok(())) => Err(error),
+                (Err(error), Err(maintenance)) => Err(error.context(format!(
+                    "Mail action failed after facts were committed; eager maintenance also failed: {maintenance:#}"
+                ))),
+            };
             let notices = context.notices.take();
             match result {
                 Err(error) if !notices.is_empty() => Err(error.context(notices.join("\n"))),
@@ -268,6 +281,10 @@ struct Storage {
     signer: SigningKey,
     scopes: Scopes,
     notices: RefCell<Vec<String>>,
+    // Operation-local batching only: no facts or query results are copied.
+    published_scopes: RefCell<BTreeSet<Id>>,
+    #[cfg(test)]
+    maintenance_calls: std::cell::Cell<usize>,
 }
 
 impl Storage {
@@ -278,6 +295,9 @@ impl Storage {
             signer,
             scopes,
             notices: RefCell::new(Vec::new()),
+            published_scopes: RefCell::new(BTreeSet::new()),
+            #[cfg(test)]
+            maintenance_calls: std::cell::Cell::new(0),
         })
     }
 
@@ -473,6 +493,34 @@ impl Storage {
             let collection = open_configured(pile, scope, self.signer.verifying_key())?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
+            self.published_scopes.borrow_mut().insert(scope);
+            Ok(())
+        })
+    }
+
+    fn maintain_published(&self) -> Result<()> {
+        let scopes: Vec<_> = self.published_scopes.borrow().iter().copied().collect();
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        self.storage.with_pile(|pile, _| {
+            for scope in scopes {
+                let collection = open_configured(pile, scope, self.signer.verifying_key())
+                    .with_context(|| format!(
+                        "Mail facts were committed; reopen collection {scope:x} for eager maintenance"
+                    ))?;
+                #[cfg(test)]
+                self.maintenance_calls.set(self.maintenance_calls.get() + 1);
+                pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                    pile,
+                    collection,
+                    &self.signer,
+                ))
+                .with_context(|| format!(
+                    "Mail facts were committed; eager maintenance failed for collection {scope:x}"
+                ))?;
+                self.published_scopes.borrow_mut().remove(&scope);
+            }
             Ok(())
         })
     }
@@ -1353,6 +1401,116 @@ mod tests {
             "From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <{message_id}>\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nSubject: Hello\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n--test\r\nContent-Type: text/plain\r\n\r\nbody\r\n--test\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--test--\r\n"
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn successful_mail_action_carries_written_scopes_before_returning() {
+        let fixture = Fixture::new();
+        let marker = *fucid();
+        let facade = Mail::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        facade
+            .with_operation(|storage| {
+                storage.publish(
+                    storage.scopes.mail,
+                    entity! { metadata::tag: &marker },
+                    "first",
+                )?;
+                storage.publish(
+                    storage.scopes.files,
+                    entity! { metadata::tag: &marker },
+                    "attachment",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        for scope in [scopes().mail, scopes().files] {
+            let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
+            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            let facts = pile
+                .snapshot()
+                .unwrap()
+                .collection(rank9)
+                .unwrap()
+                .view::<FactArchive>()
+                .unwrap();
+            assert!(exists!(
+                pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
+            ));
+        }
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn mail_action_batches_repeated_publications_into_one_upkeep_per_scope() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        for _ in 0..3 {
+            let marker = *fucid();
+            storage
+                .publish(
+                    storage.scopes.mail,
+                    entity! { metadata::tag: &marker },
+                    "batch item",
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.maintenance_calls.get(), 0);
+        assert_eq!(storage.published_scopes.borrow().len(), 1);
+        storage.maintain_published().unwrap();
+        assert_eq!(storage.maintenance_calls.get(), 1);
+        assert!(storage.published_scopes.borrow().is_empty());
+        storage.maintain_published().unwrap();
+        assert_eq!(storage.maintenance_calls.get(), 1);
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn failed_mail_action_preserves_and_carries_its_committed_prefix() {
+        let fixture = Fixture::new();
+        let marker = *fucid();
+        let facade = Mail::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let error = facade
+            .with_operation(|storage| {
+                storage.publish(
+                    storage.scopes.mail,
+                    entity! { metadata::tag: &marker },
+                    "committed prefix",
+                )?;
+                Err::<(), _>(anyhow!("injected later action failure"))
+            })
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("facts were committed"));
+        assert!(text.contains("injected later action failure"));
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let source = open_configured(&mut pile, scopes().mail, signer.verifying_key()).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let facts = pile
+            .snapshot()
+            .unwrap()
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        assert!(exists!(
+            pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
+        ));
+        pile.close().unwrap();
     }
 
     #[test]

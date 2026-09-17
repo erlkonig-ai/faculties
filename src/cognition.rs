@@ -148,13 +148,25 @@ pub fn publish_events_with_storage(
     }
     storage.with_pile(|pile, signer| {
         let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        fragments
-            .into_iter()
-            .map(|fragment| {
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Cognition event")
-            })
-            .collect()
+        let mut commits = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .with_context(|| {
+                    format!(
+                        "commit authored Cognition event ({} earlier event COMMITs succeeded; publication is not rolled back)",
+                        commits.len()
+                    )
+                })?;
+            commits.push(commit);
+        }
+        if !commits.is_empty() {
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context("Cognition facts were committed; eager maintenance failed")?;
+        }
+        Ok(commits)
     })
 }
 
@@ -546,11 +558,9 @@ mod tests {
         let rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .unwrap();
-        let snapshot = pollster::block_on(async {
-            drop(pile.ensure(source, &signer).await.unwrap());
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            pile.maintain(rank9, &signer).await.unwrap()
-        });
+        // The ordinary publication boundary, not this observer, must have
+        // carried the event into the derived query target.
+        let snapshot = pile.snapshot().unwrap();
         let facts = snapshot
             .collection(rank9)
             .unwrap()
@@ -560,6 +570,45 @@ mod tests {
         assert_eq!(facts.iter().collect::<TribleSet>(), event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));
         drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn successful_event_batch_is_visible_to_a_passive_rank9_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("cognition.pile");
+        let key_path = directory.path().join("cognition.key");
+        File::create(&pile_path).unwrap();
+        initialize_open_collection_fixture(&pile_path, Some(&key_path));
+        let first = reason_fragment(None, None, "first", None, point(1.0));
+        let second = reason_fragment(None, None, "second", None, point(2.0));
+        let mut expected = first.facts().clone();
+        expected += second.facts().clone();
+        assert_eq!(
+            publish_events(&pile_path, Some(&key_path), [first, second])
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let facts = pile
+            .snapshot()
+            .unwrap()
+            .collection(rank9)
+            .unwrap()
+            .view::<FactArchive>()
+            .unwrap();
+        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
         pile.close().unwrap();
     }
 

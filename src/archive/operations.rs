@@ -1235,6 +1235,12 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish archive replay cursor")?;
+            pollster::block_on(crate::storage::maintain_admitted_fact_targets(
+                pile, collection, signer,
+            ))
+            .context(
+                "Archive replay cursor was committed, but maintaining its query views failed",
+            )?;
             Ok(())
         })();
         result
