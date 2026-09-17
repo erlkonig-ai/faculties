@@ -29,6 +29,14 @@ source-cohort digest, and argv receipt through `GB10_EXACT_INVOCATION`.
 Untracked siblings and `target/` output outside that source closure do not block
 a release.
 
+That `RUSTFLAGS` field is read from the environment only, so flags supplied by
+`.cargo/config.toml` -- currently `-Ctarget-feature=+fp16` for
+`aarch64-unknown-linux-gnu` -- do not appear in it. They are still captured,
+one field over: the config file is part of the Faculties tree whose revision
+and tree hash the manifest already records. When auditing how a generation was
+compiled, read the recorded source revision as well as `environment`; neither
+alone is the whole recipe.
+
 Build and inspect without writing anything:
 
 ```sh
