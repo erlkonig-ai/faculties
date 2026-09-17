@@ -5,6 +5,11 @@
 #   behind-upstream.sh --all    include read-only vendor clones we never commit to
 #   behind-upstream.sh --quiet  print nothing when everything is current
 #
+# Output is terse on purpose. It is read by a habit nudge every time something
+# falls behind, so every line of standing explanation would be paid for again on
+# each firing. The reasoning lives in this header, where it is read once by a
+# person and never by the loop.
+#
 # Exit 0 means something is behind, so it serves directly as a habit condition:
 #   habit add behind-upstream --when "when @script" --script <this file>
 #
@@ -97,6 +102,7 @@ work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT
 
 skipped=0
+examined=0
 for dot in $(find "$ROOT" -maxdepth 2 -name .git -print 2>/dev/null | sort); do
   # A .git FILE is a linked worktree or a dead alias. Worktrees share their
   # parent's remote-tracking refs, so fetching one repeats the same network call
@@ -119,6 +125,7 @@ for dot in $(find "$ROOT" -maxdepth 2 -name .git -print 2>/dev/null | sort); do
     skipped=$(( skipped + 1 ))
     continue
   fi
+  examined=$(( examined + 1 ))
 
   # Concurrent, because the sweep is network latency rather than work.
   (
@@ -136,17 +143,29 @@ wait
 
 lines=$(cat "$work"/* 2>/dev/null | sort)
 
+# Examining nothing is not an all-clear. If ROOT is wrong, or a machine lays its
+# checkouts out differently, or the authorship test matches none of them, the
+# sweep finds zero repos and every one of them could be a year behind. Reporting
+# "all current" there would be this script committing the exact error it exists
+# to catch, on a box where nobody would think to question it. So a sweep that
+# examined nothing is DUE, with a different message.
+if [ "$examined" = "0" ]; then
+  echo "examined NOTHING under $ROOT -- this is not an all-clear."
+  echo "No checkout there has both an upstream and a commit matching: $OURS"
+  echo "Set BEHIND_ROOT to this machine's workspace, or BEHIND_OURS to its authors."
+  exit 0
+fi
+
 if [ -z "$lines" ]; then
-  [ "$QUIET" = "0" ] && echo "Every checkout we commit to is current."
+  [ "$QUIET" = "0" ] && echo "all current ($examined checked)"
   exit 1
 fi
 
-echo "Checkouts behind upstream:"
+echo "behind upstream:"
 printf '%s\n' "$lines" | while IFS=$'\t' read -r name behind upstream; do
-  printf '  %-28s %5s commit(s) behind %s\n' "$name" "$behind" "$upstream"
+  printf '  %-24s %5s  %s\n' "$name" "$behind" "$upstream"
 done
-echo
-echo "A checkout that is behind looks identical to one that is current."
-echo "Pull before concluding anything is absent, broken, or already fixed."
-[ "$skipped" -gt 0 ] && echo "($skipped read-only vendor clone(s) not checked; --all includes them.)"
+# The skipped count stays, short. It is the one guard against reading a narrow
+# sweep as a complete one, which is the failure this whole script exists to stop.
+[ "$skipped" -gt 0 ] && echo "($skipped vendor clone(s) skipped; --all to include)"
 exit 0
