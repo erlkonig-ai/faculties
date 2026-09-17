@@ -33,12 +33,12 @@ use GORBIE::themes::colorhash;
 use crate::memory::{self};
 use crate::memory_cover::{chunk_about_archive_message, chunk_about_exec_result, chunk_references};
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
-use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::widgets::storage::DatasetView;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
-/// How many of the most-recent chunks to keep in the rendered snapshot.
+/// How many of the most-recent chunks to keep in one rendered result.
 /// Bounded so the widget stays responsive when a long-running agent
 /// has accumulated thousands of chunks — older ones are still in the
 /// pile, but the CLI is the right tool for time-range archeology.
@@ -95,101 +95,89 @@ impl ChunkRow {
     }
 }
 
-struct MemorySnapshot {
-    cached_revision: DatasetRevision,
-    chunks: Vec<ChunkRow>,
-    /// Total chunk count regardless of MAX_CHUNKS clamp — surfaced in
-    /// the section header so the user can tell when they're seeing a
-    /// truncated window.
-    total: usize,
-}
+// ── Point-of-use query ───────────────────────────────────────────────
 
-// ── Snapshot ─────────────────────────────────────────────────────────
-
-impl MemorySnapshot {
-    fn refresh(dataset: DatasetView<'_>) -> Self {
-        let space = dataset.facts;
-        let mut chunks = Vec::new();
-        for (id, start, end) in find!(
-            (
-                id: Id,
-                start: Inline<inlineencodings::NsTAIInterval>,
-                end: Inline<inlineencodings::NsTAIInterval>
-            ),
-            pattern!(space, [{
-                ?id @ metadata::tag: &KIND_CHUNK_ID,
-                ctx::start_at: ?start,
-                ctx::end_at: ?end,
-            }])
-        ) {
-            let Ok((start, _)): Result<(Epoch, Epoch), _> = start.try_from_inline() else {
-                continue;
-            };
-            let Ok((end, _)): Result<(Epoch, Epoch), _> = end.try_from_inline() else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (epoch_to_chrono(start), epoch_to_chrono(end)) else {
-                continue;
-            };
-            if end < start {
-                continue;
-            }
-
-            let summary_handles: BTreeSet<memory::TextHandle> = find!(
-                handle: memory::TextHandle,
-                pattern!(space, [{ id @ ctx::summary: ?handle }])
-            )
-            .collect();
-            let summaries = if summary_handles.is_empty() {
-                vec!["Image memory".to_owned()]
-            } else {
-                summary_handles
-                    .into_iter()
-                    .map(|handle| {
-                        memory::read_text(dataset.reader, handle)
-                            .unwrap_or_else(|_| "[summary unavailable]".to_owned())
-                    })
-                    .collect()
-            };
-            for summary in summaries {
-                chunks.push(ChunkRow {
-                    id,
-                    start,
-                    end,
-                    summary,
-                    reference_count: chunk_references(space, id).len(),
-                    about_exec_result: chunk_about_exec_result(space, id),
-                    about_archive_message: chunk_about_archive_message(space, id),
-                });
-            }
+/// Query only the values needed for this render. The returned rows are
+/// operation-local presentation values: they are dropped after the frame and
+/// never retained as a second Memory model.
+fn query_chunks(dataset: DatasetView<'_>) -> (Vec<ChunkRow>, usize) {
+    let space = dataset.facts;
+    let mut chunks = Vec::new();
+    for (id, start, end) in find!(
+        (
+            id: Id,
+            start: Inline<inlineencodings::NsTAIInterval>,
+            end: Inline<inlineencodings::NsTAIInterval>
+        ),
+        pattern!(space, [{
+            ?id @ metadata::tag: &KIND_CHUNK_ID,
+            ctx::start_at: ?start,
+            ctx::end_at: ?end,
+        }])
+    ) {
+        let Ok((start, _)): Result<(Epoch, Epoch), _> = start.try_from_inline() else {
+            continue;
+        };
+        let Ok((end, _)): Result<(Epoch, Epoch), _> = end.try_from_inline() else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (epoch_to_chrono(start), epoch_to_chrono(end)) else {
+            continue;
+        };
+        if end < start {
+            continue;
         }
-        chunks.sort_by(|left, right| {
-            (left.id, left.start, left.end, &left.summary).cmp(&(
-                right.id,
-                right.start,
-                right.end,
-                &right.summary,
-            ))
-        });
-        chunks.dedup_by(|left, right| {
-            left.id == right.id
-                && left.start == right.start
-                && left.end == right.end
-                && left.summary == right.summary
-        });
-        let total = chunks.len();
 
-        // Newest-first is presentation only. The id tie-break makes equal
-        // spans deterministic without choosing between coexisting episodes.
-        chunks.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| a.id.cmp(&b.id)));
-        chunks.truncate(MAX_CHUNKS);
-
-        MemorySnapshot {
-            cached_revision: dataset.revision,
-            chunks,
-            total,
+        let summary_handles: BTreeSet<memory::TextHandle> = find!(
+            handle: memory::TextHandle,
+            pattern!(space, [{ id @ ctx::summary: ?handle }])
+        )
+        .collect();
+        let summaries = if summary_handles.is_empty() {
+            vec!["Image memory".to_owned()]
+        } else {
+            summary_handles
+                .into_iter()
+                .map(|handle| {
+                    memory::read_text(dataset.reader, handle)
+                        .unwrap_or_else(|_| "[summary unavailable]".to_owned())
+                })
+                .collect()
+        };
+        for summary in summaries {
+            chunks.push(ChunkRow {
+                id,
+                start,
+                end,
+                summary,
+                reference_count: chunk_references(space, id).len(),
+                about_exec_result: chunk_about_exec_result(space, id),
+                about_archive_message: chunk_about_archive_message(space, id),
+            });
         }
     }
+    chunks.sort_by(|left, right| {
+        (left.id, left.start, left.end, &left.summary).cmp(&(
+            right.id,
+            right.start,
+            right.end,
+            &right.summary,
+        ))
+    });
+    chunks.dedup_by(|left, right| {
+        left.id == right.id
+            && left.start == right.start
+            && left.end == right.end
+            && left.summary == right.summary
+    });
+    let total = chunks.len();
+
+    // Newest-first is presentation only. The id tie-break makes equal
+    // spans deterministic without choosing between coexisting episodes.
+    chunks.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| a.id.cmp(&b.id)));
+    chunks.truncate(MAX_CHUNKS);
+
+    (chunks, total)
 }
 
 fn epoch_to_chrono(e: Epoch) -> Option<DateTime<Utc>> {
@@ -275,13 +263,11 @@ fn first_line(text: &str, max_chars: usize) -> String {
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-pub struct MemoryViewer {
-    snapshot: Option<MemorySnapshot>,
-}
+pub struct MemoryViewer {}
 
 impl Default for MemoryViewer {
     fn default() -> Self {
-        Self { snapshot: None }
+        Self {}
     }
 }
 
@@ -291,28 +277,15 @@ impl MemoryViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.snapshot.as_ref() {
-            None => true,
-            Some(l) => l.cached_revision != dataset.revision,
-        };
-        if need_refresh {
-            self.snapshot = Some(MemorySnapshot::refresh(dataset));
-        }
+        let (chunks, total) = query_chunks(dataset);
 
         ctx.section("Memory", |ctx| {
-            let Some(snapshot) = self.snapshot.as_ref() else {
-                return;
-            };
-
             ctx.grid(|g| {
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let shown = snapshot.chunks.len();
-                    let label = if shown < snapshot.total {
-                        format!(
-                            "SHOWING {shown} OF {} MEMORY CHUNKS (NEWEST FIRST)",
-                            snapshot.total,
-                        )
+                    let shown = chunks.len();
+                    let label = if shown < total {
+                        format!("SHOWING {shown} OF {} MEMORY CHUNKS (NEWEST FIRST)", total,)
                     } else {
                         format!("{shown} MEMORY CHUNK{}", if shown == 1 { "" } else { "S" },)
                     };
@@ -325,7 +298,7 @@ impl MemoryViewer {
                     );
                 });
 
-                if snapshot.chunks.is_empty() {
+                if chunks.is_empty() {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
@@ -349,7 +322,7 @@ impl MemoryViewer {
                     return;
                 }
 
-                for chunk in &snapshot.chunks {
+                for chunk in &chunks {
                     g.full(|ctx| {
                         render_chunk_card(ctx.ui_mut(), chunk);
                     });
