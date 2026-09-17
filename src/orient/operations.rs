@@ -301,6 +301,8 @@ struct OrientSource {
     succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     label: &'static str,
+    #[cfg(test)]
+    view_decodes: std::sync::atomic::AtomicUsize,
 }
 
 impl OrientSource {
@@ -351,6 +353,8 @@ impl OrientSource {
             succinct,
             rank9,
             label,
+            #[cfg(test)]
+            view_decodes: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -404,13 +408,28 @@ impl OrientSource {
         Ok(required)
     }
 
-    fn observe(&self, snapshot: &FacultySnapshot) -> Result<OrientFact> {
+    fn observe(
+        &self,
+        snapshot: &FacultySnapshot,
+        previous: Option<&OrientFact>,
+    ) -> Result<OrientFact> {
         let collection = snapshot
             .collection(self.rank9)
             .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
-        let view = collection
-            .view::<FactArchive>()
-            .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
+        // Always resolve authority, witnesses and residency in the new snapshot.
+        // Only decoding is reusable: the exact physical cover fixes the immutable
+        // archive bytes, but new witnesses can change its represented support.
+        let view = match previous.filter(|prior| prior.collection.cover() == collection.cover()) {
+            Some(prior) => prior.view.clone(),
+            None => {
+                #[cfg(test)]
+                self.view_decodes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                collection
+                    .view::<FactArchive>()
+                    .with_context(|| format!("read resident {} Rank9 projection", self.label))?
+            }
+        };
         Ok(OrientFact { collection, view })
     }
 }
@@ -580,19 +599,35 @@ async fn maintain_sources(
 fn observe_sources(
     snapshot: FacultySnapshot,
     sources: &OrientSources,
+    previous: Option<&OrientObservation>,
 ) -> Result<OrientObservation> {
-    let messages = sources.messages.observe(&snapshot)?;
-    let mail = sources.mail.observe(&snapshot)?;
-    let teams = sources.teams.observe(&snapshot)?;
-    let compass = sources.compass.observe(&snapshot)?;
-    let relations = sources.relations.observe(&snapshot)?;
-    let status = sources.status.observe(&snapshot)?;
+    let previous = previous.map(|observation| &observation.facts);
+    let messages = sources
+        .messages
+        .observe(&snapshot, previous.map(|facts| &facts.messages))?;
+    let mail = sources
+        .mail
+        .observe(&snapshot, previous.map(|facts| &facts.mail))?;
+    let teams = sources
+        .teams
+        .observe(&snapshot, previous.map(|facts| &facts.teams))?;
+    let compass = sources
+        .compass
+        .observe(&snapshot, previous.map(|facts| &facts.compass))?;
+    let relations = sources
+        .relations
+        .observe(&snapshot, previous.map(|facts| &facts.relations))?;
+    let status = sources
+        .status
+        .observe(&snapshot, previous.map(|facts| &facts.status))?;
     let habits = sources
         .habits
         .as_ref()
-        .map(|source| source.observe(&snapshot))
+        .map(|source| source.observe(&snapshot, previous.and_then(|facts| facts.habits.as_ref())))
         .transpose()?;
-    let presentations = sources.presentations.observe(&snapshot)?;
+    let presentations = sources
+        .presentations
+        .observe(&snapshot, previous.map(|facts| &facts.presentations))?;
     // Positive known-winner membership is an ordinary relation: it does not
     // require the fact and register collections to have identical support.
     let compass_status = snapshot
@@ -623,12 +658,13 @@ fn observe_snapshot(
     snapshot: FacultySnapshot,
     sources: &OrientSources,
     consuming: bool,
+    previous: Option<&OrientObservation>,
 ) -> Result<OrientObservation> {
     #[cfg(test)]
     sources
         .observations
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let observation = observe_sources(snapshot, sources)?;
+    let observation = observe_sources(snapshot, sources, previous)?;
     if consuming {
         require_receipts(&sources.receipt_boundary, &observation.facts.presentations)?;
     }
@@ -643,7 +679,7 @@ fn observe_current_sources(
     let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("freeze shared Orient native store snapshot: {error}"))?;
-    observe_snapshot(snapshot, sources, consuming)
+    observe_snapshot(snapshot, sources, consuming, None)
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -2839,11 +2875,12 @@ async fn load_wait_frame(
     snapshot: FacultySnapshot,
     pile_path: &Path,
     persona_input: &str,
+    previous: Option<&OrientObservation>,
 ) -> Result<WaitFrameLoad> {
     // The observation and polling baseline are the same immutable prefix.
     // Later selected-payload acquisition cannot swallow a concurrent append.
     let instant = snapshot.instant();
-    let observation = match observe_snapshot(snapshot.clone(), sources, true) {
+    let observation = match observe_snapshot(snapshot.clone(), sources, false, previous) {
         Ok(observation) => observation,
         Err(error) if is_preparation_pending(&error) => {
             let mut pending =
@@ -2853,6 +2890,18 @@ async fn load_wait_frame(
         }
         Err(error) => return Err(error),
     };
+    if let Err(error) =
+        require_receipts(&sources.receipt_boundary, &observation.facts.presentations)
+    {
+        if !error.is::<PresentationReceiptsPending>() {
+            return Err(error);
+        }
+        let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Preparation);
+        // This is not a readable consuming frame yet. Retain only its immutable
+        // observation so the next fresh attachment can reuse equal covers.
+        pending.observation = Some(observation);
+        return Ok(WaitFrameLoad::Pending(pending));
+    }
     let mut pending = PendingWaitFrame::awaiting_view(snapshot, PendingWaitReason::Payload);
     pending.observation = Some(observation);
     match resume_wait_payloads(pile, &mut pending, pile_path, persona_input, instant).await? {
@@ -2963,6 +3012,7 @@ async fn load_wait_frame_before_health_deadline(
     pile_path: &Path,
     persona_input: &str,
     next_health_change: Option<Epoch>,
+    previous: Option<&OrientObservation>,
 ) -> Result<Option<WaitFrameLoad>> {
     let unchanged = pending
         .as_ref()
@@ -3007,12 +3057,16 @@ async fn load_wait_frame_before_health_deadline(
             )));
         }
     }
+    let previous = pending
+        .as_ref()
+        .and_then(|pending| pending.observation.as_ref())
+        .or(previous);
     tokio::select! {
         boundary = health::deadline(next_health_change) => {
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input) => frame.map(Some),
+        frame = load_wait_frame(pile, sources, snapshot, pile_path, persona_input, previous) => frame.map(Some),
     }
 }
 
@@ -3074,6 +3128,7 @@ async fn cmd_wait(
                 pile_path,
                 persona_input,
                 next_health_change,
+                None,
             )
             .await?
             {
@@ -3179,6 +3234,7 @@ async fn cmd_wait(
                     pile_path,
                     persona_input,
                     next_health_change,
+                    Some(&current),
                 )
                 .await?
                 else {
@@ -3342,7 +3398,7 @@ async fn cmd_wake(
         // Wake renders the requested overview, not unseen news. Its output
         // does not depend on prior Presented facts; recording what this wake
         // shows afterward must not impose a historical receipt-read barrier.
-        let observation = observe_snapshot(snapshot, &sources, false)?;
+        let observation = observe_snapshot(snapshot, &sources, false, None)?;
         let memory_facts = observation
             .snapshot
             .collection(memory_collection.rank9)
@@ -3850,7 +3906,7 @@ mod tests {
                 .unwrap();
             let before = sources
                 .presentations
-                .observe(&pile.snapshot().unwrap())
+                .observe(&pile.snapshot().unwrap(), None)
                 .unwrap();
             assert_eq!(
                 presented_events(before.view(), persona),
@@ -3893,7 +3949,7 @@ mod tests {
                 .await
                 .unwrap();
             let snapshot = pile.snapshot().unwrap();
-            let after = sources.presentations.observe(&snapshot).unwrap();
+            let after = sources.presentations.observe(&snapshot, None).unwrap();
             assert_eq!(
                 presented_events(after.view(), persona),
                 BTreeSet::from([prior_event, goal_id]),
@@ -4116,6 +4172,7 @@ mod tests {
                     &fixture.path,
                     "waiting-reader",
                     None,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -4152,6 +4209,7 @@ mod tests {
                 &fixture.path,
                 "waiting-reader",
                 None,
+                None,
             )
             .await
             .unwrap()
@@ -4174,6 +4232,7 @@ mod tests {
                     &mut pending,
                     &fixture.path,
                     "not-a-resident-persona",
+                    None,
                     None,
                 )
                 .await
@@ -4340,7 +4399,7 @@ mod tests {
                 .unwrap();
             let watermark = pile.snapshot_at(Epoch::from_tai_seconds(100.0)).unwrap();
             let WaitFrameLoad::Ready(frame) =
-                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt")
+                load_wait_frame(&mut pile, &sources, watermark, &fixture.path, "gpt", None)
                     .await
                     .unwrap()
             else {
@@ -4413,7 +4472,7 @@ mod tests {
                 .await
                 .unwrap();
             let watermark = pile.snapshot().unwrap();
-            let observation = observe_snapshot(watermark, &sources, true).unwrap();
+            let observation = observe_snapshot(watermark, &sources, true, None).unwrap();
 
             let next = compass::status_fragment(
                 goal,
@@ -4442,7 +4501,7 @@ mod tests {
                 .maintain(sources.compass.rank9, &fixture.signer)
                 .await
                 .unwrap();
-            let lagging = observe_sources(snapshot, &sources).unwrap();
+            let lagging = observe_sources(snapshot, &sources, Some(&observation)).unwrap();
             let status_support = lagging.snapshot.collection(sources.compass_status).unwrap();
             assert_ne!(lagging.facts.compass.support(), status_support.support());
             let query = lagging.query(&lagging.snapshot);
@@ -4453,7 +4512,7 @@ mod tests {
                 .maintain(sources.compass_status, &fixture.signer)
                 .await
                 .unwrap();
-            let advanced = observe_sources(ready, &sources).unwrap();
+            let advanced = observe_sources(ready, &sources, Some(&lagging)).unwrap();
             let query = advanced.query(&advanced.snapshot);
             assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
             assert_eq!(
@@ -4533,6 +4592,7 @@ mod tests {
             watermark.clone(),
             &fixture.path,
             "test-persona",
+            None,
         )
         .await
         .unwrap();
@@ -4573,11 +4633,16 @@ mod tests {
         );
         let sampled = pile.snapshot_at(watermark.instant()).unwrap();
         assert!(wait_storage_changed(&sampled, &frame.watermark));
-        let WaitFrameLoad::Ready(next) =
-            load_wait_frame(&mut pile, &sources, sampled, &fixture.path, "test-persona")
-                .await
-                .unwrap()
-        else {
+        let WaitFrameLoad::Ready(next) = load_wait_frame(
+            &mut pile,
+            &sources,
+            sampled,
+            &fixture.path,
+            "test-persona",
+            Some(&frame.observation),
+        )
+        .await
+        .unwrap() else {
             panic!("externally maintained target must be readable")
         };
         assert_eq!(next.observation.facts.messages.view().iter().count(), 1);
@@ -4762,7 +4827,7 @@ mod tests {
                 .await
                 .unwrap();
             let watermark = pile.snapshot_at(instant).unwrap();
-            let observation = observe_snapshot(watermark.clone(), &sources, true).unwrap();
+            let observation = observe_snapshot(watermark.clone(), &sources, true, None).unwrap();
             let support = observation.facts.messages.support().clone();
             let handle = Inline::new(body.raw);
             let mut supply = Supply {
@@ -4877,6 +4942,7 @@ mod tests {
             watermark.clone(),
             &fixture.path,
             "not-yet-resident",
+            None,
         )
         .await
         .unwrap();

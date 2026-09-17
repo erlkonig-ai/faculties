@@ -89,7 +89,7 @@ impl HealthSources {
     }
 
     pub(super) fn observe(&self, pile: &mut FacultyStore) -> Result<HealthObservation> {
-        self.at(pile.snapshot()?)
+        self.at(pile.snapshot()?, None)
     }
 
     /// Health is delivered before any ordinary source or payload acquisition.
@@ -139,7 +139,8 @@ impl HealthSources {
             wait_storage_changed(&sampled, watermark)
         });
         if changed {
-            let observation = self.at(sampled.clone())?;
+            let previous = self.poll_view.as_ref().map(|(_, observation)| observation);
+            let observation = self.at(sampled.clone(), previous)?;
             self.poll_view = Some((sampled, observation));
             #[cfg(test)]
             {
@@ -158,11 +159,21 @@ impl HealthSources {
         Ok(())
     }
 
-    fn at(&self, snapshot: FacultySnapshot) -> Result<HealthObservation> {
-        let facts = self.health.observe(&snapshot)?;
+    fn at(
+        &self,
+        snapshot: FacultySnapshot,
+        previous: Option<&HealthObservation>,
+    ) -> Result<HealthObservation> {
+        let facts = self
+            .health
+            .observe(&snapshot, previous.map(|view| &view.facts))?;
         let latest = snapshot.collection(self.latest)?.view::<LwwIndex>()?;
-        let relations = self.relations.observe(&snapshot)?;
-        let presentations = self.presentations.observe(&snapshot)?;
+        let relations = self
+            .relations
+            .observe(&snapshot, previous.map(|view| &view.relations))?;
+        let presentations = self
+            .presentations
+            .observe(&snapshot, previous.map(|view| &view.presentations))?;
         Ok(HealthObservation {
             snapshot,
             facts,
@@ -492,7 +503,7 @@ mod tests {
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
             self.sources.maintain(&self.store, &self.signer).unwrap();
             self.sources
-                .at(self.store.snapshot_at(at).unwrap())
+                .at(self.store.snapshot_at(at).unwrap(), None)
                 .unwrap()
         }
     }
@@ -598,7 +609,7 @@ mod tests {
         assert!(f.store.snapshot().unwrap().changes_since(&ready).is_empty());
         assert!(f
             .sources
-            .at(before)
+            .at(before, None)
             .unwrap()
             .facts
             .collection
@@ -778,7 +789,7 @@ mod tests {
         // Same stored records and resident targets: time is the only difference.
         let expired = f
             .sources
-            .at(f.store.snapshot_at(at(60.0)).unwrap())
+            .at(f.store.snapshot_at(at(60.0)).unwrap(), Some(&fresh))
             .unwrap();
         assert!(expired.snapshot.changes_since(&fresh.snapshot).is_empty());
         let after = expired.report();
@@ -1023,7 +1034,7 @@ mod tests {
         }
         let lagging = f
             .sources
-            .at(f.store.snapshot_at(at(11.0)).unwrap())
+            .at(f.store.snapshot_at(at(11.0)).unwrap(), None)
             .unwrap();
         assert_ne!(
             lagging.facts.support(),
@@ -1063,7 +1074,7 @@ mod tests {
         assert_eq!(short.report().attention.ids().collect::<Vec<_>>(), vec![id]);
 
         f.sources.max_age = Duration::from_secs(120);
-        let long = f.sources.at(short.snapshot.clone()).unwrap();
+        let long = f.sources.at(short.snapshot.clone(), Some(&short)).unwrap();
         assert!(long.report().attention.is_empty());
         assert_eq!(long.report().next_change, Some(at(120.0)));
         assert!(long.snapshot.changes_since(&short.snapshot).is_empty());
