@@ -3470,30 +3470,29 @@ async fn prepare_wait_frame_before_health_deadline(
         .is_none_or(|previous| wait_storage_changed(&snapshot, previous))
     {
         let before = snapshot.clone();
-        let result = tokio::select! {
-            _ = wait_timeout_deadline(timeout_at) => {
-                *upkeep_interrupted = true;
-                return Ok(None);
-            }
-            boundary = health::deadline(next_health_change) => {
-                boundary?;
-                *upkeep_interrupted = true;
-                return Ok(None);
-            }
-            result = async {
+        let result = wait_upkeep_before_deadline(
+            async {
                 maintain_inputs(pile, signer, sources).await?;
                 refresh_receipts_before_observation(pile, signer, sources, output).await
-            } => result,
-        };
-        if let Err(error) = result {
-            if !is_preparation_pending(&error) {
-                return Err(error);
+            },
+            upkeep_interrupted,
+            next_health_change,
+            timeout_at,
+        )
+        .await;
+        match result {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => {
+                if !is_preparation_pending(&error) {
+                    return Err(error);
+                }
+                let mut fresh =
+                    PendingWaitFrame::awaiting_view(before, PendingWaitReason::Preparation);
+                fresh.missing = pending_blob(&error);
+                return Ok(Some(WaitFrameLoad::Pending(fresh)));
             }
-            let mut fresh = PendingWaitFrame::awaiting_view(before, PendingWaitReason::Preparation);
-            fresh.missing = pending_blob(&error);
-            return Ok(Some(WaitFrameLoad::Pending(fresh)));
         }
-        *upkeep_interrupted = false;
         *maintained_from = Some(before);
         snapshot = pile.snapshot()?;
         evaluated_at = clock::now()?;
@@ -3504,6 +3503,36 @@ async fn prepare_wait_frame_before_health_deadline(
             pile, sources, snapshot, pending, pile_path, persona_input,
             next_health_change, evaluated_at,
         ) => frame,
+    }
+}
+
+/// Poll eager upkeep only until a clock or command boundary needs the caller.
+/// A cancelled attempt cannot certify its prefix or replace a selected frame;
+/// those actions remain in the caller's successful-completion branch.
+async fn wait_upkeep_before_deadline<F>(
+    upkeep: F,
+    upkeep_interrupted: &mut bool,
+    next_health_change: Option<Epoch>,
+    timeout_at: Option<tokio::time::Instant>,
+) -> Result<bool>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        _ = wait_timeout_deadline(timeout_at) => {
+            *upkeep_interrupted = true;
+            Ok(false)
+        }
+        boundary = health::deadline(next_health_change) => {
+            boundary?;
+            *upkeep_interrupted = true;
+            Ok(false)
+        }
+        result = upkeep => {
+            result?;
+            *upkeep_interrupted = false;
+            Ok(true)
+        }
     }
 }
 
@@ -5409,150 +5438,80 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_interrupts_eager_target_acquisition() {
-        use triblespace::core::collection::CollectionDerive;
-        use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+    fn wait_timeout_cancels_pending_upkeep_and_allows_a_later_retry() {
+        use std::cell::Cell;
 
-        let fixture = TestPile::new();
-        let mut pile: FacultyStore = FacultyStore::lazy(
-            crate::storage::open_pile_strict(&fixture.path).unwrap(),
-            fixture.signer.clone(),
-            PeerConfig {
-                peers: Vec::new(),
-                qos: ReconcileQos {
-                    direction: ReconcileDirection::ReadOnly,
-                },
-                provider_publication_budget: Some(0),
-            },
-        );
-        let sources =
-            pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
-        let retained = observe_current_sources(&mut pile, &sources).unwrap();
-        let retained_watermark = retained.snapshot.clone();
-        let fragment = entity! { metadata::name: "source whose endorsed image has not landed" };
-        let output = IntoBlob::<SuccinctArchiveBlob>::to_blob(
-            SuccinctArchive::<OrderedUniverse>::from(fragment.facts()),
-        );
-        let commit = pile
-            .commit(sources.messages.source, &fixture.signer, fragment)
-            .unwrap();
-        // A valid record-before-blob arrival: maintenance first asks for the
-        // already endorsed output before rebuilding it from the resident source.
-        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &fixture.signer,
-            sources.messages.succinct.handle(),
-            (commit.data(), commit.fingerprint()),
-            inlineencodings::Handle::<SuccinctArchiveBlob>::to_hash(output.get_handle()),
-        )))
-        .unwrap();
-        assert!(!pile
-            .snapshot()
-            .unwrap()
-            .contains_blob(output.get_handle())
-            .unwrap());
-        let options = WaitOptions {
-            timeout: Some(Duration::from_millis(400)),
-            // Before the budget was applied to upkeep, its first-read cap was
-            // ten seconds and the outer three-second tripwire would fail instead.
-            poll_interval: Duration::from_secs(10),
-        };
-        let mut text = String::new();
-        let mut emit = |part| {
-            let crate::out::Part::Text { text: part } = part else {
-                bail!("expected text")
-            };
-            text.push_str(&part);
-            Ok(())
-        };
-        let rt = runtime().unwrap();
-        rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                cmd_wait(
-                    &mut pile,
-                    &fixture.signer,
-                    &fixture.path,
-                    Some(&fmt_id(id(93))),
-                    &options,
-                    Duration::from_secs(180),
-                    &mut Out::new(&mut emit),
-                ),
-            )
-            .await
-            .expect("command timeout must interrupt eager upkeep, not only payload reads")
-            .unwrap();
-        });
-        assert!(text.contains("No fully readable attention view"), "{text}");
-        assert!(
-            pile.health().started_at.is_some(),
-            "the acquisition arm must execute"
-        );
-        assert!(!pile
-            .snapshot()
-            .unwrap()
-            .contains_blob(output.get_handle())
-            .unwrap());
+        struct DroppedAttempt<'a>(&'a Cell<usize>);
+        impl Drop for DroppedAttempt<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
 
-        // The same interruption must not replace an already-selected payload
-        // frame or certify that the changed prefix has been maintained.
-        let mut maintained_from = Some(retained_watermark.clone());
+        // A missing endorsed blob is not a reliable stall fixture: ordinary
+        // maintenance can choose resident support or rebuild another image.
+        // Inject a definitely-pending future at the actual upkeep boundary
+        // instead, and count both entry and cancellation. This does not claim
+        // that any particular Core selection must acquire that missing image.
+        let started = Cell::new(0);
+        let dropped = Cell::new(0);
+        let completed = Cell::new(0);
         let mut upkeep_interrupted = false;
-        let mut pending = Some(PendingWaitFrame {
-            watermark: retained_watermark.clone(),
-            reason: PendingWaitReason::Payload,
-            missing: None,
-            observation: Some(retained),
-            persona: Some(id(93)),
-            habits: None,
-        });
-        let sampled = pile.snapshot().unwrap();
-        let mut discard = |_| Ok(());
-        rt.block_on(async {
+        runtime().unwrap().block_on(async {
+            let timeout_at = tokio::time::Instant::now() + Duration::from_millis(50);
+            let acquisition = async {
+                started.set(started.get() + 1);
+                let _attempt = DroppedAttempt(&dropped);
+                std::future::pending::<()>().await;
+                completed.set(completed.get() + 1);
+                Ok(())
+            };
             let result = tokio::time::timeout(
                 Duration::from_secs(3),
-                prepare_wait_frame_before_health_deadline(
-                    &mut pile,
-                    &fixture.signer,
-                    &sources,
-                    sampled,
-                    &mut maintained_from,
+                wait_upkeep_before_deadline(
+                    acquisition,
                     &mut upkeep_interrupted,
-                    &mut pending,
-                    &fixture.path,
-                    &fmt_id(id(93)),
                     None,
-                    Some(tokio::time::Instant::now() + Duration::from_millis(50)),
-                    clock::now().unwrap(),
-                    &mut Out::new(&mut discard),
+                    Some(timeout_at),
                 ),
             )
             .await
-            .expect("the retained-frame retry has the same command budget")
+            .expect("without the upkeep timeout arm this definitely-pending future never returns")
             .unwrap();
-            assert!(result.is_none());
+            assert!(!result, "a deadline must not claim upkeep completed");
+            assert!(tokio::time::Instant::now() >= timeout_at);
+            assert!(upkeep_interrupted);
+            assert_eq!(started.get(), 1, "upkeep must actually be polled");
+            assert_eq!(dropped.get(), 1, "the interrupted acquisition is cancelled");
+            assert_eq!(completed.get(), 0, "no post-acquisition work executed");
+
+            // A later attempt with enough remaining budget can take longer than
+            // the initial short cap and succeed; interruption is not sticky.
+            let acquisition = async {
+                started.set(started.get() + 1);
+                let _attempt = DroppedAttempt(&dropped);
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                completed.set(completed.get() + 1);
+                Ok(())
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                wait_upkeep_before_deadline(
+                    acquisition,
+                    &mut upkeep_interrupted,
+                    None,
+                    Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+                ),
+            )
+            .await
+            .expect("a successful retry remains bounded")
+            .unwrap();
+            assert!(result);
+            assert!(!upkeep_interrupted);
+            assert_eq!(started.get(), 2);
+            assert_eq!(dropped.get(), 2);
+            assert_eq!(completed.get(), 1);
         });
-        assert!(upkeep_interrupted);
-        assert!(maintained_from
-            .unwrap()
-            .changes_since(&retained_watermark)
-            .is_empty());
-        let pending = pending.unwrap();
-        assert_eq!(pending.reason, PendingWaitReason::Payload);
-        assert_eq!(pending.persona, Some(id(93)));
-        assert!(pending
-            .watermark
-            .changes_since(&retained_watermark)
-            .is_empty());
-        assert!(pending
-            .observation
-            .unwrap()
-            .facts
-            .messages
-            .view()
-            .iter()
-            .next()
-            .is_none());
-        pile.close().unwrap();
     }
 
     #[test]
