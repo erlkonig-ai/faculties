@@ -128,20 +128,38 @@ for dot in $(find "$ROOT" -maxdepth 2 -name .git -print 2>/dev/null | sort); do
   examined=$(( examined + 1 ))
 
   # Concurrent, because the sweep is network latency rather than work.
+  #
+  # A REPO WE COULD NOT COMPARE MUST NOT READ AS CURRENT. Both of the ways this
+  # can fail are silent by nature: a fetch that times out leaves the old
+  # tracking ref in place and rev-list happily counts against WEEK-OLD data,
+  # and a rev-list that fails outright (force-pushed upstream, ref gone) just
+  # returns nothing. Either one used to produce no output, which the reporting
+  # below could not tell apart from "this repo is current" -- so a box with no
+  # network at all would report "all current" about every checkout on it, with
+  # a confident count to back it up. Each failure now writes its own line.
   (
-    timeout "$FETCH_TIMEOUT" git -C "$repo" fetch --quiet "${upstream%%/*}" 2>/dev/null
+    key=${name//\//_}
+    fetched=1
+    timeout "$FETCH_TIMEOUT" git -C "$repo" fetch --quiet "${upstream%%/*}" 2>/dev/null || fetched=0
     # Only what upstream has and we do not. Commits of ours that upstream lacks
     # are stranded-work.sh's question, not this one.
     behind=$(git -C "$repo" rev-list --count "HEAD..$upstream" 2>/dev/null)
-    [ -n "$behind" ] && [ "$behind" != "0" ] || exit 0
     # Keyed on the repo, not $$ -- inside a subshell $$ is still the PARENT
     # shell's pid, so every branch of the fan-out would write the same file.
-    printf '%s\t%s\t%s\n' "$name" "$behind" "$upstream" > "$work/${name//\//_}"
+    if [ -z "$behind" ]; then
+      printf '%s\tcannot compare against %s\n' "$name" "$upstream" > "$work/p_$key"
+    elif [ "$fetched" = "0" ]; then
+      printf '%s\tfetch failed; %s behind %s is from STALE refs\n' \
+        "$name" "$behind" "$upstream" > "$work/p_$key"
+    elif [ "$behind" != "0" ]; then
+      printf '%s\t%s\t%s\n' "$name" "$behind" "$upstream" > "$work/b_$key"
+    fi
   ) &
 done
 wait
 
-lines=$(cat "$work"/* 2>/dev/null | sort)
+lines=$(cat "$work"/b_* 2>/dev/null | sort)
+problems=$(cat "$work"/p_* 2>/dev/null | sort)
 
 # Examining nothing is not an all-clear. If ROOT is wrong, or a machine lays its
 # checkouts out differently, or the authorship test matches none of them, the
@@ -156,7 +174,18 @@ if [ "$examined" = "0" ]; then
   exit 0
 fi
 
+# A problem is due on its own. Not knowing is not good news.
+if [ -n "$problems" ]; then
+  echo "could NOT check:"
+  printf '%s\n' "$problems" | while IFS=$'\t' read -r name why; do
+    printf '  %-24s %s\n' "$name" "$why"
+  done
+fi
+
 if [ -z "$lines" ]; then
+  if [ -n "$problems" ]; then
+    exit 0
+  fi
   [ "$QUIET" = "0" ] && echo "all current ($examined checked)"
   exit 1
 fi

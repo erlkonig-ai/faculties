@@ -1,0 +1,50 @@
+# Cargo configuration for the Faculties source cohort.
+#
+# Discovery is by the *invocation's* current directory, not by package: these
+# settings apply to every `cargo` run whose CWD is inside this repository, and
+# therefore also to the sibling path dependencies (mary, triblespace-rs, the
+# CubeCL forks) compiled as part of such a build. They do NOT apply to a cargo
+# run started from a sibling's own directory, and they never modify a file --
+# this is not the `cargo fmt --all` hazard, which rewrites sibling sources.
+
+[target.aarch64-unknown-linux-gnu]
+# Raise the AArch64-Linux codegen baseline to ARMv8.2-A FP16.
+#
+# WHY: the default-feature graph reaches `gemm-f16` (faculties/local-embed ->
+# mary/gemma -> burn -> burn-train -> burn-flex -> gemm feature "f16"). Its
+# `gemm-common`'s *vector* half-precision helpers in src/simd.rs -- `vmulq_f16`
+# (1949), `vfmaq_f16` (1975), and friends -- wrap raw `asm!` blocks
+# ("fmul {0:v}.8h, ...") but carry only `#[inline]`, with no
+# `#[target_feature(enable = "fp16")]`. Their scalar siblings a few lines above
+# (`multiply_f16_fp16` at 1932, `add_f16_fp16`, `fmaq_f16`) do carry it, so this
+# is an upstream omission rather than a design choice. Inline asm is assembled
+# with the enclosing function's feature set, so at the crate baseline LLVM's
+# integrated assembler rejects them: "error: instruction requires: fullfp16".
+#
+# This is invisible on macOS and fatal on Linux because the two AArch64 triples
+# have different default baselines. `aarch64-apple-darwin` already enables
+# `fp16` (its default target-cpu is an Apple core); `aarch64-unknown-linux-gnu`
+# enables only `neon`. Nothing about the build hosts differs -- the GB10 Sparks'
+# Cortex-X925/A725 cores report `fphp`/`asimdhp` -- it is purely the triple's
+# generic-ARMv8.0 default.
+#
+# TRADEOFF: this raises the baseline for the whole aarch64-linux build,
+# including the release artifacts built by .github/workflows/release.yml, from
+# ARMv8.0-A to ARMv8.2-A+FP16. Those binaries will fault on pre-ARMv8.2 cores
+# (Cortex-A53/A72, e.g. Raspberry Pi 4). That is accepted because there is no
+# configuration that both compiles this dependency graph and keeps an ARMv8.0
+# baseline: gemm-common's asm is emitted unconditionally, so the real choice is
+# an ARMv8.2 aarch64-linux binary or none at all. Runtime dispatch inside gemm
+# (`feature_detected!("fp16")`) is unaffected.
+#
+# `+fp16` is deliberately the minimum. Do not commit `-Ctarget-cpu=native`
+# here: it would bake whichever core built the artifact into a published
+# release. `native` remains correct for a local, machine-specific build, and
+# README.md still documents it for that.
+#
+# NOTE: a `RUSTFLAGS` environment variable REPLACES this setting rather than
+# merging with it -- Cargo picks exactly one rustflags source. `RUSTFLAGS`
+# carrying `-Ctarget-cpu=native` is a superset and stays fine, but setting
+# `RUSTFLAGS` for an unrelated reason (say `-D warnings`) silently drops `+fp16`
+# and the gemm-f16 failure returns.
+rustflags = ["-Ctarget-feature=+fp16"]
