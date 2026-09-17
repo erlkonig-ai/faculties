@@ -194,7 +194,7 @@ fn recorded_utterance_is_visible_without_a_repairing_voice_read() {
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
     use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
-    use triblespace::core::repo::{SnapshotSource, StorageClose};
+    use triblespace::core::repo::SnapshotSource;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("voice.pile");
     std::fs::File::create(&path).unwrap();

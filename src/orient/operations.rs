@@ -5549,7 +5549,9 @@ mod tests {
             .facts
             .messages
             .view()
-            .is_empty());
+            .iter()
+            .next()
+            .is_none());
         pile.close().unwrap();
     }
 

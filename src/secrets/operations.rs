@@ -158,7 +158,6 @@ impl SecretsStorage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace::core::repo::StorageClose;
 
     #[test]
     fn adding_a_secret_returns_with_its_metadata_already_queryable() {

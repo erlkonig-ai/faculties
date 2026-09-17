@@ -2754,7 +2754,7 @@ mod tests {
         let faculty = Files::with_storage(storage.clone());
         let id = faculty
             .add_bytes(
-                anybytes::Bytes::from_static(b"eager file"),
+                anybytes::Bytes::from_source(b"eager file".to_vec()),
                 "eager.txt",
                 "text/plain",
                 &[],
