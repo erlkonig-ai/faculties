@@ -461,7 +461,7 @@ fn daemon_sigterm_closes_normally_after_delivery() {
     let f = Fixture::new();
     let event = f.message("stop the persistent observer", f.persona);
     let report = f.directory.path().join("delivered");
-    let mut child = f
+    let child = f
         .process(None)
         .args([
             "daemon",
