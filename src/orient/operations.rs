@@ -211,7 +211,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
     admitted_record_witnesses, Collection, CollectionRealizationError, CollectionSnapshot,
     CollectionSnapshotExt, CollectionStoreExt, Support,
@@ -519,7 +519,7 @@ struct OrientObservation {
     /// changing any selected fact view, support, or authorization boundary.
     snapshot: FacultySnapshot,
     facts: OrientFacts,
-    compass_status: LwwIndex,
+    compass_status: LwwQuery,
 }
 
 impl OrientObservation {
@@ -599,7 +599,9 @@ fn observe_sources(
         .collection(sources.compass_status)
         .map_err(|error| anyhow!("observe Compass status register: {error}"))?
         .view::<LwwIndex>()
-        .map_err(|error| anyhow!("read Compass status register: {error}"))?;
+        .map_err(|error| anyhow!("read Compass status register: {error}"))?
+        .query()
+        .map_err(|error| anyhow!("prepare Compass status register query: {error}"))?;
     Ok(OrientObservation {
         snapshot,
         facts: OrientFacts {
@@ -659,7 +661,7 @@ struct OrientQuery<'a> {
     status: &'a FactArchive,
     habits: Option<&'a FactArchive>,
     presentations: &'a FactArchive,
-    compass_status: &'a LwwIndex,
+    compass_status: &'a LwwQuery,
     snapshot: &'a FacultySnapshot,
 }
 

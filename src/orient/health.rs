@@ -160,7 +160,10 @@ impl HealthSources {
 
     fn at(&self, snapshot: FacultySnapshot) -> Result<HealthObservation> {
         let facts = self.health.observe(&snapshot)?;
-        let latest = snapshot.collection(self.latest)?.view::<LwwIndex>()?;
+        let latest = snapshot
+            .collection(self.latest)?
+            .view::<LwwIndex>()?
+            .query()?;
         let relations = self.relations.observe(&snapshot)?;
         let presentations = self.presentations.observe(&snapshot)?;
         Ok(HealthObservation {
@@ -194,7 +197,7 @@ pub(super) async fn deadline(deadline: Option<Epoch>) -> Result<()> {
 pub(super) struct HealthObservation {
     snapshot: FacultySnapshot,
     facts: OrientFact,
-    latest: LwwIndex,
+    latest: LwwQuery,
     relations: OrientFact,
     presentations: OrientFact,
     max_age: Duration,
@@ -315,7 +318,7 @@ fn collection_label(
 /// Missing/unknown rows do not invalidate other reports or invent a green bit.
 fn render_health(
     facts: &FactArchive,
-    latest: &LwwIndex,
+    latest: &LwwQuery,
     snapshot: &FacultySnapshot,
     max_age: Duration,
 ) -> HealthReport {

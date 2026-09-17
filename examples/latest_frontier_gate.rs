@@ -325,7 +325,9 @@ fn gate_compass_stated_order(space: &TribleSet) -> Result<()> {
     let projection = derive_element(&archive, board::status_of.id(), metadata::created_at.id())
         .map_err(|error| anyhow::anyhow!("derive Compass status register: {error}"))?;
     let order = LwwIndex::decode(&projection)
-        .map_err(|error| anyhow::anyhow!("decode Compass status register: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("decode Compass status register: {error}"))?
+        .query()
+        .map_err(|error| anyhow::anyhow!("prepare Compass status register query: {error}"))?;
 
     let mut compared = 0usize;
     let mut with_status = 0usize;

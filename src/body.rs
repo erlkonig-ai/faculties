@@ -20,7 +20,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -74,7 +74,7 @@ pub struct BodyCatalog {
 pub struct BodySnapshot {
     facts: FactArchive,
     store_snapshot: PileSnapshot,
-    intents: LwwIndex,
+    intents: LwwQuery,
 }
 
 impl BodySnapshot {
@@ -89,12 +89,12 @@ impl BodySnapshot {
     }
 
     /// Maintained order for the Body intent register.
-    pub fn intent_register(&self) -> &LwwIndex {
+    pub fn intent_register(&self) -> &LwwQuery {
         &self.intents
     }
 
     /// Consume the coherent snapshot into facts, store snapshot, and index.
-    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwIndex) {
+    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwQuery) {
         (self.facts, self.store_snapshot, self.intents)
     }
 }
@@ -103,7 +103,7 @@ impl BodySnapshot {
 ///
 /// `metadata::tag` is the identity coordinate: every intent event states the
 /// single register value [`KIND_INTENT`]. `metadata::created_at` is an
-/// order-preserving point interval, and [`LwwIndex`] breaks equal-time ties by
+/// order-preserving point interval, and [`LwwQuery`] breaks equal-time ties by
 /// intrinsic event id, matching the historical JIT reader exactly. Capture
 /// rows form an independent `KIND_CAPTURE` register in the same target bytes;
 /// [`latest_intent`] scopes the read with `winner(KIND_INTENT)`.
@@ -522,7 +522,7 @@ pub fn validate_candidate(
 /// validation failure.
 pub fn latest_intent<P: TriblePattern>(
     facts: &P,
-    register: &LwwIndex,
+    register: &LwwQuery,
 ) -> Result<Option<IntentRow>> {
     let Some(id) = register.winner(KIND_INTENT) else {
         return Ok(None);
@@ -586,7 +586,9 @@ pub async fn materialize_indexed_collection(
         .collection(target)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
         .view::<LwwIndex>()
-        .map_err(|error| anyhow!("read Body intent register: {error}"))?;
+        .map_err(|error| anyhow!("read Body intent register: {error}"))?
+        .query()
+        .map_err(|error| anyhow!("prepare Body intent register query: {error}"))?;
     Ok(BodySnapshot {
         facts,
         store_snapshot,
@@ -677,7 +679,11 @@ mod tests {
             let intent_collection = snapshot.collection(target).unwrap();
             assert_ne!(fact_collection.support(), intent_collection.support());
             let facts = fact_collection.view::<FactArchive>().unwrap();
-            let lagging = intent_collection.view::<LwwIndex>().unwrap();
+            let lagging = intent_collection
+                .view::<LwwIndex>()
+                .unwrap()
+                .query()
+                .unwrap();
             assert_eq!(
                 latest_intent(&facts, &lagging).unwrap().unwrap().id,
                 first_id
@@ -688,6 +694,8 @@ mod tests {
                 .collection(target)
                 .unwrap()
                 .view::<LwwIndex>()
+                .unwrap()
+                .query()
                 .unwrap();
             assert_eq!(latest_intent(before.facts(), &advanced).unwrap(), None);
             assert_eq!(

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use triblespace::core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -52,7 +52,7 @@ pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub struct CompassSnapshot<R = PileSnapshot> {
     facts: FactArchive,
     store_snapshot: R,
-    status: LwwIndex,
+    status: LwwQuery,
 }
 
 impl<R> CompassSnapshot<R> {
@@ -67,12 +67,12 @@ impl<R> CompassSnapshot<R> {
     }
 
     /// Known complete LWW winners attached from the same store observation.
-    pub fn status_register(&self) -> &LwwIndex {
+    pub fn status_register(&self) -> &LwwQuery {
         &self.status
     }
 
     /// Consume the coherent snapshot into facts, store snapshot, and status index.
-    pub fn into_parts(self) -> (FactArchive, R, LwwIndex) {
+    pub fn into_parts(self) -> (FactArchive, R, LwwQuery) {
         (self.facts, self.store_snapshot, self.status)
     }
 }
@@ -1136,7 +1136,9 @@ where
         .collection(status_target)
         .context("observe Compass status register")?
         .view::<LwwIndex>()
-        .context("read Compass status register")?;
+        .context("read Compass status register")?
+        .query()
+        .context("prepare Compass status register query")?;
     Ok(CompassSnapshot {
         facts: fact_archive,
         store_snapshot,
@@ -1386,6 +1388,8 @@ mod tests {
                 .collection(target)
                 .unwrap()
                 .view::<LwwIndex>()
+                .unwrap()
+                .query()
                 .unwrap();
             store.commit(source, &signer, next + unseen).unwrap();
             let snapshot = store.snapshot().unwrap();
@@ -1410,6 +1414,8 @@ mod tests {
                 .collection(target)
                 .unwrap()
                 .view::<LwwIndex>()
+                .unwrap()
+                .query()
                 .unwrap();
             assert_eq!(
                 crate::schemas::compass::latest_status_event(&facts, &advanced, goal)

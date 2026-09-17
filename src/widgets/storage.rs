@@ -24,7 +24,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::latest::LatestIndex;
-use triblespace::core::collection::lww_register::LwwIndex;
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
 use triblespace::core::collection::{
     Collection, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
@@ -185,13 +185,13 @@ pub struct DatasetView<'a> {
     pub facts: &'a FactArchive,
     pub reader: &'a PileSnapshot,
     pub revision: DatasetRevision,
-    lww_registers: &'a BTreeMap<(Id, Id), LwwIndex>,
+    lww_registers: &'a BTreeMap<(Id, Id), LwwQuery>,
     latest_indexes: &'a BTreeMap<Id, LatestIndex>,
 }
 
 impl DatasetView<'_> {
     /// Maintained LWW order for the requested identity and order attributes.
-    pub fn lww_register(&self, identity: Id, orders: Id) -> Option<&LwwIndex> {
+    pub fn lww_register(&self, identity: Id, orders: Id) -> Option<&LwwQuery> {
         self.lww_registers.get(&(identity, orders))
     }
 
@@ -242,7 +242,7 @@ struct LoadedDataset {
     facts: FactArchive,
     reader: PileSnapshot,
     revision: DatasetRevision,
-    lww_registers: BTreeMap<(Id, Id), LwwIndex>,
+    lww_registers: BTreeMap<(Id, Id), LwwQuery>,
     latest_indexes: BTreeMap<Id, LatestIndex>,
 }
 
@@ -251,7 +251,7 @@ impl LoadedDataset {
         facts: FactArchive,
         revision: DatasetRevision,
         reader: PileSnapshot,
-        lww_registers: BTreeMap<(Id, Id), LwwIndex>,
+        lww_registers: BTreeMap<(Id, Id), LwwQuery>,
         latest_indexes: BTreeMap<Id, LatestIndex>,
     ) -> Self {
         Self {
@@ -671,7 +671,7 @@ async fn load_inputs_from_pile(
 ) -> Result<LoadedInputs, String> {
     let loaded = async {
         let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
-        let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwIndex>>::new();
+        let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwQuery>>::new();
         let mut latest_by_scope = BTreeMap::<Id, BTreeMap<Id, LatestIndex>>::new();
 
         let mut collections = Vec::new();
@@ -806,7 +806,9 @@ async fn load_inputs_from_pile(
                 .map_err(|error| format!("attach Compass status register: {error}"))?;
             let index = collection
                 .view::<LwwIndex>()
-                .map_err(|error| format!("read Compass status register: {error}"))?;
+                .map_err(|error| format!("read Compass status register: {error}"))?
+                .query()
+                .map_err(|error| format!("prepare Compass status register query: {error}"))?;
             revisions_by_scope
                 .get_mut(&COMPASS_SCOPE_ID)
                 .expect("Compass facts were attached")
