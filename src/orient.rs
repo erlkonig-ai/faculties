@@ -40,6 +40,31 @@ pub fn receipt_fragment(
     fragment
 }
 
+/// Receipts for due occurrences of standing intentions.
+///
+/// A habit's due event is an intention and an instant, not a record with an id
+/// of its own, so the receipt cites both rather than a derived identity. The
+/// pair is what a reader joins on, and joining is the point: an id that has to
+/// be computed before it can be looked up is a hash-join, and only a set of ids
+/// ever made one necessary here.
+pub fn habit_receipt_fragment(
+    due: impl IntoIterator<Item = (Id, Inline<inlineencodings::NsTAIInterval>)>,
+    created_at: Inline<inlineencodings::NsTAIInterval>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    for (habit, due_at) in due {
+        let receipt = entity! {
+            metadata::tag: &KIND_PRESENTED,
+            presentation::habit: &habit,
+            presentation::due_at: &due_at,
+        };
+        let id = receipt.root().expect("one habit receipt entity");
+        fragment += receipt;
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: &created_at };
+    }
+    fragment
+}
+
 fn presented_record(persona: Id, event: Id) -> Fragment {
     entity! {
         metadata::tag: &KIND_PRESENTED,

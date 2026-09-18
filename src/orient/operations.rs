@@ -685,11 +685,21 @@ impl OrientSource {
     }
 }
 
-/// Rich receipt facts and their compact, ordinary derived membership set.
-/// The signing key is the zooid identity; routing aliases are not authority.
+/// Receipt facts, projected the same way every other Orient input is.
+/// The signing key is the observer's identity; routing aliases are not authority.
+///
+/// This used to derive an `EntityIdSetBlob` over `presentation::event`, and a
+/// set of ids can answer exactly one question: is THIS id present. Every
+/// caller therefore had to COMPUTE an id in order to ask -- which is the
+/// hash-join the substrate rules forbid, and it forced a presented occurrence
+/// to have a derived identity whether or not it had any business having one.
+/// A habit's due event has none: it is an intention and an instant. Projecting
+/// receipts as an ordinary Rank9 fact archive lets each caller JOIN on whatever
+/// actually identifies its occurrence, so nothing has to be named to be found.
 struct ReceiptSource {
     source: Collection<SimpleArchive>,
-    ids: Collection<EntityIdSetBlob>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
 impl ReceiptSource {
@@ -699,16 +709,21 @@ impl ReceiptSource {
             crate::schemas::orient::RECEIPT_COLLECTION_NAME,
             policy.clone(),
         )?;
-        let ids = pile.derive::<EntityIdSetBlob>(source, presentation::event.id(), policy)?;
-        Ok(Self { source, ids })
+        let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+        let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+        Ok(Self {
+            source,
+            succinct,
+            rank9,
+        })
     }
 
     fn observe(&self, snapshot: &FacultySnapshot) -> Result<ReceiptObservation> {
         let collection = trace_refresh_call("Orient receipts", "attach", || {
-            snapshot.collection(self.ids)
+            snapshot.collection(self.rank9)
         })?;
         let view = trace_refresh_call("Orient receipts", "view", || {
-            collection.view::<EntityIdSet>()
+            collection.view::<FactArchive>()
         })?;
         Ok(ReceiptObservation { collection, view })
     }
@@ -723,18 +738,23 @@ impl ReceiptSource {
         let snapshot = pile
             .snapshot()
             .context("freeze Orient receipt membership authority")?;
+        let subject = signer.verifying_key();
         let admitted = self
-            .ids
-            .writer_is_admitted(&snapshot, signer.verifying_key())
-            .map_err(|error| anyhow!("check Orient receipt membership WRITE admission: {error}"))?;
+            .succinct
+            .writer_is_admitted(&snapshot, subject)
+            .map_err(|error| anyhow!("check Orient receipt Succinct WRITE admission: {error}"))?
+            && self
+                .rank9
+                .writer_is_admitted(&snapshot, subject)
+                .map_err(|error| anyhow!("check Orient receipt Rank9 WRITE admission: {error}"))?;
         drop(snapshot);
         if !admitted {
             return Ok(());
         }
         drop(
-            pile.maintain(self.ids, signer)
+            pile.maintain(self.rank9, signer)
                 .await
-                .context("maintain Orient receipt membership set")?,
+                .context("maintain Orient receipt projection")?,
         );
         Ok(())
     }
@@ -760,13 +780,35 @@ async fn refresh_receipts_before_observation(
 }
 
 struct ReceiptObservation {
-    collection: CollectionSnapshot<FacultySnapshot, EntityIdSetBlob>,
-    view: EntityIdSet,
+    collection: CollectionSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    view: FactArchive,
 }
 
 impl ReceiptObservation {
-    fn view(&self) -> &EntityIdSet {
+    fn view(&self) -> &FactArchive {
         &self.view
+    }
+
+    #[cfg(test)]
+    fn contains(&self, event: Id) -> bool {
+        event_presented(&self.view, event)
+    }
+
+    /// Every event id this signer holds a receipt for.
+    #[cfg(test)]
+    fn presented_events(&self) -> BTreeSet<Id> {
+        find!(
+            event: Id,
+            pattern!(&self.view, [{ _?receipt @ presentation::event: ?event }])
+        )
+        .collect()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        !exists!(pattern!(&self.view, [{ _?receipt @
+            metadata::tag: &crate::schemas::orient::KIND_PRESENTED,
+        }]))
     }
 
     fn is_current(&self, snapshot: &FacultySnapshot) -> bool {
@@ -1034,7 +1076,7 @@ struct OrientQuery<'a> {
     relations: &'a FactArchive,
     status: &'a FactArchive,
     habits: Option<&'a FactArchive>,
-    presentations: &'a EntityIdSet,
+    presentations: &'a FactArchive,
     compass_status: &'a LwwQuery,
     snapshot: &'a FacultySnapshot,
 }
@@ -2329,46 +2371,94 @@ fn push_due_detail(out: &mut String, due: &[(Id, DueHabit)]) {
     }
 }
 
+/// What this frame has to say about intentions: every due event not yet
+/// receipted, plus warnings for intentions that newly need attention.
+///
+/// Due-ness is decided by RECEIPT, not by comparing against the previous
+/// observation. A transition comparison answers "did this change since I last
+/// looked", which is the wrong question -- an intention that fell due while
+/// nothing was looking never transitions in any observation anyone holds, and
+/// so was silently lost. Attention warnings keep the transition form because
+/// they describe a change of condition rather than an occurrence to present.
 fn render_habit_transitions(
     previous: &HabitObservation,
     current: &HabitObservation,
-) -> Option<String> {
+    presented: &FactArchive,
+) -> Option<(String, Vec<(Id, i64)>)> {
     use std::fmt::Write as _;
-    let due = newly_due(previous, current);
+    let (due_text, events) = render_due_habits_unreceipted(current, presented)
+        .unwrap_or_else(|| (String::new(), Vec::new()));
     let attention = newly_needing_attention(previous, current);
-    if due.is_empty() && attention.is_empty() {
+    if due_text.is_empty() && attention.is_empty() {
         return None;
     }
     let mut out = String::new();
-    push_due_news(&mut out, &due);
     // The warning already names the habit and its id, so it *is* the reason;
     // the separate attention block below it only repeated the same string.
     for (_, warning) in &attention {
         writeln!(out, "News: habit needs attention: {warning}").unwrap();
     }
-    push_due_detail(&mut out, &due);
-    Some(out)
+    out.push_str(&due_text);
+    Some((out, events))
 }
 
-/// Intentions addressed to the observing persona that are already due when a
-/// watcher arms. Their due instant can fall between one wait's exit and the
-/// next arm, and nobody else will complete them, so they are reported at once
-/// instead of joining the quiet baseline that keeps a rearmed watcher from
-/// repeating every unsatisfied shared intention.
-fn render_habits_due_at_arm(current: &HabitObservation) -> Option<String> {
-    let owned: Vec<(Id, DueHabit)> = current
+/// Every due intention this persona has not already been shown, and the due
+/// events to receipt for having shown them.
+///
+/// This replaces two mechanisms that both existed only because the answer to
+/// "has this persona seen this already?" was being inferred from process-local
+/// state. A fresh `orient wait` has no such state, so an arm could either stay
+/// quiet (losing an intention whose due instant fell between one wait's exit
+/// and the next arm) or repeat everything unsatisfied. The old split reported
+/// only intentions addressed to the observing persona at arm and left shared
+/// ones to whoever saw the transition -- which resolves to NOBODY exactly when
+/// the transition happened in the gap. Observed 2026-09-18:
+/// `work-ledger-grooming` (`every 7d`, addressed to everyone) went due
+/// unobserved and would have sat due for a week.
+///
+/// A receipt answers it as a fact instead, the way it already does for
+/// messages: each due event has a stable identity derived from
+/// `(habit, since)`, so presenting it is recorded and a rearmed watcher simply
+/// does not present it again. Completion ends the due event; the next
+/// recurrence has a later `since`, hence a different identity, and is
+/// presented once more.
+fn render_due_habits_unreceipted(
+    current: &HabitObservation,
+    presented: &FactArchive,
+) -> Option<(String, Vec<(Id, i64)>)> {
+    let due: Vec<(Id, DueHabit)> = current
         .due
         .iter()
-        .filter(|(_, habit)| habit.targeted)
+        .filter(|(id, habit)| !habit_due_presented(presented, **id, habit.since))
         .map(|(id, habit)| (*id, habit.clone()))
         .collect();
-    if owned.is_empty() {
+    if due.is_empty() {
         return None;
     }
+    let presented_now = due.iter().map(|(id, habit)| (*id, habit.since)).collect();
     let mut out = String::new();
-    push_due_news(&mut out, &owned);
-    push_due_detail(&mut out, &owned);
-    Some(out)
+    push_due_news(&mut out, &due);
+    push_due_detail(&mut out, &due);
+    Some((out, presented_now))
+}
+
+/// Has this observer already been shown this intention's due occurrence?
+///
+/// An ordinary join on what identifies the occurrence -- the intention and the
+/// instant its due began. The receipt collection is private to this signing
+/// key, so the observer is the descriptor's authority and needs no clause.
+fn event_presented(presented: &FactArchive, event: Id) -> bool {
+    exists!(pattern!(presented, [{ _?receipt @ presentation::event: &event }]))
+}
+
+fn habit_due_presented(presented: &FactArchive, habit: Id, since: i64) -> bool {
+    let Ok(due_at) = clock::point(Epoch::from_tai_seconds(since as f64)) else {
+        return false;
+    };
+    exists!(pattern!(presented, [{ _?receipt @
+        presentation::habit: &habit,
+        presentation::due_at: &due_at,
+    }]))
 }
 
 #[derive(Debug)]
@@ -2662,12 +2752,19 @@ impl AttentionView {
         self.events.keys().copied()
     }
 
-    fn pending(&self, presented: &EntityIdSet) -> Self {
+    /// Everything this observer has not already been shown.
+    ///
+    /// An ordinary join against the receipt facts. It used to be a membership
+    /// test against a set of ids, which answers only "is THIS id present" and
+    /// so obliged every caller to have an id in hand before it could ask --
+    /// fine for a message, which is a record with an identity, and the reason
+    /// a habit's due occurrence had to be given a derived one it did not want.
+    fn pending(&self, presented: &FactArchive) -> Self {
         Self {
             events: self
                 .events
                 .iter()
-                .filter(|(event, _)| !presented.contains(**event))
+                .filter(|(event, _)| !event_presented(presented, **event))
                 .map(|(event, detail)| (*event, detail.clone()))
                 .collect(),
         }
@@ -3254,6 +3351,34 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
         text,
         events: pending.ids().collect(),
     })
+}
+
+/// Record that these due events were presented to this persona.
+///
+/// A habit report is not news and must never acknowledge a message body the
+/// reader did not see -- that is why the two are receipted separately rather
+/// than folded into one fragment. What it DOES acknowledge is itself: the due
+/// events it just displayed, so a rearmed watcher does not display them again.
+fn commit_habit_receipts(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    due: &[(Id, i64)],
+) -> Result<()> {
+    if due.is_empty() {
+        return Ok(());
+    }
+    let mut pairs = Vec::with_capacity(due.len());
+    for (habit, since) in due {
+        pairs.push((
+            *habit,
+            clock::point(Epoch::from_tai_seconds(*since as f64))?,
+        ));
+    }
+    let collection = presentation_collection_for_write(pile, signer)?;
+    let fragment = orient_model::habit_receipt_fragment(pairs, clock::point_now()?);
+    pile.commit(collection, signer, fragment)
+        .map_err(|error| anyhow!("commit Orient habit presentation facts: {error}"))?;
+    Ok(())
 }
 
 fn apply_prepared_news(
@@ -3982,7 +4107,7 @@ async fn cmd_observe(
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
-            let mut swept: Option<(HabitObservation, String)> = None;
+            let mut swept: Option<(HabitObservation, String, Vec<(Id, i64)>)> = None;
             if let Some(pending) = pending_frame.as_ref() {
                 if let (Some(persona), Some(habits), Some(observation)) = (
                     pending.persona,
@@ -3994,7 +4119,11 @@ async fn cmd_observe(
                             // An owned intention already due when the watcher
                             // arms is reported at once, even while a news body
                             // is still pending.
-                            let owned_due = render_habits_due_at_arm(habits).unwrap_or_default();
+                            let (owned_due, due_events) = render_due_habits_unreceipted(
+                                habits,
+                                observation.facts.presentations.view(),
+                            )
+                            .unwrap_or_else(|| (String::new(), Vec::new()));
                             pending_habits_seen = Some(habits.clone());
                             last_pending_sweep = Instant::now();
                             if !owned_due.is_empty() {
@@ -4022,24 +4151,32 @@ async fn cmd_observe(
                                     now_secs,
                                     persona,
                                 )?;
-                                let habit_report = render_habit_transitions(seen, &current_habits)
-                                    .unwrap_or_default();
-                                swept = Some((current_habits, habit_report));
+                                let (habit_report, due_events) = render_habit_transitions(
+                                    seen,
+                                    &current_habits,
+                                    observation.facts.presentations.view(),
+                                )
+                                .unwrap_or_else(|| (String::new(), Vec::new()));
+                                swept = Some((current_habits, habit_report, due_events));
                             } else if continuous {
                                 // A newly readable pending frame may contain
                                 // a completion or a new due occurrence even
                                 // while its directed-news body is unavailable.
-                                let report =
-                                    render_habit_transitions(seen, habits).unwrap_or_default();
+                                let (report, due_events) = render_habit_transitions(
+                                    seen,
+                                    habits,
+                                    observation.facts.presentations.view(),
+                                )
+                                .unwrap_or_else(|| (String::new(), Vec::new()));
                                 if seen != habits {
-                                    swept = Some((habits.clone(), report));
+                                    swept = Some((habits.clone(), report, due_events));
                                 }
                             }
                         }
                     }
                 }
             }
-            if let Some((current_habits, habit_report)) = swept {
+            if let Some((current_habits, habit_report, swept_events)) = swept {
                 // The sweep's observation is what the retained frame carries
                 // into Ready, so Ready compares against what was last seen and
                 // never against the observation its first preparation cached.
@@ -4051,6 +4188,7 @@ async fn cmd_observe(
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
                     write_complete_report(output, &habit_report, "Orient habit report")?;
+                    commit_habit_receipts(pile, signer, &swept_events)?;
                     if !continuous {
                         return Ok(WaitOutcome {
                             news_printed: true,
@@ -4112,13 +4250,15 @@ async fn cmd_observe(
         // With a baseline taken while news was pending, what fell due since is
         // news at this frame and the fresh observation is kept; without one,
         // an owned intention already due is reported at arm.
-        let arm_report = match pending_habits_seen.take() {
-            Some(seen) => render_habit_transitions(&seen, &habit_seen),
-            None => render_habits_due_at_arm(&habit_seen),
+        let presented = current.facts.presentations.view();
+        let (arm_report, arm_due_events) = match pending_habits_seen.take() {
+            Some(seen) => render_habit_transitions(&seen, &habit_seen, presented),
+            None => render_due_habits_unreceipted(&habit_seen, presented),
         }
-        .unwrap_or_default();
+        .unwrap_or_else(|| (String::new(), Vec::new()));
         let arm_fired = !arm_report.is_empty();
         apply_prepared_news(pile, signer, false, &news, &arm_report, output)?;
+        commit_habit_receipts(pile, signer, &arm_due_events)?;
         if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
                 news_printed: true,
@@ -4229,8 +4369,12 @@ async fn cmd_observe(
                         pending_frame = None;
                         view_pending = false;
                         current_habit_context_valid = true;
-                        let habit_report = render_habit_transitions(&habit_seen, &candidate.habits)
-                            .unwrap_or_default();
+                        let (habit_report, due_events) = render_habit_transitions(
+                            &habit_seen,
+                            &candidate.habits,
+                            candidate.observation.facts.presentations.view(),
+                        )
+                        .unwrap_or_else(|| (String::new(), Vec::new()));
                         let habit_fired = !habit_report.is_empty();
                         let ordinary_fired = matches!(candidate.news, News::Report { .. });
                         apply_prepared_news(
@@ -4241,6 +4385,7 @@ async fn cmd_observe(
                             &habit_report,
                             output,
                         )?;
+                        commit_habit_receipts(pile, signer, &due_events)?;
                         if (habit_fired || ordinary_fired) && !continuous {
                             return Ok(WaitOutcome {
                                 news_printed: true,
@@ -4305,11 +4450,16 @@ async fn cmd_observe(
                 pile_path,
                 now_secs,
             )?;
-            let habit_report =
-                render_habit_transitions(&habit_seen, &current_habits).unwrap_or_default();
+            let (habit_report, due_events) = render_habit_transitions(
+                &habit_seen,
+                &current_habits,
+                current.facts.presentations.view(),
+            )
+            .unwrap_or_else(|| (String::new(), Vec::new()));
             let habit_fired = !habit_report.is_empty();
             if habit_fired {
                 write_complete_report(output, &habit_report, "Orient habit report")?;
+                commit_habit_receipts(pile, signer, &due_events)?;
             }
             habit_seen = current_habits;
             last_habit_sweep = Instant::now();
@@ -4512,6 +4662,37 @@ async fn cmd_wake(
 
 #[cfg(test)]
 mod tests {
+    /// Project receipt facts the way the live path does, so tests exercise the
+    /// same join rather than a stand-in for it.
+    fn receipts_archive(facts: &TribleSet) -> FactArchive {
+        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+        FactArchive::new(vec![SuccinctArchive::from(facts)])
+    }
+
+    /// No receipts at all: every due occurrence is unpresented.
+    fn nothing_presented() -> FactArchive {
+        receipts_archive(&TribleSet::new())
+    }
+
+    fn presented_habit_due(due: impl IntoIterator<Item = (Id, i64)>) -> FactArchive {
+        let pairs: Vec<_> = due
+            .into_iter()
+            .map(|(habit, since)| {
+                (
+                    habit,
+                    clock::point(Epoch::from_tai_seconds(since as f64)).unwrap(),
+                )
+            })
+            .collect();
+        let fragment = orient_model::habit_receipt_fragment(pairs, clock::point_now().unwrap());
+        receipts_archive(&TribleSet::from(fragment))
+    }
+
+    fn presented(events: impl IntoIterator<Item = Id>) -> FactArchive {
+        let fragment = orient_model::receipt_fragment(events, clock::point_now().unwrap());
+        receipts_archive(&TribleSet::from(fragment))
+    }
+
     fn due_habit(label: &str, since: i64, targeted: bool) -> DueHabit {
         DueHabit {
             label: label.to_owned(),
@@ -4528,13 +4709,19 @@ mod tests {
         due.due
             .insert(habit, due_habit("owned reminder", 100, true));
         due.next_cooldown_at = Some(200);
-        assert!(render_habits_due_at_arm(&due).is_some());
+        assert!(render_due_habits_unreceipted(&due, &nothing_presented()).is_some());
         let mut seen = Some(due.clone());
         // All initial-pending invalidation sites use this boundary. Losing
         // inputs must stop their clock, not turn recovery into another arm.
         invalidate_pending_habit_context(true, &mut seen);
         assert_eq!(pending_habit_deadline(true, None, &seen), None);
-        assert!(render_habit_transitions(seen.as_ref().unwrap(), &due).is_none());
+        // Unchanged since the baseline, but still unreceipted, so still
+        // reported: what decides is whether this observer has been SHOWN the
+        // occurrence, not whether it changed since something it happens to
+        // hold in memory.
+        assert!(
+            render_habit_transitions(seen.as_ref().unwrap(), &due, &nothing_presented()).is_some()
+        );
         assert_eq!(
             pending_habit_deadline(true, Some(&due), &seen),
             Some(Epoch::from_tai_seconds(200.0))
@@ -4542,7 +4729,9 @@ mod tests {
         let mut next = due.clone();
         next.due
             .insert(habit, due_habit("owned reminder", 300, true));
-        assert!(render_habit_transitions(seen.as_ref().unwrap(), &next).is_some());
+        assert!(
+            render_habit_transitions(seen.as_ref().unwrap(), &next, &nothing_presented()).is_some()
+        );
         invalidate_pending_habit_context(false, &mut seen);
         assert!(seen.is_none(), "one-shot rearm semantics remain unchanged");
     }
@@ -4567,21 +4756,54 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_due_habits_are_reported_when_the_watcher_arms() {
+    fn a_due_occurrence_is_reported_until_its_receipt_exists_then_never_again() {
         let owned = Id::new([8; 16]).unwrap();
         let shared = Id::new([9; 16]).unwrap();
         let mut armed = HabitObservation::default();
+
+        // A SHARED intention is reported. It used to stay a quiet baseline on
+        // the reasoning that whoever saw its transition would take it -- but
+        // when the due instant falls between one wait's exit and the next arm
+        // NOBODY sees the transition, so that resolved to nobody, silently.
+        // `work-ledger-grooming` (every 7d, addressed to everyone) was lost
+        // exactly this way on 2026-09-18.
         armed
             .due
-            .insert(shared, due_habit("stranded-work", 0, false));
-        assert!(
-            render_habits_due_at_arm(&armed).is_none(),
-            "an untargeted due intention stays a quiet baseline"
-        );
+            .insert(shared, due_habit("work-ledger-grooming", 700, false));
+        let (shared_report, shared_events) =
+            render_due_habits_unreceipted(&armed, &nothing_presented())
+                .expect("a shared due occurrence is reported");
+        assert!(shared_report.contains("work-ledger-grooming"));
+        assert_eq!(shared_events, vec![(shared, 700)]);
+
         armed.due.insert(owned, due_habit("cc-tick", 1300, true));
-        let report = render_habits_due_at_arm(&armed).expect("an owned clock is reported at arm");
-        assert!(report.contains("News: habit became due: cc-tick"));
-        assert!(!report.contains("stranded-work"));
+        let (both, events) = render_due_habits_unreceipted(&armed, &nothing_presented())
+            .expect("both due occurrences are reported");
+        assert!(both.contains("News: habit became due: cc-tick"));
+        assert!(both.contains("work-ledger-grooming"));
+        assert_eq!(events.len(), 2);
+
+        // Receipting ONE occurrence silences exactly that one. Targeting has
+        // nothing to do with it; being shown does.
+        let seen_shared = presented_habit_due([(shared, 700)]);
+        let (only_owned, owned_events) = render_due_habits_unreceipted(&armed, &seen_shared)
+            .expect("the unreceipted occurrence is still reported");
+        assert!(only_owned.contains("cc-tick"));
+        assert!(!only_owned.contains("work-ledger-grooming"));
+        assert_eq!(owned_events, vec![(owned, 1300)]);
+
+        // Receipt both and the watcher is quiet, however often it rearms.
+        let seen_both = presented_habit_due([(shared, 700), (owned, 1300)]);
+        assert!(render_due_habits_unreceipted(&armed, &seen_both).is_none());
+        assert!(render_due_habits_unreceipted(&armed, &seen_both).is_none());
+
+        // A fresh due of the SAME habit is a different occurrence: later
+        // `since`, so the old receipt does not cover it.
+        let mut again = HabitObservation::default();
+        again.due.insert(owned, due_habit("cc-tick", 1900, true));
+        let (recurred, _) = render_due_habits_unreceipted(&again, &seen_both)
+            .expect("a later due occurrence is presented again");
+        assert!(recurred.contains("cc-tick"));
     }
 
     use super::super::cli::{parse_wait_target, WaitTarget};
@@ -4883,7 +5105,7 @@ mod tests {
                 .await
                 .unwrap();
             let next = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(next.facts.presentations.view().contains(event));
+            assert!(next.facts.presentations.contains(event));
             assert_eq!(
                 person_anchors(next.facts.relations.view()),
                 BTreeSet::from([known])
@@ -4923,7 +5145,7 @@ mod tests {
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(observation.facts.presentations.view().is_empty());
+            assert!(observation.facts.presentations.is_empty());
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -4941,8 +5163,8 @@ mod tests {
                 .await
                 .unwrap();
             let ready = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(ready.facts.presentations.view().contains(id(76)));
-            assert!(observation.facts.presentations.view().is_empty());
+            assert!(ready.facts.presentations.contains(id(76)));
+            assert!(observation.facts.presentations.is_empty());
             pile.close().unwrap();
         });
     }
@@ -4974,10 +5196,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(restarted.presentations.source, sources.presentations.source);
-            assert_eq!(restarted.presentations.ids, sources.presentations.ids);
+            assert_eq!(restarted.presentations.rank9, sources.presentations.rank9);
             assert!(restarted
                 .presentations
-                .ids
+                .rank9
                 .writer_is_admitted(&pile.snapshot().unwrap(), reader.verifying_key())
                 .unwrap());
             let before = pile.snapshot().unwrap();
@@ -5021,22 +5243,16 @@ mod tests {
             save_presentations(&mut pile, &reader, [id(80)]).unwrap();
             let aliases = ReceiptSource::register(&mut pile, &reader).unwrap();
             assert_eq!(aliases.source, restarted.presentations.source);
-            assert_eq!(aliases.ids, restarted.presentations.ids);
+            assert_eq!(aliases.rank9, restarted.presentations.rank9);
             assert!(!observe_current_sources(&mut pile, &restarted)
                 .unwrap()
                 .facts
                 .presentations
-                .view()
                 .contains(id(80)));
             aliases.maintain(&mut pile, &reader).await.unwrap();
             let refreshed = observe_current_sources(&mut pile, &restarted).unwrap();
             assert_eq!(
-                refreshed
-                    .facts
-                    .presentations
-                    .view()
-                    .iter()
-                    .collect::<BTreeSet<_>>(),
+                refreshed.facts.presentations.presented_events(),
                 BTreeSet::from([event, id(80)]),
             );
             pile.close().unwrap();
@@ -5167,11 +5383,8 @@ mod tests {
                 .presentations
                 .observe(&pile.snapshot().unwrap())
                 .unwrap();
-            assert_eq!(
-                before.view().iter().collect::<BTreeSet<_>>(),
-                BTreeSet::from([prior_event]),
-            );
-            assert!(!before.view().contains(id(89)));
+            assert_eq!(before.presented_events(), BTreeSet::from([prior_event]),);
+            assert!(!before.contains(id(89)));
             assert!(!pile
                 .snapshot()
                 .unwrap()
@@ -5210,14 +5423,13 @@ mod tests {
             let snapshot = pile.snapshot().unwrap();
             let after = sources.presentations.observe(&snapshot).unwrap();
             assert_eq!(
-                after.view().iter().collect::<BTreeSet<_>>(),
+                after.presented_events(),
                 BTreeSet::from([prior_event, goal_id]),
             );
             assert!(observe_current_sources(&mut pile, &sources)
                 .unwrap()
                 .facts
                 .presentations
-                .view()
                 .contains(goal_id));
             assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
             assert!(snapshot.wants().unwrap().next().is_none());
@@ -5277,7 +5489,7 @@ mod tests {
             let observation = observe_current_sources(&mut copied, &sources).unwrap();
             let observed = &observation.facts.presentations;
             assert_eq!(
-                observed.view().iter().collect::<BTreeSet<_>>(),
+                observed.presented_events(),
                 BTreeSet::from([id(82), id(83)])
             );
             assert!(observation.snapshot.wants().unwrap().next().is_none());
@@ -5438,8 +5650,8 @@ mod tests {
                 assert!(fact.is_current(&advanced));
             }
             let refreshed = observe_snapshot(advanced, &sources).unwrap();
-            assert!(refreshed.facts.presentations.view().contains(id(87)));
-            assert!(observation.facts.presentations.view().is_empty());
+            assert!(refreshed.facts.presentations.contains(id(87)));
+            assert!(observation.facts.presentations.is_empty());
             assert!(refreshed.snapshot.wants().unwrap().next().is_none());
             assert!(pile.health().started_at.is_none());
             pile.close().unwrap();
@@ -5904,7 +6116,6 @@ mod tests {
             .presentations
             .observe(&pile.snapshot().unwrap())
             .unwrap()
-            .view()
             .is_empty());
         assert!(before
             .collection(sources.messages.rank9)
@@ -5924,7 +6135,6 @@ mod tests {
             .presentations
             .observe(&pile.snapshot().unwrap())
             .unwrap()
-            .view()
             .contains(event));
         assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
         pile.close().unwrap();
@@ -6447,7 +6657,11 @@ mod tests {
             };
             assert!(current.habits.due.contains_key(&probe_id));
             assert_eq!(current.habits.next_cooldown_at, None);
-            assert!(render_habits_due_at_arm(&current.habits).is_none());
+            // Due and unreceipted, so reported. Under the old rule this
+            // stayed silent because the intention was not addressed to this
+            // persona -- which is exactly how a shared intention that fell due
+            // unobserved was lost.
+            assert!(render_due_habits_unreceipted(&current.habits, &nothing_presented()).is_some());
 
             // A later selected frame has a missing body and a genuinely newer
             // Habit context. Its cooling row is absent from `current`, so a
@@ -6535,7 +6749,9 @@ mod tests {
             )
             .unwrap();
             assert!(!seen.due.contains_key(&probe_id));
-            assert!(render_habit_transitions(&current.habits, &seen).is_none());
+            assert!(
+                render_habit_transitions(&current.habits, &seen, &nothing_presented()).is_none()
+            );
             assert_eq!(fs::read(&evaluations).unwrap(), b"xxx");
             assert!(stored_presentations(&mut pile, &fixture.signer, persona).is_empty());
 
@@ -6562,7 +6778,7 @@ mod tests {
             };
             assert_eq!(ready.persona, persona);
             assert!(
-                render_habit_transitions(&seen, &ready.habits).is_none(),
+                render_habit_transitions(&seen, &ready.habits, &nothing_presented()).is_none(),
                 "Ready must not resurrect the Due result cached before the timer sweep"
             );
             assert_eq!(ready.habits, seen);
@@ -6925,7 +7141,7 @@ mod tests {
         view.insert(AttentionEvent::Message(first));
         view.insert(AttentionEvent::Mail(second));
 
-        let presented = EntityIdSet::try_from_blob(entity_id_set::encode([first])).unwrap();
+        let presented = presented([first]);
         assert_eq!(
             view.pending(&presented).ids().collect::<Vec<_>>(),
             vec![second]
@@ -7335,7 +7551,7 @@ mod tests {
         save_presentations(&mut pile, &fixture.signer, view.ids()).unwrap();
         let presented = stored_presentations(&mut pile, &fixture.signer, persona);
         assert_eq!(presented, BTreeSet::from([first, second]));
-        let projected = EntityIdSet::try_from_blob(entity_id_set::encode(presented)).unwrap();
+        let projected = super::tests::presented(presented);
         assert!(view.pending(&projected).is_empty());
         pile.close().unwrap();
     }
@@ -7344,7 +7560,7 @@ mod tests {
     fn becoming_relevant_late_does_not_retroactively_present_an_event() {
         let event = id(10);
         let initial = AttentionView::default();
-        let presented = EntityIdSet::try_from_blob(entity_id_set::encode(initial.ids())).unwrap();
+        let presented = presented(initial.ids());
 
         let mut later = AttentionView::default();
         later.insert(AttentionEvent::Note {

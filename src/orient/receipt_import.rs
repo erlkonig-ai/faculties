@@ -211,7 +211,7 @@ mod tests {
             );
             assert!(
                 after
-                    .collection(f.destination.ids)
+                    .collection(f.destination.rank9)
                     .unwrap()
                     .cover()
                     .is_empty(),

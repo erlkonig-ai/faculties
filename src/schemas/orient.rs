@@ -34,5 +34,26 @@ pub mod presentation {
         /// Stable identity of the presented source event.
         /// Minted with `trible genid` on 2026-09-02.
         "9676166D45A7EAE009DDB1B56C933526" as event: inlineencodings::GenId;
+
+        /// The standing intention whose due occurrence was presented.
+        ///
+        /// A habit due event has no record of its own to name, so a receipt
+        /// cites the intention and the instant its due began instead of a
+        /// derived identity. That is deliberate: an id you must COMPUTE in
+        /// order to look it up is a hash-join, and the only reason the older
+        /// membership set needed one was that a set of ids cannot answer any
+        /// other question. A queryable projection can, so the receipt carries
+        /// what the join actually needs.
+        ///
+        /// Minted with `trible genid` on 2026-09-18.
+        "B1103608112B9A8043DAE1B1C10EE26E" as habit: inlineencodings::GenId;
+
+        /// The instant that due occurrence began: the last completion plus the
+        /// cooldown. With `habit` it identifies ONE due event, so completing
+        /// the intention and coming due again is a different occurrence and is
+        /// presented again.
+        ///
+        /// Minted with `trible genid` on 2026-09-18.
+        "6C6D4F69E59F96DD55C996CDDEDE9598" as due_at: inlineencodings::NsTAIInterval;
     }
 }

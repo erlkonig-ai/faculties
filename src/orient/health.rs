@@ -97,15 +97,15 @@ impl HealthSources {
             let receipt_result: Result<()> = async {
                 if self
                     .presentations
-                    .ids
+                    .rank9
                     .writer_is_admitted(&snapshot, signer.verifying_key())
-                    .context("check Orient receipt membership WRITE admission")?
+                    .context("check Orient receipt projection WRITE admission")?
                 {
                     drop(
                         local
-                            .maintain(self.presentations.ids, signer)
+                            .maintain(self.presentations.rank9, signer)
                             .await
-                            .context("maintain Orient receipt membership set")?,
+                            .context("maintain Orient receipt projection")?,
                     );
                 }
                 Ok(())
@@ -709,7 +709,7 @@ mod tests {
             records,
             "health-first reads must not require WRITE on remote inputs",
         );
-        assert!(observed.presentations.view().is_empty());
+        assert!(observed.presentations.is_empty());
         assert!(observed.snapshot.wants().unwrap().next().is_none());
     }
 
@@ -765,7 +765,7 @@ mod tests {
             "foreground upkeep must not replace an earlier selected view"
         );
         assert!(
-            observed.presentations.view().is_empty(),
+            observed.presentations.is_empty(),
             "observing is not presenting"
         );
         assert!(observed.snapshot.wants().unwrap().next().is_none());
@@ -811,7 +811,7 @@ mod tests {
         let lagging = f.sources.at(before, clock::now().unwrap()).unwrap();
         assert!(events
             .iter()
-            .all(|event| !lagging.presentations.view().contains(*event)));
+            .all(|event| !lagging.presentations.contains(*event)));
         assert!(matches!(
             lagging.news(persona, &lagging.report()),
             News::Report { .. }
@@ -819,7 +819,7 @@ mod tests {
         let ready = f.sources.observe(&mut f.store, &reader_key).unwrap();
         assert!(events
             .iter()
-            .all(|event| ready.presentations.view().contains(*event)));
+            .all(|event| ready.presentations.contains(*event)));
         assert!(matches!(ready.news(persona, &ready.report()), News::Quiet));
         let mut parts = Vec::new();
         let mut emit = |part| {
@@ -872,7 +872,7 @@ mod tests {
         let raw_receipts = before.collection(receipts).unwrap().cover().clone();
         let failure = {
             let mut local = f.store.store();
-            pollster::block_on(local.maintain(f.sources.presentations.ids, &f.signer))
+            pollster::block_on(local.maintain(f.sources.presentations.rank9, &f.signer))
                 .err()
                 .expect("resident malformed admitted receipt must actually fail upkeep")
         };
@@ -882,7 +882,7 @@ mod tests {
         // optional private presentation projection could not catch up.
         let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
         assert!(!observed.report().attention.is_empty());
-        assert!(observed.presentations.view().is_empty());
+        assert!(observed.presentations.is_empty());
         let mut text = String::new();
         let mut emit = |part| {
             let crate::out::Part::Text { text: part } = part else {
@@ -1398,7 +1398,8 @@ mod tests {
         {
             let mut local = f.store.store();
             drop(
-                pollster::block_on(local.maintain(f.sources.presentations.ids, &f.signer)).unwrap(),
+                pollster::block_on(local.maintain(f.sources.presentations.rank9, &f.signer))
+                    .unwrap(),
             );
         }
         let caught_up = f.store.snapshot().unwrap();
@@ -1413,7 +1414,7 @@ mod tests {
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(events
             .iter()
-            .all(|event| observed.presentations.view().contains(*event)));
+            .all(|event| observed.presentations.contains(*event)));
         assert!(matches!(
             observed.news(persona, &observed.report()),
             News::Quiet
