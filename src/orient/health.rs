@@ -103,9 +103,15 @@ impl HealthSources {
                 {
                     drop(
                         local
+                            .maintain(self.presentations.succinct, signer)
+                            .await
+                            .context("maintain Orient receipt Succinct collection")?,
+                    );
+                    drop(
+                        local
                             .maintain(self.presentations.rank9, signer)
                             .await
-                            .context("maintain Orient receipt projection")?,
+                            .context("maintain Orient receipt Rank9 collection")?,
                     );
                 }
                 Ok(())
@@ -872,7 +878,10 @@ mod tests {
         let raw_receipts = before.collection(receipts).unwrap().cover().clone();
         let failure = {
             let mut local = f.store.store();
-            pollster::block_on(local.maintain(f.sources.presentations.rank9, &f.signer))
+            // The malformed member is in the SOURCE, so the hop that reads the
+            // source is where it surfaces. Maintaining the Rank9 tip alone
+            // would derive from the Succinct intermediate and never look.
+            pollster::block_on(local.maintain(f.sources.presentations.succinct, &f.signer))
                 .err()
                 .expect("resident malformed admitted receipt must actually fail upkeep")
         };
@@ -1397,6 +1406,13 @@ mod tests {
 
         {
             let mut local = f.store.store();
+            // Both hops, as the live upkeep does: maintaining only the Rank9
+            // tip derives it from a Succinct that has not caught up, so the
+            // projection does not advance and nothing is refreshed.
+            drop(
+                pollster::block_on(local.maintain(f.sources.presentations.succinct, &f.signer))
+                    .unwrap(),
+            );
             drop(
                 pollster::block_on(local.maintain(f.sources.presentations.rank9, &f.signer))
                     .unwrap(),

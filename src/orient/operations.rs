@@ -751,10 +751,17 @@ impl ReceiptSource {
         if !admitted {
             return Ok(());
         }
+        // Both hops, in order: the Rank9 derives from the Succinct, so
+        // refreshing only the tip leaves it reading a stale intermediate.
+        drop(
+            pile.maintain(self.succinct, signer)
+                .await
+                .context("maintain Orient receipt Succinct collection")?,
+        );
         drop(
             pile.maintain(self.rank9, signer)
                 .await
-                .context("maintain Orient receipt projection")?,
+                .context("maintain Orient receipt Rank9 collection")?,
         );
         Ok(())
     }
@@ -6358,8 +6365,10 @@ mod tests {
         // No fixture upkeep or daemon: the command must carry these raw
         // Relations and Habit writes before it can decide what is due.
 
-        // Both fell due before the watcher armed. The clock addressed to this
-        // persona is reported at once; the shared intention is a quiet baseline.
+        // Both fell due before the watcher armed, and BOTH are reported: no
+        // watcher observed either transition, so leaving the shared one to
+        // "whoever saw it" leaves it to nobody. Reporting is what writes the
+        // receipt, which is what makes the rearm below quiet.
         let armed = run_wait_for(
             &mut pile,
             &fixture,
@@ -6371,9 +6380,12 @@ mod tests {
             armed.contains("News: habit became due: cc-clock"),
             "{armed}"
         );
-        assert!(!armed.contains("shared-clock"), "{armed}");
+        assert!(armed.contains("shared-clock"), "{armed}");
 
-        // Completed now: the rearmed watcher is quiet until the next due.
+        // Completed now. The rearmed watcher is quiet about BOTH: the owned
+        // clock because completion ended its occurrence, the shared one
+        // because the first report receipted it. Neither needs a baseline
+        // held in this process to stay quiet.
         let (fresh, _) = habits::completion_fragment(owned_id, clock::point(now).unwrap()).unwrap();
         pile.commit(habit_source, &fixture.signer, fresh).unwrap();
         let rearmed = run_wait_for(
@@ -6514,7 +6526,7 @@ mod tests {
         let (owned_done, _) = habits::completion_fragment(owned_id, done).unwrap();
         // A shared script intention counts its evaluations: once at the first
         // preparation and once per timer sweep, never per cancelled retry.
-        let (probe, _) = habits::habit_fragment(
+        let (probe, probe_id) = habits::habit_fragment(
             "evaluation-probe",
             "when printf x >> evaluation-probe-invocations",
             "probe",
@@ -6529,6 +6541,24 @@ mod tests {
             owned + owned_done + probe,
         )
         .unwrap();
+
+        // The probe is due the moment the watcher arms, and the clock is not
+        // (it falls due about three seconds in). Receipt the probe's
+        // occurrence first, so this test measures what it is named for: the
+        // owned clock getting its turn while a body fetch stalls, rather than
+        // a one-shot wait returning on the first thing that happens to be
+        // reportable. An intention never completed has `since` 0.
+        let seen_probe = orient_model::habit_receipt_fragment(
+            [(
+                probe_id,
+                clock::point(Epoch::from_tai_seconds(0.0)).unwrap(),
+            )],
+            clock::point_now().unwrap(),
+        );
+        let receipts = ReceiptSource::register(&mut pile, &fixture.signer)
+            .unwrap()
+            .source;
+        pile.commit(receipts, &fixture.signer, seen_probe).unwrap();
         pollster::block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
 
         let started = Instant::now();
@@ -6551,6 +6581,8 @@ mod tests {
             started.elapsed() < Duration::from_secs(8),
             "the clock must not wait for the stalled fetch budget"
         );
+        // Receipted before the wait, so it stays quiet -- which is the whole
+        // contract: being SHOWN silences an occurrence, not being unowned.
         assert!(!text.contains("evaluation-probe"), "{text}");
         let evaluations = fs::read(fixture.dir.join("evaluation-probe-invocations"))
             .unwrap()
@@ -6559,8 +6591,32 @@ mod tests {
             evaluations <= 2,
             "condition scripts reran under cancelled body retries: {evaluations} evaluations"
         );
+        // A habit-only report still acknowledges NO NEWS -- it must never
+        // receipt a message body the reader did not see. That invariant is
+        // preserved by shape, not by abstinence: a habit receipt carries
+        // `habit`+`due_at` and no `event`, so it cannot be mistaken for one.
         assert!(stored_presentations(&mut pile, &fixture.signer, cc).is_empty());
+        assert!(
+            !stored_habit_presentations(&mut pile, &fixture.signer).is_empty(),
+            "the report receipted the occurrences it displayed"
+        );
         pile.close().unwrap();
+    }
+
+    /// Habit due occurrences this signer holds receipts for, as `(habit, due)`.
+    fn stored_habit_presentations(pile: &mut FacultyStore, signer: &SigningKey) -> BTreeSet<Id> {
+        let collection = ReceiptSource::register(pile, signer).unwrap().source;
+        let snapshot = pile.snapshot().unwrap();
+        let facts = snapshot
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap();
+        find!(
+            habit: Id,
+            pattern!(&facts, [{ _?receipt @ presentation::habit: ?habit }])
+        )
+        .collect()
     }
 
     #[test]
