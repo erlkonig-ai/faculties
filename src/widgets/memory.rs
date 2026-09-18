@@ -28,7 +28,7 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use hifitime::Epoch;
 
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use crate::memory::{self};
 use crate::memory_cover::{chunk_about_archive_message, chunk_about_exec_result, chunk_references};
@@ -64,16 +64,6 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
 
 fn chunk_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
-}
-
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row struct ───────────────────────────────────────────────────────
@@ -366,7 +356,7 @@ fn render_chunk_card(ui: &mut egui::Ui, chunk: &ChunkRow) {
     let accent = chunk_color(chunk.id);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_text = colorhash::text_color_on(bubble_fill);
-    let body_muted = mix(body_text, bubble_fill, 0.22);
+    let body_muted = blend(body_text, bubble_fill, 0.22);
 
     egui::Frame::NONE
         .fill(bubble_fill)

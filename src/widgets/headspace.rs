@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use crate::headspace::{self, ConfigValue, ProfileValue, Resolution};
 use triblespace::core::id::Id;
@@ -46,16 +46,6 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
 
 fn profile_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
-}
-
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row structs ──────────────────────────────────────────────────────
@@ -376,7 +366,7 @@ fn render_active_card(ui: &mut egui::Ui, p: &ModelProfile, persona_id: Option<Id
     let accent = profile_color(p.id);
     let text_on_accent = colorhash::text_color_on(accent);
     let body_text = colorhash::text_color_on(bubble_fill);
-    let body_muted = mix(body_text, bubble_fill, 0.22);
+    let body_muted = blend(body_text, bubble_fill, 0.22);
 
     egui::Frame::NONE
         .fill(bubble_fill)
@@ -575,7 +565,7 @@ fn render_token_budget(
     painter.rect_filled(
         out_rect,
         egui::CornerRadius::ZERO,
-        mix(accent, body_text, 0.55),
+        blend(accent, body_text, 0.55),
     );
 
     // Safety segment (the right edge — the do-not-cross buffer).
@@ -586,7 +576,7 @@ fn render_token_budget(
     painter.rect_filled(
         safety_rect,
         egui::CornerRadius::ZERO,
-        mix(body_text, frame, 0.40),
+        blend(body_text, frame, 0.40),
     );
 }
 
@@ -596,7 +586,7 @@ fn render_other_profile_card(ui: &mut egui::Ui, p: &ModelProfile) {
     let bubble_fill = ui.visuals().window_fill;
     let accent = profile_color(p.id);
     let body_text = colorhash::text_color_on(bubble_fill);
-    let body_muted = mix(body_text, bubble_fill, 0.30);
+    let body_muted = blend(body_text, bubble_fill, 0.30);
 
     egui::Frame::NONE
         .fill(bubble_fill)

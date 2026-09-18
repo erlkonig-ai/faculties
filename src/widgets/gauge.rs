@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use triblespace::core::metadata;
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
@@ -38,16 +38,6 @@ fn color_frame(ui: &egui::Ui) -> egui::Color32 {
     } else {
         egui::Color32::from_rgb(0xec, 0xec, 0xec)
     }
-}
-
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Tag taxonomy ─────────────────────────────────────────────────────
@@ -257,7 +247,7 @@ fn render_summary_line(ui: &mut egui::Ui, live: &GaugeLive) {
 fn render_dashboard_card(ui: &mut egui::Ui, live: &GaugeLive) {
     let bubble_fill = ui.visuals().window_fill;
     let body_text = colorhash::text_color_on(bubble_fill);
-    let body_muted = mix(body_text, bubble_fill, 0.30);
+    let body_muted = blend(body_text, bubble_fill, 0.30);
 
     egui::Frame::NONE
         .fill(bubble_fill)

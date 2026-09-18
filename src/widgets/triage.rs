@@ -23,7 +23,7 @@
 //! ```
 
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use crate::storage::FactArchive;
 use crate::triage::{
@@ -78,16 +78,6 @@ fn color_reason() -> egui::Color32 {
 /// RAL 3020 traffic red — error / non-zero exit.
 fn color_error() -> egui::Color32 {
     egui::Color32::from_rgb(0xcc, 0x0a, 0x17)
-}
-
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Data ─────────────────────────────────────────────────────────────
@@ -602,7 +592,7 @@ fn render_suggestions_card(ui: &mut egui::Ui, suggestions: &[String]) {
 fn render_queues_card(ui: &mut egui::Ui, live: &TriageLive) {
     let bubble_fill = ui.visuals().window_fill;
     let body_text = colorhash::text_color_on(bubble_fill);
-    let body_muted = mix(body_text, bubble_fill, 0.30);
+    let body_muted = blend(body_text, bubble_fill, 0.30);
 
     egui::Frame::NONE
         .fill(bubble_fill)
@@ -856,7 +846,7 @@ fn render_event_card(ui: &mut egui::Ui, ev: &EventRow, now: Option<i128>) {
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);
-        mix(body_text, bubble_fill, 0.22)
+        blend(body_text, bubble_fill, 0.22)
     };
 
     egui::Frame::NONE

@@ -35,7 +35,7 @@ use chrono::{
 use hifitime::Epoch;
 
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use crate::planner as planner_model;
 use crate::relations::{self, Head, ProfileInput, ProfileView};
@@ -81,20 +81,6 @@ fn color_today() -> egui::Color32 {
 
 fn person_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
-}
-
-/// Blend `a` toward `b` by `t` (0 = pure `a`, 1 = pure `b`). Used for
-/// the body's muted-text colour: `mix(text, bg, 0.45)` lands roughly
-/// halfway, giving a softer reading hierarchy without going invisible
-/// against either dark or light backgrounds.
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Time helpers ─────────────────────────────────────────────────────
@@ -1001,7 +987,7 @@ fn render_event_card(ui: &mut egui::Ui, event: &EventRow, live: &PlannerLive) {
                 // Subtle hierarchy: ~25% bg mixed into text keeps
                 // meta rows quieter than the primary text without
                 // collapsing contrast against the body fill.
-                let body_muted = mix(body_text, bubble_fill, 0.22);
+                let body_muted = blend(body_text, bubble_fill, 0.22);
                 egui::Frame::NONE
                     .fill(bubble_fill)
                     .corner_radius(egui::CornerRadius::ZERO)

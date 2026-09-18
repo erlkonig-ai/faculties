@@ -13,7 +13,7 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use hifitime::{Duration as HifiDuration, Epoch};
 
 use GORBIE::prelude::CardCtx;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{blend, colorhash};
 
 use triblespace::core::id::Id;
 
@@ -49,16 +49,6 @@ fn channel_color(id: Id) -> egui::Color32 {
 
 fn author_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
-}
-
-fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| {
-        ((x as f32) * (1.0 - t) + (y as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 // ── Row structs ──────────────────────────────────────────────────────
@@ -423,7 +413,7 @@ fn render_message_card(
     let text_on_accent = colorhash::text_color_on(accent);
     let body_muted = {
         let body_text = colorhash::text_color_on(bubble_fill);
-        mix(body_text, bubble_fill, 0.22)
+        blend(body_text, bubble_fill, 0.22)
     };
 
     egui::Frame::NONE
