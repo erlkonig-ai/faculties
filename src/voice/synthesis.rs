@@ -1,6 +1,6 @@
 //! One streaming Qwen3-TTS source, drained either into resident audio or a host sink.
 use anybytes::Bytes;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "voice")]
 use std::sync::{Arc, Mutex};
