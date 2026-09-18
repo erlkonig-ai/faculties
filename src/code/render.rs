@@ -236,8 +236,11 @@ pub fn duplicates(report: &DuplicateReport, out: &mut Out<'_>) -> Result<()> {
     }
     out.line("")?;
     out.line(
-        "these are EXACT duplicates: one item, several placements. Near-duplicates are out of \
-scope — an exact match is what content addressing can see, and nothing here approximates.",
+        "these are EXACT duplicates: one item, several placements. Exact means the normalized \
+token stream, and under rust-syn-v1 that stream carries `///` doc comments — so two identical \
+bodies are two items when only one of them is documented, and this count is a FLOOR. \
+Near-duplicates are out of scope: an exact match is what content addressing can see, and nothing \
+here approximates.",
     )?;
     provenance(&report.provenance, out)
 }

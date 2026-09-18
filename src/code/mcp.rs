@@ -57,7 +57,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "code_dup",
-        description: "Code that exists in more than one place, as a self-join on the placement relation. These are EXACT duplicates; near-duplicates are out of scope.",
+        description: "Code that exists in more than one place, as a self-join on the placement relation. These are EXACT duplicates; near-duplicates are out of scope. Exactness is the normalized token stream, which under rust-syn-v1 includes `///` doc comments, so two identical bodies are separate items when only one is documented and the reported count is a floor.",
         input_schema: r#"{"type":"object","properties":{"min_lines":{"type":"integer","description":"Ignore duplicates shorter than this many lines."},"cross_repo":{"type":"boolean","description":"Only duplication that crosses a repository boundary."},"repo":{"type":"string"},"at":{"type":"string"}},"additionalProperties":false}"#,
     },
     Tool {
