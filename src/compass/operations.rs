@@ -1391,7 +1391,7 @@ mod tests {
         let name = triblespace::core::collection::descriptor::name(&descriptor)
             .unwrap()
             .unwrap();
-        let mut store = AcquiringPile::new(remote.blobs);
+        let mut store = AcquiringPile::new(remote.into_inner().blobs);
         let before = store.snapshot().unwrap();
 
         let opened = pollster::block_on(storage::read(&mut store, &before, |reader| {

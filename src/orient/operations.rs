@@ -6918,11 +6918,13 @@ mod tests {
             ),
         )
         .unwrap();
-        // A shared script intention that is due at arm and no longer due two
+        // A shared script intention that is due at arm and no longer due ten
         // seconds later. Due-ness is decided by receipt: the first watcher
         // presents it once, while the message body is still pending, and
         // receipts it; the rearmed watcher stays quiet about it and waits for
-        // the body.
+        // the body. Ten seconds, not two: the first read of an arm is budgeted
+        // one poll interval and a loaded machine cuts it, so the window in
+        // which the habits are first evaluated must hold many attempts.
         let marker = fixture.dir.join("due-marker");
         fs::write(&marker, b"").unwrap();
         let (probe, _) =
@@ -6938,9 +6940,9 @@ mod tests {
 
         let path = fixture.path.clone();
         let deliverer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_secs(10));
             fs::remove_file(&marker).unwrap();
-            std::thread::sleep(Duration::from_secs(64));
+            std::thread::sleep(Duration::from_secs(50));
             let mut second = open_store(&path).unwrap();
             second
                 .put::<blobencodings::UTF8String, _>("arrives after the sweep".to_owned())
