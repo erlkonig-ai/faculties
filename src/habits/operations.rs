@@ -277,8 +277,48 @@ struct HabitSession<'a> {
 
 impl HabitSession<'_> {
     fn commit(&mut self, fragment: Fragment) -> Result<CollectionCommit> {
+        require_command_write_authority(self.pile, self.collection, self.signer)?;
         commit_habit_fragment(self.pile, self.collection, self.signer, fragment)
     }
+}
+
+/// Refuse a command whose record would be published but never admitted.
+///
+/// Publication itself stays unconditional — [`commit_habit_fragment`] keeps
+/// that property, because an offline COMMIT can be activated later by evidence
+/// that has not arrived yet. What must not stay silent is the *command*. A
+/// `habit done` whose COMMIT is never admitted prints a completion id and
+/// changes nothing a reader can see: the maintained projection every read goes
+/// through only ever carries admitted support, so the intention keeps coming
+/// due, `habit list` keeps reporting the last admitted completion, and nothing
+/// anywhere says why. This module already states the principle for a missing
+/// script blob — a standing intention that quietly stops firing is worse than
+/// one that refuses outright, because nobody notices the first — and an
+/// unadmitted writer is the same failure with the same cure. Mirrors the
+/// identical guard Compass applies before publishing.
+fn require_command_write_authority(
+    pile: &mut Pile,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<()> {
+    let snapshot = pile
+        .snapshot()
+        .context("freeze Habit publication authority")?;
+    let admitted = collection
+        .writer_is_admitted(&snapshot, signer.verifying_key())
+        .context("check Habit collection WRITE admission")?;
+    drop(snapshot);
+    if !admitted {
+        bail!(
+            "key {} is not admitted to write Habit collection {}. The record would be published \
+             as a raw ledger entry that never enters an admitted snapshot, so no reader — \
+             `habit list` included — would ever see it. Grant that key WRITE on the collection, \
+             or run with an admitted key.",
+            hex::encode_upper(signer.verifying_key().to_bytes()),
+            hex::encode_upper(collection.handle().raw),
+        );
+    }
+    Ok(())
 }
 
 /// Publish the fragment; derived query views advance when a reader prepares
@@ -506,6 +546,41 @@ mod tests {
             unseen
         );
         assert!(resolve_predecessor(&definitions, "a5a5").is_err());
+    }
+
+    #[test]
+    fn a_command_refuses_a_write_no_reader_would_ever_see() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("habit.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let owner = SigningKey::from_bytes(&[61; 32]);
+        let outsider = SigningKey::from_bytes(&[62; 32]);
+        let source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+
+        require_command_write_authority(&mut pile, source, &owner).unwrap();
+
+        let error = require_command_write_authority(&mut pile, source, &outsider).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not admitted to write"), "{error:#}");
+        assert!(
+            message.contains(&hex::encode_upper(outsider.verifying_key().to_bytes())),
+            "the refusal names the key that has to be granted WRITE: {error:#}"
+        );
+        assert!(
+            message.contains(&hex::encode_upper(source.handle().raw)),
+            "the refusal names the collection to grant it on: {error:#}"
+        );
+
+        // The library publication path is deliberately untouched: an offline
+        // COMMIT stays available for later activation.
+        let (fragment, _) =
+            habits::habit_fragment("raw outsider habit", "every 1h", "observe", None, &[], &[])
+                .unwrap();
+        commit_habit_fragment(&mut pile, source, &outsider, fragment).unwrap();
+        pile.close().unwrap();
     }
 
     #[test]
