@@ -361,6 +361,13 @@ impl RelationsStorage<'_> {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
+                crate::collection_names::require_command_write_admission(
+                    pile,
+                    collection,
+                    signer,
+                    "Relations",
+                    "relations list",
+                )?;
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
             }

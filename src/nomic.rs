@@ -692,6 +692,13 @@ pub fn golden_publish(
     drop(snapshot);
     let (fragment, recorded) = report.unrecorded_observations();
     if !recorded.is_empty() {
+        crate::collection_names::require_command_write_admission(
+            store,
+            collection,
+            signer,
+            "golden-report model",
+            "files golden",
+        )?;
         store
             .commit(collection, signer, fragment)
             .context("record golden observations referring to the model roots")?;

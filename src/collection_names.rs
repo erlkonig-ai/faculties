@@ -210,6 +210,57 @@ where
 /// WRITE admission. This is the appropriate boundary for consumers of a
 /// shared collection which never publish to it. Admission uses the descriptor
 /// and proof evidence in the supplied frozen snapshot.
+/// Refuse a COMMAND whose record would be published but never admitted.
+///
+/// [`open_configured`] says why publication itself stays unconditional, and
+/// that stays true: a library may publish an offline COMMIT that later
+/// evidence activates. What must not stay silent is a command a person typed.
+/// An unadmitted COMMIT is appended and then invisible — every read goes
+/// through a maintained projection that carries admitted support only — so the
+/// command prints an id, exits zero, and changes nothing anyone can observe.
+/// That is how a wrong signing key ran for eight hours without a single
+/// symptom.
+///
+/// On the ordinary path this can never fire: the descriptor's WRITE authority
+/// IS the signer's own key, so admission is self-satisfied. It exists for the
+/// override path, where `TRIBLESPACE_COLLECTION_<FACULTY>` names an exact
+/// descriptor whose authority may be somebody else's key — which is precisely
+/// the configuration that produced the incident.
+///
+/// `faculty` names the collection in the message and `reader_hint` names a
+/// command whose output would silently not change, because "your write went
+/// nowhere" is only actionable if the reader knows where to look.
+pub fn require_command_write_admission<S>(
+    store: &mut S,
+    collection: Collection<SimpleArchive>,
+    signer: &ed25519_dalek::SigningKey,
+    faculty: &str,
+    reader_hint: &str,
+) -> anyhow::Result<()>
+where
+    S: SnapshotSource,
+    S::Snapshot: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+{
+    let snapshot = store
+        .snapshot()
+        .map_err(|error| anyhow!("freeze {faculty} publication authority: {error}"))?;
+    let admitted = collection
+        .writer_is_admitted(&snapshot, signer.verifying_key())
+        .map_err(|error| anyhow!("check {faculty} collection WRITE admission: {error}"))?;
+    drop(snapshot);
+    if !admitted {
+        bail!(
+            "key {} is not admitted to write the {faculty} collection {}. The record would be \
+             appended as a raw ledger entry that never enters an admitted snapshot, so no \
+             reader — `{reader_hint}` included — would ever see it. Grant that key WRITE on the \
+             collection, or run with an admitted key.",
+            hex::encode_upper(signer.verifying_key().to_bytes()),
+            hex::encode_upper(collection.handle().raw),
+        );
+    }
+    Ok(())
+}
+
 pub fn open_configured_read<S>(
     storage: &mut S,
     scope: Id,

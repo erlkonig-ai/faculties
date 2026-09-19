@@ -635,6 +635,13 @@ impl TeamsSession {
         fragment.describe_with(entity! { metadata::description: description });
         let storage = self.storage.clone();
         storage.with_pile(|pile, _| {
+            crate::collection_names::require_command_write_admission(
+                pile,
+                self.collection,
+                &self.signer,
+                "Teams",
+                "teams read",
+            )?;
             let commit = pile
                 .commit(self.collection, &self.signer, fragment)
                 .context("commit Teams fragment")?;

@@ -200,6 +200,13 @@ impl VoiceSession<'_> {
     ) -> Result<CollectionCommit> {
         voice_model::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: description });
+        crate::collection_names::require_command_write_admission(
+            self.pile,
+            self.collection,
+            self.signer,
+            "Voice",
+            "voice route show",
+        )?;
         let commit = self
             .pile
             .commit(self.collection, self.signer, fragment)

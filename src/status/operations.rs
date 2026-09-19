@@ -306,6 +306,13 @@ fn commit_status(
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    crate::collection_names::require_command_write_admission(
+        pile,
+        collection,
+        signer,
+        "Status",
+        "status list",
+    )?;
     let commit = pile
         .commit(collection, signer, fragment)
         .context("commit authored Status event")?;

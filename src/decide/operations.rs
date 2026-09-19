@@ -386,6 +386,13 @@ impl DecideStorage<'_> {
         self.with_store(|pile, collection, signer, view| {
             let (mut fragment, value) = operation(view)?;
             fragment.describe_with(entity! { metadata::description: description });
+            crate::collection_names::require_command_write_admission(
+                pile,
+                collection,
+                signer,
+                "Decide",
+                "decide show",
+            )?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
             Ok(value)

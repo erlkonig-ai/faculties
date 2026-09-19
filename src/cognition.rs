@@ -148,6 +148,13 @@ pub fn publish_events_with_storage(
     }
     storage.with_pile(|pile, signer| {
         let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        crate::collection_names::require_command_write_admission(
+            pile,
+            collection,
+            signer,
+            "Cognition",
+            "reason",
+        )?;
         let mut commits = Vec::with_capacity(fragments.len());
         for fragment in fragments {
             let commit = pile

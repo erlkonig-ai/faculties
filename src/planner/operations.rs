@@ -354,6 +354,13 @@ impl PlannerStorage<'_> {
             let (fragment, value) = operation(loaded)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
+                crate::collection_names::require_command_write_admission(
+                    pile,
+                    collection,
+                    signer,
+                    "Planner",
+                    "planner list",
+                )?;
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
             }

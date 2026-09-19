@@ -155,6 +155,13 @@ impl<P: BorrowMut<Pile>> CodeImportWriter<P> {
         }
         let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
         let published = fragment.facts().clone();
+        crate::collection_names::require_command_write_admission(
+            &mut *self.pile.borrow_mut(),
+            self.collection,
+            &self.signer,
+            "Code",
+            "code find",
+        )?;
         let commit = self
             .pile
             .borrow_mut()

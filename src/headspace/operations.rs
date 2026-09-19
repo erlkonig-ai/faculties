@@ -261,6 +261,13 @@ impl Storage {
         self.storage.with_pile(|pile, _| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
             let collection = open_configured(pile, scope, self.signer.verifying_key())?;
+            crate::collection_names::require_command_write_admission(
+                pile,
+                collection,
+                &self.signer,
+                "Headspace",
+                "headspace show",
+            )?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             Ok(())
