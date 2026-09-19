@@ -1004,29 +1004,21 @@ mod tests {
         let target_merge = CollectionMerge::sign(
             &signer,
             target,
-            (target_commit.data(), target_commit.fingerprint()),
-            (target_commit.data(), target_commit.fingerprint()),
+            target_commit.data(),
+            target_commit.data(),
             Inline::new([5; 32]),
         );
         let other_merge = CollectionMerge::sign(
             &signer,
             other,
-            (other_commit.data(), other_commit.fingerprint()),
-            (other_commit.data(), other_commit.fingerprint()),
+            other_commit.data(),
+            other_commit.data(),
             Inline::new([8; 32]),
         );
-        let derive_to_target = CollectionDerive::sign(
-            &signer,
-            target,
-            (other_commit.data(), other_commit.fingerprint()),
-            Inline::new([10; 32]),
-        );
-        let derive_from_target = CollectionDerive::sign(
-            &signer,
-            other,
-            (target_commit.data(), target_commit.fingerprint()),
-            Inline::new([12; 32]),
-        );
+        let derive_to_target =
+            CollectionDerive::sign(&signer, target, other_commit.data(), Inline::new([10; 32]));
+        let derive_from_target =
+            CollectionDerive::sign(&signer, other, target_commit.data(), Inline::new([12; 32]));
 
         for record in [
             CollectionRecord::Commit(target_commit),
@@ -1128,8 +1120,8 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &owner,
                 collection.handle(),
-                (commits[0].data(), commits[0].fingerprint()),
-                (commits[1].data(), commits[1].fingerprint()),
+                commits[0].data(),
+                commits[1].data(),
                 Handle::<SimpleArchive>::to_hash(joined),
             )))
             .unwrap();

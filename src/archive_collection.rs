@@ -1767,8 +1767,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &signer,
             source.handle(),
-            (block_commit.data(), block_commit.fingerprint()),
-            (remainder_commit.data(), remainder_commit.fingerprint()),
+            block_commit.data(),
+            remainder_commit.data(),
             union_data,
         );
         CollectionStore::insert(&mut pile, CollectionRecord::Merge(merge)).unwrap();
@@ -1778,12 +1778,7 @@ mod tests {
         let output = archive_bm25::derive_element(&reader, union.clone()).unwrap();
         let input_data = Handle::<SimpleArchive>::to_hash(union.get_handle());
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let derive = CollectionDerive::sign(
-            &signer,
-            target.handle(),
-            (input_data, merge.fingerprint()),
-            output_data,
-        );
+        let derive = CollectionDerive::sign(&signer, target.handle(), input_data, output_data);
         drop(reader);
         pile.put::<PortableBM25Blob, _>(output).unwrap();
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
@@ -2006,12 +2001,7 @@ mod tests {
             .unwrap();
         let output = archive_bm25::derive_element(&store_snapshot, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let pending = CollectionDerive::sign(
-            &signer,
-            target.handle(),
-            (commit.data(), commit.fingerprint()),
-            output_data,
-        );
+        let pending = CollectionDerive::sign(&signer, target.handle(), commit.data(), output_data);
         drop(output);
         drop(store_snapshot);
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
