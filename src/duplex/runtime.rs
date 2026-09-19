@@ -1264,6 +1264,13 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let result = (|| -> Result<()> {
         crate::voice::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: "duplex spoke" });
+        crate::collection_names::require_command_write_admission(
+            &mut pile,
+            collection,
+            &signer,
+            "Duplex",
+            "voice route show",
+        )?;
         pile.commit(collection, &signer, fragment)
             .context("commit the utterance")?;
         Ok(())
