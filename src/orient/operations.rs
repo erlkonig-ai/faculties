@@ -257,6 +257,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 #[cfg(test)]
+use triblespace::core::collection::observed_store::{DependencyTracker, ObservedStore};
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
     Collection, CollectionEncoding, CollectionRealizationError, CollectionSnapshot,
@@ -912,6 +913,13 @@ struct OrientObservation {
     /// Exact acquisition may advance its blob residency without
     /// changing any selected fact view, support, or authorization boundary.
     snapshot: FacultySnapshot,
+    /// Every payload this observation renders -- message bodies, titles,
+    /// subjects, habit scripts -- consulted through a reader that records the
+    /// handle, present or not. A payload that lands after the envelope is then
+    /// an arrival this observation depends on, and the sweep refreshes it.
+    /// Read through the raw snapshot instead and it never would: the fact
+    /// views only ever depend on records in their own lineage.
+    payloads: DependencyTracker,
     facts: OrientFacts,
     compass_status: LwwQuery,
     compass_status_collection: CollectionSnapshot<FacultySnapshot, LwwRegisterBlob>,
@@ -936,6 +944,14 @@ impl OrientObservation {
                 .is_none_or(|fact| fact.is_current(snapshot))
             && self.facts.presentations.is_current(snapshot)
             && self.compass_status_collection.is_current(snapshot)
+            && StoreSnapshot::changes_for(
+                snapshot,
+                &self.snapshot,
+                &self
+                    .payloads
+                    .lock()
+                    .expect("payload read-set is not poisoned"),
+            ) == StoreChanges::NONE
     }
 
     fn query<'a>(&'a self, snapshot: &'a FacultySnapshot) -> OrientQuery<'a> {
@@ -949,7 +965,10 @@ impl OrientObservation {
             habits: self.facts.habits.as_ref().map(OrientFact::view),
             presentations: self.facts.presentations.view(),
             compass_status: &self.compass_status,
-            snapshot,
+            payloads: ObservedStore::with_tracker(
+                snapshot.clone(),
+                std::sync::Arc::clone(&self.payloads),
+            ),
         }
     }
 }
@@ -1033,6 +1052,7 @@ fn observe_sources(
         .map_err(|error| anyhow!("prepare Compass status register query: {error}"))?;
     Ok(OrientObservation {
         snapshot,
+        payloads: DependencyTracker::default(),
         facts: OrientFacts {
             messages,
             mail,
@@ -1085,7 +1105,9 @@ struct OrientQuery<'a> {
     habits: Option<&'a FactArchive>,
     presentations: &'a FactArchive,
     compass_status: &'a LwwQuery,
-    snapshot: &'a FacultySnapshot,
+    /// The reader every payload is read through: the current snapshot, with
+    /// each consultation charged to the observation's read-set.
+    payloads: ObservedStore<FacultySnapshot>,
 }
 
 fn is_payload_pending(error: &anyhow::Error) -> bool {
@@ -1109,36 +1131,36 @@ fn is_preparation_pending(error: &anyhow::Error) -> bool {
     })
 }
 
-fn read_utf8(
-    snapshot: &FacultySnapshot,
+fn read_utf8<R: BlobStoreList + BlobStoreGet>(
+    reader: &R,
     handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
     label: &str,
 ) -> Result<String> {
     let unknown = Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(handle.raw);
-    if !snapshot
+    if !reader
         .contains_blob(unknown)
         .map_err(|error| anyhow!("inspect {label} residency: {error}"))?
     {
         return Err(MissingBlob { handle: unknown }.into());
     }
-    let value: View<str> = BlobStoreGet::get(snapshot, handle)
+    let value: View<str> = BlobStoreGet::get(reader, handle)
         .with_context(|| format!("read {label} payload {}", hex::encode(handle.raw)))?;
     Ok(value.to_string())
 }
 
-fn read_bytes(
-    snapshot: &FacultySnapshot,
+fn read_bytes<R: BlobStoreList + BlobStoreGet>(
+    reader: &R,
     handle: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
     label: &str,
 ) -> Result<Vec<u8>> {
     let unknown = Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(handle.raw);
-    if !snapshot
+    if !reader
         .contains_blob(unknown)
         .map_err(|error| anyhow!("inspect {label} residency: {error}"))?
     {
         return Err(MissingBlob { handle: unknown }.into());
     }
-    let value: Bytes = BlobStoreGet::get(snapshot, handle)
+    let value: Bytes = BlobStoreGet::get(reader, handle)
         .with_context(|| format!("read {label} payload {}", hex::encode(handle.raw)))?;
     Ok(value.to_vec())
 }
@@ -1478,7 +1500,7 @@ fn native_task_title(query: &OrientQuery<'_>, task: Id) -> Result<String> {
         pattern!(query.compass, [{ task @ board::title: ?handle }])
     )
     .next()
-    .map(|handle| read_utf8(query.snapshot, handle, "Compass title"))
+    .map(|handle| read_utf8(&query.payloads, handle, "Compass title"))
     .transpose()
     .map(|title| title.unwrap_or_default())
 }
@@ -1526,7 +1548,7 @@ fn render_native_messages(
             read_native_person_label(query, row.to)?,
         )
         .unwrap();
-        let body = read_utf8(query.snapshot, row.body, "Message body")?;
+        let body = read_utf8(&query.payloads, row.body, "Message body")?;
         if body.is_empty() {
             writeln!(out, "    ").unwrap();
         } else {
@@ -1787,12 +1809,12 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
     let handles = teams_message_detail_handles(query, message)?;
     let author = handles
         .author
-        .map(|handle| read_utf8(query.snapshot, handle, "Teams author display name"))
+        .map(|handle| read_utf8(&query.payloads, handle, "Teams author display name"))
         .transpose()?
         .unwrap_or_else(|| "(unknown)".to_owned());
     let content = handles
         .content
-        .map(|handle| read_utf8(query.snapshot, handle, "Teams message content"))
+        .map(|handle| read_utf8(&query.payloads, handle, "Teams message content"))
         .transpose()?
         .unwrap_or_else(|| "(no content)".to_owned());
     Ok((author, content))
@@ -1847,10 +1869,10 @@ fn render_native_mail(
             .unwrap_or_else(|| "?".to_owned());
         let from = summary
             .from
-            .map(|handle| read_utf8(query.snapshot, handle, "Mail From"))
+            .map(|handle| read_utf8(&query.payloads, handle, "Mail From"))
             .transpose()?
             .unwrap_or_else(|| "(no From)".to_owned());
-        let subject = read_utf8(query.snapshot, summary.subject, "Mail subject")?;
+        let subject = read_utf8(&query.payloads, summary.subject, "Mail subject")?;
         writeln!(out, "- [{}] {} {} — {}", fmt_id(wire), age, from, subject,).unwrap();
     }
     Ok((out, shown))
@@ -2031,7 +2053,7 @@ fn render_window_status(query: &OrientQuery<'_>) -> Result<(String, BTreeSet<Id>
     }
     let mut rows = Vec::new();
     for (person, (_, handle)) in &latest {
-        let text = Some(read_utf8(query.snapshot, *handle, "Status text")?);
+        let text = Some(read_utf8(&query.payloads, *handle, "Status text")?);
         rows.push((read_native_person_label(query, *person)?, text));
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2484,12 +2506,12 @@ fn is_persona_not_found(error: &anyhow::Error) -> bool {
 }
 
 fn resolve_native_persona(query: &OrientQuery<'_>, input: &str) -> Result<Id> {
-    resolve_resident_persona(query.relations, query.snapshot, input)
+    resolve_resident_persona(query.relations, &query.payloads, input)
 }
 
-fn resolve_resident_persona(
+fn resolve_resident_persona<R: BlobStoreList + BlobStoreGet>(
     facts: &FactArchive,
-    snapshot: &FacultySnapshot,
+    reader: &R,
     input: &str,
 ) -> Result<Id> {
     let input = input.trim();
@@ -2507,7 +2529,7 @@ fn resolve_resident_persona(
         let heads = profile_heads(facts, person);
         let mut matched = false;
         for handle in profile_lookup_handles(facts, person) {
-            let value = read_utf8(snapshot, handle, "Relations profile selector")?;
+            let value = read_utf8(reader, handle, "Relations profile selector")?;
             if relations::lookup_key(&value) == wanted {
                 matched = true;
                 break;
@@ -2564,7 +2586,7 @@ fn native_person_label_handle(
 
 fn read_native_person_label(query: &OrientQuery<'_>, person: Id) -> Result<String> {
     native_person_label_handle(query, person)?
-        .map(|handle| read_utf8(query.snapshot, handle, "Relations person label"))
+        .map(|handle| read_utf8(&query.payloads, handle, "Relations person label"))
         .transpose()
         .map(|label| label.unwrap_or_else(|| fmt_id(person)))
 }
@@ -2573,7 +2595,7 @@ fn persona_keys(query: &OrientQuery<'_>, persona: Id) -> Result<HashSet<String>>
     profile_lookup_handles(query.relations, persona)
         .into_iter()
         .map(|handle| {
-            read_utf8(query.snapshot, handle, "Relations persona selector")
+            read_utf8(&query.payloads, handle, "Relations persona selector")
                 .map(|value| value.to_ascii_lowercase())
         })
         .collect()
@@ -2613,8 +2635,8 @@ fn group_attention_name_handles<P: TriblePattern>(
     Ok(handles.into_iter().collect())
 }
 
-fn group_attention_keys<P: TriblePattern>(
-    reader: &FacultySnapshot,
+fn group_attention_keys<R: BlobStoreList + BlobStoreGet, P: TriblePattern>(
+    reader: &R,
     facts: &P,
     persona: Id,
 ) -> Result<HashSet<String>> {
@@ -2630,7 +2652,7 @@ fn group_attention_keys<P: TriblePattern>(
 fn attention_keys(query: &OrientQuery<'_>, persona: Id) -> Result<HashSet<String>> {
     let mut keys = persona_keys(query, persona)?;
     keys.extend(group_attention_keys(
-        query.snapshot,
+        &query.payloads,
         query.relations,
         persona,
     )?);
@@ -3084,7 +3106,7 @@ fn render_news_detail(
         for id in &new_msgs {
             if let Some(row) = rows.iter().find(|r| r.id == *id) {
                 let from = read_native_person_label(query, row.from)?;
-                let body = read_utf8(query.snapshot, row.body, "Message body")?;
+                let body = read_utf8(&query.payloads, row.body, "Message body")?;
                 writeln!(out, "- {from}: {body}").unwrap();
             }
         }
@@ -3106,10 +3128,10 @@ fn render_news_detail(
             })?;
             let from = summary
                 .from
-                .map(|handle| read_utf8(query.snapshot, handle, "Mail From"))
+                .map(|handle| read_utf8(&query.payloads, handle, "Mail From"))
                 .transpose()?
                 .unwrap_or_else(|| "(no From)".to_owned());
-            let subject = read_utf8(query.snapshot, summary.subject, "Mail subject")?;
+            let subject = read_utf8(&query.payloads, summary.subject, "Mail subject")?;
             writeln!(out, "- [{}] {} — {}", fmt_id(*wire), from, subject,).unwrap();
         }
     }
@@ -3190,7 +3212,7 @@ fn clip_line(text: &str, limit: usize) -> Option<String> {
 /// `prepare_news_once` treats that as a pending payload — withholding the whole
 /// report over text the reader never had before.
 fn news_text(query: &OrientQuery<'_>, handle: compass::TextHandle, label: &str) -> Option<String> {
-    read_utf8(query.snapshot, handle, label).ok()
+    read_utf8(&query.payloads, handle, label).ok()
 }
 
 /// How a goal is named in a News line: `[short] "Title"` when a title reads,
@@ -4123,18 +4145,21 @@ async fn cmd_observe(
                 ) {
                     match &pending_habits_seen {
                         None => {
-                            // An owned intention already due when the watcher
-                            // arms is reported at once, even while a news body
-                            // is still pending.
-                            let (owned_due, due_events) = render_due_habits_unreceipted(
+                            // An intention already due when the watcher arms,
+                            // shared or addressed, is presented at once, even
+                            // while a news body is still pending -- and
+                            // receipted, so a rearmed watcher does not present
+                            // the same occurrence again.
+                            let (due_report, due_events) = render_due_habits_unreceipted(
                                 habits,
                                 observation.facts.presentations.view(),
                             )
                             .unwrap_or_else(|| (String::new(), Vec::new()));
                             pending_habits_seen = Some(habits.clone());
                             last_pending_sweep = Instant::now();
-                            if !owned_due.is_empty() {
-                                write_complete_report(output, &owned_due, "Orient habit report")?;
+                            if !due_report.is_empty() {
+                                write_complete_report(output, &due_report, "Orient habit report")?;
+                                commit_habit_receipts(pile, signer, &due_events)?;
                                 if !continuous {
                                     return Ok(WaitOutcome {
                                         news_printed: true,
@@ -4244,12 +4269,9 @@ async fn cmd_observe(
             habits: mut habit_seen,
             news,
         } = initial;
-        // Already-due habits establish a quiet, process-local baseline. A
-        // rearmed one-shot watcher therefore waits for a transition instead
-        // of reporting the same unsatisfied intention forever. An intention
-        // addressed to this persona is the exception: its due instant can
-        // fall between one wait's exit and the next arm, and nobody else will
-        // complete it, so it is reported at once.
+        // Due-ness is decided by receipt: whatever this arm presents is
+        // receipted, so a rearmed one-shot watcher does not repeat it, and an
+        // occurrence already presented is not repeated here.
         let mut last_habit_sweep = Instant::now();
         let mut current_habit_context_valid = true;
 
@@ -6860,7 +6882,8 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_refreshes_the_observation_the_retained_frame_carries_into_ready() {
+    fn a_shared_intention_due_at_arm_is_presented_once_and_the_body_still_carries_the_frame_into_ready(
+    ) {
         let fixture = TestPile::new();
         let mut pile = open_store(&fixture.path).unwrap();
         let sources =
@@ -6895,8 +6918,11 @@ mod tests {
             ),
         )
         .unwrap();
-        // A shared script intention that is due at arm (the quiet baseline)
-        // and no longer due at the first sweep.
+        // A shared script intention that is due at arm and no longer due two
+        // seconds later. Due-ness is decided by receipt: the first watcher
+        // presents it once, while the message body is still pending, and
+        // receipts it; the rearmed watcher stays quiet about it and waits for
+        // the body.
         let marker = fixture.dir.join("due-marker");
         fs::write(&marker, b"").unwrap();
         let (probe, _) =
@@ -6921,7 +6947,22 @@ mod tests {
                 .unwrap();
             second.close().unwrap();
         });
-        let text = run_wait_for(
+        let first = run_wait_for(
+            &mut pile,
+            &fixture,
+            "cc",
+            Duration::from_secs(80),
+            Duration::from_millis(200),
+        );
+        assert!(
+            first.contains("News: habit became due: probe"),
+            "a shared intention due at arm is presented while the body is pending: {first}"
+        );
+        assert!(
+            !first.contains("News: new message"),
+            "the body had not landed yet: {first}"
+        );
+        let second = run_wait_for(
             &mut pile,
             &fixture,
             "cc",
@@ -6930,14 +6971,14 @@ mod tests {
         );
         deliverer.join().unwrap();
         assert!(
-            text.contains("News: new message"),
-            "the body must land within the wait: {text}"
+            second.contains("News: new message"),
+            "the body must land within the wait: {second}"
         );
-        // Ready compares the last sweep's observation, where the probe is no
-        // longer due, never the first preparation's, where it was.
+        // The occurrence presented at the first arm was receipted there; the
+        // rearmed watcher's own arm, sweep and Ready never present it again.
         assert!(
-            !text.contains("became due"),
-            "a stale cached observation was carried into Ready: {text}"
+            !second.contains("became due"),
+            "a presented occurrence was shown again by a rearmed watcher: {second}"
         );
         pile.close().unwrap();
     }
