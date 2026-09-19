@@ -277,48 +277,15 @@ struct HabitSession<'a> {
 
 impl HabitSession<'_> {
     fn commit(&mut self, fragment: Fragment) -> Result<CollectionCommit> {
-        require_command_write_authority(self.pile, self.collection, self.signer)?;
+        crate::collection_names::require_command_write_admission(
+            self.pile,
+            self.collection,
+            self.signer,
+            "Habit",
+            "habit list",
+        )?;
         commit_habit_fragment(self.pile, self.collection, self.signer, fragment)
     }
-}
-
-/// Refuse a command whose record would be published but never admitted.
-///
-/// Publication itself stays unconditional — [`commit_habit_fragment`] keeps
-/// that property, because an offline COMMIT can be activated later by evidence
-/// that has not arrived yet. What must not stay silent is the *command*. A
-/// `habit done` whose COMMIT is never admitted prints a completion id and
-/// changes nothing a reader can see: the maintained projection every read goes
-/// through only ever carries admitted support, so the intention keeps coming
-/// due, `habit list` keeps reporting the last admitted completion, and nothing
-/// anywhere says why. This module already states the principle for a missing
-/// script blob — a standing intention that quietly stops firing is worse than
-/// one that refuses outright, because nobody notices the first — and an
-/// unadmitted writer is the same failure with the same cure. Mirrors the
-/// identical guard Compass applies before publishing.
-fn require_command_write_authority(
-    pile: &mut Pile,
-    collection: Collection<SimpleArchive>,
-    signer: &SigningKey,
-) -> Result<()> {
-    let snapshot = pile
-        .snapshot()
-        .context("freeze Habit publication authority")?;
-    let admitted = collection
-        .writer_is_admitted(&snapshot, signer.verifying_key())
-        .context("check Habit collection WRITE admission")?;
-    drop(snapshot);
-    if !admitted {
-        bail!(
-            "key {} is not admitted to write Habit collection {}. The record would be published \
-             as a raw ledger entry that never enters an admitted snapshot, so no reader — \
-             `habit list` included — would ever see it. Grant that key WRITE on the collection, \
-             or run with an admitted key.",
-            hex::encode_upper(signer.verifying_key().to_bytes()),
-            hex::encode_upper(collection.handle().raw),
-        );
-    }
-    Ok(())
 }
 
 /// Publish the fragment; derived query views advance when a reader prepares
@@ -560,9 +527,23 @@ mod tests {
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
                 .unwrap();
 
-        require_command_write_authority(&mut pile, source, &owner).unwrap();
+        crate::collection_names::require_command_write_admission(
+            &mut pile,
+            source,
+            &owner,
+            "Habit",
+            "habit list",
+        )
+        .unwrap();
 
-        let error = require_command_write_authority(&mut pile, source, &outsider).unwrap_err();
+        let error = crate::collection_names::require_command_write_admission(
+            &mut pile,
+            source,
+            &outsider,
+            "Habit",
+            "habit list",
+        )
+        .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("not admitted to write"), "{error:#}");
         assert!(

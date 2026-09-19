@@ -380,6 +380,52 @@ where
 mod tests {
     use super::*;
 
+    /// The guard refuses an unadmitted writer and says enough to fix it.
+    ///
+    /// Also pins the half that must NOT change: publication itself stays
+    /// unconditional, so the same key can still append through the library
+    /// path. The guard is on the command, not on the commit.
+    #[test]
+    fn the_command_guard_refuses_an_unadmitted_writer_and_names_the_remedy() {
+        let mut store = MemoryRepo::default();
+        let owner = SigningKey::from_bytes(&[61; 32]);
+        let outsider = SigningKey::from_bytes(&[62; 32]);
+        let collection = open(&mut store, decide::DEFAULT_SCOPE_ID, owner.verifying_key())
+            .expect("register the signer-private descriptor");
+
+        require_command_write_admission(&mut store, collection, &owner, "Decide", "decide show")
+            .expect("the descriptor's own authority is admitted");
+
+        let error = require_command_write_admission(
+            &mut store,
+            collection,
+            &outsider,
+            "Decide",
+            "decide show",
+        )
+        .expect_err("an unadmitted writer must not get a silent success");
+        let message = format!("{error:#}");
+        assert!(message.contains("not admitted to write"), "{message}");
+        assert!(
+            message.contains(&hex::encode_upper(outsider.verifying_key().to_bytes())),
+            "the refusal names the key to grant: {message}"
+        );
+        assert!(
+            message.contains(&hex::encode_upper(collection.handle().raw)),
+            "the refusal names the collection to grant it on: {message}"
+        );
+        assert!(
+            message.contains("decide show"),
+            "the refusal names a reader that would silently not change: {message}"
+        );
+
+        // The library path is deliberately untouched.
+        let fragment = entity! { metadata::description: "raw outsider publication".to_owned() };
+        store
+            .commit(collection, &outsider, fragment)
+            .expect("publication stays unconditional");
+    }
+
     use std::collections::BTreeSet;
 
     use ed25519_dalek::SigningKey;
